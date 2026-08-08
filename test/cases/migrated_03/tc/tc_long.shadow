@@ -1,0 +1,9 @@
+//@desc: long integer type is accepted
+//@expect: typecheck: 1
+dsb tc_long;
+kimo f(x: long) -> long {
+    let y: long = x + 1;
+    let z: long = y - 2;
+    return z;
+}
+kimo main() -> int { return 0; }

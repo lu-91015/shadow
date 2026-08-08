@@ -1,0 +1,68 @@
+//@desc: operator overloading — Add/Sub/Mul/Div/Rem traits rewrite binary ops to trait method calls
+//@expect: 14\n6\n40\n2\n2
+dsb cg_operator_overload;
+
+trait Add {
+    kimo add(self: Self, rhs: Self) -> Self;
+}
+trait Sub {
+    kimo sub(self: Self, rhs: Self) -> Self;
+}
+trait Mul {
+    kimo mul(self: Self, rhs: Self) -> Self;
+}
+trait Div {
+    kimo div(self: Self, rhs: Self) -> Self;
+}
+trait Rem {
+    kimo rem(self: Self, rhs: Self) -> Self;
+}
+
+struct Vec2 {
+    x: int;
+    y: int;
+}
+
+impl Add for Vec2 {
+    kimo add(self: Vec2, rhs: Vec2) -> Vec2 {
+        return Vec2 { x: self.x + rhs.x, y: self.y + rhs.y };
+    }
+}
+impl Sub for Vec2 {
+    kimo sub(self: Vec2, rhs: Vec2) -> Vec2 {
+        return Vec2 { x: self.x - rhs.x, y: self.y - rhs.y };
+    }
+}
+impl Mul for Vec2 {
+    kimo mul(self: Vec2, rhs: Vec2) -> Vec2 {
+        return Vec2 { x: self.x * rhs.x, y: self.y * rhs.y };
+    }
+}
+impl Div for Vec2 {
+    kimo div(self: Vec2, rhs: Vec2) -> Vec2 {
+        return Vec2 { x: self.x / rhs.x, y: self.y / rhs.y };
+    }
+}
+impl Rem for Vec2 {
+    kimo rem(self: Vec2, rhs: Vec2) -> Vec2 {
+        return Vec2 { x: self.x % rhs.x, y: self.y % rhs.y };
+    }
+}
+
+kimo main() -> int {
+    let a = Vec2 { x: 10, y: 4 };
+    let b = Vec2 { x: 4, y: 2 };
+
+    let s = a + b;       // rewrite to a.add(b)  -> Vec2{14, 6}
+    let d = a - b;       // rewrite to a.sub(b)  -> Vec2{6, 2}
+    let p = a * b;       // rewrite to a.mul(b)  -> Vec2{40, 8}
+    let q = a / b;       // rewrite to a.div(b)  -> Vec2{2, 2}
+    let r = a % b;       // rewrite to a.rem(b)  -> Vec2{0, 0}  (10%4=2, 4%2=0)
+
+    println(s.x);        // 14
+    println(d.x);        // 6
+    println(p.x);        // 40
+    println(q.x);        // 2
+    println(r.x);        // 2
+    return 0;
+}

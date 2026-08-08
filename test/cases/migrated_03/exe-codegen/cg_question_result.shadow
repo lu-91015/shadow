@@ -1,0 +1,49 @@
+//@desc: L6 `?` on Result<T,E> — unwraps Ok(T); Err throws (catchable via try/catch)
+//@expect: 7\n12\ncaught: 1\nafter: 0
+dsb cg_question_result;
+
+// Result<T,E> 由类型检查器 prelude 预注册（Ok=0, Err=1），无需本地定义。
+
+let g_side: int = 0;
+
+kimo half_plus(x: int) -> Result<int, string> {
+    if (x == 0) {
+        return Err("zero not allowed");
+    }
+    return Ok(x + 2);
+}
+
+// let 形式：let v = expr?;
+kimo use_let(x: int) -> int {
+    let v = half_plus(x)?;
+    return v;
+}
+
+// 赋值形式：v = expr?;
+kimo use_assign(x: int) -> int {
+    let v: int = 0;
+    v = half_plus(x)?;
+    return v;
+}
+
+// 错误路径：Err 时 `?` 抛出，g_side 不会被置位
+kimo use_err() -> int {
+    let v = half_plus(0)?;
+    g_side = 1;  // 不会执行
+    return v;
+}
+
+kimo main() -> int {
+    println(use_let(5));     // Ok(7) -> 7
+    println(use_assign(10)); // Ok(12) -> 12
+
+    g_side = 0;
+    try {
+        use_err();           // Err -> throw
+    } catch {
+        println("caught: 1");
+    }
+    print("after: ");
+    println(g_side);         // 0（throw 后语句被跳过）
+    return 0;
+}

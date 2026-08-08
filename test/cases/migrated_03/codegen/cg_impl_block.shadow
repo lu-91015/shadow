@@ -1,0 +1,15 @@
+//@ mode: codegen
+//@ desc: impl block defines methods that can be called via obj.method() syntax
+//@expect-ir: call
+dsb cg_impl_block;
+
+struct Point { x: int, y: int }
+impl Point {
+    kimo get_x(self: Point) -> int { return self.x; }
+    kimo sum(self: Point) -> int { return self.x + self.y; }
+}
+kimo main() -> int {
+    let p = Point { x: 42, y: 99 };
+    let r = p.get_x();
+    return r;
+}

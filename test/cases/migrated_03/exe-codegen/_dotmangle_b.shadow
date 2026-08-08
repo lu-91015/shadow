@@ -1,0 +1,7 @@
+dsb dotmangle_b;
+
+pub let VALUE: int = 200;
+
+pub kimo get_value() -> int {
+    return VALUE;
+}

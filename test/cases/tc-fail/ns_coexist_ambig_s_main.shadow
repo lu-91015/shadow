@@ -1,0 +1,11 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：同时 import 两个都有 pub struct Pt 的模块 → 使用处 ambiguous struct
+//@expect-stderr: ambiguous struct 'Pt'
+//@args: --strict
+dsb ns_coexist_ambig_s_main;
+import ns_coexist_ambig._a;
+import ns_coexist_ambig._b;
+kimo main() -> int {
+    let p = Pt { v: 1 };
+    return 0;
+}

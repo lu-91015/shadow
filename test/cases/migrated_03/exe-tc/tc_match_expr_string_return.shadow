@@ -1,0 +1,11 @@
+//@expect: 1
+//@desc: match-expression returning a string, then used as a function argument
+dsb tc_match_expr_string_return;
+kimo describe(n: int) -> string {
+    return match n { 1 => "one", 2 => "two", 3 => "three" };
+}
+kimo main() -> int {
+    let s = describe(2);
+    if (s == "two") { println(1); return 0; }
+    println(0); return 0;
+}

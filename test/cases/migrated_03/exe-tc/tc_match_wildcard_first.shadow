@@ -1,0 +1,10 @@
+//@desc: `_` wildcard as the first arm type-checks (later arms become unreachable but TC allows)
+//@expect: 1
+dsb tc_match_wildcard_first;
+kimo main() -> int {
+    let r = match 3 {
+        _ => 1,
+        2 => 2,
+    };
+    println(r); return 0;
+}

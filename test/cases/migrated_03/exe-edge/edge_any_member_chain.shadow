@@ -1,0 +1,11 @@
+//@desc: chained `any` member access (box struct, access two fields)
+//@expect: 7
+dsb edge_any_member_chain;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 3, y: 4 };
+    let a = p as any;
+    let vx = a.x as int;
+    let vy = a.y as int;
+    println(vx + vy); return 0;
+}

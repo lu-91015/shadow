@@ -1,0 +1,14 @@
+//@desc: array as function parameter (simple)
+//@expect: 42\n0
+dsb cg_array_simple;
+
+kimo get_first(arr: array) -> int {
+    return arr[0] as int;
+}
+
+kimo main() -> int {
+    let data = [42, 7];
+    let x = get_first(data);
+    println(to_string(x));
+    println(0); return 0;
+}

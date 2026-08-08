@@ -1,0 +1,15 @@
+//@desc: GC across array + struct + for-loop (root management)
+//@expect-ir: shadow_gc_alloc
+//@expect-ir: shadow_gc_root_
+//@expect-ir: shadow_gc_frame_leave
+dsb codegen_gc_lifecycle;
+struct Pair { a: int, b: int }
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let p = Pair { a: 1, b: 2 };
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + x;
+    }
+    return sum + p.a;
+}

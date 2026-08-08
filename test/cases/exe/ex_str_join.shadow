@@ -1,0 +1,10 @@
+//@mode: exe
+//@desc: str_join 基础拼接（预计算总长一次分配）
+//@expect: a-b-c
+dsb ex_str_join;
+kimo main() -> int {
+    let parts = ["a", "b", "c"];
+    let s = str_join(parts, "-");
+    println(s);
+    return 0;
+}

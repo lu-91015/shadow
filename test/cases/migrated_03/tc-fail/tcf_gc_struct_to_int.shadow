@@ -1,0 +1,8 @@
+//@desc: assign struct to int variable should fail
+//@expect-stderr: Type check failed
+dsb tcf_gc_struct_to_int;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let n: int = P { x: 1, y: 2 };
+    return n;
+}

@@ -1,0 +1,13 @@
+//@desc: real accumulating while loop codegens to a back-edge
+//@expect-ir: br
+dsb codegen_sum_loop;
+kimo sum() -> int {
+    let i = 0;
+    let s = 0;
+    while (i < 10) {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+kimo main() -> int { return sum(); }

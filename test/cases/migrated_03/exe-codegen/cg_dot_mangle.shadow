@@ -1,0 +1,16 @@
+//@expect: 100
+//@expect: 200
+//@expect: 100
+//@expect: 200
+//@ desc: cross-module same-name pub let with dot syntax, mangled to module__name
+dsb cg_dot_mangle;
+import _dotmangle_a;
+import _dotmangle_b;
+
+kimo main() -> int {
+    println(dotmangle_a.VALUE);
+    println(dotmangle_b.VALUE);
+    println(dotmangle_a.get_value());
+    println(dotmangle_b.get_value());
+    return 0;
+}

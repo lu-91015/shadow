@@ -1,0 +1,10 @@
+//@desc: exe-extra generated case (exa_whsq_104)
+//@expect: 55
+dsb exa_whsq_104;
+kimo main() -> int {
+    let i = 1;
+    let s = 0;
+    while (i <= 5) { s = s + i * i; i = i + 1; }
+    println(s);
+    return 0;
+}

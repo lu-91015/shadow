@@ -1,0 +1,13 @@
+//@ mode: tc
+//@ desc: local private function should shadow imported pub function with same name
+dsb ns_local_shadow;
+import _ns_pub_add;
+
+// This private add should be preferred over the imported pub add
+kimo add(a: int, b: int) -> int { return a - b; }
+
+kimo main() -> int {
+    // Local add: 10 - 3 = 7 (not 10 + 3 = 13)
+    let r = add(10, 3);
+    return r;
+}

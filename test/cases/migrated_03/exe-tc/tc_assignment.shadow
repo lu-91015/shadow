@@ -1,0 +1,11 @@
+//@desc: mutable binding reassignment type-checks
+//@expect: -1
+dsb tc_assignment;
+kimo f() -> int {
+    let x = 0;
+    x = x + 1;
+    x = x * 2;
+    x = x - 3;
+    return x;
+}
+kimo main() -> int { println(f()); return 0; }

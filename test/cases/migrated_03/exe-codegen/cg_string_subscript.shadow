@@ -1,0 +1,8 @@
+//@desc: string subscript compiled to shadow_string_subscript call (ptr, not i32)
+//@expect: 0
+dsb cg_string_subscript;
+kimo main() -> int {
+    let s = "abc";
+    let ch = s[1];
+    println(0); return 0;
+}

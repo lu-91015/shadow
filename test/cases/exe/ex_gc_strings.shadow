@@ -1,0 +1,33 @@
+// ex_gc_strings.shadow — GC v1：大量 string/array 分配回收，验证引用保活
+// 每轮分配 5000 个字符串并保留一半，重复多轮；若 GC 误回收则崩溃/输出错。
+dsb ex_gc_strings;
+
+kimo main() -> int {
+    let round = 0;
+    while (round < 300) {
+        let keep: array<string> = [];
+        let i = 0;
+        while (i < 5000) {
+            let s: string = "item-" + int_to_str(i) + "-" + int_to_str(round);
+            if (i % 2 == 0) {
+                keep = array_push(keep, s);
+            }
+            i = i + 1;
+        }
+        // 校验保留的一半完整
+        i = 0;
+        while (i < len(keep)) {
+            let s2 = keep[i] as string;
+            let ok = 0;
+            if (str_contains(s2, "item-") == 1) { ok = 1; }
+            if (ok == 0) {
+                println("ERR bad string");
+                return 1;
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    println("strings ok rounds=300");
+    return 0;
+}

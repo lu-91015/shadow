@@ -1,0 +1,8 @@
+//@desc: deeply left-nested arithmetic expression (25 terms) does not blow the parser stack; vars prevent constant folding
+//@expect: 325
+dsb edge_deep_expr;
+kimo main() -> int {
+    let a = 1; let b = 2; let c = 3; let d = 4; let e = 5;
+    let r = a + b + c + d + e + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 23 + 24 + 25;
+    println(r); return 0;
+}

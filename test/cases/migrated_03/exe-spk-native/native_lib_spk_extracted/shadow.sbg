@@ -1,0 +1,8 @@
+# native_lib.spk 内嵌的 shadow.sbg
+# [native] 节声明 native 文件：编译器在 import 解包后自动收集并传给链接器
+[package]
+name = "native_lib"
+version = "0.1.0"
+
+[native]
+sources = ["native/calc_bind.cpp"]

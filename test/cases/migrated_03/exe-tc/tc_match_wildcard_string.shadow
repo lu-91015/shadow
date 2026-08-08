@@ -1,0 +1,11 @@
+//@expect: 0
+//@desc: match-expression returning a string with a `_` wildcard arm
+dsb tc_match_wildcard_string;
+kimo main() -> int {
+    let s = match 2 {
+        1 => "one",
+        _ => "other",
+    };
+    let n = s[0];
+    println(0); return 0;
+}

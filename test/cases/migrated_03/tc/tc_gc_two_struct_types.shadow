@@ -1,0 +1,9 @@
+//@desc: two different struct types with field access
+dsb tc_gc_two_struct_types;
+struct A { val: int }
+struct B { val: int }
+kimo main() -> int {
+    let a = A { val: 1 };
+    let b = B { val: 2 };
+    return a.val + b.val;
+}

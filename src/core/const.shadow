@@ -1,0 +1,270 @@
+// Shadow 0.4 — core 常量定义
+// ============================================================
+// 语法完全复刻 shadow-0.3：dsb 模块声明 + pub let 全局常量。
+// 常量跨模块可见（P0.4-1 全局 pub 回退），模块内直接引用无需 import。
+// 字符串拼接遵循原则 9：禁止裸 + 链，统一 str_join。
+dsb core_const;
+
+// ============ 类型种类 TYPE_* ============
+pub let TYPE_VOID: int = 0;
+pub let TYPE_INT: int = 1;
+pub let TYPE_LONG: int = 2;
+pub let TYPE_FLOAT: int = 3;
+pub let TYPE_DOUBLE: int = 4;
+pub let TYPE_BOOL: int = 5;
+pub let TYPE_STRING: int = 6;
+pub let TYPE_ARRAY: int = 7;
+pub let TYPE_STRUCT: int = 8;
+pub let TYPE_ENUM: int = 9;
+pub let TYPE_ANY: int = 10;
+pub let TYPE_FUNCTION: int = 11;
+pub let TYPE_CHAR: int = 12;
+pub let TYPE_SHORT: int = 13;
+pub let TYPE_DICT: int = 14;
+pub let TYPE_INFER: int = 15;
+pub let TYPE_UNIT: int = 16;
+pub let TYPE_DATE: int = 17;
+pub let TYPE_TIMESTAMP: int = 18;
+pub let TYPE_NANOTIMESTAMP: int = 19;
+pub let TYPE_OPAQUE: int = 20;
+pub let TYPE_ENUM_PAYLOAD: int = 21;
+pub let TYPE_TUPLE: int = 22;
+pub let TYPE_SET: int = 23;
+pub let TYPE_FUTURE: int = 24;
+
+// ============ Token 种类 TOK_* ============
+pub let TOK_EOF: int = 0;
+pub let TOK_IDENT: int = 1;
+pub let TOK_INT_LIT: int = 2;
+pub let TOK_LONG_LIT: int = 3;
+pub let TOK_FLOAT_LIT: int = 4;
+pub let TOK_STRING_LIT: int = 5;
+pub let TOK_CHAR_LIT: int = 6;
+
+pub let TOK_KIMO: int = 10;
+pub let TOK_LET: int = 11;
+pub let TOK_IF: int = 12;
+pub let TOK_ELSE: int = 13;
+pub let TOK_WHILE: int = 14;
+pub let TOK_FOR: int = 15;
+pub let TOK_RETURN: int = 16;
+pub let TOK_BREAK: int = 17;
+pub let TOK_CONTINUE: int = 18;
+pub let TOK_TRUE: int = 19;
+pub let TOK_FALSE: int = 20;
+pub let TOK_AS: int = 21;
+pub let TOK_STRUCT: int = 22;
+pub let TOK_ENUM: int = 23;
+pub let TOK_IMPORT: int = 24;
+pub let TOK_PUB: int = 25;
+pub let TOK_TYPE: int = 26;
+pub let TOK_NULL: int = 27;
+pub let TOK_IN: int = 28;
+
+pub let TOK_INT_TY: int = 30;
+pub let TOK_LONG_TY: int = 31;
+pub let TOK_FLOAT_TY: int = 32;
+pub let TOK_DOUBLE_TY: int = 33;
+pub let TOK_BOOL_TY: int = 34;
+pub let TOK_STRING_TY: int = 35;
+pub let TOK_VOID_TY: int = 36;
+pub let TOK_ANY_TY: int = 37;
+pub let TOK_CHAR_TY: int = 38;
+pub let TOK_SHORT_TY: int = 39;
+
+pub let TOK_MATCH: int = 50;
+pub let TOK_NEW: int = 51;
+pub let TOK_MUT: int = 52;
+pub let TOK_IMPL: int = 53;
+pub let TOK_TRY: int = 54;
+pub let TOK_CATCH: int = 55;
+pub let TOK_THROW: int = 56;
+pub let TOK_PANIC: int = 57;
+pub let TOK_MACRO: int = 58;
+
+pub let TOK_PLUS: int = 60;
+pub let TOK_MINUS: int = 61;
+pub let TOK_STAR: int = 62;
+pub let TOK_SLASH: int = 63;
+pub let TOK_PERCENT: int = 64;
+pub let TOK_EQ: int = 65;
+pub let TOK_EQEQ: int = 66;
+pub let TOK_BANG: int = 67;
+pub let TOK_BANGEQ: int = 68;
+pub let TOK_LT: int = 69;
+pub let TOK_GT: int = 70;
+pub let TOK_LE: int = 71;
+pub let TOK_GE: int = 72;
+pub let TOK_AND: int = 73;
+pub let TOK_OR: int = 74;
+
+pub let TOK_LPAREN: int = 80;
+pub let TOK_RPAREN: int = 81;
+pub let TOK_LBRACE: int = 82;
+pub let TOK_RBRACE: int = 83;
+pub let TOK_LBRACKET: int = 84;
+pub let TOK_RBRACKET: int = 85;
+pub let TOK_COMMA: int = 86;
+pub let TOK_COLON: int = 87;
+pub let TOK_SEMICOLON: int = 88;
+pub let TOK_ARROW: int = 89;
+pub let TOK_AT: int = 90;
+pub let TOK_DOT: int = 91;
+
+pub let TOK_FATARROW: int = 92;
+pub let TOK_PLUSEQ: int = 93;
+pub let TOK_MINUSEQ: int = 94;
+pub let TOK_STAREQ: int = 95;
+pub let TOK_SLASHEQ: int = 96;
+pub let TOK_QUESTION: int = 97;
+pub let TOK_RANGE: int = 98;
+pub let TOK_ELLIPSIS: int = 99;
+
+pub let TOK_ASYNC: int = 100;
+pub let TOK_AWAIT: int = 101;
+pub let TOK_SPAWN: int = 102;
+pub let TOK_YIELD: int = 103;
+pub let TOK_TRAIT: int = 104;
+pub let TOK_INTERFACE: int = 105;
+pub let TOK_DO: int = 106;
+pub let TOK_SET: int = 107;
+pub let TOK_DATE_TY: int = 108;
+pub let TOK_TIMESTAMP_TY: int = 109;
+pub let TOK_NANOTIMESTAMP_TY: int = 110;
+pub let TOK_OPAQUE_TY: int = 111;
+pub let TOK_WITH: int = 112;
+pub let TOK_DSB: int = 113;
+pub let TOK_DEFER: int = 114;
+pub let TOK_COLONCOLON: int = 115;
+
+// ============ 表达式种类 EXPR_* ============
+pub let EXPR_INT: int = 1;
+pub let EXPR_LONG: int = 2;
+pub let EXPR_FLOAT: int = 3;
+pub let EXPR_STRING: int = 4;
+pub let EXPR_BOOL: int = 5;
+pub let EXPR_NULL: int = 6;
+pub let EXPR_VAR: int = 7;
+pub let EXPR_BINARY: int = 8;
+pub let EXPR_UNARY: int = 9;
+pub let EXPR_CALL: int = 10;
+pub let EXPR_INDEX: int = 11;
+pub let EXPR_MEMBER: int = 12;
+pub let EXPR_CAST: int = 13;
+pub let EXPR_ARRAY_LIT: int = 14;
+pub let EXPR_STRUCT_LIT: int = 15;
+pub let EXPR_ASSIGN: int = 16;
+pub let EXPR_MATCH: int = 17;
+pub let EXPR_NEW: int = 18;
+pub let EXPR_IF: int = 19;
+// enum 变体构造/解构模式：str1=变体名，items=负载值/绑定名
+pub let EXPR_ENUM_VARIANT: int = 20;
+// 闭包字面量 kimo(params) -> ret { body }：closure_def=FuncDef
+pub let EXPR_CLOSURE: int = 21;
+// 错误传播 `?` 后缀：child1=被包裹表达式
+pub let EXPR_QUESTION: int = 22;
+// 元组字面量 (e1, e2, ...)：items=元素
+pub let EXPR_TUPLE: int = 23;
+// for range 字面量 a..b：child1=start, child2=end
+pub let EXPR_RANGE: int = 24;
+// 协程 spawn：str1=函数名，items=可选参数
+pub let EXPR_SPAWN: int = 25;
+// await：child1=Future 表达式
+pub let EXPR_AWAIT: int = 26;
+
+// ============ 语句种类 STMT_* ============
+pub let STMT_LET: int = 1;
+pub let STMT_ASSIGN: int = 2;
+pub let STMT_EXPR: int = 3;
+pub let STMT_IF: int = 4;
+pub let STMT_WHILE: int = 5;
+pub let STMT_FOR: int = 6;
+pub let STMT_RETURN: int = 7;
+pub let STMT_BREAK: int = 8;
+pub let STMT_CONTINUE: int = 9;
+pub let STMT_BLOCK: int = 10;
+pub let STMT_FUNC: int = 11;
+pub let STMT_STRUCT: int = 12;
+pub let STMT_ENUM: int = 13;
+pub let STMT_MATCH: int = 14;
+pub let STMT_PANIC: int = 15;
+pub let STMT_TRY: int = 16;
+pub let STMT_THROW: int = 17;
+pub let STMT_WITH: int = 18;
+pub let STMT_DEFER: int = 19;
+
+// ============ 二元操作符 BIN_* ============
+pub let BIN_ADD: int = 0;
+pub let BIN_SUB: int = 1;
+pub let BIN_MUL: int = 2;
+pub let BIN_DIV: int = 3;
+pub let BIN_REM: int = 4;
+pub let BIN_EQ: int = 5;
+pub let BIN_NE: int = 6;
+pub let BIN_LT: int = 7;
+pub let BIN_GT: int = 8;
+pub let BIN_LE: int = 9;
+pub let BIN_GE: int = 10;
+pub let BIN_AND: int = 11;
+pub let BIN_OR: int = 12;
+
+// ============ 一元操作符 UN_* ============
+pub let UN_NEG: int = 0;
+pub let UN_NOT: int = 1;
+
+// ============ 诊断（LSP-6） ============
+pub let DIAG_ERROR: int = 1;
+pub let DIAG_WARNING: int = 2;
+pub let DIAG_INFO: int = 3;
+pub let DIAG_HINT: int = 4;
+pub let DIAG_SRC_LEX: int = 0;
+pub let DIAG_SRC_PARSE: int = 1;
+pub let DIAG_SRC_TYPE: int = 2;
+pub let DIAG_SRC_OTHER: int = 3;
+pub let DIAG_SRC_TC: int = 2;
+
+// ============ any 盒 tag ============
+pub let ANY_TAG_INT: int = 0;
+pub let ANY_TAG_LONG: int = 1;
+pub let ANY_TAG_FLOAT: int = 2;
+pub let ANY_TAG_STRING: int = 3;
+pub let ANY_TAG_BOOL: int = 4;
+pub let ANY_TAG_PTR: int = 5;
+pub let ANY_TAG_NULL: int = 6;
+
+// ============ MIR 操作码 ============
+pub let MIR_CONST_INT: int = 1;
+pub let MIR_CONST_FLOAT: int = 2;
+pub let MIR_CONST_STR: int = 3;
+pub let MIR_CONST_BOOL: int = 4;
+pub let MIR_CONST_NULL: int = 5;
+pub let MIR_LOAD_VAR: int = 6;
+pub let MIR_STORE_VAR: int = 7;
+pub let MIR_BINOP: int = 8;
+pub let MIR_UNOP: int = 9;
+pub let MIR_CALL: int = 10;
+pub let MIR_CAST: int = 11;
+pub let MIR_ALLOCA: int = 12;
+pub let MIR_RET: int = 13;
+pub let MIR_BR: int = 14;
+pub let MIR_CONDBR: int = 15;
+pub let MIR_LABEL: int = 16;
+pub let MIR_INDEX: int = 17;
+pub let MIR_MEMBER: int = 18;
+pub let MIR_ARRAY_LIT: int = 19;
+pub let MIR_STRUCT_LIT: int = 20;
+pub let MIR_STORE_INDEX: int = 21;
+pub let MIR_STORE_MEMBER: int = 22;
+pub let MIR_ENUM_CONSTRUCT: int = 23;
+pub let MIR_ENUM_GET_TAG: int = 24;
+pub let MIR_ENUM_GET_PAYLOAD: int = 25;
+pub let MIR_MAKE_CLOSURE: int = 26;
+pub let MIR_CALL_INDIRECT: int = 27;
+pub let MIR_SPAWN: int = 28;
+pub let MIR_AWAIT: int = 29;
+
+// ============ .lu 缓存全局变量初始值标签 ============
+pub let LU_INIT_NONE: int = 0;
+pub let LU_INIT_INT: int = 1;
+pub let LU_INIT_STR: int = 2;
+pub let LU_INIT_UNSUP: int = 3;

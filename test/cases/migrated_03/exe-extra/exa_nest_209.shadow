@@ -1,0 +1,17 @@
+//@desc: exe-extra generated case (exa_nest_209)
+//@expect: -3
+//@expect: 1
+//@expect: 7
+dsb exa_nest_209;
+kimo f(x: int) -> int { return x + 1; }
+kimo g(x: int) -> int { return x * 2; }
+kimo h(x: int) -> int { return x - 3; }
+kimo main() -> int {
+    let r = f(g(h(1)));
+    println(r);
+    let r2 = h(g(f(1)));
+    println(r2);
+    let r3 = g(f(1)) + f(g(1));
+    println(r3);
+    return 0;
+}

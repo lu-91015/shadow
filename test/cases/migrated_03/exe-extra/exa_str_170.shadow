@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_170)
+//@expect: hithere
+//@expect: 7
+//@expect: h
+dsb exa_str_170;
+kimo main() -> int {
+    let s = "hi" + "there";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

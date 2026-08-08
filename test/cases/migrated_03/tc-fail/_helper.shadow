@@ -1,0 +1,4 @@
+dsb _helper;
+// Helper module for pub visibility negative test
+pub kimo helper_public() -> int { return 42; }
+kimo helper_private() -> int { return 99; }

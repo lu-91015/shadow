@@ -1,0 +1,6 @@
+dsb _math_helper;
+// Helper for import test
+pub kimo max(a: int, b: int) -> int {
+    if (a > b) { return a; }
+    return b;
+}

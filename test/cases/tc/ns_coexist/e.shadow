@@ -1,0 +1,9 @@
+dsb e;
+import ns_coexist.pb.lib;
+// e 用 b 的：Pt(a) + enum 变体声明
+// run() = c(2) + g(20) + a(5) = 27
+pub kimo run() -> int {
+    let p = Pt { a: 5 };
+    let col = Color.Green;
+    return c() + g + p.a;
+}

@@ -1,0 +1,4 @@
+dsb _ns_ambig_mod_b;
+pub kimo same_func() -> int {
+    return 2;
+}

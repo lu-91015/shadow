@@ -1,0 +1,15 @@
+//@desc: async kimo function — calling it auto-spawns a coroutine, returns Future
+//@xfail: 0.4 coroutine runtime AV (async/await crash, known bug)
+//@expect: 100
+dsb cg_async_func;
+
+async kimo compute(x: int) -> int {
+    return x * 10;
+}
+
+kimo main() -> int {
+    let f = compute(10);
+    let v = await f;
+    println(v as int);
+    return 0;
+}

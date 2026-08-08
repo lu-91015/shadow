@@ -1,0 +1,6 @@
+dsb _mylib_helper;
+// mylib 的 helper — 被 transitive_test.shadow 通过 mylib.mylib_helper 导入
+// 文件名以下划线开头 → run_tests_03.py 的 discover() 会跳过
+pub kimo mylib_value() -> int {
+    return 100;
+}

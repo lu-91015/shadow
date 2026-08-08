@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_173)
+//@expect: catdog
+//@expect: 6
+//@expect: c
+dsb exa_str_173;
+kimo main() -> int {
+    let s = "cat" + "dog";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

@@ -1,0 +1,8 @@
+//@desc: string array index lowers to shadow_array_get_ptr (pointer get)
+//@expect-ir: shadow_array_get_ptr
+dsb cg_string_array_index;
+kimo main() -> int {
+    let a = ["x", "y"];
+    let s = a[0];
+    return 0;
+}

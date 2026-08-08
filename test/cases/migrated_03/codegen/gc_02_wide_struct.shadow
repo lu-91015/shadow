@@ -1,0 +1,8 @@
+//@desc: GC alloc struct with many fields
+//@expect-ir: shadow_gc_alloc
+dsb gc_02_wide_struct;
+struct Wide { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int }
+kimo main() -> int {
+    let w = Wide { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 };
+    return w.a + w.h;
+}

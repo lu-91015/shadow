@@ -1,0 +1,19 @@
+//@desc: dict d[k] = v assignment syntax
+//@expect: world\n42\nnewval
+dsb cg_dict_assign;
+
+kimo main() -> int {
+    let d: dict<string, string> = hashmap_new();
+    // 写入 via d[k] = v 语法
+    d["hello"] = "world";
+    d["num"] = "42";
+    println(d["hello"]);   // world
+    println(d["num"]);     // 42
+
+    // 覆盖已有 key
+    d["hello"] = "newval";
+    println(d["hello"]);   // newval
+
+    hashmap_free(d);
+    return 0;
+}

@@ -1,0 +1,10 @@
+//@ mode: tc-fail
+//@ desc: assigning one enum type to another is rejected
+dsb tc_fail_enum_mismatch;
+enum Color { Red; Green }
+enum Size { Small; Large }
+kimo main() -> int {
+    let c = Color.Red;
+    let s: Size = c;
+    return 0;
+}

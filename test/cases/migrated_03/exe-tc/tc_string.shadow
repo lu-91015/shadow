@@ -1,0 +1,10 @@
+//@desc: string literal and concatenation type-check
+//@expect: 1
+dsb tc_string;
+kimo f() -> int {
+    let s = "hello";
+    let t = s + " world";
+    if (s == t) { return 0; }
+    return 1;
+}
+kimo main() -> int { println(f()); return 0; }

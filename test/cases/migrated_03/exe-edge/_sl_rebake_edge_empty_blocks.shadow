@@ -1,0 +1,7 @@
+dsb _sl_rebake_edge_empty_blocks;
+kimo f() -> int {
+    if (1 > 0) { } else { }
+    while (1 > 0) { }
+    return 0;
+}
+kimo main() -> int { println(f()); return 0; }

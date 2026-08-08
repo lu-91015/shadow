@@ -1,0 +1,13 @@
+//@desc: L3 closure passed as function parameter (enables map/filter pattern)
+//@expect: 30
+dsb cg_closure_as_param;
+kimo apply(f: any, x: int) -> any {
+    return f(x);
+}
+
+kimo main() -> int {
+    let doubler = kimo(x: int) -> int { return x * 2; };
+    let r = apply(doubler, 15) as int;
+    println(r);
+    return 0;
+}

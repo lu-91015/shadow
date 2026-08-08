@@ -1,0 +1,15 @@
+//@desc: GC alloc inside for loop with break/continue
+//@expect-ir: shadow_gc_alloc
+dsb gc_13_break_continue;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let arr = [1, 2, 3, 4, 5];
+    let sum = 0;
+    for (x in arr) {
+        if (x == 3) { continue; }
+        if (x == 5) { break; }
+        let p = P { x: x, y: x };
+        sum = sum + p.x;
+    }
+    return sum;
+}

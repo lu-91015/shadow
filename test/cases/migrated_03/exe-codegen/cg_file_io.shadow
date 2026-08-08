@@ -1,0 +1,22 @@
+//@desc: L4 file IO — write/read/exists/delete roundtrip
+//@expect: 0\n1\n1\nhello file\n1\n0
+dsb cg_file_io;
+kimo main() -> int {
+    let path = "test/_s03_l4_file_io_tmp.txt";
+    // 初始状态：文件不存在
+    println(file_exists(path));              // 0
+    // 写入文件
+    let w = file_write(path, "hello file");
+    println(w);                              // 1
+    // 验证文件存在
+    println(file_exists(path));              // 1
+    // 读取文件内容
+    let content = file_read(path);
+    println(content);                       // hello file
+    // 删除文件
+    let d = file_delete(path);
+    println(d);                              // 1
+    // 验证文件已删除
+    println(file_exists(path));              // 0
+    return 0;
+}

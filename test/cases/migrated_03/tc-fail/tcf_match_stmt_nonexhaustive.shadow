@@ -1,0 +1,18 @@
+//@desc: statement-level match on enum without wildcard must cover all variants
+//@expect-stderr: non-exhaustive
+dsb tcf_match_stmt_nonexhaustive;
+
+enum Color {
+    Red(int),
+    Green,
+    Blue
+}
+
+kimo main() -> int {
+    let c = Green;
+    match c {
+        Red(v) => { println(v); },
+        Green => { println("g"); }
+    }
+    return 0;
+}

@@ -1,0 +1,125 @@
+//@mode: exe
+//@desc: 增量 GC 混合写屏障承重验证——持久对象池在标记切片间反复隐身
+//@expect: barrier ok rounds=80 pool=1500
+//@env: SHADOW_GC_STRESS=8 SHADOW_GC_VERIFY=2
+//@timeout: 180
+// ex_gc_barrier.shadow — 专打增量标记的经典漏标窗口（Wilson 条件）
+//
+// 漏标需要两条同时成立：
+//   ① 某个**黑**对象获得了指向**白**对象的引用；
+//   ② 通往该白对象的所有**灰**路径被摧毁。
+//
+// 构造方式：
+//   · 白对象 —— 对象池在 main 开头一次性建成并长期存活。此后每轮 GC 周期
+//     启动时它们都是白的（"分配即黑"只覆盖周期内新分配的对象，救不了它们）。
+//   · 黑容器 —— 搬运目的地数组在标记期间分配，直接置黑；标记终止重扫根时
+//     黑对象不再展开扫描，装进去的元素永远进不了灰队列。
+//   · 摧毁灰路径 —— 搬运的同时把 Slot.c 置空。若该 Slot 尚未被标记器扫到，
+//     这个 Cell 就此彻底隐身。搬回来时 Slot 可能已经变黑，于是继续隐身。
+//
+// 没有混合写屏障，这些 Cell 会被清扫，tag 字符串内存随即被复用；
+// 末尾逐条内容校验必然发现。有屏障则一个不少。
+//
+// A/B 自证（关键：STRESS 让标记切片足够慢，把窗口撑开）：
+//   SHADOW_GC_STRESS=8 ./ex_gc_barrier.shadow.exe                    → barrier ok
+//   SHADOW_GC_STRESS=8 SHADOW_GC_BARRIER=0 ./ex_gc_barrier.shadow.exe → 崩溃 / ERR
+dsb ex_gc_barrier;
+
+struct Cell {
+    tag: string;
+    id: int;
+}
+
+struct Slot {
+    c: Cell;
+    id: int;
+}
+
+// 持久对象池：建成后跨全部轮次存活 —— 每个 GC 周期启动时都是"白"的
+let g_slots: array<Slot> = [];
+
+kimo clobber(depth: int, acc: int) -> int {
+    // 深递归 + 每层造串：把栈上残留的指针副本冲掉，
+    // 免得标记终止的保守栈扫描顺手救活本该死掉的对象，掩盖漏标。
+    if (depth <= 0) { return acc; }
+    let pad = "x" + int_to_str(depth) + "-" + int_to_str(acc);
+    return clobber(depth - 1, acc + len(pad));
+}
+
+kimo main() -> int {
+    let n = 1500;
+
+    // ── 阶段 0：一次性建池。此后不再新建 Cell —— 它们必须靠 GC 正确性活着。 ──
+    let i = 0;
+    while (i < n) {
+        g_slots = array_push(g_slots,
+            Slot { c: Cell { tag: "cell#" + int_to_str(i), id: i }, id: i });
+        i = i + 1;
+    }
+
+    let round = 0;
+    let bad = 0;
+    while (round < 80) {
+        // ── 阶段 A：搬出 —— 白 Cell 进黑数组，同时摧毁原路径 ──
+        let stash: array<Cell> = [];
+        i = 0;
+        while (i < n) {
+            let s: Slot = g_slots[i];
+            let c: Cell = s.c;
+            if ((c as any) == 0) {
+                println("ERR null cell at " + int_to_str(i)
+                        + " round=" + int_to_str(round));
+                return 1;
+            }
+            s.c = 0 as Cell;                 // ← 删除屏障点：摧毁灰路径
+            stash = array_push(stash, c);    // ← 插入屏障点：黑数组获得白引用
+            i = i + 1;
+        }
+
+        // ── 阶段 B：冲刷栈，逼漏标暴露而不是被保守扫描兜住 ──
+        if (clobber(300, round) < 0) { return 1; }
+
+        // ── 阶段 C：搬回 —— 目标 Slot 此时可能已变黑，于是继续隐身 ──
+        i = 0;
+        while (i < n) {
+            let s2: Slot = g_slots[i];
+            s2.c = stash[i];
+            i = i + 1;
+        }
+        stash = [];
+        if (clobber(300, round) < 0) { return 1; }
+
+        // ── 阶段 D：逐条校验池内容完好 ──
+        i = 0;
+        while (i < n) {
+            let s3: Slot = g_slots[i];
+            let c3: Cell = s3.c;
+            if ((c3 as any) == 0) {
+                println("ERR cell reclaimed at " + int_to_str(i)
+                        + " round=" + int_to_str(round));
+                return 1;
+            }
+            if (c3.id != i) {
+                println("ERR id mismatch at " + int_to_str(i)
+                        + " round=" + int_to_str(round)
+                        + " got=" + int_to_str(c3.id));
+                return 1;
+            }
+            if (str_eq(c3.tag, "cell#" + int_to_str(i)) == 0) {
+                println("ERR tag corrupted at " + int_to_str(i)
+                        + " round=" + int_to_str(round) + " got=" + c3.tag);
+                bad = bad + 1;
+                if (bad > 3) { return 1; }
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+
+    if (bad != 0) {
+        println("ERR corrupted=" + int_to_str(bad));
+        return 1;
+    }
+    println("barrier ok rounds=80 pool=" + int_to_str(len(g_slots)));
+    return 0;
+}

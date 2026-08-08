@@ -1,0 +1,33 @@
+# 构建产物
+build/
+*.o
+*.obj
+*.exe
+*.ll
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# 测试产物
+test/cases/**/*.exe
+test/cases/**/*.ll
+test/cases/**/*.o
+test/**/__pycache__/
+**/__pycache__/
+*.pyc
+
+# 临时文件
+*.tmp
+tmp_*
+_spk_extracted/
+
+# 例外：bootstrap 冻结工件必须入库（自举链硬依赖）
+!bootstrap/s03.exe
+!bootstrap/runtime_clang.o
+!bootstrap/runtime_for_selfhost.o
+!bootstrap/miniz.o
+
+# 测试/构建临时产物（exe tmp、SPK 锁）
+*.tmp*
+shadow.lock

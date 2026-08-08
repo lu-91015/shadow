@@ -1,0 +1,9 @@
+//@ mode: codegen
+//@ desc: generic with union type constraint
+//@expect-ir: identity__T_int
+dsb cg_constraint_union;
+kimo identity<T: int|long>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    return a;
+}

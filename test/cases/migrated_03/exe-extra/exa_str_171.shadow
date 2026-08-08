@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_171)
+//@expect: onetwo
+//@expect: 6
+//@expect: o
+dsb exa_str_171;
+kimo main() -> int {
+    let s = "one" + "two";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

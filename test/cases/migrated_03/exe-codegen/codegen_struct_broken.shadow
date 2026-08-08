@@ -1,0 +1,5 @@
+//@desc: struct field access — let p: Point; p.x = 3; p.y = 4; return p.x + p.y;
+//@expect: 7
+dsb codegen_struct_broken;
+struct Point { x: int; y: int }
+kimo main() -> int { let p: Point; p.x = 3; p.y = 4; println(p.x + p.y); return 0; }

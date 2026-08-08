@@ -1,0 +1,24 @@
+//@desc: hashmap<K,V> type alias for dict<K,V> — interop with hashmap_* API
+//@expect: world\nbar\n2\n1
+dsb cg_hashmap_type_alias;
+
+kimo main() -> int {
+    // hashmap<K,V> 类型声明（与 dict<K,V> 等价）
+    let h: hashmap<string, string> = hashmap_new();
+    hashmap_insert(h, "hello", "world");
+    hashmap_insert(h, "foo", "bar");
+
+    // d[k] 索引读取（与 dict 共用 shadow_dict_get_string）
+    println(h["hello"]);  // world
+    println(h["foo"]);    // bar
+
+    // hashmap_size
+    println(hashmap_size(h));  // 2
+
+    // d[k] = v 索引赋值（与 dict 共用 shadow_dict_set）
+    h["foo"] = "baz";
+    println(hashmap_contains(h, "foo"));  // 1
+
+    hashmap_free(h);
+    return 0;
+}

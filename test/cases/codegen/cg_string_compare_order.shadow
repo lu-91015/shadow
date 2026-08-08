@@ -1,0 +1,10 @@
+//@mode: codegen
+//@desc: string ordering (<) compiled to shadow_string_eq + icmp slt
+//@expect-ir: icmp slt
+dsb cg_string_compare_order;
+kimo main() -> int {
+    let s = "a";
+    let t = "b";
+    if (s < t) { return 1; }
+    return 0;
+}

@@ -1,0 +1,52 @@
+//@mode: exe
+//@desc: Char/Short type - arithmetic operations, comparisons, function params/returns
+//@expect-stdout: 200
+//@expect-stdout: 500
+//@expect-stdout: 1
+//@expect-stdout: 0
+//@expect-stdout: 65
+//@expect-stdout: 300
+//@expect-stdout: 97
+dsb cg_char_short;
+
+kimo add_short(a: short, b: short) -> short {
+    return a + b;
+}
+
+kimo is_char_eq(c: char, target: char) -> bool {
+    return c == target;
+}
+
+kimo main() -> int {
+    // short arithmetic
+    let a: short = 100;
+    let b: short = 100;
+    let sum = a + b;
+    println(to_string(sum));
+
+    let s2: short = 1000;
+    let s3: short = 500;
+    let diff = s2 - s3;
+    println(to_string(diff));
+
+    // short comparison
+    let cmp1 = (a < b);
+    let cmp2 = (a > b);
+    println(to_string(cmp1));
+    println(to_string(cmp2));
+
+    // char value
+    let c: char = 65;
+    println(to_string(c));
+
+    // function params and returns (short)
+    let result = add_short(a, 200);
+    println(to_string(result));
+
+    // function params and returns (char)
+    let c2: char = 97;
+    let eq = is_char_eq(c2, 97);
+    println(to_string(eq));
+
+    return 0;
+}

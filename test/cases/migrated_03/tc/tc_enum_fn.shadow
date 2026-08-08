@@ -1,0 +1,13 @@
+//@ desc: enum used as function parameter and return type
+dsb tc_enum_fn;
+enum Color { Red; Green; Blue }
+kimo next_color(c: Color) -> Color {
+    if (c == Color.Red) { return Color.Green; }
+    if (c == Color.Green) { return Color.Blue; }
+    return Color.Red;
+}
+kimo main() -> int {
+    let c = Color.Red;
+    let n = next_color(c);
+    return 0;
+}

@@ -1,0 +1,7 @@
+//@desc: if condition that is a string (not bool/numeric) reports a located error
+//@expect-stderr: if condition must be bool
+dsb tcf_err_if_cond_loc;
+kimo main() -> int {
+    if ("not a bool") { return 1; }
+    return 0;
+}

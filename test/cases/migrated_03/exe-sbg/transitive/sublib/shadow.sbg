@@ -1,0 +1,4 @@
+# shadow.sbg — sublib 包（被 mylib 传递依赖）
+[package]
+name = "sublib"
+version = "0.2.0"

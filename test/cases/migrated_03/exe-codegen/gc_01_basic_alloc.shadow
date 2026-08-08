@@ -1,0 +1,8 @@
+//@desc: GC alloc basic struct on heap
+//@expect: 10
+dsb gc_01_basic_alloc;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 10, y: 20 };
+    println(p.x); return 0;
+}

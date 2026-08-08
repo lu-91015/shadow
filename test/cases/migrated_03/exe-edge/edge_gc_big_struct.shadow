@@ -1,0 +1,8 @@
+//@desc: GC struct alloc with large field count
+//@expect: 17
+dsb edge_gc_big_struct;
+struct Big { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int, k: int, l: int, m: int, n: int, o: int, p: int }
+kimo main() -> int {
+    let b = Big { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 16 };
+    println(b.a + b.p); return 0;
+}

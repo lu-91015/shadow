@@ -1,0 +1,10 @@
+//@mode: typeat
+//@desc: LSP-4 position-indexed type query — hover on a string variable reference
+//@pos: 9 16
+//@expect: type-at: string
+dsb ta_str;
+
+kimo main() -> int {
+    let s = "hi";
+    return len(s);
+}

@@ -1,0 +1,6 @@
+dsb simple_test;
+kimo main() -> int {
+    let x: int = 1;
+    let y: int = 2;
+    return x + y;
+}

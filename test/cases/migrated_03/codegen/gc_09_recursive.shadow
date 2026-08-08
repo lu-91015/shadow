@@ -1,0 +1,12 @@
+//@desc: GC with recursive function allocating structs
+//@expect-ir: shadow_gc_alloc
+dsb gc_09_recursive;
+struct P { x: int, y: int }
+kimo fact(n: int) -> int {
+    if (n <= 1) { return 1; }
+    let p = P { x: n, y: n };
+    return p.x * fact(n - 1);
+}
+kimo main() -> int {
+    return fact(5);
+}

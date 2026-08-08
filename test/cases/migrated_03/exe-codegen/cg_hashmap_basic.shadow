@@ -1,0 +1,22 @@
+//@desc: L4 HashMap basic — new/insert/get/contains/size/remove/free (string→string)
+//@expect: 0\n1\nworld\n2\n1\n0\n1\n\nbar
+dsb cg_hashmap_basic;
+
+kimo main() -> int {
+    let m = hashmap_new();
+    println(hashmap_size(m));               // 0
+    hashmap_insert(m, "hello", "world");
+    println(hashmap_contains(m, "hello")); // 1
+    println(hashmap_get(m, "hello"));      // world
+    hashmap_insert(m, "foo", "bar");
+    println(hashmap_size(m));              // 2
+    println(hashmap_remove(m, "hello"));   // 1 (removed)
+    println(hashmap_contains(m, "hello")); // 0
+    println(hashmap_size(m));              // 1
+    // 不存在的 key 返回空字符串
+    println(hashmap_get(m, "missing"));   // (empty)
+    // 已存在的 key 更新值
+    println(hashmap_get(m, "foo"));        // bar
+    hashmap_free(m);
+    return 0;
+}

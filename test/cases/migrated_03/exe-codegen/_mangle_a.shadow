@@ -1,0 +1,7 @@
+dsb mangle_a;
+
+pub let VALUE: int = 100;
+
+pub kimo get_value() -> int {
+    return VALUE;
+}

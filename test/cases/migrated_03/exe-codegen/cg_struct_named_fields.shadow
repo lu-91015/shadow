@@ -1,0 +1,35 @@
+//@desc: struct literal named fields: omitted fields zero-init, out-of-order fields land correctly (bug #58)
+//@expect: 1
+//@expect: 0
+//@expect: 0
+//@expect: 7
+//@expect: 8
+//@expect: 2
+//@expect: 30
+dsb cg_struct_named_fields;
+
+struct S {
+    a: int;
+    b: int;
+    s: string;
+    arr: any;
+}
+
+kimo main() -> int {
+    // 省略字段 → 零值（b=0，s=""）
+    let x = S { a: 1 };
+    println(x.a);
+    println(x.b);
+    println(len(x.s));
+
+    // 乱序字段 → 按名字落位
+    let y = S { s: "hi", a: 7, b: 8 };
+    println(y.a);
+    println(y.b);
+    println(len(y.s));
+
+    // 全字段
+    let z = S { a: 10, b: 20, s: "abc", arr: [1, 2, 3] };
+    println(z.a + z.b);
+    return 0;
+}

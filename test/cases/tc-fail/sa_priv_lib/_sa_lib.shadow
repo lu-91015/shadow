@@ -1,0 +1,9 @@
+// 严格态库：私有符号(priv_fn/PrivS)跨模块不可见，pub 符号(pub_fn/PubS)需 import 才可见。
+// 严格态由入口侧的 --strict 标志触发（dsb 行保持纯 `dsb <name>;`）。
+dsb _sa_lib;
+
+struct PrivS { v: int }
+pub struct PubS { v: int }
+
+kimo priv_fn() -> int { return 1; }
+pub kimo pub_fn() -> int { return 2; }

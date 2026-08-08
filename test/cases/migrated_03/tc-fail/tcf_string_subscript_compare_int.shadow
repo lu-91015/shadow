@@ -1,0 +1,8 @@
+//@desc: string subscript (typed string) compared with an int is a type mismatch
+//@expect-stderr: type mismatch in comparison
+dsb tcf_string_subscript_compare_int;
+kimo main() -> int {
+    let s = "hello";
+    if (s[0] == 5) { return 0; }
+    return 1;
+}

@@ -1,0 +1,9 @@
+//@ desc: local function should be preferred over imported pub function (shadowing)
+dsb tc_module_namespace_local;
+import _mod_a_helper
+kimo add(a: int, b: int) -> int { return a - b; }
+kimo main() -> int {
+    // Local add is preferred (10 - 3 = 7, not 10 + 3 = 13)
+    let r1 = add(10, 3);
+    return r1;
+}

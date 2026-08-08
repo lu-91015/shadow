@@ -1,0 +1,9 @@
+//@desc: match-expression can yield a string concatenated with another string
+dsb tc_match_expr_string;
+kimo main() -> int {
+    let x = 2;
+    let s = match x { 1 => "one", 2 => "two", 3 => "three" };
+    let t = s + "!";
+    if (t == "two!") { return 1; }
+    return 0;
+}

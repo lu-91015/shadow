@@ -1,0 +1,8 @@
+//@desc: struct field passed as function argument
+dsb tc_gc_struct_field_arg;
+struct P { x: int, y: int }
+kimo add(a: int, b: int) -> int { return a + b; }
+kimo main() -> int {
+    let p = P { x: 5, y: 10 };
+    return add(p.x, p.y);
+}

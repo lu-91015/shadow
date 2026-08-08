@@ -1,0 +1,8 @@
+//@desc: string array element assignment lowers to shadow_array_set_ptr
+//@expect-ir: shadow_array_set_ptr
+dsb cg_string_array_set;
+kimo main() -> int {
+    let a = ["x", "y"];
+    a[0] = "z";
+    return 0;
+}

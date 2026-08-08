@@ -1,0 +1,49 @@
+//@expect: Writing: hello
+//@expect: Writing: world
+//@expect: Read: world
+//@expect: Cleanup ok
+//@desc: L1+ Codegen A — Reader/Writer trait + File struct 端到端（真实文件 IO via @extern runtime + 多 trait 实现 + 清理）
+dsb cg_trait_reader_writer;
+
+@extern("shadow_write_file") kimo rt_write_file(path: string, content: string) -> int { return 0; }
+@extern("shadow_read_file") kimo rt_read_file(path: string) -> string { return ""; }
+@extern("shadow_delete_file") kimo rt_delete_file(path: string) -> int { return 0; }
+
+trait Writer {
+    kimo write(self: Self, s: string) -> int;
+}
+
+trait Reader {
+    kimo read(self: Self) -> string;
+}
+
+struct File {
+    path: string
+}
+
+impl Writer for File {
+    kimo write(self: File, s: string) -> int {
+        let n = rt_write_file(self.path, s);
+        println("Writing: " + s);
+        return n;
+    }
+}
+
+impl Reader for File {
+    kimo read(self: File) -> string {
+        return rt_read_file(self.path);
+    }
+}
+
+kimo main() -> int {
+    let f = File { path: "_test_trait_file.tmp" };
+    let _ = f.write("hello");
+    let _ = f.write("world");
+    let content = f.read();
+    println("Read: " + content);
+    let deleted = rt_delete_file("_test_trait_file.tmp");
+    if (deleted == 1) {
+        println("Cleanup ok");
+    }
+    return 0;
+}

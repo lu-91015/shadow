@@ -1,0 +1,6 @@
+//@desc: circular import is rejected per §2.1 (loading-stack cycle detection)
+//@expect-stderr: Type check failed
+dsb gc_import_cycle_a;
+import _gc_import_cycle_b;
+kimo a_fn() -> int { return 1; }
+kimo main() -> int { return a_fn(); }

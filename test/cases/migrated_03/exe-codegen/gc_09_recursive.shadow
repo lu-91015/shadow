@@ -1,0 +1,12 @@
+//@desc: GC with recursive function allocating structs
+//@expect: 120
+dsb gc_09_recursive;
+struct P { x: int, y: int }
+kimo fact(n: int) -> int {
+    if (n <= 1) { return 1; }
+    let p = P { x: n, y: n };
+    return p.x * fact(n - 1);
+}
+kimo main() -> int {
+    println(fact(5)); return 0;
+}

@@ -1,0 +1,11 @@
+//@desc: .spk package import — dep packed in mylib.spk
+//@expect: 84
+//@expect: hello_from_spk
+dsb spk_basic;
+import mylib._spk_helper
+
+kimo main() -> int {
+    println(spk_helper_value());
+    println(spk_helper_greet());
+    return 0;
+}

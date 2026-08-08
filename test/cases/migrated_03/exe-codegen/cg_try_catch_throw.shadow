@@ -1,0 +1,14 @@
+//@expect: 99
+//@ desc: try/catch with direct throw in try body generates exception flag checks
+dsb cg_try_catch_throw;
+
+kimo main() -> int {
+    let result = 0;
+    try {
+        throw "error";
+        result = 1;
+    } catch {
+        result = 99;
+    }
+    println(result); return 0;
+}

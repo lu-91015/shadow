@@ -1,0 +1,10 @@
+//@ mode: codegen
+//@ desc: generic function identity<T>(x: T) -> T, type-erased to any
+//@expect-ir: call
+dsb cg_generic_fn;
+
+kimo identity<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    return a;
+}

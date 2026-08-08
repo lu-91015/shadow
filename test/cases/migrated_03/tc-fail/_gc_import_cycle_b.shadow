@@ -1,0 +1,7 @@
+dsb _gc_import_cycle_b;
+// Helper file for circular import test — NOT a standalone test case.
+// gc_import_cycle_a.shadow imports this file, and this file imports
+// gc_import_cycle_a.shadow back, creating a cycle.
+// Per §2.1 this should be a compile error, detected via loading-stack cycle detection.
+import gc_import_cycle_a;
+kimo b_fn() -> int { return 2; }

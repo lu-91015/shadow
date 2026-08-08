@@ -1,0 +1,13 @@
+//@ mode: exe
+//@ desc: import module can call its own private functions (import priv call fix)
+//@ expect: 42
+//@ expect: 7
+dsb test_main;
+
+import mylib;
+
+kimo main() -> int {
+    println(pub_sum(19, 23));
+    println(make_point(3, 4));
+    return 0;
+}

@@ -1,0 +1,7 @@
+//@desc: access field on array variable should fail
+//@expect-stderr: Type check failed
+dsb tcf_gc_field_on_array;
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    return arr.length;
+}

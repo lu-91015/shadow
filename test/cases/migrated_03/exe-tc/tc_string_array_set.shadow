@@ -1,0 +1,9 @@
+//@desc: assign a string into a string array element type-checks
+//@expect: 0
+dsb tc_string_array_set;
+kimo main() -> int {
+    let names = ["a", "b"];
+    names[0] = "z";
+    let s = names[0];
+    println(0); return 0;
+}

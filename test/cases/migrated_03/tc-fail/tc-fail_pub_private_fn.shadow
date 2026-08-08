@@ -1,0 +1,8 @@
+//@ mode: tc-fail
+//@ desc: calling a non-pub function from an imported module should fail
+dsb tc_fail_pub_private_fn;
+
+import _helper
+kimo main() -> int {
+    return helper_private();
+}

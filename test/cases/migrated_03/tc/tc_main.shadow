@@ -1,0 +1,4 @@
+//@desc: minimal main returning 0 type-checks
+//@expect: typecheck: 1
+dsb tc_main;
+kimo main() -> int { return 0; }

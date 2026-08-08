@@ -1,0 +1,20 @@
+//@desc: str_split/str_join/str_format — string processing extensions
+//@expect: 2\nhello\nworld\nhello,world\nName: Alice, Age: 30
+dsb cg_str_split_join_format;
+kimo main() -> int {
+    // str_split: "hello world" split by " " -> ["hello", "world"]
+    let parts = str_split("hello world", " ");
+    println(len(parts));           // 2
+    println(parts[0]);             // hello
+    println(parts[1]);             // world
+
+    // str_join: ["hello", "world"] joined by "," -> "hello,world"
+    let arr = ["hello", "world"];
+    println(str_join(arr, ","));   // hello,world
+
+    // str_format: "Name: {0}, Age: {1}" with ["Alice", "30"]
+    let args = ["Alice", "30"];
+    println(str_format("Name: {0}, Age: {1}", args));  // Name: Alice, Age: 30
+
+    return 0;
+}

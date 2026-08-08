@@ -1,0 +1,13 @@
+//@desc: LSP-2 库化 API：类型错误被收集为诊断而非杀进程；--check 仍正常退出
+//@expect: check: stage=check
+//@expect: diag:
+//@expect: SH-TC001
+//@expect: ok=0
+dsb chk_type_error;
+
+kimo main() -> int {
+    // 未定义函数：类型检查错误。CLI 模式下会打印并以非零码退出，
+    // 库模式必须把它变成一条结构化诊断，且进程继续存活。
+    let x: int = no_such_function_here();
+    return 0;
+}

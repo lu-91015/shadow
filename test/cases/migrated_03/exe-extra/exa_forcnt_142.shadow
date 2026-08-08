@@ -1,0 +1,10 @@
+//@desc: exe-extra generated case (exa_forcnt_142)
+//@expect: 0
+dsb exa_forcnt_142;
+kimo main() -> int {
+    let a = [1, 1, 1];
+    let c = 0;
+    for (v in a) { if (v > 8) { c = c + 1; } }
+    println(c);
+    return 0;
+}

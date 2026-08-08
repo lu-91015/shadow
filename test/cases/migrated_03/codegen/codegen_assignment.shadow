@@ -1,0 +1,5 @@
+//@desc: assignment codegens to a store
+//@expect-ir: store
+dsb codegen_assignment;
+kimo f() -> int { let x = 0; x = x + 1; return x; }
+kimo main() -> int { return f(); }

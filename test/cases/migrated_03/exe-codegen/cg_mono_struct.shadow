@@ -1,0 +1,16 @@
+//@desc: Phase 3 - monomorphization with struct / array type arguments keeps field access working
+//@expect: 7
+//@expect: 3
+//@expect: 25
+dsb cg_mono_struct;
+struct P { x: int, y: int }
+kimo id<T>(v: T) -> T { return v; }
+kimo second<A, B>(a: A, b: B) -> B { return b; }
+kimo main() -> int {
+    let p = id(P { x: 3, y: 4 });
+    println(p.x + p.y);
+    let arr = id([1, 2, 3]);
+    println(len(arr));
+    println(second("ignored", 25));
+    return 0;
+}

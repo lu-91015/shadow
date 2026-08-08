@@ -1,0 +1,9 @@
+//@mode: codegen
+//@desc: match-expression with 20 arms stresses the icmp/branch chain
+//@expect-ir: icmp eq
+dsb edge_match_expr_many_arms;
+kimo main() -> int {
+    let x = 11;
+    let r = match x { 0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6, 7 => 7, 8 => 8, 9 => 9, 10 => 10, 11 => 11, 12 => 12, 13 => 13, 14 => 14, 15 => 15, 16 => 16, 17 => 17, 18 => 18, 19 => 19 };
+    return r;
+}

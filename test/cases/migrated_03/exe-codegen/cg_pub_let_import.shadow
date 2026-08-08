@@ -1,0 +1,10 @@
+//@expect: 42
+//@desc: pub let from imported module is visible across modules
+dsb cg_pub_let_import;
+import _publet_helper;
+
+kimo main() -> int {
+    println(exported_value + 2);
+    return 0;
+}
+

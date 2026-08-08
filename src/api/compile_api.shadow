@@ -1,0 +1,1447 @@
+// Shadow 0.4 — 编译器即库 API（compile_api）
+// ============================================================
+// Phase 14（LSP）核心：把编译管线以库形式暴露，供 LSP 服务器与
+// 查询类 CLI（--check/--ranges/--at/--type-at/--diag-json）复用。
+// 对齐 0.3 compile_api.shadow 的行为语义，但基于 0.4 全新 AST/管线：
+//   tokenize → parse（ps_set_fatal_mode(0) 收集）→ tc_check_program
+//   （tc_begin_collect 收集，不 println 污染协议流）。
+//
+// 结果存储：单槽全局（api_prog/api_tokens/api_sdiags…）。LSP 每次
+// didChange 重新编译，所有查询 handler 复用同一编译结果。
+// 0.3 的 32 槽 LRU 在 0.4 暂以"每次请求编译"替代（后续可优化）。
+//
+// 0.3 宿主（s03.exe）编译约束（本文件被 stage1 编译）：
+//   - 无嵌套数组索引（用中间变量）；数组元素原地修改用全局数组；
+//   - struct 判空用 `as any == 0`（勿直接 ==）；
+//   - 字符串拼接大量使用原则 9 str_join 替代裸 + 链（本文件逻辑简单，
+//     拼接量小，直接 + 亦可，但保持与 main.shadow 一致的风格）。
+dsb api;
+
+
+
+// ============ 全局编译结果 ============
+pub let api_stage: int = 0;             // 0=lex 1=parse 2=check
+pub let api_file: string = "";
+pub let api_tokens: array<Token> = [];
+pub let api_prog: Program = 0 as Program;
+pub let api_sdiags: array<string> = [];   // sdiag 行（结构化文本）
+pub let api_parse_raw: array<string> = []; // parser 原始诊断
+pub let api_tc_raw: array<string> = [];   // typechecker 原始诊断
+pub let api_err_count: int = 0;           // parse + tc 错误总数
+pub let api_ok: int = 0;                  // 1=无错误
+// 预计算节点表：每行 "tag|fidx|depth|line|col|end_line|end_col|kind|str1|type"
+// tag: "S"=Stmt "E"=Expr。api_check 内（局部 prog 上下文）一次性填充。
+// 关键：0.4/0.3 codegen 下 AST struct 经 array<any> 装箱往返后字段指针失效
+// （AV fault=0x18），因此所有查询只查此字符串表，绝不二次访问 AST。
+pub let api_nodes: array<string> = [];
+pub let api_cur_fidx: int = 0;
+pub let api_fmeta: array<string> = [];
+pub let api_smeta: array<string> = [];
+pub let api_emeta: array<string> = [];
+pub let api_gmeta: array<string> = [];
+pub let api_imeta: array<string> = [];
+pub let api_pmeta: array<string> = [];
+pub let api_scan_line: int = 0;
+pub let api_scan_col: int = 0;
+pub let api_scan_word: string = "";
+pub let api_scan_mode: int = 0;
+// 查询计数过滤：>0 时只统计行号 <= api_main_end 的符号（主文件模块；LSP 查询用）
+pub let api_main_end: int = 0;
+pub let api_hit_found: int = 0;
+pub let api_hit_area: long = 0;
+
+// 内部符号名 → 源码原名：__mod_<mod>__<name> ⇒ <name>。
+// 兼容态 TC 把私有符号按所属模块 mangle 以实现命名空间隔离（tc_reg_name_for），
+// 但 LSP / 查询 CLI 面向用户，必须回显源码里写的名字。模块名本身可含单下划线
+// （如 rng_basic），故从固定前缀 "__mod_" 之后扫描第一处 "__" 作为分隔。
+pub kimo api_demangle(n: string) -> string {
+    if (str_starts_with(n, "__mod_") == 0) { return n; }
+    let ln = len(n);
+    let i = 6;
+    while (i + 1 < ln) {
+        if (str_eq(substr2(n, i, i + 2), "__") == 1) {
+            return substr2(n, i + 2, ln);
+        }
+        i = i + 1;
+    }
+    return n;
+}
+pub let api_hit_info: string = "";
+pub let api_acc_refs: array<string> = [];
+
+// ============ 小工具 ============
+
+// 手写 atoi（parse_int 在宿主编译下对 any 参数不可靠；字符码 48-57）
+pub kimo api_atoi(s: string) -> int {
+    let n = len(s);
+    let val = 0;
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "0") == 1) { val = val * 10 + 0; }
+        else if (str_eq(c, "1") == 1) { val = val * 10 + 1; }
+        else if (str_eq(c, "2") == 1) { val = val * 10 + 2; }
+        else if (str_eq(c, "3") == 1) { val = val * 10 + 3; }
+        else if (str_eq(c, "4") == 1) { val = val * 10 + 4; }
+        else if (str_eq(c, "5") == 1) { val = val * 10 + 5; }
+        else if (str_eq(c, "6") == 1) { val = val * 10 + 6; }
+        else if (str_eq(c, "7") == 1) { val = val * 10 + 7; }
+        else if (str_eq(c, "8") == 1) { val = val * 10 + 8; }
+        else if (str_eq(c, "9") == 1) { val = val * 10 + 9; }
+        else { break; }
+        i = i + 1;
+    }
+    return val;
+}
+
+// 最后一次出现位置（-1 未找到）
+pub kimo api_last_index_of(s: string, needle: string) -> int {
+    let n = len(s);
+    let nl = len(needle);
+    if (nl == 0) { return -1; }
+    let i = n - nl;
+    while (i >= 0) {
+        let sub = substr2(s, i, i + nl);
+        if (str_eq(sub, needle) == 1) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// JSON 字符串转义（0.4 无内建 json_escape）
+pub kimo api_json_escape(s: string) -> string {
+    let n = len(s);
+    let parts: array<string> = [];
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "\"") == 1) { parts = array_push(parts, "\\\""); }
+        else if (str_eq(c, "\\") == 1) { parts = array_push(parts, "\\\\"); }
+        else if (str_eq(c, "\n") == 1) { parts = array_push(parts, "\\n"); }
+        else if (str_eq(c, "\t") == 1) { parts = array_push(parts, "\\t"); }
+        else if (str_eq(c, "\r") == 1) { parts = array_push(parts, "\\r"); }
+        else { parts = array_push(parts, c); }
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+// 类型显示名（递归展开 array<..>/dict<..>/fn 签名）
+pub kimo api_type_name(t: Type) -> string {
+    if (api_type_none(t) == 1) { return ""; }
+    let k = t.kind;
+    if (k == TYPE_ARRAY) {
+        let inner = api_type_name(t.elem_type);
+        let parts: array<string> = [];
+        parts = array_push(parts, "array<");
+        parts = array_push(parts, inner);
+        parts = array_push(parts, ">");
+        return str_join(parts, "");
+    }
+    if (k == TYPE_DICT) {
+        let parts: array<string> = [];
+        parts = array_push(parts, "dict<");
+        parts = array_push(parts, api_type_name(t.key_type));
+        parts = array_push(parts, ", ");
+        parts = array_push(parts, api_type_name(t.val_type));
+        parts = array_push(parts, ">");
+        return str_join(parts, "");
+    }
+    if (k == TYPE_FUNCTION) {
+        let parts: array<string> = [];
+        parts = array_push(parts, "fn(");
+        let pt = t.param_types;
+        let ptp = pt as any;
+        if (ptp != 0) {
+            let pi = 0;
+            while (pi < len(pt)) {
+                if (pi > 0) { parts = array_push(parts, ", "); }
+                parts = array_push(parts, api_type_name(pt[pi] as Type));
+                pi = pi + 1;
+            }
+        }
+        parts = array_push(parts, ") -> ");
+        parts = array_push(parts, api_type_name(t.ret_type));
+        return str_join(parts, "");
+    }
+    return ty_display_name(t);
+}
+
+// 位置区间半开 [line:col, end_line:end_col) 包含判断
+pub kimo api_loc_contains(loc: Location, line: int, col: int) -> int {
+    if (line < loc.line) { return 0; }
+    if (line > loc.end_line) { return 0; }
+    if (line == loc.line && col < loc.col) { return 0; }
+    if (line == loc.end_line && col >= loc.end_col) { return 0; }
+    return 1;
+}
+
+// 区间面积（越小越深）
+pub kimo api_loc_area(loc: Location) -> long {
+    let dl = loc.end_line - loc.line;
+    if (dl < 0) { dl = 0; }
+    let w = loc.end_col - loc.col;
+    if (w < 0) { w = 0; }
+    let dl2 = dl as long;
+    let w2 = w as long;
+    let a1 = dl2 * 100000;
+    return a1 + w2;
+}
+
+// loc → "L:C-EL:EC"（1-based 半开）
+pub kimo api_loc_str(loc: Location) -> string {
+    let p1 = int_to_str(loc.line) + ":" + int_to_str(loc.col);
+    let p2 = int_to_str(loc.end_line) + ":" + int_to_str(loc.end_col);
+    return p1 + "-" + p2;
+}
+
+// ============ 编译（check）============
+// 从 "path:L:C: message" 提取 L、C、message；返回 "L|C|message"
+pub kimo api_extract_lc(seg: string) -> string {
+    let n = len(seg);
+    // 找 ": " 最后一次出现（message 分隔）；message 为空时退化为 ":"
+    let mi = -1;
+    let i = n - 2;
+    while (i >= 0) {
+        let sub = substr2(seg, i, i + 2);
+        if (str_eq(sub, ": ") == 1) { mi = i; break; }
+        i = i - 1;
+    }
+    let head = seg;
+    let message = "";
+    if (mi >= 0) {
+        head = substr2(seg, 0, mi);
+        message = substr2(seg, mi + 2, n);
+    } else {
+        // 退化：无 ": "，尝试 ":"（如 "path:1:1"）
+        let ci = api_last_index_of(seg, ":");
+        if (ci >= 0) {
+            head = substr2(seg, 0, ci);
+            message = substr2(seg, ci + 1, n);
+        }
+    }
+    // head 最后两个冒号 → L:C
+    let c2 = -1;
+    let c1 = -1;
+    i = len(head) - 1;
+    while (i >= 0) {
+        let ch = substr2(head, i, i + 1);
+        if (str_eq(ch, ":") == 1) {
+            if (c2 < 0) { c2 = i; }
+            else { c1 = i; break; }
+        }
+        i = i - 1;
+    }
+    let line = 1;
+    let col = 1;
+    if (c1 >= 0 && c2 > c1) {
+        line = api_atoi(substr2(head, c1 + 1, c2));
+        col = api_atoi(substr2(head, c2 + 1, len(head)));
+    }
+    let out = int_to_str(line) + "|" + int_to_str(col) + "|" + message;
+    return out;
+}
+
+// 旁路区间 rng（"L:C:EL:EC"）→ 终点 "EL:EC"。
+// 安全阀：仅当 rng 的起点与消息文本解析出的 line:col 完全一致时才采信，
+// 否则退化为点区间（宽度 0），确保永远不会产出错位的 LSP range。
+pub kimo api_range_end(rng: string, line: string, col: string) -> string {
+    let fallback = line + ":" + col;
+    if (len(rng) == 0) { return fallback; }
+    let p = str_split(rng, ":");
+    if (len(p) < 4) { return fallback; }
+    let rl = p[0] as string;
+    let rc = p[1] as string;
+    if (str_eq(rl, line) == 0) { return fallback; }
+    if (str_eq(rc, col) == 0) { return fallback; }
+    let el = p[2] as string;
+    let ec = p[3] as string;
+    if (len(el) == 0) { return fallback; }
+    if (len(ec) == 0) { return fallback; }
+    return el + ":" + ec;
+}
+
+// 并行数组安全取值（越界返回 ""）
+pub kimo api_range_at(arr: array<string>, i: int) -> string {
+    if (i < 0) { return ""; }
+    if (i >= len(arr)) { return ""; }
+    let s = arr[i] as string;
+    return s;
+}
+
+// parser 诊断文本 → sdiag 行
+// 输入 "SH-PARSE002: Parse error at file:L:C: expected X but got 'Y'"
+// rng：与该诊断对应的出错 token 区间（来自 ps_get_diag_ranges），空串则退化为点区间
+pub kimo api_parse_to_sdiag(msg: string, rng: string) -> string {
+    let colon = str_index_of(msg, ":");
+    let code = "";
+    let rest = msg;
+    if (colon >= 0) {
+        code = substr2(msg, 0, colon);
+        rest = substr2(msg, colon + 1, len(msg));
+    }
+    // rest: " Parse error at file:L:C: message"
+    let at_i = str_index_of(rest, "at ");
+    let seg = rest;
+    if (at_i >= 0) {
+        seg = substr2(rest, at_i + 3, len(rest));
+    }
+    let lc = api_extract_lc(seg);
+    let parts = str_split(lc, "|");
+    let line = "1";
+    let col = "1";
+    let message = "";
+    if (len(parts) >= 3) {
+        line = parts[0] as string;
+        col = parts[1] as string;
+        message = parts[2] as string;
+    }
+    let endlc = api_range_end(rng, line, col);
+    let p = code + " error parse " + line + ":" + col + "-" + endlc + " " + message;
+    return p;
+}
+
+// typechecker 诊断文本 → sdiag 行
+// 输入 "file:L:C: SH-TC001: error: msg"
+// rng：与该诊断对应的 AST 节点区间（来自 tc_collected_ranges），空串则退化为点区间
+pub kimo api_tc_to_sdiag(msg: string, rng: string) -> string {
+    let ti = str_index_of(msg, "SH-TC");
+    let seg = msg;
+    if (ti >= 0) {
+        seg = substr2(msg, 0, ti);
+    }
+    let code = "SH-TC001";
+    if (ti >= 0) {
+        // 提取 "SH-TC001"（到 ":"）
+        let tail = substr2(msg, ti, len(msg));
+        let tc_colon = str_index_of(tail, ":");
+        if (tc_colon > 0) { code = substr2(tail, 0, tc_colon); }
+    }
+    let lc = api_extract_lc(seg);
+    let parts = str_split(lc, "|");
+    let line = "1";
+    let col = "1";
+    if (len(parts) >= 2) {
+        line = parts[0] as string;
+        col = parts[1] as string;
+    }
+    // 真实错误信息在 "SH-TCxxx: error: " 之后的 tail 中（seg 里只有 file:L:C:，无消息文本）
+    let message = "";
+    if (ti >= 0) {
+        let tail = substr2(msg, ti, len(msg));   // "SH-TC001: error: <msg>"
+        let ec = str_index_of(tail, "error: ");
+        if (ec >= 0) {
+            message = substr2(tail, ec + 7, len(tail));
+        } else {
+            let dc = str_index_of(tail, ": ");
+            if (dc >= 0) { message = substr2(tail, dc + 2, len(tail)); }
+        }
+    }
+    let endlc = api_range_end(rng, line, col);
+    let p = code + " error typecheck " + line + ":" + col + "-" + endlc + " " + message;
+    return p;
+}
+
+
+// ============ struct 判空辅助（0.4 用 as any == 0，勿直接 == 0 as T） ============
+pub kimo api_prog_none() -> int {
+    let x = api_prog as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo api_type_none(t: Type) -> int {
+    let x = t as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+
+// 库模式编译：source → 全局结果；返回 stage（0=lex 1=parse 2=check）
+pub kimo api_check(source: string, file: string) -> int {
+    api_file = file;
+    api_stage = 0;
+    api_main_end = 0;
+    api_sdiags = [];
+    api_parse_raw = [];
+    api_tc_raw = [];
+    api_err_count = 0;
+    api_ok = 0;
+    // 严格态由 `--strict` CLI 标志触发（Phase 15）；dsb 行恢复纯 `dsb <name>;` 语义，不承载 strict 关键字。
+    // LSP/API 单文件场景默认兼容态；如需严格态由调用方显式 tc_set_strict(1)。
+    tc_set_strict(0);
+    // lex + parse（收集模式）
+    ps_set_fatal_mode(0);
+    ps_reset_diags();
+    let toks = tokenize(source, file);
+    api_tokens = toks;
+    let prog = parse(toks, file);
+    api_prog = prog;
+    api_parse_raw = ps_get_diags();
+    let parse_rngs = ps_get_diag_ranges();
+    let np = len(api_parse_raw);
+    let i = 0;
+    while (i < np) {
+        api_sdiags = array_push(api_sdiags, api_parse_to_sdiag(api_parse_raw[i] as string, api_range_at(parse_rngs, i)));
+        i = i + 1;
+    }
+    if (np > 0) { api_stage = 1; }
+    // TC（收集模式）——即使 parse 有错也跑（0.3：语法错误下返回部分 AST，TC 容错）
+    // Phase 15 严格态：tc_is_strict() 由调用方显式设置（--strict 或 LSP 配置）；否则兼容入口
+    tc_begin_collect();
+    let n_errs = 0;
+    if (tc_is_strict() == 1) {
+        n_errs = tc_check_program_strict(prog);
+    } else {
+        n_errs = tc_check_program(prog);
+    }
+    api_tc_raw = tc_end_collect();
+    let tc_rngs = tc_collected_ranges();
+    let nt = len(api_tc_raw);
+    i = 0;
+    while (i < nt) {
+        api_sdiags = array_push(api_sdiags, api_tc_to_sdiag(api_tc_raw[i] as string, api_range_at(tc_rngs, i)));
+        i = i + 1;
+    }
+    api_err_count = np + n_errs;
+    // 转存符号元信息（局部 prog 上下文安全）
+    api_nodes = [];
+    api_fmeta = [];
+    api_smeta = [];
+    api_emeta = [];
+    api_gmeta = [];
+    api_imeta = [];
+    api_pmeta = [];
+    let bi = 0;
+    while (bi < len(prog.funcs)) {
+        let bf = prog.funcs[bi] as FuncDef;
+        // 关键：在此局部上下文直接遍历函数体，把节点摊平成字符串表
+        api_cur_fidx = bi;
+        api_walk_stmt_rec(bf.body, 0);
+        let sp: array<string> = [];
+        sp = array_push(sp, "fn ");
+        sp = array_push(sp, bf.name);
+        sp = array_push(sp, "(");
+        let pi2 = 0;
+        while (pi2 < len(bf.params)) {
+            if (pi2 > 0) { sp = array_push(sp, ", "); }
+            let pp = bf.params[pi2] as Param;
+            sp = array_push(sp, pp.name);
+            sp = array_push(sp, ": ");
+            sp = array_push(sp, api_type_name(pp.type_ref));
+            let pm = pp.name + "|" + int_to_str(pp.loc.line) + "|" + int_to_str(pp.loc.col) + "|" +
+                     int_to_str(pp.loc.end_line) + "|" + int_to_str(pp.loc.end_col);
+            api_pmeta = array_push(api_pmeta, pm);
+            pi2 = pi2 + 1;
+        }
+        sp = array_push(sp, ") -> ");
+        sp = array_push(sp, api_type_name(bf.return_type));
+        let sig = str_join(sp, "");
+        let rtname = api_type_name(bf.return_type);
+        // 符号名必须回显源码原名：兼容态私有函数在 TC 注册期被 mangle 成
+        // __mod_<mod>__<name>（符号隔离），若原样吐给 LSP/查询层，用户会看到
+        // `func: __mod_rng_basic__add` 这种内部名（rng_basic / rng_multiline 回归）。
+        let fm = api_demangle(bf.name) + "|" + int_to_str(bf.loc.line) + "|" + int_to_str(bf.loc.col) + "|" +
+                 int_to_str(bf.loc.end_line) + "|" + int_to_str(bf.loc.end_col) + "|" + rtname + "|" + sig;
+        api_fmeta = array_push(api_fmeta, fm);
+        bi = bi + 1;
+    }
+    let si2 = 0;
+    while (si2 < len(prog.structs)) {
+        let sd2 = prog.structs[si2] as StructDef;
+        let sm = sd2.name + "|" + int_to_str(sd2.loc.line) + "|" + int_to_str(sd2.loc.col) + "|" +
+                 int_to_str(sd2.loc.end_line) + "|" + int_to_str(sd2.loc.end_col);
+        api_smeta = array_push(api_smeta, sm);
+        si2 = si2 + 1;
+    }
+    let ei2 = 0;
+    while (ei2 < len(prog.enums)) {
+        let ed2 = prog.enums[ei2] as EnumDef;
+        let em = ed2.name + "|" + int_to_str(ed2.loc.line) + "|" + int_to_str(ed2.loc.col) + "|" +
+                 int_to_str(ed2.loc.end_line) + "|" + int_to_str(ed2.loc.end_col);
+        api_emeta = array_push(api_emeta, em);
+        ei2 = ei2 + 1;
+    }
+    let gi2 = 0;
+    while (gi2 < len(prog.globals)) {
+        let gd2 = prog.globals[gi2] as GlobalVar;
+        let gm = gd2.name + "|" + int_to_str(gd2.loc.line) + "|" + int_to_str(gd2.loc.col) + "|" +
+                 int_to_str(gd2.loc.end_line) + "|" + int_to_str(gd2.loc.end_col) + "|" +
+                 api_type_name(gd2.type_ref);
+        api_gmeta = array_push(api_gmeta, gm);
+        gi2 = gi2 + 1;
+    }
+    let ii2 = 0;
+    while (ii2 < len(prog.impls)) {
+        let id2 = prog.impls[ii2] as ImplDef;
+        let jj2 = 0;
+        while (jj2 < len(id2.methods)) {
+            let md2 = id2.methods[jj2] as FuncDef;
+            let im2 = md2.name + "|" + int_to_str(md2.loc.line) + "|" + int_to_str(md2.loc.col) + "|" +
+                      int_to_str(md2.loc.end_line) + "|" + int_to_str(md2.loc.end_col);
+            api_imeta = array_push(api_imeta, im2);
+            jj2 = jj2 + 1;
+        }
+        ii2 = ii2 + 1;
+    }
+    // TC 已跑完 → stage=check（0.3：stage 表示到达的管线阶段）
+    api_stage = 2;
+    if (api_err_count == 0) { api_ok = 1; }
+    return api_stage;
+}
+
+// ---- 查询计数 ----
+pub kimo api_stage_name() -> string {
+    if (api_stage == 0) { return "lex"; }
+    if (api_stage == 1) { return "parse"; }
+    return "check";
+}
+pub kimo api_token_count() -> int { return len(api_tokens); }
+// 查询模式设置主文件行上界；>0 时 func/struct/enum/global 计数与 ranges 只统计主文件模块
+//（runtime/import 模块是符号来源，不计入主文件的查询计数）
+pub kimo api_set_main_end(n: int) -> void { api_main_end = n; }
+pub kimo api_func_count() -> int {
+    if (api_main_end <= 0) { return len(api_fmeta); }
+    let cnt = 0;
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 2) {
+            let ln = api_atoi(fm[1] as string);
+            if (ln > 0 && ln <= api_main_end) { cnt = cnt + 1; }
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+pub kimo api_struct_count() -> int {
+    if (api_main_end <= 0) { return len(api_smeta); }
+    let cnt = 0;
+    let i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 2) {
+            let ln = api_atoi(sm[1] as string);
+            if (ln > 0 && ln <= api_main_end) { cnt = cnt + 1; }
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+pub kimo api_enum_count() -> int {
+    if (api_main_end <= 0) { return len(api_emeta); }
+    let cnt = 0;
+    let i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 2) {
+            let ln = api_atoi(em[1] as string);
+            if (ln > 0 && ln <= api_main_end) { cnt = cnt + 1; }
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+pub kimo api_global_count() -> int {
+    if (api_main_end <= 0) { return len(api_gmeta); }
+    let cnt = 0;
+    let i = 0;
+    while (i < len(api_gmeta)) {
+        let gm = str_split(api_gmeta[i] as string, "|");
+        if (len(gm) >= 2) {
+            let ln = api_atoi(gm[1] as string);
+            if (ln > 0 && ln <= api_main_end) { cnt = cnt + 1; }
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+pub kimo api_module_name() -> string {
+    if (api_prog_none() == 1) { return ""; }
+    return api_prog.module_name;
+}
+pub kimo api_sdiag_count() -> int { return len(api_sdiags); }
+pub kimo api_sdiag_line_at(i: int) -> string {
+    if (i < 0 || i >= len(api_sdiags)) { return ""; }
+    return api_sdiags[i] as string;
+}
+pub kimo api_err_count_total() -> int { return api_err_count; }
+pub kimo api_ok_flag() -> int { return api_ok; }
+
+// ============ AST 遍历（递归 + 全局当前节点） ============
+// 关键约束（0.4 codegen 实测）：Stmt/Expr（大 struct）不能作为用户函数参数、
+// 不能存入 struct 数组（AV fault=0x18）。可靠：string 数组、数组元素取用、
+// 全局 struct 赋值、小 struct（Location/Type）参数。
+pub kimo api_visit_expr(e: Expr, d: int) -> void {
+    let e0 = e as any;
+    if (e0 == 0) { return; }
+    // 防御：parser 省略的字段在宿主下是 null 而非空值，直接拼接会 AV
+    // 空字段统一写 "-" 占位，保证 str_split 段数恒为 10
+    let nm = "-";
+    let nm_raw = e.str1;
+    let nm_p = nm_raw as any;
+    if (nm_p != 0) {
+        if (len(nm_raw) > 0) { nm = nm_raw; }
+    }
+    let l1 = 0;
+    let c1 = 0;
+    let l2 = 0;
+    let c2 = 0;
+    let lc = e.loc;
+    let lc_p = lc as any;
+    if (lc_p != 0) {
+        l1 = lc.line;
+        c1 = lc.col;
+        l2 = lc.end_line;
+        c2 = lc.end_col;
+    }
+    // 类型：inferred_type 在 0.4 恒为合法 Type（prelude mk_expr 预填 TYPE_INFER
+    // 哨兵，TC 回填真实类型）。TYPE_INFER 表示未推断 → 写 "-" 占位。
+    let ty = "-";
+    let it = e.inferred_type;
+    let itk = it.kind;
+    if (itk != TYPE_INFER) {
+        ty = api_type_name(it);
+    }
+    let p1 = "E|" + int_to_str(api_cur_fidx) + "|" + int_to_str(d);
+    let p2 = p1 + "|" + int_to_str(l1) + "|" + int_to_str(c1);
+    let p3 = p2 + "|" + int_to_str(l2) + "|" + int_to_str(c2);
+    let p4 = p3 + "|" + int_to_str(e.kind) + "|" + nm + "|" + ty;
+    api_nodes = array_push(api_nodes, p4);
+}
+
+pub kimo api_visit_stmt(s: Stmt, d: int) -> void {
+    let s0 = s as any;
+    if (s0 == 0) { return; }
+    let nm = "-";
+    let nm_raw = s.str1;
+    let nm_p = nm_raw as any;
+    if (nm_p != 0) {
+        if (len(nm_raw) > 0) { nm = nm_raw; }
+    }
+    let l1 = 0;
+    let c1 = 0;
+    let l2 = 0;
+    let c2 = 0;
+    let lc = s.loc;
+    let lc_p = lc as any;
+    if (lc_p != 0) {
+        l1 = lc.line;
+        c1 = lc.col;
+        l2 = lc.end_line;
+        c2 = lc.end_col;
+    }
+    // 类型：同 api_visit_expr（见注释）。STMT_LET 的 inferred_type = 绑定值类型，
+    // 用于 inlayHint（mode 2）。
+    let ty = "-";
+    let it = s.inferred_type;
+    let itk = it.kind;
+    if (itk != TYPE_INFER) {
+        ty = api_type_name(it);
+    }
+    let p1 = "S|" + int_to_str(api_cur_fidx) + "|" + int_to_str(d);
+    let p2 = p1 + "|" + int_to_str(l1) + "|" + int_to_str(c1);
+    let p3 = p2 + "|" + int_to_str(l2) + "|" + int_to_str(c2);
+    let p4 = p3 + "|" + int_to_str(s.kind) + "|" + nm + "|" + ty;
+    api_nodes = array_push(api_nodes, p4);
+}
+
+pub kimo api_walk_stmt_rec(s: Stmt, d: int) -> void {
+    let s0 = s as any;
+    if (s0 == 0) { return; }
+    api_visit_stmt(s, d);
+    let d1 = d + 1;
+    api_walk_stmt_rec(s.child1, d1);
+    api_walk_stmt_rec(s.child2, d1);
+    api_walk_stmt_rec(s.child3, d1);
+    // 数组字段：parser 只初始化该 kind 用到的字段，其余为 null，
+    // 直接 len() 会 AV，必须先判空。
+    let a1 = s.items;
+    let a1p = a1 as any;
+    if (a1p != 0) {
+        let k1 = 0;
+        while (k1 < len(a1)) {
+            api_walk_stmt_rec(a1[k1] as Stmt, d1);
+            k1 = k1 + 1;
+        }
+    }
+    let a2 = s.items2;
+    let a2p = a2 as any;
+    if (a2p != 0) {
+        let k2 = 0;
+        while (k2 < len(a2)) {
+            api_walk_stmt_rec(a2[k2] as Stmt, d1);
+            k2 = k2 + 1;
+        }
+    }
+    let a3 = s.exprs;
+    let a3p = a3 as any;
+    if (a3p != 0) {
+        let k3 = 0;
+        while (k3 < len(a3)) {
+            api_walk_expr_rec(a3[k3] as Expr, d1);
+            k3 = k3 + 1;
+        }
+    }
+    let x1 = s.expr1;
+    let x1p = x1 as any;
+    if (x1p != 0) { api_walk_expr_rec(x1, d1); }
+    let x2 = s.expr2;
+    let x2p = x2 as any;
+    if (x2p != 0) { api_walk_expr_rec(x2, d1); }
+}
+
+pub kimo api_walk_expr_rec(e: Expr, d: int) -> void {
+    let e0 = e as any;
+    if (e0 == 0) { return; }
+    api_visit_expr(e, d);
+    let d1 = d + 1;
+    api_walk_expr_rec(e.child1, d1);
+    api_walk_expr_rec(e.child2, d1);
+    api_walk_expr_rec(e.child3, d1);
+    let b1 = e.items;
+    let b1p = b1 as any;
+    if (b1p != 0) {
+        let k1 = 0;
+        while (k1 < len(b1)) {
+            api_walk_expr_rec(b1[k1] as Expr, d1);
+            k1 = k1 + 1;
+        }
+    }
+    let b2 = e.items2;
+    let b2p = b2 as any;
+    if (b2p != 0) {
+        let k2 = 0;
+        while (k2 < len(b2)) {
+            api_walk_expr_rec(b2[k2] as Expr, d1);
+            k2 = k2 + 1;
+        }
+    }
+    let b3 = e.stmt_items;
+    let b3p = b3 as any;
+    if (b3p != 0) {
+        let k3 = 0;
+        while (k3 < len(b3)) {
+            api_walk_stmt_rec(b3[k3] as Stmt, d1);
+            k3 = k3 + 1;
+        }
+    }
+    let cdef = e.closure_def;
+    let copt = cdef as any;
+    if (copt != 0) {
+        let cf0 = match cdef { Some(x) => x, None => 0 as FuncDef };
+        let cf = cf0 as FuncDef;
+        let cfp = cf as any;
+        if (cfp != 0) { api_walk_stmt_rec(cf.body, d1); }
+    }
+}
+
+// 在预计算节点表上重放扫描（不再触碰 AST）。
+// mode 0 = 最深命中 Expr；1 = 按名字收集 Expr 引用；2 = let 类型（inlayHint）；
+// 3 = 收集全部 Stmt 区间；4 = 按名字找 let 定义。
+pub kimo api_walk_program() -> void {
+    let i = 0;
+    let n = len(api_nodes);
+    while (i < n) {
+        let row = api_nodes[i] as string;
+        let f = str_split(row, "|");
+        if (len(f) < 10) { i = i + 1; continue; }
+        let tag = f[0] as string;
+        let ln = api_atoi(f[3] as string);
+        let cl = api_atoi(f[4] as string);
+        let eln = api_atoi(f[5] as string);
+        let ecl = api_atoi(f[6] as string);
+        let nk = api_atoi(f[7] as string);
+        let nm = f[8] as string;
+        if (str_eq(nm, "-") == 1) { nm = ""; }
+        let tyn = f[9] as string;
+        if (str_eq(tyn, "-") == 1) { tyn = ""; }
+        let is_expr = str_eq(tag, "E");
+        if (api_scan_mode == 0 && is_expr == 1) {
+            if (api_pos_in(ln, cl, eln, ecl, api_scan_line, api_scan_col) == 1) {
+                let a = api_span_area(ln, cl, eln, ecl);
+                if (api_hit_found == 0 || a < api_hit_area) {
+                    api_hit_found = 1;
+                    api_hit_area = a;
+                    let q1 = int_to_str(ln) + "|" + int_to_str(cl);
+                    let q2 = q1 + "|" + int_to_str(eln) + "|" + int_to_str(ecl);
+                    api_hit_info = q2 + "|" + int_to_str(nk) + "|" + nm + "|" + tyn;
+                }
+            }
+        } else if (api_scan_mode == 1 && is_expr == 1) {
+            let want = 0;
+            if (nk == EXPR_VAR || nk == EXPR_CALL) { want = 1; }
+            if (nk == EXPR_MEMBER || nk == EXPR_NEW) { want = 1; }
+            if (want == 1 && str_eq(nm, api_scan_word) == 1) {
+                api_acc_refs = array_push(api_acc_refs, int_to_str(ln) + "|" + int_to_str(cl));
+            }
+        } else if (api_scan_mode == 2 && is_expr == 0) {
+            if (nk == STMT_LET && len(tyn) > 0) {
+                api_acc_refs = array_push(api_acc_refs, int_to_str(ln) + "|" + int_to_str(cl) + "|" + tyn);
+            }
+        } else if (api_scan_mode == 3 && is_expr == 0) {
+            let q1 = int_to_str(ln) + "|" + int_to_str(cl);
+            api_acc_refs = array_push(api_acc_refs, q1 + "|" + int_to_str(eln) + "|" + int_to_str(ecl));
+        } else if (api_scan_mode == 4 && is_expr == 0) {
+            if (nk == STMT_LET && str_eq(nm, api_scan_word) == 1) {
+                let q1 = int_to_str(ln) + "|" + int_to_str(cl);
+                api_acc_refs = array_push(api_acc_refs, q1 + "|" + int_to_str(eln) + "|" + int_to_str(ecl));
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// 位置是否落在半开区间 [l:c, el:ec) 内
+pub kimo api_pos_in(l: int, c: int, el: int, ec: int, line: int, col: int) -> int {
+    if (line < l || line > el) { return 0; }
+    if (line == l && col < c) { return 0; }
+    if (line == el && col >= ec) { return 0; }
+    return 1;
+}
+
+// 区间"面积"：跨行数 * 100000 + 列跨度，用于挑最深（最小）节点
+pub kimo api_span_area(l: int, c: int, el: int, ec: int) -> long {
+    let dl = el - l;
+    let dc = ec - c;
+    if (dl > 0) { dc = ec + 1000; }
+    let dll = dl as long;
+    let dcl = dc as long;
+    let mul = 100000 as long;
+    let a = dll * mul;
+    return a + dcl;
+}
+
+// ============ 位置查询 ============
+
+// 位置 → 最深命中 Expr 信息 "L|C|EL|EC|kind|str1|type"（""=未命中）
+pub kimo api_deepest_expr_info(line: int, col: int) -> string {
+    api_scan_line = line;
+    api_scan_col = col;
+    api_scan_mode = 0;
+    api_hit_found = 0;
+    api_hit_area = 0;
+    api_hit_info = "";
+    api_walk_program();
+    return api_hit_info;
+}
+
+// 位置 → 类型显示名（Expr 优先，其次函数/全局定义）
+pub kimo api_type_at_pos(line: int, col: int) -> string {
+    let info = api_deepest_expr_info(line, col);
+    if (len(info) > 0) {
+        let parts = str_split(info, "|");
+        if (len(parts) >= 7) {
+            let ty = parts[6] as string;
+            if (len(ty) > 0) { return ty; }
+        }
+    }
+    // 函数定义命中（fmeta）
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 6) {
+            let fl = api_atoi(fm[1] as string);
+            let fc = api_atoi(fm[2] as string);
+            let fel = api_atoi(fm[3] as string);
+            let fec = api_atoi(fm[4] as string);
+            if (line >= fl && line <= fel && (line > fl || col >= fc) && (line < fel || col < fec)) {
+                return fm[5] as string;
+            }
+        }
+        i = i + 1;
+    }
+    // 全局变量命中（gmeta）
+    i = 0;
+    while (i < len(api_gmeta)) {
+        let gm = str_split(api_gmeta[i] as string, "|");
+        if (len(gm) >= 6) {
+            let gl = api_atoi(gm[1] as string);
+            let gc = api_atoi(gm[2] as string);
+            let gel = api_atoi(gm[3] as string);
+            let gec = api_atoi(gm[4] as string);
+            if (line >= gl && line <= gel && (line > gl || col >= gc) && (line < gel || col < gec)) {
+                return gm[5] as string;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 位置 → AST 节点描述（--at）
+pub kimo api_node_at_pos(line: int, col: int) -> string {
+    let r0 = int_to_str(line) + ":" + int_to_str(col);
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 5) {
+            let fl = api_atoi(fm[1] as string);
+            let fc = api_atoi(fm[2] as string);
+            let fel = api_atoi(fm[3] as string);
+            let fec = api_atoi(fm[4] as string);
+            if (line >= fl && line <= fel && (line > fl || col >= fc) && (line < fel || col < fec)) {
+                let parts: array<string> = [];
+                parts = array_push(parts, "at: ");
+                parts = array_push(parts, r0);
+                parts = array_push(parts, " hit=func name=");
+                parts = array_push(parts, fm[0] as string);
+                parts = array_push(parts, " range=");
+                parts = array_push(parts, fm[1] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, fm[2] as string);
+                parts = array_push(parts, "-");
+                parts = array_push(parts, fm[3] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, fm[4] as string);
+                return str_join(parts, "");
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 5) {
+            let fl2 = api_atoi(sm[1] as string);
+            let fc2 = api_atoi(sm[2] as string);
+            let fel2 = api_atoi(sm[3] as string);
+            let fec2 = api_atoi(sm[4] as string);
+            if (line >= fl2 && line <= fel2 && (line > fl2 || col >= fc2) && (line < fel2 || col < fec2)) {
+                let parts: array<string> = [];
+                parts = array_push(parts, "at: ");
+                parts = array_push(parts, r0);
+                parts = array_push(parts, " hit=struct name=");
+                parts = array_push(parts, sm[0] as string);
+                parts = array_push(parts, " range=");
+                parts = array_push(parts, sm[1] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, sm[2] as string);
+                parts = array_push(parts, "-");
+                parts = array_push(parts, sm[3] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, sm[4] as string);
+                return str_join(parts, "");
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 5) {
+            let fl3 = api_atoi(em[1] as string);
+            let fc3 = api_atoi(em[2] as string);
+            let fel3 = api_atoi(em[3] as string);
+            let fec3 = api_atoi(em[4] as string);
+            if (line >= fl3 && line <= fel3 && (line > fl3 || col >= fc3) && (line < fel3 || col < fec3)) {
+                let parts: array<string> = [];
+                parts = array_push(parts, "at: ");
+                parts = array_push(parts, r0);
+                parts = array_push(parts, " hit=enum name=");
+                parts = array_push(parts, em[0] as string);
+                parts = array_push(parts, " range=");
+                parts = array_push(parts, em[1] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, em[2] as string);
+                parts = array_push(parts, "-");
+                parts = array_push(parts, em[3] as string);
+                parts = array_push(parts, ":");
+                parts = array_push(parts, em[4] as string);
+                return str_join(parts, "");
+            }
+        }
+        i = i + 1;
+    }
+    let info = api_deepest_expr_info(line, col);
+    if (len(info) > 0) {
+        let parts: array<string> = [];
+        parts = array_push(parts, "at: ");
+        parts = array_push(parts, r0);
+        parts = array_push(parts, " hit=expr ");
+        parts = array_push(parts, info);
+        return str_join(parts, "");
+    }
+    return "at: " + r0 + " hit=none";
+}
+
+// 从源码提取 (line,col) 处的标识符（1-based）
+pub kimo api_ident_at(line: int, col: int) -> string {
+    let lines = str_split(api_source(), "\n");
+    if (line < 1 || line > len(lines)) { return ""; }
+    let ln = lines[line - 1] as string;
+    if (col < 1 || col > len(ln)) { return ""; }
+    let start = col;
+    let end = col;
+    // 向左扩展到标识符起点
+    let i = col - 1;
+    while (i >= 1) {
+        let c = substr2(ln, i - 1, i);
+        if (str_eq(c, "_") == 1 || str_eq(c, ".") == 1) { start = i; i = i - 1; continue; }
+        if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9")) {
+            start = i; i = i - 1; continue;
+        }
+        break;
+    }
+    // 向右扩展到标识符终点
+    i = col;
+    while (i <= len(ln)) {
+        let c2 = substr2(ln, i - 1, i);
+        if (str_eq(c2, "_") == 1) { end = i; i = i + 1; continue; }
+        if ((c2 >= "a" && c2 <= "z") || (c2 >= "A" && c2 <= "Z") || (c2 >= "0" && c2 <= "9")) {
+            end = i; i = i + 1; continue;
+        }
+        break;
+    }
+    return substr2(ln, start - 1, end);
+}
+
+pub let api_src_cache: string = "";
+
+pub kimo api_set_source(src: string) -> void { api_src_cache = src; }
+pub kimo api_source() -> string { return api_src_cache; }
+
+// 程序内找同名符号定义位置；返回 "line|col|end_line|end_col|kind|name"（""=未找到）
+// kind: func/struct/enum/global/let/param
+pub kimo api_find_definition(word: string) -> string {
+    if (len(word) == 0) { return ""; }
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 5 && str_eq(fm[0] as string, word) == 1) {
+            let m1 = fm[1] as string;
+            let m2 = fm[2] as string;
+            let m3 = fm[3] as string;
+            let m4 = fm[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|func|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 5 && str_eq(sm[0] as string, word) == 1) {
+            let m1 = sm[1] as string;
+            let m2 = sm[2] as string;
+            let m3 = sm[3] as string;
+            let m4 = sm[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|struct|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 5 && str_eq(em[0] as string, word) == 1) {
+            let m1 = em[1] as string;
+            let m2 = em[2] as string;
+            let m3 = em[3] as string;
+            let m4 = em[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|enum|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_gmeta)) {
+        let gm = str_split(api_gmeta[i] as string, "|");
+        if (len(gm) >= 5 && str_eq(gm[0] as string, word) == 1) {
+            let m1 = gm[1] as string;
+            let m2 = gm[2] as string;
+            let m3 = gm[3] as string;
+            let m4 = gm[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|global|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_imeta)) {
+        let im = str_split(api_imeta[i] as string, "|");
+        if (len(im) >= 5 && str_eq(im[0] as string, word) == 1) {
+            let m1 = im[1] as string;
+            let m2 = im[2] as string;
+            let m3 = im[3] as string;
+            let m4 = im[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|func|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_pmeta)) {
+        let pm = str_split(api_pmeta[i] as string, "|");
+        if (len(pm) >= 5 && str_eq(pm[0] as string, word) == 1) {
+            let m1 = pm[1] as string;
+            let m2 = pm[2] as string;
+            let m3 = pm[3] as string;
+            let m4 = pm[4] as string;
+            let out = m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|param|" + word;
+            return out;
+        }
+        i = i + 1;
+    }
+    // let 绑定（mode=4）
+    api_scan_word = word;
+    api_scan_mode = 4;
+    api_acc_refs = [];
+    api_walk_program();
+    let nl = len(api_acc_refs);
+    if (nl > 0) {
+        let lp = str_split(api_acc_refs[0] as string, "|");
+        if (len(lp) >= 4) {
+            let p0 = lp[0] as string;
+            let p1 = lp[1] as string;
+            let p2 = lp[2] as string;
+            let p3 = lp[3] as string;
+            let out = p0 + "|" + p1 + "|" + p2 + "|" + p3 + "|let|" + word;
+            return out;
+        }
+    }
+    return "";
+}
+
+pub kimo api_find_references(word: string) -> string {
+    if (len(word) == 0) { return ""; }
+    api_scan_word = word;
+    api_scan_mode = 1;
+    api_acc_refs = [];
+    api_walk_program();
+    let def = api_find_definition(word);
+    if (len(def) > 0) {
+        let dp = str_split(def, "|");
+        if (len(dp) >= 2) {
+            let pos0 = dp[0] as string;
+            let pos1 = dp[1] as string;
+            let pos = pos0 + "|" + pos1;
+            api_acc_refs = array_push(api_acc_refs, pos);
+        }
+    }
+    return str_join(api_acc_refs, ";");
+}
+
+pub kimo api_collect_symbols() -> string {
+    let out: array<string> = [];
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 7) {
+            let n0 = fm[0] as string;
+            let s0 = fm[6] as string;
+            let item = n0 + "|3|" + s0 + "|1";
+            out = array_push(out, item);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 1) {
+            let n1 = sm[0] as string;
+            let item = n1 + "|5|struct " + n1 + "|2";
+            out = array_push(out, item);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 1) {
+            let n2 = em[0] as string;
+            let item = n2 + "|7|enum " + n2 + "|3";
+            out = array_push(out, item);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_gmeta)) {
+        let gm = str_split(api_gmeta[i] as string, "|");
+        if (len(gm) >= 6) {
+            let n3 = gm[0] as string;
+            let t3 = gm[5] as string;
+            let item = n3 + "|13|" + t3 + "|4";
+            out = array_push(out, item);
+        }
+        i = i + 1;
+    }
+    // 内置函数
+    out = array_push(out, "len|3|len(s) -> int|5");
+    out = array_push(out, "str_eq|3|str_eq(a, b) -> int|5");
+    out = array_push(out, "str_contains|3|str_contains(s, needle) -> int|5");
+    out = array_push(out, "str_index_of|3|str_index_of(s, needle) -> int|5");
+    out = array_push(out, "str_replace|3|str_replace(s, old, new) -> string|5");
+    out = array_push(out, "str_trim|3|str_trim(s) -> string|5");
+    out = array_push(out, "str_to_upper|3|str_to_upper(s) -> string|5");
+    out = array_push(out, "str_to_lower|3|str_to_lower(s) -> string|5");
+    out = array_push(out, "str_char_at|3|str_char_at(s, idx) -> string|5");
+    out = array_push(out, "str_split|3|str_split(s, delim) -> array|5");
+    out = array_push(out, "str_join|3|str_join(arr, sep) -> string|5");
+    out = array_push(out, "str_format|3|str_format(fmt, args) -> string|5");
+    out = array_push(out, "substr2|3|substr2(s, start, end) -> string|5");
+    out = array_push(out, "int_to_str|3|int_to_str(v) -> string|5");
+    out = array_push(out, "long_to_str|3|long_to_str(v) -> string|5");
+    out = array_push(out, "float_to_str|3|float_to_str(v) -> string|5");
+    out = array_push(out, "bool_to_str|3|bool_to_str(v) -> string|5");
+    out = array_push(out, "parse_int|3|parse_int(s) -> int|5");
+    out = array_push(out, "parse_long|3|parse_long(s) -> long|5");
+    out = array_push(out, "parse_float|3|parse_float(s) -> float|5");
+    out = array_push(out, "parse_bool|3|parse_bool(s) -> bool|5");
+    out = array_push(out, "println|3|println(s)|5");
+    out = array_push(out, "print|3|print(s)|5");
+    out = array_push(out, "to_string|3|to_string(v) -> string|5");
+    out = array_push(out, "array_push|3|array_push(arr, v) -> array|5");
+    out = array_push(out, "file_read|3|file_read(path) -> string|5");
+    out = array_push(out, "file_write|3|file_write(path, content) -> int|5");
+    out = array_push(out, "file_exists|3|file_exists(path) -> int|5");
+    out = array_push(out, "file_delete|3|file_delete(path) -> int|5");
+    out = array_push(out, "file_list_dir|3|file_list_dir(path) -> string|5");
+    out = array_push(out, "dir_create|3|dir_create(path) -> int|5");
+    out = array_push(out, "path_exists|3|path_exists(path) -> int|5");
+    out = array_push(out, "path_join|3|path_join(base, child) -> string|5");
+    out = array_push(out, "path_dirname|3|path_dirname(path) -> string|5");
+    out = array_push(out, "path_basename|3|path_basename(path) -> string|5");
+    out = array_push(out, "hashmap_new|3|hashmap_new() -> map|5");
+    out = array_push(out, "hashmap_insert|3|hashmap_insert(m, k, v)|5");
+    out = array_push(out, "hashmap_get|3|hashmap_get(m, k) -> any|5");
+    out = array_push(out, "hashmap_contains|3|hashmap_contains(m, k) -> int|5");
+    out = array_push(out, "hashmap_remove|3|hashmap_remove(m, k)|5");
+    out = array_push(out, "hashmap_size|3|hashmap_size(m) -> int|5");
+    out = array_push(out, "set_new|3|set_new() -> set|5");
+    out = array_push(out, "set_add|3|set_add(s, v)|5");
+    out = array_push(out, "set_contains|3|set_contains(s, v) -> int|5");
+    out = array_push(out, "set_remove|3|set_remove(s, v)|5");
+    out = array_push(out, "set_size|3|set_size(s) -> int|5");
+    out = array_push(out, "rt_spawn_nullary|3|rt_spawn_nullary(f)|5");
+    out = array_push(out, "rt_future_await|3|rt_future_await(f)|5");
+    return str_join(out, ";");
+}
+
+pub kimo api_func_sig(f: FuncDef) -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "fn ");
+    parts = array_push(parts, f.name);
+    parts = array_push(parts, "(");
+    let i = 0;
+    while (i < len(f.params)) {
+        if (i > 0) { parts = array_push(parts, ", "); }
+        let p = f.params[i] as Param;
+        parts = array_push(parts, p.name);
+        parts = array_push(parts, ": ");
+        parts = array_push(parts, api_type_name(p.type_ref));
+        i = i + 1;
+    }
+    parts = array_push(parts, ") -> ");
+    parts = array_push(parts, api_type_name(f.return_type));
+    return str_join(parts, "");
+}
+
+// hover 信息（markdown）：命中函数 → 签名；变量 → "let x: type"；类型名 → 声明
+pub kimo api_hover_info(line: int, col: int) -> string {
+    let word = api_ident_at(line, col);
+    if (len(word) == 0) { return ""; }
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 7 && str_eq(fm[0] as string, word) == 1) {
+            let sig = fm[6] as string;
+            let doc = api_func_doc_at(api_atoi(fm[1] as string));
+            if (len(doc) > 0) { return sig + "\n\n" + doc; }
+            return sig;
+        }
+        i = i + 1;
+    }
+    let t = api_type_at_pos(line, col);
+    if (len(t) > 0) {
+        return "let " + word + ": " + t;
+    }
+    i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 1 && str_eq(sm[0] as string, word) == 1) {
+            return "struct " + word;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 1 && str_eq(em[0] as string, word) == 1) {
+            return "enum " + word;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 函数上方文档注释（// 连续注释块的最后一行）
+pub kimo api_func_doc_at(start_line: int) -> string {
+    let lines = str_split(api_source(), "\n");
+    let sl = start_line;
+    if (sl <= 1) { return ""; }
+    let docs: array<string> = [];
+    let i = sl - 2;
+    while (i >= 0) {
+        let ln = str_trim(lines[i] as string);
+        if (str_starts_with(ln, "//") == 1) {
+            let body = str_trim(substr2(ln, 2, len(ln)));
+            docs = array_push(docs, body);
+        } else {
+            break;
+        }
+        i = i - 1;
+    }
+    if (len(docs) == 0) { return ""; }
+    let rev: array<string> = [];
+    let j = len(docs) - 1;
+    while (j >= 0) {
+        rev = array_push(rev, docs[j] as string);
+        j = j - 1;
+    }
+    return str_join(rev, "\n");
+}
+
+// ============ sdiag JSON（0-based LSP Diagnostic[]）============
+pub kimo api_sdiag_json_array() -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let i = 0;
+    let n = len(api_sdiags);
+    while (i < n) {
+        if (i > 0) { parts = array_push(parts, ","); }
+        let line = api_sdiags[i] as string;
+        parts = array_push(parts, api_sdiag_to_json(line));
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// sdiag 行 "CODE severity source L:C-L:C message" → LSP Diagnostic JSON（0-based）
+pub kimo api_sdiag_to_json(sdiag: string) -> string {
+    // 解析五段
+    let sp = str_split(sdiag, " ");
+    let code = "";
+    let sev = 1;
+    let source = "shadow-parse";
+    let rng = "1:1-1:1";
+    let message = "";
+    if (len(sp) >= 1) { code = sp[0] as string; }
+    if (len(sp) >= 2) {
+        if (str_eq(sp[1] as string, "warning") == 1) { sev = 2; }
+        else if (str_eq(sp[1] as string, "info") == 1) { sev = 3; }
+        else if (str_eq(sp[1] as string, "hint") == 1) { sev = 4; }
+    }
+    if (len(sp) >= 3) { source = sp[2] as string; }
+    if (len(sp) >= 4) { rng = sp[3] as string; }
+    // 剩余（从第 5 段起）为 message
+    let mi = 4;
+    while (mi < len(sp)) {
+        if (mi > 4) { message = message + " "; }
+        message = message + sp[mi] as string;
+        mi = mi + 1;
+    }
+    // 解析 rng "L:C-EL:EC"（1-based）→ 0-based
+    let dash = str_index_of(rng, "-");
+    let start_s = rng;
+    if (dash >= 0) { start_s = substr2(rng, 0, dash); }
+    let sc = str_index_of(start_s, ":");
+    let sl = 1;
+    let sch = 0;
+    if (sc >= 0) {
+        sl = api_atoi(substr2(start_s, 0, sc));
+        sch = api_atoi(substr2(start_s, sc + 1, len(start_s)));
+    }
+    let el = sl;
+    let ech = sch + 1;
+    if (dash >= 0) {
+        let end_s = substr2(rng, dash + 1, len(rng));
+        let ec2 = str_index_of(end_s, ":");
+        if (ec2 >= 0) {
+            el = api_atoi(substr2(end_s, 0, ec2));
+            ech = api_atoi(substr2(end_s, ec2 + 1, len(end_s)));
+        }
+    }
+    // source 名称：parse → shadow-parse；typecheck → shadow-typecheck
+    let src_name = "shadow-parse";
+    if (str_eq(source, "typecheck") == 1) { src_name = "shadow-typecheck"; }
+    // 组装 JSON
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"range\":{\"start\":{\"line\":");
+    parts = array_push(parts, int_to_str(sl - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(sch - 1));
+    parts = array_push(parts, "},\"end\":{\"line\":");
+    parts = array_push(parts, int_to_str(el - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(ech - 1));
+    parts = array_push(parts, "}},\"severity\":");
+    parts = array_push(parts, int_to_str(sev));
+    parts = array_push(parts, ",\"code\":\"");
+    parts = array_push(parts, code);
+    parts = array_push(parts, "\",\"source\":\"");
+    parts = array_push(parts, src_name);
+    parts = array_push(parts, "\",\"message\":\"");
+    parts = array_push(parts, api_json_escape(message));
+    parts = array_push(parts, "\"}");
+    return str_join(parts, "");
+}
+
+// ============ ranges（--ranges 用）============
+pub kimo api_ranges() -> string {
+    let parts: array<string> = [];
+    if (api_prog_none() == 1) {
+        return "ranges: funcs=0";
+    }
+    parts = array_push(parts, "ranges: funcs=");
+    parts = array_push(parts, int_to_str(api_func_count()));
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 5) {
+            if (api_main_end > 0) {
+                let ln = api_atoi(fm[1] as string);
+                if (ln <= 0 || ln > api_main_end) { i = i + 1; continue; }
+            }
+            let fh: array<string> = [];
+            fh = array_push(fh, "\nfunc: ");
+            fh = array_push(fh, fm[0] as string);
+            fh = array_push(fh, " ");
+            fh = array_push(fh, fm[1] as string);
+            fh = array_push(fh, ":");
+            fh = array_push(fh, fm[2] as string);
+            fh = array_push(fh, "-");
+            fh = array_push(fh, fm[3] as string);
+            fh = array_push(fh, ":");
+            fh = array_push(fh, fm[4] as string);
+            parts = array_push(parts, str_join(fh, ""));
+        }
+        // 该函数体内的顶层语句（depth==1，body 块本身 depth==0 不列）
+        let j = 0;
+        let ns = len(api_nodes);
+        while (j < ns) {
+            let row = api_nodes[j] as string;
+            let f = str_split(row, "|");
+            if (len(f) >= 10) {
+                let tag = f[0] as string;
+                let fidx = api_atoi(f[1] as string);
+                let dep = api_atoi(f[2] as string);
+                if (str_eq(tag, "S") == 1 && fidx == i && dep == 1) {
+                    let sh: array<string> = [];
+                    sh = array_push(sh, "\n  stmt: ");
+                    sh = array_push(sh, f[3] as string);
+                    sh = array_push(sh, ":");
+                    sh = array_push(sh, f[4] as string);
+                    sh = array_push(sh, "-");
+                    sh = array_push(sh, f[5] as string);
+                    sh = array_push(sh, ":");
+                    sh = array_push(sh, f[6] as string);
+                    parts = array_push(parts, str_join(sh, ""));
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+

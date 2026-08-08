@@ -1,0 +1,9 @@
+//@desc: .spk package with native C++ files — opaque handle round-trip via P0-2
+//@expect: 84
+dsb main;
+import native_lib.calc
+
+kimo main() -> int {
+    println(calc_double(42));
+    return 0;
+}

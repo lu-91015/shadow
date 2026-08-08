@@ -1,0 +1,15 @@
+//@mode: lsp
+//@desc: LSP-7 integration fixture — opened via didOpen from test_lsp.py.
+//       Hover on `a` (line 3, col 12, 0-based) should report type `int`.
+//       Definition from `return x;` (line 7) should jump to `main` (line 5).
+dsb lsp_demo;
+
+kimo add(a: int, b: int) -> int {
+    let s = a + b;
+    return s;
+}
+
+kimo main() -> int {
+    let x = add(1, 2);
+    return x;
+}

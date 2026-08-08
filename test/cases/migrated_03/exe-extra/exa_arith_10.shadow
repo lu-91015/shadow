@@ -1,0 +1,11 @@
+//@desc: exe-extra generated case (exa_arith_10)
+//@expect: 5
+//@expect: 5
+//@expect: -4
+dsb exa_arith_10;
+kimo main() -> int {
+    println((1 + 1) * 4 - 3);
+    println(1 * 1 + 4);
+    println(1 - 1 - 4);
+    return 0;
+}

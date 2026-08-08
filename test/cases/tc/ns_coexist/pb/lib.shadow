@@ -1,0 +1,7 @@
+dsb lib;
+// 模块 b：同名 struct Pt(a)、enum Color{Green}、泛型 Pair<T>{g1} —— 与 a 的同名类型跨模块共存
+pub let g: int = 20;
+pub struct Pt { a: int }
+pub enum Color { Green }
+pub struct Pair<T> { g1: T }
+pub kimo c() -> int { return 2; }

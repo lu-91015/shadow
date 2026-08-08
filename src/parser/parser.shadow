@@ -1,0 +1,2962 @@
+// Shadow 0.4 — 语法分析器（Parser）
+// ============================================================
+// 语法完全复刻 shadow-0.3（dsb/kimo/import/pub/@extern/match/try/with/defer 等）。
+// 逻辑参考 0.3 parser.shadow，但 AST 完全适配 0.4 结构（core/ast.shadow），
+// **不使用 any 盒子**：Expr.items/items2/str_items/type_args、Stmt.items/items2/exprs、
+// DeferEntry 等全部具体类型。
+//
+// 宿主（s03.exe）import 模块内解析缺陷规避规范（见 core/utils.shadow 头部）：
+//   1. return 0 as struct 必须经中间变量；2. return 表达式含 as any 必须经中间变量+if；
+//   3. return 表达式含跨模块常量必须经本地变量；4. 跨模块 pub 符号无需 import（P0.4-1）。
+//   5. `(expr as T).field` 连写不被支持，必须 `let t = x as T; t.field`。
+dsb core_parser;
+
+// ============ 全局状态 ============
+let ps_tokens: array<Token> = [];
+let ps_idx: int = 0;
+let ps_file: string = "";
+// 大整数/长整型字面量解析走 C 层 strtoll（rt/rt_parse_only.c 补符号，rt_parse_only.o 进 shadow.exe 链接）。
+// ⚠️ 不能在此用 Shadow long 算术（v = v*10 + d）：自举链 s03/stage 会把 long 运算降级 i32，
+// 10^12 级字面量解析会溢出（-1000000000000L → 全局 727379968 / 局部 3567587328）。
+@extern("__rt_shadow_parse_long") kimo parser_rt_parse_long(s: any) -> long { return 0; }
+let ps_diags: array<string> = [];   // 本次 parse 收集的诊断（文本形式）
+// 与 ps_diags 一一对应的出错 token 区间，格式 "L:C:EL:EC"（EL:EC 为半开终点）。
+// 诊断消息本身只带起点，LSP 需要完整区间；此处旁路携带，消费侧比对起点一致后才采信。
+let ps_diag_ranges: array<string> = [];
+let ps_err_count: int = 0;
+let ps_fatal_mode: int = 1;         // 1=CLI（有错即 exit 1）；0=LSP/库模式
+let ps_defer_list: array<DeferEntry> = [];  // 扁平 defer 列表（depth, body）
+let ps_block_depth: int = 0;
+let ps_no_struct_lit: int = 0;
+let ps_match_counter: int = 0;
+let ps_try_depth: int = 0;
+let ps_cur_fn_ret_ty: Type = type_none_inner();
+let ps_last_arg_name: string = "";
+let ps_macros: array<MacroDef> = [];     // 新语法宏注册表
+let ps_macro_hyg_counter: int = 0;
+
+// defer 条目（0.4 具体类型，替代 0.3 的 [depth, body] any 元组）
+pub struct DeferEntry { depth: int; body: array<Stmt> }
+
+// ============ 错误恢复基础设施 ============
+pub kimo ps_set_fatal_mode(m: int) -> void { ps_fatal_mode = m; }
+pub kimo ps_get_fatal_mode() -> int { return ps_fatal_mode; }
+pub kimo ps_get_diags() -> array<string> { return ps_diags; }
+pub kimo ps_get_diag_ranges() -> array<string> { return ps_diag_ranges; }
+pub kimo ps_get_err_count() -> int { return ps_err_count; }
+
+pub kimo ps_reset_diags() -> void {
+    ps_diags = [];
+    ps_diag_ranges = [];
+    ps_err_count = 0;
+}
+
+// 当前 token 覆盖区间（错误发现位置；越界退化为 EOF 或 (1,1)）
+pub kimo ps_cur_range() -> Location {
+    let n = len(ps_tokens);
+    if (n == 0) { return mk_loc(ps_file, 1, 1); }
+    let i = ps_idx;
+    if (i < 0) { i = 0; }
+    if (i >= n) { i = n - 1; }
+    let t = ps_tokens[i] as Token;
+    return mk_loc_range(ps_file, t.line, t.col, t.end_line, t.end_col);
+}
+
+// 记录一条语法错误（CLI 模式立即打印 + 收集；超 100 条防雪崩）
+pub kimo ps_err(msg: string) -> void {
+    if (ps_fatal_mode == 1) {
+        println(msg);
+    }
+    if (ps_err_count <= 100) {
+        ps_diags = array_push(ps_diags, msg);
+        // 旁路记录出错 token 的完整区间（全部调用点都在「当前 token 即出错 token」时刻触发）
+        let r = ps_cur_range();
+        let rs = int_to_str(r.line) + ":" + int_to_str(r.col) + ":" + int_to_str(r.end_line) + ":" + int_to_str(r.end_col);
+        ps_diag_ranges = array_push(ps_diag_ranges, rs);
+    }
+    ps_err_count = ps_err_count + 1;
+    if (ps_err_count > 100) {
+        if (ps_fatal_mode == 1) {
+            println("SH-PARSE-LIMIT: too many parse errors (>100), aborting");
+            rt_exit(1);
+        }
+    }
+}
+
+// 同步点恢复：跳到下一条语句边界
+pub kimo ps_sync_stmt() -> void {
+    while (ps_at(TOK_EOF) != 1) {
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); return; }
+        if (ps_at(TOK_RBRACE) == 1) { return; }
+        ps_adv();
+    }
+}
+
+// 同步点恢复：跳到下一个顶层声明起点（至少消费 1 token 防卡死）
+pub kimo ps_sync_toplevel() -> void {
+    if (ps_at(TOK_EOF) != 1) { ps_adv(); }
+    while (ps_at(TOK_EOF) != 1) {
+        let k = ps_cur_kind();
+        if (k == TOK_KIMO) { return; }
+        if (k == TOK_STRUCT) { return; }
+        if (k == TOK_ENUM) { return; }
+        if (k == TOK_PUB) { return; }
+        if (k == TOK_IMPORT) { return; }
+        if (k == TOK_LET) { return; }
+        if (k == TOK_TRAIT) { return; }
+        if (k == TOK_IMPL) { return; }
+        if (k == TOK_TYPE) { return; }
+        if (k == TOK_MACRO) { return; }
+        if (k == TOK_SEMICOLON) { ps_adv(); return; }
+        if (k == TOK_RBRACE) { ps_adv(); return; }
+        ps_adv();
+    }
+}
+
+// ============ 位置访问 ============
+pub kimo ps_cur_kind() -> int {
+    let t = ps_tokens[ps_idx] as Token;
+    return t.kind;
+}
+
+pub kimo ps_cur_text() -> string {
+    let t = ps_tokens[ps_idx] as Token;
+    return t.text;
+}
+
+pub kimo ps_cur_line() -> int {
+    let t = ps_tokens[ps_idx] as Token;
+    return t.line;
+}
+
+pub kimo ps_cur_col() -> int {
+    let t = ps_tokens[ps_idx] as Token;
+    return t.col;
+}
+
+pub kimo ps_adv() -> void {
+    if (ps_idx < len(ps_tokens) - 1) { ps_idx = ps_idx + 1; }
+}
+
+// 上一个已消费 token 的结束行/列（即当前 token 之前那个 token 的 end）
+pub kimo ps_prev_end_line() -> int {
+    let i = ps_idx - 1;
+    if (i < 0) { i = 0; }
+    let t = ps_tokens[i] as Token;
+    return t.end_line;
+}
+
+pub kimo ps_prev_end_col() -> int {
+    let i = ps_idx - 1;
+    if (i < 0) { i = 0; }
+    let t = ps_tokens[i] as Token;
+    return t.end_col;
+}
+
+// 终点必须不早于起点
+pub kimo ps_end_is_valid(loc: Location, el: int, ec: int) -> int {
+    if (el < loc.line) { return 0; }
+    if (el == loc.line) {
+        if (ec < loc.col) { return 0; }
+    }
+    return 1;
+}
+
+// 表达式区间回填（幂等：点区间才回填）
+pub kimo ps_finish_expr(e: Expr) -> Expr {
+    if (loc_is_point(e.loc) == 0) { return e; }
+    let el = ps_prev_end_line();
+    let ec = ps_prev_end_col();
+    if (ps_end_is_valid(e.loc, el, ec) == 0) { return e; }
+    let nl = loc_with_end(e.loc, el, ec);
+    e.loc = nl;
+    return e;
+}
+
+// 语句区间回填
+pub kimo ps_finish_stmt(s: Stmt) -> Stmt {
+    if (loc_is_point(s.loc) == 0) { return s; }
+    let el = ps_prev_end_line();
+    let ec = ps_prev_end_col();
+    if (ps_end_is_valid(s.loc, el, ec) == 0) { return s; }
+    let nl = loc_with_end(s.loc, el, ec);
+    s.loc = nl;
+    return s;
+}
+
+// ============ 各优先级层包装器（区间回填） ============
+pub kimo parse_primary() -> Expr { return ps_finish_expr(parse_primary_inner()); }
+pub kimo parse_unary() -> Expr { return ps_finish_expr(parse_unary_inner()); }
+pub kimo parse_mul() -> Expr { return ps_finish_expr(parse_mul_inner()); }
+pub kimo parse_add() -> Expr { return ps_finish_expr(parse_add_inner()); }
+pub kimo parse_cmp() -> Expr { return ps_finish_expr(parse_cmp_inner()); }
+pub kimo parse_eq() -> Expr { return ps_finish_expr(parse_eq_inner()); }
+pub kimo parse_and() -> Expr { return ps_finish_expr(parse_and_inner()); }
+pub kimo parse_or() -> Expr { return ps_finish_expr(parse_or_inner()); }
+pub kimo parse_expr() -> Expr { return ps_finish_expr(parse_expr_inner()); }
+pub kimo parse_statement() -> Stmt { return ps_finish_stmt(parse_statement_inner()); }
+
+// 函数定义区间覆盖 `kimo name(...) -> T { ... }` 整体
+pub kimo parse_function(is_pub: int, extern_name: string) -> FuncDef {
+    let fd = parse_function_inner(is_pub, extern_name);
+    if (loc_is_point(fd.loc) == 1) {
+        let el = ps_prev_end_line();
+        let ec = ps_prev_end_col();
+        if (ps_end_is_valid(fd.loc, el, ec) == 1) {
+            let nl = loc_with_end(fd.loc, el, ec);
+            fd.loc = nl;
+        }
+    }
+    return fd;
+}
+
+// ============ 基础辅助 ============
+pub kimo ps_expect(kind: int, what: string) -> void {
+    if (ps_cur_kind() != kind) {
+        let ck = ps_cur_kind();
+        if (kind == TOK_IDENT &&
+            (ck == TOK_ASYNC || ck == TOK_AWAIT || ck == TOK_SPAWN || ck == TOK_YIELD ||
+             ck == TOK_DO)) {
+            let msg = "SH-PARSE001: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": '" + ps_cur_text() + "' is a reserved keyword (planned for a future version), not usable as an identifier";
+            ps_err(msg);
+            ps_adv();
+            return;
+        }
+        let msg2 = "SH-PARSE002: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": expected " + what + " but got '" + ps_cur_text() + "'";
+        ps_err(msg2);
+        return;
+    }
+    ps_adv();
+}
+
+pub kimo ps_at(kind: int) -> int {
+    if (ps_cur_kind() == kind) { return 1; }
+    return 0;
+}
+
+// 前瞻：ps_idx + offset 处 token kind（越界返回 -1）
+pub kimo ps_peek_kind(offset: int) -> int {
+    let idx = ps_idx + offset;
+    if (idx >= 0 && idx < len(ps_tokens)) {
+        let t = ps_tokens[idx] as Token;
+        return t.kind;
+    }
+    return -1;
+}
+
+// 前瞻：当前在 '<' 时，检查类型实参列表是否以 '>' 结尾且其后是 target_kind
+// （区分泛型结构体字面量 Name<T>{...} 与比较运算 Name < T）
+pub kimo ps_peek_type_args_then(target_kind: int) -> int {
+    let i = 0;
+    let depth = 0;
+    while (1 == 1) {
+        let pk = ps_peek_kind(i);
+        if (pk == -1) { return 0; }
+        if (pk == TOK_LT) { depth = depth + 1; }
+        if (pk == TOK_GT) { depth = depth - 1; }
+        if (depth == 0 && pk == TOK_GT) {
+            let next = ps_peek_kind(i + 1);
+            if (next == target_kind) { return 1; }
+            return 0;
+        }
+        if (depth == 0) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 解析单个调用参数：检测命名参数 IDENT: expr，设置 ps_last_arg_name
+pub kimo ps_parse_call_arg() -> Expr {
+    ps_last_arg_name = "";
+    if (ps_at(TOK_IDENT) == 1 && ps_peek_kind(1) == TOK_COLON) {
+        ps_last_arg_name = ps_cur_text();
+        ps_adv();
+        ps_adv();
+    }
+    return parse_expr();
+}
+
+// 当前 token 是否可作为 import 路径组件
+pub kimo ps_is_path_component() -> int {
+    let k = ps_cur_kind();
+    if (k == TOK_IDENT) { return 1; }
+    if (k == TOK_INT_TY) { return 1; }
+    if (k == TOK_LONG_TY) { return 1; }
+    if (k == TOK_FLOAT_TY) { return 1; }
+    if (k == TOK_DOUBLE_TY) { return 1; }
+    if (k == TOK_BOOL_TY) { return 1; }
+    if (k == TOK_STRING_TY) { return 1; }
+    if (k == TOK_VOID_TY) { return 1; }
+    if (k == TOK_ANY_TY) { return 1; }
+    if (k == TOK_CHAR_TY) { return 1; }
+    if (k == TOK_SHORT_TY) { return 1; }
+    return 0;
+}
+
+pub kimo ps_expect_path_component() -> void {
+    if (ps_is_path_component() == 1) {
+        ps_adv();
+    } else {
+        let msg = "SH-PARSE003: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": expected identifier but got '" + ps_cur_text() + "'";
+        ps_err(msg);
+    }
+}
+
+// --- 时间字面量字符串 → 整数（提取数字位按序拼接）---
+pub kimo parse_time_digits(s: string) -> long {
+    let n = len(s);
+    let i = 0;
+    let v: long = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c == "0") { v = v * 10; }
+        else if (c == "1") { v = v * 10 + 1; }
+        else if (c == "2") { v = v * 10 + 2; }
+        else if (c == "3") { v = v * 10 + 3; }
+        else if (c == "4") { v = v * 10 + 4; }
+        else if (c == "5") { v = v * 10 + 5; }
+        else if (c == "6") { v = v * 10 + 6; }
+        else if (c == "7") { v = v * 10 + 7; }
+        else if (c == "8") { v = v * 10 + 8; }
+        else if (c == "9") { v = v * 10 + 9; }
+        i = i + 1;
+    }
+    return v;
+}
+
+// --- 字符转 ASCII ---
+pub kimo char_to_int(ch: string) -> long {
+    if (ch == " ") { return 32; }
+    if (ch == "!") { return 33; }
+    if (ch == "\"") { return 34; }
+    if (ch == "#") { return 35; }
+    if (ch == "$") { return 36; }
+    if (ch == "%") { return 37; }
+    if (ch == "&") { return 38; }
+    if (ch == "'") { return 39; }
+    if (ch == "(") { return 40; }
+    if (ch == ")") { return 41; }
+    if (ch == "*") { return 42; }
+    if (ch == "+") { return 43; }
+    if (ch == ",") { return 44; }
+    if (ch == "-") { return 45; }
+    if (ch == ".") { return 46; }
+    if (ch == "/") { return 47; }
+    if (ch == "0") { return 48; } if (ch == "1") { return 49; }
+    if (ch == "2") { return 50; } if (ch == "3") { return 51; }
+    if (ch == "4") { return 52; } if (ch == "5") { return 53; }
+    if (ch == "6") { return 54; } if (ch == "7") { return 55; }
+    if (ch == "8") { return 56; } if (ch == "9") { return 57; }
+    if (ch == ":") { return 58; } if (ch == ";") { return 59; }
+    if (ch == "<") { return 60; } if (ch == "=") { return 61; }
+    if (ch == ">") { return 62; } if (ch == "?") { return 63; }
+    if (ch == "@") { return 64; }
+    if (ch == "A") { return 65; } if (ch == "B") { return 66; }
+    if (ch == "C") { return 67; } if (ch == "D") { return 68; }
+    if (ch == "E") { return 69; } if (ch == "F") { return 70; }
+    if (ch == "G") { return 71; } if (ch == "H") { return 72; }
+    if (ch == "I") { return 73; } if (ch == "J") { return 74; }
+    if (ch == "K") { return 75; } if (ch == "L") { return 76; }
+    if (ch == "M") { return 77; } if (ch == "N") { return 78; }
+    if (ch == "O") { return 79; } if (ch == "P") { return 80; }
+    if (ch == "Q") { return 81; } if (ch == "R") { return 82; }
+    if (ch == "S") { return 83; } if (ch == "T") { return 84; }
+    if (ch == "U") { return 85; } if (ch == "V") { return 86; }
+    if (ch == "W") { return 87; } if (ch == "X") { return 88; }
+    if (ch == "Y") { return 89; } if (ch == "Z") { return 90; }
+    if (ch == "[") { return 91; } if (ch == "\\") { return 92; }
+    if (ch == "]") { return 93; } if (ch == "^") { return 94; }
+    if (ch == "_") { return 95; } if (ch == "`") { return 96; }
+    if (ch == "a") { return 97; } if (ch == "b") { return 98; }
+    if (ch == "c") { return 99; } if (ch == "d") { return 100; }
+    if (ch == "e") { return 101; } if (ch == "f") { return 102; }
+    if (ch == "g") { return 103; } if (ch == "h") { return 104; }
+    if (ch == "i") { return 105; } if (ch == "j") { return 106; }
+    if (ch == "k") { return 107; } if (ch == "l") { return 108; }
+    if (ch == "m") { return 109; } if (ch == "n") { return 110; }
+    if (ch == "o") { return 111; } if (ch == "p") { return 112; }
+    if (ch == "q") { return 113; } if (ch == "r") { return 114; }
+    if (ch == "s") { return 115; } if (ch == "t") { return 116; }
+    if (ch == "u") { return 117; } if (ch == "v") { return 118; }
+    if (ch == "w") { return 119; } if (ch == "x") { return 120; }
+    if (ch == "y") { return 121; } if (ch == "z") { return 122; }
+    if (ch == "{") { return 123; } if (ch == "|") { return 124; }
+    if (ch == "}") { return 125; } if (ch == "~") { return 126; }
+    if (ch == "\n") { return 10; } if (ch == "\t") { return 9; }
+    if (ch == "\r") { return 13; } if (ch == "\0") { return 0; }
+    return 0;
+}
+
+// ============ 类型解析 ============
+pub kimo parse_type() -> Type {
+    let k = ps_cur_kind();
+    let t = mk_type(TYPE_INT);
+    // 元组类型 (T1, T2, ...)
+    if (k == TOK_LPAREN) {
+        ps_adv();
+        let elem_types: array<Type> = [];
+        if (ps_at(TOK_RPAREN) != 1) {
+            elem_types = array_push(elem_types, parse_type());
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                if (ps_at(TOK_RPAREN) == 1) { break; }
+                elem_types = array_push(elem_types, parse_type());
+            }
+        }
+        ps_expect(TOK_RPAREN, ")");
+        let tt = mk_type(TYPE_TUPLE);
+        tt.param_types = elem_types;
+        return tt;
+    }
+    if (k == TOK_INT_TY) { t = mk_type(TYPE_INT); ps_adv(); }
+    else if (k == TOK_LONG_TY) { t = mk_type(TYPE_LONG); ps_adv(); }
+    else if (k == TOK_FLOAT_TY) { t = mk_type(TYPE_FLOAT); ps_adv(); }
+    else if (k == TOK_DOUBLE_TY) { t = mk_type(TYPE_DOUBLE); ps_adv(); }
+    else if (k == TOK_BOOL_TY) { t = mk_type(TYPE_BOOL); ps_adv(); }
+    else if (k == TOK_STRING_TY) { t = mk_type(TYPE_STRING); ps_adv(); }
+    else if (k == TOK_VOID_TY) { t = mk_type(TYPE_VOID); ps_adv(); }
+    else if (k == TOK_ANY_TY) { t = mk_type(TYPE_ANY); ps_adv(); }
+    else if (k == TOK_CHAR_TY) { t = mk_type(TYPE_CHAR); ps_adv(); }
+    else if (k == TOK_SHORT_TY) { t = mk_type(TYPE_SHORT); ps_adv(); }
+    else if (k == TOK_DATE_TY) { t = mk_type(TYPE_DATE); ps_adv(); }
+    else if (k == TOK_TIMESTAMP_TY) { t = mk_type(TYPE_TIMESTAMP); ps_adv(); }
+    else if (k == TOK_NANOTIMESTAMP_TY) { t = mk_type(TYPE_NANOTIMESTAMP); ps_adv(); }
+    else if (k == TOK_OPAQUE_TY) { t = mk_type(TYPE_OPAQUE); ps_adv(); }
+    else if (k == TOK_IDENT) {
+        let ident = ps_cur_text();
+        ps_adv();
+        // §3.8 兼容态：命名空间限定类型名 a.b.c.T（Java 式 FQN）。
+        // 仅当用户在类型位置写入点号链时触发；编译器自身源码用简单类型名，不受影响。
+        while (ps_at(TOK_DOT) == 1) {
+            ps_adv();
+            let seg = ps_cur_text();
+            ps_expect(TOK_IDENT, "namespace segment");
+            ident = ident + "." + seg;
+        }
+        if (str_eq(ident, "array") == 1) {
+            t = mk_type(TYPE_ARRAY);
+            if (ps_at(TOK_LT) == 1) {
+                ps_adv();
+                let elem_t = parse_type();
+                ps_expect(TOK_GT, ">");
+                t.elem_type = elem_t;
+            }
+        } else if (str_eq(ident, "dict") == 1 || str_eq(ident, "map") == 1 || str_eq(ident, "hashmap") == 1) {
+            t = mk_type(TYPE_DICT);
+            if (ps_at(TOK_LT) == 1) {
+                ps_adv();
+                let key_t = parse_type();
+                ps_expect(TOK_COMMA, ",");
+                let val_t = parse_type();
+                ps_expect(TOK_GT, ">");
+                t.key_type = key_t;
+                t.val_type = val_t;
+            }
+        } else if (str_eq(ident, "set") == 1) {
+            t = mk_type(TYPE_SET);
+            if (ps_at(TOK_LT) == 1) {
+                ps_adv();
+                let elem_t = parse_type();
+                ps_expect(TOK_GT, ">");
+                t.elem_type = elem_t;
+            }
+        } else {
+            t = mk_named_type(TYPE_STRUCT, ident);
+            // 泛型类型实参 Name<T1, T2, ...>
+            if (ps_at(TOK_LT) == 1) {
+                ps_adv();
+                let targs: array<Type> = [];
+                targs = array_push(targs, parse_type());
+                while (ps_at(TOK_COMMA) == 1) {
+                    ps_adv();
+                    targs = array_push(targs, parse_type());
+                }
+                ps_expect(TOK_GT, ">");
+                t.param_types = targs;
+            }
+        }
+    }
+    else {
+        if (k == TOK_ASYNC || k == TOK_AWAIT || k == TOK_SPAWN || k == TOK_YIELD ||
+            k == TOK_DO) {
+            let msg = "SH-PARSE004: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": '" + ps_cur_text() + "' is a reserved keyword (planned for a future version), not usable as a type";
+            ps_err(msg);
+            ps_adv();
+            return mk_type(TYPE_ANY);
+        }
+        let msg2 = "SH-PARSE005: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": expected type but got '" + ps_cur_text() + "'";
+        ps_err(msg2);
+        return mk_type(TYPE_ANY);
+    }
+    // 数组类型: Type[]
+    while (ps_at(TOK_LBRACKET) == 1) {
+        ps_adv();
+        ps_expect(TOK_RBRACKET, "]");
+        let arr_t = mk_type(TYPE_ARRAY);
+        arr_t.elem_type = t;
+        t = arr_t;
+    }
+    return t;
+}
+
+// ============ match 模式解析 ============
+// 支持：_ 通配符 / ident（无负载变体或绑定变量）/ Variant(b1,b2,...) / 字面量
+pub kimo ps_parse_match_pattern() -> Expr {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    let k = ps_cur_kind();
+    if (k == TOK_IDENT) {
+        let name = ps_cur_text();
+        if (str_eq(name, "_") == 1) {
+            let pw = mk_expr(EXPR_VAR, loc);
+            pw.str1 = "_";
+            ps_adv();
+            return pw;
+        }
+        ps_adv();
+        // Variant(b1, b2, ...) — 解构模式
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            let bindings: array<string> = [];
+            if (ps_at(TOK_RPAREN) != 1) {
+                let bname = ps_cur_text();
+                ps_expect(TOK_IDENT, "binding name");
+                bindings = array_push(bindings, bname);
+                while (ps_at(TOK_COMMA) == 1) {
+                    ps_adv();
+                    let bn = ps_cur_text();
+                    ps_expect(TOK_IDENT, "binding name");
+                    bindings = array_push(bindings, bn);
+                }
+            }
+            ps_expect(TOK_RPAREN, ")");
+            let e = mk_expr(EXPR_ENUM_VARIANT, loc);
+            e.str1 = name;
+            e.str_items = bindings;
+            return e;
+        }
+        // 裸 ident（无负载变体或绑定变量，由 TC 决定）
+        let e = mk_expr(EXPR_VAR, loc);
+        e.str1 = name;
+        return e;
+    }
+    return parse_primary();
+}
+
+// ============ 字符串插值 "x=${expr}y" 去糖为拼接链 ============
+pub kimo ps_substr(s: string, start: int, end: int) -> string {
+    let result = "";
+    let i = start;
+    while (i < end) {
+        result = result + s[i];
+        i = i + 1;
+    }
+    return result;
+}
+
+// 检查字符串是否包含 ${ 插值标记
+pub kimo ps_str_has_interp(txt: string) -> int {
+    let n = len(txt);
+    let i = 0;
+    while (i < n) {
+        let c = txt[i];
+        if (c == "$") {
+            let ni = i + 1;
+            if (ni < n) {
+                let next = txt[ni];
+                if (next == "{") { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 对表达式源码 tokenize + parse_expr（保存/恢复 parser 状态）
+pub kimo ps_parse_interp_expr(expr_src: string) -> Expr {
+    let save_tokens = ps_tokens;
+    let save_idx = ps_idx;
+    let sub_tokens = tokenize(expr_src, ps_file);
+    ps_tokens = sub_tokens;
+    ps_idx = 0;
+    let expr = parse_expr();
+    ps_tokens = save_tokens;
+    ps_idx = save_idx;
+    return expr;
+}
+
+// 构建字符串插值的拼接 AST
+pub kimo ps_build_string_interp(txt: string, loc: Location) -> Expr {
+    let n = len(txt);
+    let i = 0;
+    let parts: array<Expr> = [];
+    let lit = "";
+    while (i < n) {
+        let c = txt[i];
+        if (c == "$") {
+            let ni = i + 1;
+            if (ni < n) {
+                let next = txt[ni];
+                if (next == "{") {
+                    let expr_start = i + 2;
+                    let depth = 1;
+                    let j = expr_start;
+                    while (j < n) {
+                        let cj = txt[j];
+                        if (cj == "{") { depth = depth + 1; }
+                        else if (cj == "}") {
+                            depth = depth - 1;
+                            if (depth == 0) { break; }
+                        }
+                        j = j + 1;
+                    }
+                    if (depth != 0) {
+                        lit = lit + c;
+                        i = i + 1;
+                    } else {
+                        let lit_e = mk_expr(EXPR_STRING, loc);
+                        lit_e.str1 = lit;
+                        parts = array_push(parts, lit_e);
+                        lit = "";
+                        let expr_src = ps_substr(txt, expr_start, j);
+                        let expr = ps_parse_interp_expr(expr_src);
+                        parts = array_push(parts, expr);
+                        i = j + 1;
+                    }
+                } else {
+                    lit = lit + c;
+                    i = i + 1;
+                }
+            } else {
+                lit = lit + c;
+                i = i + 1;
+            }
+        } else {
+            lit = lit + c;
+            i = i + 1;
+        }
+    }
+    let lit_e = mk_expr(EXPR_STRING, loc);
+    lit_e.str1 = lit;
+    parts = array_push(parts, lit_e);
+
+    // 构建 + 拼接链（左结合），首段为表达式时前缀 "" 保证结果为 string
+    let first = parts[0] as Expr;
+    let result = first;
+    if (first.kind != EXPR_STRING) {
+        let empty = mk_expr(EXPR_STRING, loc);
+        empty.str1 = "";
+        let bin = mk_expr(EXPR_BINARY, loc);
+        bin.child1 = empty;
+        bin.child2 = first;
+        bin.intval = BIN_ADD;
+        result = bin;
+    }
+    let k = 1;
+    while (k < len(parts)) {
+        let part = parts[k] as Expr;
+        let bin = mk_expr(EXPR_BINARY, loc);
+        bin.child1 = result;
+        bin.child2 = part;
+        bin.intval = BIN_ADD;
+        result = bin;
+        k = k + 1;
+    }
+    return result;
+}
+
+// ============ primary 表达式（优先级 climbing 底层） ============
+pub kimo parse_primary_inner() -> Expr {
+    let k = ps_cur_kind();
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+
+    if (k == TOK_INT_LIT) {
+        let txt = ps_cur_text();
+        ps_adv();
+        // C 层 strtoll 解析（自举链 long 算术降级 i32 规避，见文件头注释）
+        let v = parser_rt_parse_long(txt);
+        let e = mk_expr(EXPR_INT, loc);
+        e.intval = v;
+        return e;
+    }
+
+    if (k == TOK_LONG_LIT) {
+        let txt = ps_cur_text();
+        ps_adv();
+        let v = parser_rt_parse_long(txt);
+        let e = mk_expr(EXPR_LONG, loc);
+        e.intval = v;
+        return e;
+    }
+
+    if (k == TOK_FLOAT_LIT) {
+        let txt = ps_cur_text();
+        ps_adv();
+        let e = mk_expr(EXPR_FLOAT, loc);
+        e.str1 = txt;
+        e.floatval = str_to_double(txt);
+        return e;
+    }
+
+    if (k == TOK_STRING_LIT) {
+        let txt = ps_cur_text();
+        ps_adv();
+        if (ps_str_has_interp(txt) == 1) {
+            return ps_build_string_interp(txt, loc);
+        }
+        let e = mk_expr(EXPR_STRING, loc);
+        e.str1 = txt;
+        return e;
+    }
+
+    if (k == TOK_CHAR_LIT) {
+        let txt = ps_cur_text();
+        ps_adv();
+        let e = mk_expr(EXPR_INT, loc);
+        e.intval = char_to_int(txt);
+        let ct = mk_type(TYPE_CHAR);
+        e.inferred_type = ct;
+        return e;
+    }
+
+    if (k == TOK_TRUE) { ps_adv(); let e = mk_expr(EXPR_BOOL, loc); e.intval = 1; return e; }
+    if (k == TOK_FALSE) { ps_adv(); let e = mk_expr(EXPR_BOOL, loc); e.intval = 0; return e; }
+    if (k == TOK_NULL) { ps_adv(); return mk_expr(EXPR_NULL, loc); }
+
+    // 时间类型字面量：date"..." / timestamp"..." / nanotimestamp"..."
+    if (k == TOK_DATE_TY || k == TOK_TIMESTAMP_TY || k == TOK_NANOTIMESTAMP_TY) {
+        let ty_kw = k;
+        ps_adv();
+        if (ps_cur_kind() != TOK_STRING_LIT) {
+            let msg = "Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": time type keyword must be followed by a string literal, got '" + ps_cur_text() + "'";
+            ps_err(msg);
+            let e_ph = mk_expr(EXPR_INT, loc);
+            e_ph.intval = 0;
+            return e_ph;
+        }
+        let txt = ps_cur_text();
+        ps_adv();
+        let v: long = parse_time_digits(txt);
+        if (ty_kw == TOK_DATE_TY) {
+            let e = mk_expr(EXPR_INT, loc);
+            e.intval = v;
+            let dt = mk_type(TYPE_DATE);
+            e.inferred_type = dt;
+            return e;
+        }
+        let e = mk_expr(EXPR_LONG, loc);
+        e.intval = v;
+        let ts_ty = mk_type(TYPE_TIMESTAMP);
+        if (ty_kw == TOK_NANOTIMESTAMP_TY) {
+            ts_ty = mk_type(TYPE_NANOTIMESTAMP);
+        }
+        e.inferred_type = ts_ty;
+        return e;
+    }
+
+    // 闭包字面量 kimo(params) -> ret { body }（kimo 后跟 ( 无函数名）
+    if (k == TOK_KIMO) {
+        let next_idx = ps_idx + 1;
+        if (next_idx < len(ps_tokens)) {
+            let next_tok = ps_tokens[next_idx] as Token;
+            if (next_tok.kind == TOK_LPAREN) {
+                return parse_closure_expr(loc);
+            }
+        }
+        let msg = "Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": unexpected 'kimo' in expression context (use 'kimo(...)' for closure)";
+        ps_err(msg);
+        ps_adv();
+        return mk_expr(EXPR_INT, loc);
+    }
+
+    // new 表达式: new Type 或 new Type<T1, T2>
+    if (k == TOK_NEW) {
+        ps_adv();
+        let name = ps_cur_text();
+        ps_expect(TOK_IDENT, "identifier");
+        let type_args: array<Type> = [];
+        if (ps_at(TOK_LT) == 1) {
+            ps_adv();
+            type_args = array_push(type_args, parse_type());
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                type_args = array_push(type_args, parse_type());
+            }
+            ps_expect(TOK_GT, ">");
+        }
+        let e = mk_expr(EXPR_NEW, loc);
+        e.str1 = name;
+        e.type_args = type_args;
+        return e;
+    }
+
+    // match 表达式: match scrutinee { pat => body, ... }
+    if (k == TOK_MATCH) {
+        ps_adv();
+        ps_no_struct_lit = 1;
+        let scrutinee = parse_expr();
+        ps_no_struct_lit = 0;
+        ps_expect(TOK_LBRACE, "{");
+        let patterns: array<Expr> = [];
+        let bodies: array<Expr> = [];
+        while (ps_at(TOK_RBRACE) != 1) {
+            if (ps_at(TOK_EOF) == 1) { break; }
+            let ma_prev_idx = ps_idx;
+            let pat = ps_parse_match_pattern();
+            ps_expect(TOK_FATARROW, "=>");
+            let body = mk_expr(EXPR_INT, loc);
+            if (ps_at(TOK_LBRACE) == 1) {
+                // 块体: { stmts } — 提取 return 表达式作为 body
+                let blk = parse_block();
+                let bi = 0;
+                let found = 0;
+                while (bi < len(blk)) {
+                    let st = blk[bi] as Stmt;
+                    if (st.kind == STMT_RETURN && st.intval == 1) {
+                        body = st.expr1;
+                        found = 1;
+                    }
+                    bi = bi + 1;
+                }
+                if (found == 0) { body = mk_expr(EXPR_INT, loc); }
+            } else {
+                body = parse_expr();
+            }
+            patterns = array_push(patterns, pat);
+            bodies = array_push(bodies, body);
+            if (ps_at(TOK_COMMA) == 1) { ps_adv(); }
+            if (ps_idx == ma_prev_idx) { ps_adv(); }
+        }
+        ps_expect(TOK_RBRACE, "}");
+        let e = mk_expr(EXPR_MATCH, loc);
+        e.child1 = scrutinee;
+        e.items = patterns;
+        e.items2 = bodies;
+        return e;
+    }
+
+    // if 表达式: if (cond) { expr } else { expr }
+    if (k == TOK_IF) {
+        ps_adv();
+        ps_expect(TOK_LPAREN, "(");
+        let cond = parse_expr();
+        ps_expect(TOK_RPAREN, ")");
+        ps_expect(TOK_LBRACE, "{");
+        let then_e = parse_expr();
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        ps_expect(TOK_RBRACE, "}");
+        let else_e = mk_expr(EXPR_INT, loc);
+        if (ps_at(TOK_ELSE) == 1) {
+            ps_adv();
+            ps_expect(TOK_LBRACE, "{");
+            else_e = parse_expr();
+            if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+            ps_expect(TOK_RBRACE, "}");
+        }
+        let e = mk_expr(EXPR_IF, loc);
+        e.child1 = cond;
+        e.child2 = then_e;
+        e.child3 = else_e;
+        return e;
+    }
+
+    if (k == TOK_IDENT) {
+        let name = ps_cur_text();
+        let name_loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+        ps_adv();
+
+        // 泛型结构体字面量: Name<T> { field: expr, ... }
+        let type_args: array<Type> = [];
+        if (ps_at(TOK_LT) == 1 && ps_peek_type_args_then(TOK_LBRACE) == 1 && ps_no_struct_lit == 0) {
+            ps_adv();
+            type_args = array_push(type_args, parse_type());
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                type_args = array_push(type_args, parse_type());
+            }
+            ps_expect(TOK_GT, ">");
+        }
+        // 结构体字面量: Name { field: expr, ... }
+        if (ps_at(TOK_LBRACE) == 1 && ps_no_struct_lit == 0) {
+            ps_adv();
+            let fields: array<Expr> = [];
+            let fnames: array<string> = [];
+            if (ps_at(TOK_RBRACE) != 1) {
+                let fname = ps_cur_text();
+                ps_expect(TOK_IDENT, "identifier");
+                ps_expect(TOK_COLON, ":");
+                let fe = parse_expr();
+                fields = array_push(fields, fe);
+                fnames = array_push(fnames, fname);
+                while (ps_at(TOK_COMMA) == 1) {
+                    ps_adv();
+                    if (ps_at(TOK_RBRACE) == 1) { break; }
+                    fname = ps_cur_text();
+                    ps_expect(TOK_IDENT, "identifier");
+                    ps_expect(TOK_COLON, ":");
+                    fe = parse_expr();
+                    fields = array_push(fields, fe);
+                    fnames = array_push(fnames, fname);
+                }
+            }
+            ps_expect(TOK_RBRACE, "}");
+            let e = mk_expr(EXPR_STRUCT_LIT, loc);
+            e.str1 = name;
+            e.items = fields;
+            e.str_items = fnames;
+            e.type_args = type_args;
+            return e;
+        }
+        // 宏调用（在函数调用检测之前，宏名优先）
+        if (ps_at(TOK_LPAREN) == 1) {
+            let mdef = ps_macro_lookup(name);
+            let mn = mdef.name;
+            if (len(mn) > 0) {
+                ps_adv();
+                let margs: array<Expr> = [];
+                if (ps_at(TOK_RPAREN) != 1) {
+                    margs = array_push(margs, parse_expr());
+                    while (ps_at(TOK_COMMA) == 1) {
+                        ps_adv();
+                        margs = array_push(margs, parse_expr());
+                    }
+                }
+                ps_expect(TOK_RPAREN, ")");
+                return ps_macro_expand(mdef, margs);
+            }
+        }
+        // 函数调用
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            let args: array<Expr> = [];
+            let arg_names: array<string> = [];
+            if (ps_at(TOK_RPAREN) != 1) {
+                args = array_push(args, ps_parse_call_arg());
+                arg_names = array_push(arg_names, ps_last_arg_name);
+                while (ps_at(TOK_COMMA) == 1) {
+                    ps_adv();
+                    args = array_push(args, ps_parse_call_arg());
+                    arg_names = array_push(arg_names, ps_last_arg_name);
+                }
+            }
+            ps_expect(TOK_RPAREN, ")");
+            let e = mk_expr(EXPR_CALL, loc);
+            e.str1 = name;
+            e.items = args;
+            e.str_items = arg_names;
+            return e;
+        }
+        // 数组索引
+        if (ps_at(TOK_LBRACKET) == 1) {
+            ps_adv();
+            let idx = parse_expr();
+            ps_expect(TOK_RBRACKET, "]");
+            let e = mk_expr(EXPR_INDEX, loc);
+            let base = mk_expr(EXPR_VAR, name_loc);
+            base.str1 = name;
+            e.child1 = base;
+            e.child2 = idx;
+            return e;
+        }
+        // 成员访问
+        if (ps_at(TOK_DOT) == 1) {
+            let base = mk_expr(EXPR_VAR, name_loc);
+            base.str1 = name;
+            return parse_member_chain(base, loc);
+        }
+        let e = mk_expr(EXPR_VAR, loc);
+        e.str1 = name;
+        return e;
+    }
+
+    if (k == TOK_LPAREN) {
+        ps_adv();
+        let first = parse_expr();
+        // 元组字面量 (e1, e2, ...) — 至少 2 个元素
+        if (ps_at(TOK_COMMA) == 1) {
+            let elems: array<Expr> = [];
+            elems = array_push(elems, first);
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                if (ps_at(TOK_RPAREN) == 1) { break; }
+                elems = array_push(elems, parse_expr());
+            }
+            ps_expect(TOK_RPAREN, ")");
+            let e = mk_expr(EXPR_TUPLE, loc);
+            e.items = elems;
+            return e;
+        }
+        ps_expect(TOK_RPAREN, ")");
+        return first;
+    }
+
+    if (k == TOK_LBRACKET) {
+        // 数组字面量
+        ps_adv();
+        let elems: array<Expr> = [];
+        if (ps_at(TOK_RBRACKET) != 1) {
+            elems = array_push(elems, parse_expr());
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                elems = array_push(elems, parse_expr());
+            }
+        }
+        ps_expect(TOK_RBRACKET, "]");
+        let e = mk_expr(EXPR_ARRAY_LIT, loc);
+        e.items = elems;
+        return e;
+    }
+
+    // 预留关键字拒绝
+    if (k == TOK_ASYNC || k == TOK_AWAIT || k == TOK_SPAWN || k == TOK_YIELD ||
+        k == TOK_DO) {
+        let msg = "Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": '" + ps_cur_text() + "' is a reserved keyword (planned for a future version), not usable as an identifier";
+        ps_err(msg);
+        ps_adv();
+        return mk_expr(EXPR_INT, loc);
+    }
+
+    let msg2 = "SH-PARSE006: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": unexpected token '" + ps_cur_text() + "'";
+    ps_err(msg2);
+    ps_adv();
+    return mk_expr(EXPR_INT, loc);
+}
+
+// 解析成员访问链：.field, [idx], .method(args)
+pub kimo parse_member_chain(base: Expr, loc: Location) -> Expr {
+    let result = base;
+    while (true) {
+        if (ps_at(TOK_DOT) == 1) {
+            ps_adv();
+            // 元组数字字段访问 t.0, t.1, ...（intval 存解析后的整数索引）
+            if (ps_at(TOK_INT_LIT) == 1) {
+                let field = ps_cur_text();
+                ps_adv();
+                let e = mk_expr(EXPR_MEMBER, loc);
+                e.child1 = result;
+                e.str1 = field;
+                let tup_idx: int = 0;
+                let i = 0;
+                while (i < len(field)) {
+                    let c = field[i];
+                    let d: int = 0;
+                    if (c == "1") { d = 1; } else if (c == "2") { d = 2; }
+                    else if (c == "3") { d = 3; } else if (c == "4") { d = 4; }
+                    else if (c == "5") { d = 5; } else if (c == "6") { d = 6; }
+                    else if (c == "7") { d = 7; } else if (c == "8") { d = 8; }
+                    else if (c == "9") { d = 9; }
+                    tup_idx = tup_idx * 10 + d;
+                    i = i + 1;
+                }
+                e.intval = tup_idx;
+                result = e;
+            } else {
+                let field = ps_cur_text();
+                ps_expect(TOK_IDENT, "identifier");
+                // 方法调用: obj.method(args) → desugar to method(obj, args)
+                if (ps_at(TOK_LPAREN) == 1) {
+                    ps_adv();
+                    let args: array<Expr> = [];
+                    args = array_push(args, result);
+                    if (ps_at(TOK_RPAREN) != 1) {
+                        args = array_push(args, parse_expr());
+                        while (ps_at(TOK_COMMA) == 1) {
+                            ps_adv();
+                            args = array_push(args, parse_expr());
+                        }
+                    }
+                    ps_expect(TOK_RPAREN, ")");
+                    let e = mk_expr(EXPR_CALL, loc);
+                    e.str1 = field;
+                    e.items = args;
+                    result = e;
+                } else {
+                    let e = mk_expr(EXPR_MEMBER, loc);
+                    e.child1 = result;
+                    e.str1 = field;
+                    result = e;
+                }
+            }
+        } else if (ps_at(TOK_LBRACKET) == 1) {
+            ps_adv();
+            let idx = parse_expr();
+            ps_expect(TOK_RBRACKET, "]");
+            let e = mk_expr(EXPR_INDEX, loc);
+            e.child1 = result;
+            e.child2 = idx;
+            result = e;
+        } else { break; }
+    }
+    return result;
+}
+
+pub kimo parse_unary_inner() -> Expr {
+    let k = ps_cur_kind();
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    if (k == TOK_MINUS) {
+        ps_adv();
+        let e = parse_unary();
+        let r = mk_expr(EXPR_UNARY, loc);
+        r.intval = UN_NEG;
+        r.child1 = e;
+        return r;
+    }
+    if (k == TOK_BANG) {
+        ps_adv();
+        let e = parse_unary();
+        let r = mk_expr(EXPR_UNARY, loc);
+        r.intval = UN_NOT;
+        r.child1 = e;
+        return r;
+    }
+    // spawn <funcname> 或 spawn <funcname>(args)
+    if (k == TOK_SPAWN) {
+        ps_adv();
+        let mname = ps_cur_text();
+        ps_expect(TOK_IDENT, "spawn target function name");
+        let e = mk_expr(EXPR_SPAWN, loc);
+        e.str1 = mname;
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            let spawn_args: array<Expr> = [];
+            if (ps_at(TOK_RPAREN) != 1) {
+                spawn_args = array_push(spawn_args, parse_expr());
+                while (ps_at(TOK_COMMA) == 1) {
+                    ps_adv();
+                    spawn_args = array_push(spawn_args, parse_expr());
+                }
+            }
+            ps_expect(TOK_RPAREN, ")");
+            e.items = spawn_args;
+        }
+        return e;
+    }
+    // await <expr>
+    if (k == TOK_AWAIT) {
+        ps_adv();
+        let inner = parse_unary();
+        let e = mk_expr(EXPR_AWAIT, loc);
+        e.child1 = inner;
+        return e;
+    }
+    return parse_primary();
+}
+
+pub kimo bin_op_from_tok(kind: int) -> int {
+    if (kind == TOK_PLUS) { return BIN_ADD; }
+    if (kind == TOK_MINUS) { return BIN_SUB; }
+    if (kind == TOK_STAR) { return BIN_MUL; }
+    if (kind == TOK_SLASH) { return BIN_DIV; }
+    if (kind == TOK_PERCENT) { return BIN_REM; }
+    if (kind == TOK_EQEQ) { return BIN_EQ; }
+    if (kind == TOK_BANGEQ) { return BIN_NE; }
+    if (kind == TOK_LT) { return BIN_LT; }
+    if (kind == TOK_GT) { return BIN_GT; }
+    if (kind == TOK_LE) { return BIN_LE; }
+    if (kind == TOK_GE) { return BIN_GE; }
+    if (kind == TOK_AND) { return BIN_AND; }
+    if (kind == TOK_OR) { return BIN_OR; }
+    return -1;
+}
+
+pub kimo parse_mul_inner() -> Expr {
+    let left = parse_unary();
+    while (ps_at(TOK_STAR) == 1 || ps_at(TOK_SLASH) == 1 || ps_at(TOK_PERCENT) == 1) {
+        let op = bin_op_from_tok(ps_cur_kind());
+        ps_adv();
+        let right = parse_unary();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = op;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_add_inner() -> Expr {
+    let left = parse_mul();
+    while (ps_at(TOK_PLUS) == 1 || ps_at(TOK_MINUS) == 1) {
+        let op = bin_op_from_tok(ps_cur_kind());
+        ps_adv();
+        let right = parse_mul();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = op;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_cmp_inner() -> Expr {
+    let left = parse_add();
+    while (ps_at(TOK_LT) == 1 || ps_at(TOK_GT) == 1 || ps_at(TOK_LE) == 1 || ps_at(TOK_GE) == 1) {
+        let op = bin_op_from_tok(ps_cur_kind());
+        ps_adv();
+        let right = parse_add();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = op;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_eq_inner() -> Expr {
+    let left = parse_cmp();
+    while (ps_at(TOK_EQEQ) == 1 || ps_at(TOK_BANGEQ) == 1) {
+        let op = bin_op_from_tok(ps_cur_kind());
+        ps_adv();
+        let right = parse_cmp();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = op;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_and_inner() -> Expr {
+    let left = parse_eq();
+    while (ps_at(TOK_AND) == 1) {
+        ps_adv();
+        let right = parse_eq();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = BIN_AND;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_or_inner() -> Expr {
+    let left = parse_and();
+    while (ps_at(TOK_OR) == 1) {
+        ps_adv();
+        let right = parse_and();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = BIN_OR;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_expr_inner() -> Expr {
+    let left = parse_or();
+    // for range 字面量 a..b
+    if (ps_at(TOK_RANGE) == 1) {
+        ps_adv();
+        let right = parse_or();
+        let e = mk_expr(EXPR_RANGE, left.loc);
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    // as 转型
+    if (ps_at(TOK_AS) == 1) {
+        ps_adv();
+        let ty = parse_type();
+        let e = mk_expr(EXPR_CAST, left.loc);
+        e.child1 = left;
+        e.inferred_type = ty;
+        return e;
+    }
+    // `?` 错误传播 / 三元运算符
+    if (ps_at(TOK_QUESTION) == 1) {
+        ps_adv();
+        let nk = ps_cur_kind();
+        let can_start = 0;
+        if (nk == TOK_IDENT || nk == TOK_INT_LIT || nk == TOK_LONG_LIT ||
+            nk == TOK_FLOAT_LIT || nk == TOK_STRING_LIT || nk == TOK_CHAR_LIT ||
+            nk == TOK_TRUE || nk == TOK_FALSE || nk == TOK_NULL ||
+            nk == TOK_LPAREN || nk == TOK_LBRACKET ||
+            nk == TOK_MINUS || nk == TOK_BANG ||
+            nk == TOK_NEW || nk == TOK_MATCH || nk == TOK_KIMO ||
+            nk == TOK_SPAWN || nk == TOK_ASYNC ||
+            nk == TOK_DATE_TY || nk == TOK_TIMESTAMP_TY || nk == TOK_NANOTIMESTAMP_TY) {
+            can_start = 1;
+        }
+        if (can_start == 0) {
+            // 错误传播
+            let q = mk_expr(EXPR_QUESTION, left.loc);
+            q.child1 = left;
+            return q;
+        }
+        // 三元运算符：cond ? then : else → EXPR_IF
+        let then_e = parse_expr();
+        ps_expect(TOK_COLON, ": in ternary");
+        let else_e = parse_expr();
+        let e = mk_expr(EXPR_IF, left.loc);
+        e.child1 = left;
+        e.child2 = then_e;
+        e.child3 = else_e;
+        return e;
+    }
+    return left;
+}
+
+// ============ 宏系统 ============
+pub kimo ps_macro_lookup(name: string) -> MacroDef {
+    let i = 0;
+    while (i < len(ps_macros)) {
+        let m = ps_macros[i] as MacroDef;
+        if (str_eq(m.name, name) == 1) { return m; }
+        i = i + 1;
+    }
+    let md = MacroDef { name: "", params: [], body: mk_expr(EXPR_INT, mk_loc(ps_file, 0, 0)), loc: mk_loc(ps_file, 0, 0), is_pub: 0 };
+    return md;
+}
+
+// 深拷贝 Expr（宏展开用）
+pub kimo ps_clone_expr(e: Expr) -> Expr {
+    if (expr_is_none(e) == 1) { return e; }
+    let ne = mk_expr(e.kind, e.loc);
+    ne.str1 = e.str1;
+    ne.str2 = e.str2;
+    ne.intval = e.intval;
+    ne.floatval = e.floatval;
+    if (expr_is_none(e.child1) == 0) { ne.child1 = ps_clone_expr(e.child1); }
+    if (expr_is_none(e.child2) == 0) { ne.child2 = ps_clone_expr(e.child2); }
+    if (expr_is_none(e.child3) == 0) { ne.child3 = ps_clone_expr(e.child3); }
+    let i = 0;
+    while (i < len(e.items)) {
+        ne.items = array_push(ne.items, ps_clone_expr(e.items[i]));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.items2)) {
+        ne.items2 = array_push(ne.items2, ps_clone_expr(e.items2[i]));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.str_items)) {
+        ne.str_items = array_push(ne.str_items, e.str_items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.type_args)) {
+        ne.type_args = array_push(ne.type_args, e.type_args[i]);
+        i = i + 1;
+    }
+    ne.inferred_type = e.inferred_type;
+    return ne;
+}
+
+// 宏展开核心：形参替换 + 宏局部符号卫生重命名
+pub kimo ps_macro_subst(e: Expr, param_names: array<string>, arg_exprs: array<Expr>, hyg_suffix: string) -> Expr {
+    if (expr_is_none(e) == 1) { return e; }
+    if (e.kind == EXPR_VAR) {
+        let i = 0;
+        while (i < len(param_names)) {
+            let pn = param_names[i] as string;
+            if (str_eq(e.str1, pn) == 1) {
+                return ps_clone_expr(arg_exprs[i]);
+            }
+            i = i + 1;
+        }
+        // 宏局部符号（__ 开头）卫生重命名
+        let s1 = e.str1;
+        if (len(s1) >= 2) {
+            let c0 = s1[0];
+            let c1 = s1[1];
+            let pre = c0 + c1;
+            if (str_eq(pre, "__") == 1) {
+                let ne = mk_expr(e.kind, e.loc);
+                ne.str1 = e.str1 + hyg_suffix;
+                return ne;
+            }
+        }
+        let ne0 = mk_expr(e.kind, e.loc);
+        ne0.str1 = e.str1;
+        return ne0;
+    }
+    // 通用节点：递归子树 + 数组
+    let ne = mk_expr(e.kind, e.loc);
+    ne.str1 = e.str1;
+    ne.str2 = e.str2;
+    ne.intval = e.intval;
+    ne.floatval = e.floatval;
+    if (expr_is_none(e.child1) == 0) { ne.child1 = ps_macro_subst(e.child1, param_names, arg_exprs, hyg_suffix); }
+    if (expr_is_none(e.child2) == 0) { ne.child2 = ps_macro_subst(e.child2, param_names, arg_exprs, hyg_suffix); }
+    if (expr_is_none(e.child3) == 0) { ne.child3 = ps_macro_subst(e.child3, param_names, arg_exprs, hyg_suffix); }
+    let i = 0;
+    while (i < len(e.items)) {
+        ne.items = array_push(ne.items, ps_macro_subst(e.items[i], param_names, arg_exprs, hyg_suffix));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.items2)) {
+        ne.items2 = array_push(ne.items2, ps_macro_subst(e.items2[i], param_names, arg_exprs, hyg_suffix));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.str_items)) {
+        ne.str_items = array_push(ne.str_items, e.str_items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.type_args)) {
+        ne.type_args = array_push(ne.type_args, e.type_args[i]);
+        i = i + 1;
+    }
+    ne.inferred_type = e.inferred_type;
+    return ne;
+}
+
+// 宏展开入口
+pub kimo ps_macro_expand(mdef: MacroDef, args: array<Expr>) -> Expr {
+    let n = ps_macro_hyg_counter;
+    ps_macro_hyg_counter = ps_macro_hyg_counter + 1;
+    let hyg_suffix = "__h" + int_to_str(n);
+    if (len(args) != len(mdef.params)) {
+        let msg = "Macro error: '" + mdef.name + "' expects " + int_to_str(len(mdef.params)) + " args but got " + int_to_str(len(args));
+        ps_err(msg);
+        let loc_ph = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+        return mk_expr(EXPR_INT, loc_ph);
+    }
+    // 收集形参名（MacroParam → name 数组）
+    let pnames: array<string> = [];
+    let pi = 0;
+    while (pi < len(mdef.params)) {
+        let mp = mdef.params[pi] as MacroParam;
+        pnames = array_push(pnames, mp.name);
+        pi = pi + 1;
+    }
+    return ps_macro_subst(mdef.body, pnames, args, hyg_suffix);
+}
+
+// ============ 语句块与去糖辅助 ============
+pub kimo parse_block() -> array<Stmt> {
+    ps_expect(TOK_LBRACE, "{");
+    let stmts: array<Stmt> = [];
+    ps_block_depth = ps_block_depth + 1;
+    let my_depth = ps_block_depth;
+    let defer_start = len(ps_defer_list);
+    let safety = 0;
+    while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+        let prev_idx = ps_idx;
+        stmts = array_push(stmts, parse_statement());
+        safety = safety + 1;
+        if (safety > 100000) {
+            let msg = "SH-PARSE-BLOCK-LIMIT: parse_block exceeded 100000 statements at " + ps_file + ":" + int_to_str(ps_cur_line()) + " — possible infinite loop";
+            ps_err(msg);
+            break;
+        }
+        if (ps_idx == prev_idx) {
+            println("SH-PARSE-BLOCK-STUCK: parse_block stuck at " + ps_file + ":" + int_to_str(ps_cur_line()) + " — token not consumed");
+            ps_adv();
+        }
+    }
+    ps_expect(TOK_RBRACE, "}");
+    ps_block_depth = ps_block_depth - 1;
+    // 收集本 block 的 deferred（depth 匹配）
+    let my_deferred: array<DeferEntry> = [];
+    let di = defer_start;
+    while (di < len(ps_defer_list)) {
+        let entry = ps_defer_list[di] as DeferEntry;
+        if (entry.depth == my_depth) {
+            my_deferred = array_push(my_deferred, entry);
+        }
+        di = di + 1;
+    }
+    // 清除已处理的 defer 条目
+    let trimmed: array<DeferEntry> = [];
+    di = 0;
+    while (di < defer_start) {
+        trimmed = array_push(trimmed, ps_defer_list[di]);
+        di = di + 1;
+    }
+    ps_defer_list = trimmed;
+    // 以 LIFO 顺序追加 deferred body 到 block 末尾
+    di = len(my_deferred) - 1;
+    while (di >= 0) {
+        let de_entry = my_deferred[di] as DeferEntry;
+        let defer_body = de_entry.body;
+        let dj = 0;
+        while (dj < len(defer_body)) {
+            stmts = array_push(stmts, defer_body[dj]);
+            dj = dj + 1;
+        }
+        di = di - 1;
+    }
+    // 若有 deferred，重写 block 内 return/throw
+    if (len(my_deferred) > 0) {
+        stmts = ps_rewrite_returns_for_defer(stmts, my_deferred);
+    }
+    return stmts;
+}
+
+// 结构体类型变量无初始化器时注入 `new Type`（如 let p: Point;）
+pub kimo ps_inject_struct_new(ty: Type, init: Expr, loc: Location) -> Expr {
+    if (type_is_none(ty) == 1) { return 0 as Expr; }
+    if (expr_is_none(init) == 0) { return 0 as Expr; }
+    let t = ty;
+    let k = t.kind;
+    if (k != TYPE_STRUCT) { return 0 as Expr; }
+    let ne = mk_expr(EXPR_NEW, loc);
+    ne.str1 = t.name;
+    if (len(t.param_types) > 0) {
+        ne.type_args = t.param_types;
+    }
+    return ne;
+}
+
+// 生成类型对应的"默认值"表达式（throw 去糖 / ? 传播时使用）
+// 返回 0 as Expr 表示 void（调用方生成 return;）
+pub kimo ps_mk_default_value(ty: Type, loc: Location) -> Expr {
+    if (type_is_none(ty) == 1) {
+        let ne = mk_expr(EXPR_NULL, loc);
+        return ne;
+    }
+    let t = ty;
+    let k = t.kind;
+    if (k == TYPE_VOID || k == TYPE_UNIT) {
+        let ze = 0 as Expr;
+        return ze;
+    }
+    if (k == TYPE_INT || k == TYPE_SHORT || k == TYPE_CHAR || k == TYPE_DATE) {
+        let e = mk_expr(EXPR_INT, loc);
+        e.intval = 0;
+        return e;
+    }
+    if (k == TYPE_LONG || k == TYPE_TIMESTAMP || k == TYPE_NANOTIMESTAMP) {
+        let e = mk_expr(EXPR_LONG, loc);
+        e.intval = 0;
+        return e;
+    }
+    if (k == TYPE_FLOAT || k == TYPE_DOUBLE) {
+        let e = mk_expr(EXPR_FLOAT, loc);
+        e.floatval = 0.0;
+        e.str1 = "0";
+        return e;
+    }
+    if (k == TYPE_BOOL) {
+        let e = mk_expr(EXPR_BOOL, loc);
+        e.intval = 0;
+        return e;
+    }
+    if (k == TYPE_STRING) {
+        let e = mk_expr(EXPR_STRING, loc);
+        e.str1 = "";
+        return e;
+    }
+    if (k == TYPE_ANY || k == TYPE_OPAQUE) {
+        let e = mk_expr(EXPR_NULL, loc);
+        return e;
+    }
+    if (k == TYPE_STRUCT) {
+        let ne = mk_expr(EXPR_NEW, loc);
+        ne.str1 = t.name;
+        return ne;
+    }
+    if (k == TYPE_ARRAY) {
+        let e = mk_expr(EXPR_ARRAY_LIT, loc);
+        return e;
+    }
+    let ne = mk_expr(EXPR_NULL, loc);
+    return ne;
+}
+
+// ============ match 语句解析 ============
+// 解构臂 → STMT_MATCH（exprs=patterns, items=臂体 STMT_BLOCK）；
+// 纯字面量/通配符 → if/else 链去糖
+pub kimo ps_parse_match_stmt() -> Stmt {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_adv();
+    ps_no_struct_lit = 1;
+    let scrut = parse_expr();
+    ps_no_struct_lit = 0;
+    ps_expect(TOK_LBRACE, "{");
+
+    let pats: array<Expr> = [];
+    let blks: array<array<Stmt>> = [];
+    let has_destructure = 0;
+    while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+        let pat = ps_parse_match_pattern();
+        let pk = pat.kind;
+        if (pk == EXPR_ENUM_VARIANT) { has_destructure = 1; }
+        ps_expect(TOK_FATARROW, "=>");
+        let blk: array<Stmt> = [];
+        if (ps_at(TOK_LBRACE) == 1) {
+            blk = parse_block();
+        } else {
+            let e = parse_expr();
+            let es = mk_stmt(STMT_EXPR, e.loc);
+            es.expr1 = e;
+            blk = array_push(blk, es);
+        }
+        pats = array_push(pats, pat);
+        blks = array_push(blks, blk);
+        if (ps_at(TOK_COMMA) == 1) { ps_adv(); }
+    }
+    ps_expect(TOK_RBRACE, "}");
+
+    // 含解构臂 → 原生 STMT_MATCH
+    if (has_destructure == 1) {
+        let ms = mk_stmt(STMT_MATCH, loc);
+        ms.expr1 = scrut;
+        ms.exprs = pats;
+        // 臂体统一包装为 STMT_BLOCK 存 items
+        let des_blocks: array<Stmt> = [];
+        let ai = 0;
+        while (ai < len(blks)) {
+            let ab = mk_stmt(STMT_BLOCK, loc);
+            ab.items = blks[ai];
+            des_blocks = array_push(des_blocks, ab);
+            ai = ai + 1;
+        }
+        ms.items = des_blocks;
+        return ms;
+    }
+
+    // —— 纯字面量/通配符：旧去糖路径 ——
+    ps_match_counter = ps_match_counter + 1;
+    let tmp_name = "$match." + int_to_str(ps_match_counter);
+    let let_s = mk_stmt(STMT_LET, loc);
+    let_s.str1 = tmp_name;
+    let_s.expr1 = scrut;
+
+    let arm_conds: array<Expr> = [];
+    let sugar_blocks: array<Stmt> = [];
+    let wild_stmt = mk_stmt(STMT_BLOCK, loc);
+    let has_wild = 0;
+    let pi = 0;
+    while (pi < len(pats)) {
+        let pat2 = pats[pi];
+        let blk2 = blks[pi];
+        let is_wild = 0;
+        if (pat2.kind == EXPR_VAR && str_eq(pat2.str1, "_") == 1) { is_wild = 1; }
+        if (is_wild == 1) {
+            let wb = mk_stmt(STMT_BLOCK, loc);
+            wb.items = blk2;
+            wild_stmt = wb;
+            has_wild = 1;
+        } else {
+            let vref = mk_expr(EXPR_VAR, loc);
+            vref.str1 = tmp_name;
+            let cmp = mk_expr(EXPR_BINARY, loc);
+            cmp.intval = BIN_EQ;
+            cmp.child1 = vref;
+            cmp.child2 = pat2;
+            arm_conds = array_push(arm_conds, cmp);
+            let sb = mk_stmt(STMT_BLOCK, loc);
+            sb.items = blk2;
+            sugar_blocks = array_push(sugar_blocks, sb);
+        }
+        pi = pi + 1;
+    }
+
+    // 从后往前构建 if/else-if 链
+    let else_chain: array<Stmt> = [];
+    if (has_wild == 1) {
+        let wc: array<Stmt> = [];
+        wc = array_push(wc, wild_stmt);
+        else_chain = wc;
+    }
+    let ai2 = len(arm_conds) - 1;
+    while (ai2 >= 0) {
+        let ifs = mk_stmt(STMT_IF, loc);
+        ifs.expr1 = arm_conds[ai2];
+        let sb2 = sugar_blocks[ai2] as Stmt;
+        ifs.items = sb2.items;
+        ifs.items2 = else_chain;
+        let new_chain: array<Stmt> = [];
+        new_chain = array_push(new_chain, ifs);
+        else_chain = new_chain;
+        ai2 = ai2 - 1;
+    }
+
+    let block_stmts: array<Stmt> = [];
+    block_stmts = array_push(block_stmts, let_s);
+    let ci = 0;
+    while (ci < len(else_chain)) {
+        block_stmts = array_push(block_stmts, else_chain[ci]);
+        ci = ci + 1;
+    }
+    let blk_s = mk_stmt(STMT_BLOCK, loc);
+    blk_s.items = block_stmts;
+    return blk_s;
+}
+
+// 构造调用运行时函数（无参）的 STMT_EXPR 语句
+pub kimo ps_call_stmt0(fname: string, loc: Location) -> Stmt {
+    let call = mk_expr(EXPR_CALL, loc);
+    call.str1 = fname;
+    let st = mk_stmt(STMT_EXPR, loc);
+    st.expr1 = call;
+    return st;
+}
+
+// 构造 `rt_exception_occurred() <op> 0` 的比较表达式
+pub kimo ps_exc_cond(op: int, loc: Location) -> Expr {
+    let call = mk_expr(EXPR_CALL, loc);
+    call.str1 = "rt_exception_occurred";
+    let zero = mk_expr(EXPR_INT, loc);
+    zero.intval = 0;
+    let cmp = mk_expr(EXPR_BINARY, loc);
+    cmp.intval = op;
+    cmp.child1 = call;
+    cmp.child2 = zero;
+    return cmp;
+}
+
+// try/catch 去糖为 STMT_BLOCK：清标志 → 逐条守卫 → 末尾 catch 守卫
+pub kimo ps_parse_try_stmt() -> Stmt {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_adv();
+    ps_try_depth = ps_try_depth + 1;
+    let try_block = parse_block();
+    ps_try_depth = ps_try_depth - 1;
+    let catch_block: array<Stmt> = [];
+    if (ps_at(TOK_CATCH) == 1) {
+        ps_adv();
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            if (ps_at(TOK_IDENT) == 1) { ps_adv(); }
+            ps_expect(TOK_RPAREN, ")");
+        }
+        catch_block = parse_block();
+    }
+
+    let block_stmts: array<Stmt> = [];
+    block_stmts = array_push(block_stmts, ps_call_stmt0("rt_exception_clear", loc));
+
+    let i = 0;
+    while (i < len(try_block)) {
+        let guard = mk_stmt(STMT_IF, loc);
+        guard.expr1 = ps_exc_cond(BIN_EQ, loc);
+        let body: array<Stmt> = [];
+        body = array_push(body, try_block[i]);
+        guard.items = body;
+        block_stmts = array_push(block_stmts, guard);
+        i = i + 1;
+    }
+
+    let cguard = mk_stmt(STMT_IF, loc);
+    cguard.expr1 = ps_exc_cond(BIN_NE, loc);
+    let cbody: array<Stmt> = [];
+    cbody = array_push(cbody, ps_call_stmt0("rt_exception_clear", loc));
+    let ci = 0;
+    while (ci < len(catch_block)) {
+        cbody = array_push(cbody, catch_block[ci]);
+        ci = ci + 1;
+    }
+    cguard.items = cbody;
+    block_stmts = array_push(block_stmts, cguard);
+
+    let blk_s = mk_stmt(STMT_BLOCK, loc);
+    blk_s.items = block_stmts;
+    return blk_s;
+}
+
+// ============ with 语句（资源管理 + Drop） ============
+pub kimo ps_parse_with_stmt() -> Stmt {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_WITH, "with");
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    ps_expect(TOK_EQ, "=");
+    let init = parse_expr();
+    ps_expect(TOK_LBRACE, "{");
+    let body: array<Stmt> = [];
+    while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+        body = array_push(body, parse_statement());
+    }
+    ps_expect(TOK_RBRACE, "}");
+    // 重写 body 中 return → drop + return
+    ps_rewrite_returns_in_with(body, name, loc);
+    let stmts: array<Stmt> = [];
+    let let_stmt = mk_stmt(STMT_LET, loc);
+    let_stmt.str1 = name;
+    let_stmt.expr1 = init;
+    stmts = array_push(stmts, let_stmt);
+    let bi = 0;
+    while (bi < len(body)) {
+        stmts = array_push(stmts, body[bi]);
+        bi = bi + 1;
+    }
+    // name.drop();
+    let drop_call = mk_expr(EXPR_CALL, loc);
+    drop_call.str1 = "drop";
+    let recv_var = mk_expr(EXPR_VAR, loc);
+    recv_var.str1 = name;
+    let drop_args: array<Expr> = [];
+    drop_args = array_push(drop_args, recv_var);
+    drop_call.items = drop_args;
+    let drop_stmt = mk_stmt(STMT_EXPR, loc);
+    drop_stmt.expr1 = drop_call;
+    stmts = array_push(stmts, drop_stmt);
+    let blk = mk_stmt(STMT_BLOCK, loc);
+    blk.items = stmts;
+    return blk;
+}
+
+// 递归重写 with body 中的 STMT_RETURN → STMT_BLOCK([drop(), STMT_RETURN])
+pub kimo ps_rewrite_returns_in_with(stmts: array<Stmt>, name: string, drop_loc: Location) -> void {
+    let i = 0;
+    while (i < len(stmts)) {
+        let s = stmts[i] as Stmt;
+        let k = s.kind;
+        if (k == STMT_RETURN) {
+            let drop_call = mk_expr(EXPR_CALL, drop_loc);
+            drop_call.str1 = "drop";
+            let recv_var = mk_expr(EXPR_VAR, drop_loc);
+            recv_var.str1 = name;
+            let drop_args: array<Expr> = [];
+            drop_args = array_push(drop_args, recv_var);
+            drop_call.items = drop_args;
+            let drop_stmt = mk_stmt(STMT_EXPR, drop_loc);
+            drop_stmt.expr1 = drop_call;
+            let orig_return = mk_stmt(STMT_RETURN, s.loc);
+            orig_return.intval = s.intval;
+            orig_return.expr1 = s.expr1;
+            let blk_stmts: array<Stmt> = [];
+            blk_stmts = array_push(blk_stmts, drop_stmt);
+            blk_stmts = array_push(blk_stmts, orig_return);
+            let blk = mk_stmt(STMT_BLOCK, s.loc);
+            blk.items = blk_stmts;
+            stmts[i] = blk;
+        } else if (k == STMT_BLOCK) {
+            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+        } else if (k == STMT_IF) {
+            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+            if (len(s.items2) > 0) {
+                ps_rewrite_returns_in_with(s.items2, name, drop_loc);
+            }
+        } else if (k == STMT_WHILE) {
+            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+        } else if (k == STMT_FOR) {
+            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+        } else if (k == STMT_MATCH) {
+            let mb = s.items;
+            let mi = 0;
+            while (mi < len(mb)) {
+                let arm = mb[mi] as Stmt;
+                ps_rewrite_returns_in_with(arm.items, name, drop_loc);
+                mi = mi + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// ============ defer 语句 ============
+pub kimo ps_parse_defer_stmt() -> Stmt {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_DEFER, "defer");
+    let defer_body: array<Stmt> = [];
+    if (ps_at(TOK_LBRACE) == 1) {
+        defer_body = parse_block();
+    } else {
+        let e = parse_expr();
+        ps_expect(TOK_SEMICOLON, ";");
+        let es = mk_stmt(STMT_EXPR, loc);
+        es.expr1 = e;
+        defer_body = array_push(defer_body, es);
+    }
+    let entry = DeferEntry { depth: ps_block_depth, body: defer_body };
+    ps_defer_list = array_push(ps_defer_list, entry);
+    let placeholder = mk_stmt(STMT_EXPR, loc);
+    placeholder.intval = 1;  // no-op 占位
+    return placeholder;
+}
+
+// 重写 block 内 return/throw → 先执行 deferred 再退出
+pub kimo ps_rewrite_returns_for_defer(stmts: array<Stmt>, deferred: array<DeferEntry>) -> array<Stmt> {
+    let i = 0;
+    while (i < len(stmts)) {
+        let s = stmts[i] as Stmt;
+        let k = s.kind;
+        if (k == STMT_RETURN || k == STMT_THROW) {
+            let blk_stmts: array<Stmt> = [];
+            let di = len(deferred) - 1;
+            while (di >= 0) {
+                let df_entry = deferred[di] as DeferEntry;
+                let defer_body = df_entry.body;
+                let dj = 0;
+                while (dj < len(defer_body)) {
+                    blk_stmts = array_push(blk_stmts, defer_body[dj]);
+                    dj = dj + 1;
+                }
+                di = di - 1;
+            }
+            blk_stmts = array_push(blk_stmts, s);
+            let blk = mk_stmt(STMT_BLOCK, s.loc);
+            blk.items = blk_stmts;
+            stmts[i] = blk;
+        } else if (k == STMT_BLOCK) {
+            let nb = ps_rewrite_returns_for_defer(s.items, deferred);
+            s.items = nb;
+        } else if (k == STMT_IF) {
+            let ni = ps_rewrite_returns_for_defer(s.items, deferred);
+            s.items = ni;
+            if (len(s.items2) > 0) {
+                let ni2 = ps_rewrite_returns_for_defer(s.items2, deferred);
+                s.items2 = ni2;
+            }
+        } else if (k == STMT_WHILE) {
+            let nw = ps_rewrite_returns_for_defer(s.items, deferred);
+            s.items = nw;
+        } else if (k == STMT_FOR) {
+            let nf = ps_rewrite_returns_for_defer(s.items, deferred);
+            s.items = nf;
+        } else if (k == STMT_MATCH) {
+            let mb = s.items;
+            let mi = 0;
+            while (mi < len(mb)) {
+                let arm = mb[mi] as Stmt;
+                let na = ps_rewrite_returns_for_defer(arm.items, deferred);
+                arm.items = na;
+                mb[mi] = arm;
+                mi = mi + 1;
+            }
+            s.items = mb;
+        }
+        i = i + 1;
+    }
+    return stmts;
+}
+
+// ============ 语句解析 ============
+pub kimo parse_statement_inner() -> Stmt {
+    let k = ps_cur_kind();
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+
+    if (k == TOK_MATCH) {
+        return ps_parse_match_stmt();
+    }
+
+    if (k == TOK_LET) {
+        ps_adv();
+        if (ps_at(TOK_MUT) == 1) { ps_adv(); }
+        // 元组解构 let (a, b, ...) = expr; 去糖为 STMT_BLOCK
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            let names: array<string> = [];
+            names = array_push(names, ps_cur_text());
+            ps_expect(TOK_IDENT, "identifier");
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                if (ps_at(TOK_RPAREN) == 1) { break; }
+                names = array_push(names, ps_cur_text());
+                ps_expect(TOK_IDENT, "identifier");
+            }
+            ps_expect(TOK_RPAREN, ")");
+            ps_expect(TOK_EQ, "=");
+            let init = parse_expr();
+            ps_expect(TOK_SEMICOLON, ";");
+            let stmts: array<Stmt> = [];
+            let tmp_name = "__tup_" + int_to_str(next_node_id());
+            let let_tmp = mk_stmt(STMT_LET, loc);
+            let_tmp.str1 = tmp_name;
+            let_tmp.expr1 = init;
+            stmts = array_push(stmts, let_tmp);
+            let idx = 0;
+            while (idx < len(names)) {
+                let nm = names[idx] as string;
+                let let_elem = mk_stmt(STMT_LET, loc);
+                let_elem.str1 = nm;
+                let fld = mk_expr(EXPR_MEMBER, loc);
+                let base = mk_expr(EXPR_VAR, loc);
+                base.str1 = tmp_name;
+                fld.child1 = base;
+                fld.str1 = int_to_str(idx);
+                fld.intval = idx;
+                let_elem.expr1 = fld;
+                stmts = array_push(stmts, let_elem);
+                idx = idx + 1;
+            }
+            let blk = mk_stmt(STMT_BLOCK, loc);
+            blk.items = stmts;
+            return blk;
+        }
+        let name = ps_cur_text();
+        ps_expect(TOK_IDENT, "identifier");
+        let ty = type_none_inner();
+        if (ps_at(TOK_COLON) == 1) {
+            ps_adv();
+            ty = parse_type();
+        }
+        let init = mk_expr(EXPR_INT, loc);
+        let has_init = 0;
+        if (ps_at(TOK_EQ) == 1) {
+            ps_adv();
+            init = parse_expr();
+            has_init = 1;
+        }
+        let injected_new = 0 as Expr;
+        if (has_init == 0) {
+            injected_new = ps_inject_struct_new(ty, 0 as Expr, loc);
+        }
+        ps_expect(TOK_SEMICOLON, ";");
+        let s = mk_stmt(STMT_LET, loc);
+        s.str1 = name;
+        s.type1 = ty;
+        if (expr_is_none(injected_new) == 0) {
+            s.expr1 = injected_new;
+        } else if (has_init == 1) {
+            s.expr1 = init;
+        }
+        return s;
+    }
+
+    if (k == TOK_RETURN) {
+        ps_adv();
+        let has_val = 0;
+        let val = mk_expr(EXPR_INT, loc);
+        if (ps_at(TOK_SEMICOLON) != 1) {
+            val = parse_expr();
+            has_val = 1;
+        }
+        ps_expect(TOK_SEMICOLON, ";");
+        let s = mk_stmt(STMT_RETURN, loc);
+        s.intval = has_val;
+        if (has_val == 1) { s.expr1 = val; }
+        return s;
+    }
+
+    if (k == TOK_IF) {
+        ps_adv();
+        ps_expect(TOK_LPAREN, "(");
+        let cond = parse_expr();
+        ps_expect(TOK_RPAREN, ")");
+        let then_block = parse_block();
+        let else_block: array<Stmt> = [];
+        if (ps_at(TOK_ELSE) == 1) {
+            ps_adv();
+            if (ps_at(TOK_IF) == 1) {
+                else_block = array_push(else_block, parse_statement());
+            } else {
+                else_block = parse_block();
+            }
+        }
+        let s = mk_stmt(STMT_IF, loc);
+        s.expr1 = cond;
+        s.items = then_block;
+        s.items2 = else_block;
+        return s;
+    }
+
+    if (k == TOK_WHILE) {
+        ps_adv();
+        ps_expect(TOK_LPAREN, "(");
+        let cond = parse_expr();
+        ps_expect(TOK_RPAREN, ")");
+        let body = parse_block();
+        let s = mk_stmt(STMT_WHILE, loc);
+        s.expr1 = cond;
+        s.items = body;
+        return s;
+    }
+
+    if (k == TOK_FOR) {
+        // for (vars in iter) { body } — 强制括号
+        ps_adv();
+        if (ps_at(TOK_LPAREN) == 0) {
+            let msg = "Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": for loop requires parentheses: expected 'for (vars in expr)'";
+            ps_err(msg);
+        }
+        ps_expect(TOK_LPAREN, "(");
+        let var_names = "";
+        let first_var = 1;
+        while (true) {
+            let var_name = ps_cur_text();
+            ps_expect(TOK_IDENT, "identifier");
+            if (first_var == 1) {
+                var_names = var_name;
+                first_var = 0;
+            } else {
+                var_names = var_names + "," + var_name;
+            }
+            if (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+            } else {
+                break;
+            }
+        }
+        ps_expect(TOK_IN, "in");
+        ps_no_struct_lit = 1;
+        let iter_expr = parse_expr();
+        ps_no_struct_lit = 0;
+        ps_expect(TOK_RPAREN, ")");
+        let body = parse_block();
+        let s = mk_stmt(STMT_FOR, loc);
+        s.str1 = var_names;
+        s.expr1 = iter_expr;
+        s.items = body;
+        return s;
+    }
+
+    if (k == TOK_BREAK) {
+        ps_adv();
+        ps_expect(TOK_SEMICOLON, ";");
+        return mk_stmt(STMT_BREAK, loc);
+    }
+
+    if (k == TOK_CONTINUE) {
+        ps_adv();
+        ps_expect(TOK_SEMICOLON, ";");
+        return mk_stmt(STMT_CONTINUE, loc);
+    }
+
+    // panic 语句: panic; 或 panic(expr); → rt_panic_msg(msg)
+    if (k == TOK_PANIC) {
+        ps_adv();
+        let panic_msg = mk_expr(EXPR_STRING, loc);
+        let has_msg = 0;
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            if (ps_at(TOK_RPAREN) != 1) {
+                panic_msg = parse_expr();
+                has_msg = 1;
+            }
+            ps_expect(TOK_RPAREN, ")");
+        }
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        if (has_msg == 0) {
+            panic_msg = mk_expr(EXPR_STRING, loc);
+            panic_msg.str1 = "explicit panic";
+        }
+        let pcall = mk_expr(EXPR_CALL, loc);
+        pcall.str1 = "rt_panic_msg";
+        let pargs: array<Expr> = [];
+        pargs = array_push(pargs, panic_msg);
+        pcall.items = pargs;
+        let pstmt = mk_stmt(STMT_EXPR, loc);
+        pstmt.expr1 = pcall;
+        return pstmt;
+    }
+
+    // throw 语句: throw expr;
+    if (k == TOK_THROW) {
+        ps_adv();
+        let val = parse_expr();
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        let call = mk_expr(EXPR_CALL, loc);
+        call.str1 = "rt_throw_str";
+        let targs: array<Expr> = [];
+        targs = array_push(targs, val);
+        call.items = targs;
+        let throw_stmt = mk_stmt(STMT_EXPR, loc);
+        throw_stmt.expr1 = call;
+        if (ps_try_depth > 0) {
+            return throw_stmt;
+        }
+        // 不在 try 内：throw + return 默认值
+        let default_val = ps_mk_default_value(ps_cur_fn_ret_ty, loc);
+        let return_stmt = mk_stmt(STMT_RETURN, loc);
+        if (expr_is_none(default_val) == 1) {
+            return_stmt.intval = 0;
+        } else {
+            return_stmt.intval = 1;
+            return_stmt.expr1 = default_val;
+        }
+        let block = mk_stmt(STMT_BLOCK, loc);
+        let stmts: array<Stmt> = [];
+        stmts = array_push(stmts, throw_stmt);
+        stmts = array_push(stmts, return_stmt);
+        block.items = stmts;
+        return block;
+    }
+
+    // try/catch
+    if (k == TOK_TRY) {
+        return ps_parse_try_stmt();
+    }
+
+    // with
+    if (k == TOK_WITH) {
+        return ps_parse_with_stmt();
+    }
+
+    // defer
+    if (k == TOK_DEFER) {
+        return ps_parse_defer_stmt();
+    }
+
+    // 裸 block 语句
+    if (k == TOK_LBRACE) {
+        let block_stmts = parse_block();
+        let blk = mk_stmt(STMT_BLOCK, loc);
+        blk.items = block_stmts;
+        return blk;
+    }
+
+    // 表达式语句或赋值
+    let e = parse_expr();
+    if (ps_at(TOK_EQ) == 1) {
+        ps_adv();
+        let rhs = parse_expr();
+        ps_expect(TOK_SEMICOLON, ";");
+        let s = mk_stmt(STMT_ASSIGN, loc);
+        s.expr1 = e;
+        s.expr2 = rhs;
+        return s;
+    }
+    // 复合赋值: +=, -=, *=, /=
+    if (ps_at(TOK_PLUSEQ) == 1 || ps_at(TOK_MINUSEQ) == 1 || ps_at(TOK_STAREQ) == 1 || ps_at(TOK_SLASHEQ) == 1) {
+        let op_kind = ps_cur_kind();
+        ps_adv();
+        let rhs = parse_expr();
+        ps_expect(TOK_SEMICOLON, ";");
+        let bin_op: int = BIN_ADD;
+        if (op_kind == TOK_PLUSEQ) { bin_op = BIN_ADD; }
+        else if (op_kind == TOK_MINUSEQ) { bin_op = BIN_SUB; }
+        else if (op_kind == TOK_STAREQ) { bin_op = BIN_MUL; }
+        else { bin_op = BIN_DIV; }
+        let bin_e = mk_expr(EXPR_BINARY, loc);
+        bin_e.intval = bin_op;
+        bin_e.child1 = e;
+        bin_e.child2 = rhs;
+        let s = mk_stmt(STMT_ASSIGN, loc);
+        s.expr1 = e;
+        s.expr2 = bin_e;
+        return s;
+    }
+    // match 表达式语句：分号可选
+    let ek = e.kind;
+    if (ek == EXPR_MATCH) {
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        let s = mk_stmt(STMT_EXPR, loc);
+        s.expr1 = e;
+        return s;
+    }
+    ps_expect(TOK_SEMICOLON, ";");
+    let s = mk_stmt(STMT_EXPR, loc);
+    s.expr1 = e;
+    return s;
+}
+
+// ============ 参数解析 ============
+pub kimo parse_param() -> Param {
+    let is_va = 0;
+    if (ps_at(TOK_ELLIPSIS) == 1) {
+        is_va = 1;
+        ps_adv();
+    }
+    let name = ps_cur_text();
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_IDENT, "identifier");
+    ps_expect(TOK_COLON, ":");
+    let ty = parse_type();
+    let final_ty = ty;
+    if (is_va == 1) {
+        let arr_ty = mk_type(TYPE_ARRAY);
+        arr_ty.elem_type = ty;
+        final_ty = arr_ty;
+        let p = Param { name: name, type_ref: final_ty, loc: loc, is_mut: 0, is_variadic: 1, default_value: 0 as Expr };
+        return p;
+    }
+    if (ps_at(TOK_EQ) == 1) {
+        ps_adv();
+        let dv = parse_expr();
+        let p = Param { name: name, type_ref: ty, loc: loc, is_mut: 0, is_variadic: 0, default_value: dv };
+        return p;
+    }
+    let p = Param { name: name, type_ref: ty, loc: loc, is_mut: 0, is_variadic: 0, default_value: 0 as Expr };
+    return p;
+}
+
+// 校验可变参数必须在参数列表最后
+pub kimo ps_check_variadic_last(params: array<Param>, where_: string) -> void {
+    let n = len(params);
+    let i = 0;
+    while (i < n) {
+        let p = params[i] as Param;
+        if (p.is_variadic == 1 && i != n - 1) {
+            let msg = "Parse error at " + ps_file + ": variadic parameter '..." + p.name + "' must be the last parameter in " + where_;
+            ps_err(msg);
+        }
+        i = i + 1;
+    }
+}
+
+// ============ 闭包 ============
+pub kimo parse_closure_expr(loc: Location) -> Expr {
+    ps_expect(TOK_KIMO, "kimo");
+    ps_expect(TOK_LPAREN, "(");
+    let params: array<Param> = [];
+    if (ps_at(TOK_RPAREN) != 1) {
+        params = array_push(params, parse_param());
+        while (ps_at(TOK_COMMA) == 1) {
+            ps_adv();
+            params = array_push(params, parse_param());
+        }
+    }
+    ps_expect(TOK_RPAREN, ")");
+    ps_check_variadic_last(params, "closure");
+    ps_expect(TOK_ARROW, "->");
+    let ret_ty = parse_type();
+    let saved_ret_ty = ps_cur_fn_ret_ty;
+    ps_cur_fn_ret_ty = ret_ty;
+    let body = parse_block();
+    ps_cur_fn_ret_ty = saved_ret_ty;
+    let fd = FuncDef {
+        name: "",
+        params: params,
+        return_type: ret_ty,
+        body: 0 as Stmt,
+        loc: loc,
+        is_pub: 0,
+        is_extern: 0,
+        extern_name: "",
+        type_params: [],
+        is_async: 0,
+        is_macro: 0,
+    };
+    // 闭包 body 是语句块，包装为 STMT_BLOCK 存入
+    let blk = mk_stmt(STMT_BLOCK, loc);
+    blk.items = body;
+    fd.body = blk;
+    let e = mk_expr(EXPR_CLOSURE, loc);
+    e.closure_def = Some(fd);
+    return e;
+}
+
+// 约束类型 → 规范名串：基本类型 parse_type 返回 name 为空（靠 kind 区分），
+// 需按 kind 映射回名字串，否则约束数组会存入 "" 导致约束检查失效。
+pub kimo ps_type_const_name(t: Type) -> string {
+    if (len(t.name) > 0) { return t.name; }
+    let k = t.kind;
+    if (k == TYPE_INT) { return "int"; }
+    if (k == TYPE_LONG) { return "long"; }
+    if (k == TYPE_FLOAT) { return "float"; }
+    if (k == TYPE_DOUBLE) { return "double"; }
+    if (k == TYPE_SHORT) { return "short"; }
+    if (k == TYPE_CHAR) { return "char"; }
+    if (k == TYPE_BOOL) { return "bool"; }
+    if (k == TYPE_STRING) { return "string"; }
+    if (k == TYPE_ANY) { return "any"; }
+    if (k == TYPE_VOID) { return "void"; }
+    return "unknown";
+}
+
+// ============ 函数解析 ============
+pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_KIMO, "kimo");
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    // 泛型参数 <T, U> 或带约束 <T: int|long>
+    let type_params: array<TypeParam> = [];
+    if (ps_at(TOK_LT) == 1) {
+        ps_adv();
+        let tp_name = ps_cur_text();
+        ps_expect(TOK_IDENT, "identifier");
+        let constraints: array<string> = [];
+        if (ps_at(TOK_COLON) == 1) {
+            ps_adv();
+            let ct = parse_type();
+            constraints = array_push(constraints, ps_type_const_name(ct));
+            while (ps_at(TOK_OR) == 1) {
+                ps_adv();
+                let ct2 = parse_type();
+                constraints = array_push(constraints, ps_type_const_name(ct2));
+            }
+        }
+        type_params = array_push(type_params, TypeParam { name: tp_name, constraints: constraints });
+        while (ps_at(TOK_COMMA) == 1) {
+            ps_adv();
+            let tp2 = ps_cur_text();
+            ps_expect(TOK_IDENT, "identifier");
+            let constraints2: array<string> = [];
+            if (ps_at(TOK_COLON) == 1) {
+                ps_adv();
+                let ct3 = parse_type();
+                constraints2 = array_push(constraints2, ps_type_const_name(ct3));
+                while (ps_at(TOK_OR) == 1) {
+                    ps_adv();
+                    let ct4 = parse_type();
+                    constraints2 = array_push(constraints2, ps_type_const_name(ct4));
+                }
+            }
+            type_params = array_push(type_params, TypeParam { name: tp2, constraints: constraints2 });
+        }
+        ps_expect(TOK_GT, ">");
+    }
+    ps_expect(TOK_LPAREN, "(");
+    let params: array<Param> = [];
+    if (ps_at(TOK_RPAREN) != 1) {
+        params = array_push(params, parse_param());
+        while (ps_at(TOK_COMMA) == 1) {
+            ps_adv();
+            params = array_push(params, parse_param());
+        }
+    }
+    ps_expect(TOK_RPAREN, ")");
+    ps_check_variadic_last(params, "function");
+    ps_expect(TOK_ARROW, "->");
+    let ret_ty = parse_type();
+    let saved_ret_ty = ps_cur_fn_ret_ty;
+    ps_cur_fn_ret_ty = ret_ty;
+    let body = mk_stmt(STMT_BLOCK, loc);
+    if (len(extern_name) == 0) {
+        let b = parse_block();
+        let blk = mk_stmt(STMT_BLOCK, loc);
+        blk.items = b;
+        body = blk;
+    } else {
+        parse_block();
+        body = 0 as Stmt;
+    }
+    ps_cur_fn_ret_ty = saved_ret_ty;
+    let fd = FuncDef {
+        name: name,
+        params: params,
+        return_type: ret_ty,
+        body: body,
+        loc: loc,
+        is_pub: is_pub,
+        is_extern: 0,
+        extern_name: extern_name,
+        type_params: type_params,
+        is_async: 0,
+        is_macro: 0,
+    };
+    return fd;
+}
+
+// ============ 结构体解析 ============
+pub kimo parse_struct(is_pub: int) -> StructDef {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_STRUCT, "struct");
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    let type_params: array<TypeParam> = [];
+    if (ps_at(TOK_LT) == 1) {
+        ps_adv();
+        let tp = ps_cur_text();
+        ps_expect(TOK_IDENT, "identifier");
+        type_params = array_push(type_params, TypeParam { name: tp, constraints: [] });
+        while (ps_at(TOK_COMMA) == 1) {
+            ps_adv();
+            let tp2 = ps_cur_text();
+            ps_expect(TOK_IDENT, "identifier");
+            type_params = array_push(type_params, TypeParam { name: tp2, constraints: [] });
+        }
+        ps_expect(TOK_GT, ">");
+    }
+    ps_expect(TOK_LBRACE, "{");
+    let fields: array<StructField> = [];
+    while (ps_at(TOK_RBRACE) != 1) {
+        if (ps_at(TOK_EOF) == 1) { break; }
+        let sf_prev_idx = ps_idx;
+        let f_is_pub = 0;
+        if (ps_at(TOK_PUB) == 1) { ps_adv(); f_is_pub = 1; }
+        let fname = ps_cur_text();
+        let floc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+        ps_expect(TOK_IDENT, "identifier");
+        ps_expect(TOK_COLON, ":");
+        let fty = parse_type();
+        if (ps_at(TOK_RBRACE) != 1) {
+            if (ps_at(TOK_COMMA) == 1) { ps_adv(); }
+            else { ps_expect(TOK_SEMICOLON, ";"); }
+        }
+        fields = array_push(fields, StructField { name: fname, type_ref: fty, loc: floc, is_pub: f_is_pub });
+        if (ps_idx == sf_prev_idx) { ps_adv(); }
+    }
+    ps_expect(TOK_RBRACE, "}");
+    let sd = StructDef { name: name, fields: fields, loc: loc, is_pub: is_pub, type_params: type_params };
+    return sd;
+}
+
+// ============ 枚举解析 ============
+pub kimo parse_enum(is_pub: int) -> EnumDef {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_ENUM, "enum");
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    let type_params: array<TypeParam> = [];
+    if (ps_at(TOK_LT) == 1) {
+        ps_adv();
+        while (1 == 1) {
+            let tp_name = ps_cur_text();
+            ps_expect(TOK_IDENT, "type parameter name");
+            type_params = array_push(type_params, TypeParam { name: tp_name, constraints: [] });
+            if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+            break;
+        }
+        ps_expect(TOK_GT, ">");
+    }
+    ps_expect(TOK_LBRACE, "{");
+    let variants: array<EnumVariant> = [];
+    while (ps_at(TOK_RBRACE) != 1) {
+        if (ps_at(TOK_EOF) == 1) { break; }
+        let ev_prev_idx = ps_idx;
+        let vname = ps_cur_text();
+        let vloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+        ps_expect(TOK_IDENT, "identifier");
+        let payload_types: array<Type> = [];
+        if (ps_at(TOK_LPAREN) == 1) {
+            ps_adv();
+            while (1 == 1) {
+                let pty = parse_type();
+                payload_types = array_push(payload_types, pty);
+                if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+                break;
+            }
+            ps_expect(TOK_RPAREN, ")");
+        }
+        variants = array_push(variants, EnumVariant { name: vname, payloads: payload_types, loc: vloc });
+        if (ps_at(TOK_COMMA) == 1 || ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        if (ps_idx == ev_prev_idx) { ps_adv(); }
+    }
+    ps_expect(TOK_RBRACE, "}");
+    let ed = EnumDef { name: name, variants: variants, loc: loc, is_pub: is_pub, type_params: type_params };
+    return ed;
+}
+
+// ============ Trait 定义解析 ============
+pub kimo parse_trait_def(is_pub: int) -> TraitDef {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    if (ps_at(TOK_INTERFACE) == 1) {
+        ps_adv();
+    } else {
+        ps_expect(TOK_TRAIT, "trait");
+    }
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    let type_params: array<TypeParam> = [];
+    if (ps_at(TOK_LT) == 1) {
+        ps_adv();
+        while (1 == 1) {
+            let tp_name = ps_cur_text();
+            ps_expect(TOK_IDENT, "type parameter name");
+            type_params = array_push(type_params, TypeParam { name: tp_name, constraints: [] });
+            if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+            break;
+        }
+        ps_expect(TOK_GT, ">");
+    }
+    ps_expect(TOK_LBRACE, "{");
+    let methods: array<FuncDef> = [];
+    while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+        let m_pub = 0;
+        if (ps_at(TOK_PUB) == 1) { ps_adv(); m_pub = 1; }
+        if (ps_at(TOK_KIMO) == 1) {
+            ps_adv();
+            let mloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+            let mname = ps_cur_text();
+            ps_expect(TOK_IDENT, "method name");
+            ps_expect(TOK_LPAREN, "(");
+            let params: array<Param> = [];
+            while (ps_at(TOK_RPAREN) != 1) {
+                let pname = ps_cur_text();
+                let ploc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+                ps_expect(TOK_IDENT, "parameter name");
+                ps_expect(TOK_COLON, ":");
+                let pty = parse_type();
+                params = array_push(params, Param { name: pname, type_ref: pty, loc: ploc, is_mut: 0, is_variadic: 0, default_value: 0 as Expr });
+                if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+                break;
+            }
+            ps_expect(TOK_RPAREN, ")");
+            let ret_ty = mk_type(TYPE_VOID);
+            if (ps_at(TOK_ARROW) == 1) {
+                ps_adv();
+                ret_ty = parse_type();
+            }
+            ps_expect(TOK_SEMICOLON, ";");
+            let m = FuncDef {
+                name: mname,
+                params: params,
+                return_type: ret_ty,
+                body: 0 as Stmt,
+                loc: mloc,
+                is_pub: m_pub,
+                is_extern: 0,
+                extern_name: "",
+                type_params: [],
+                is_async: 0,
+                is_macro: 0,
+            };
+            methods = array_push(methods, m);
+        } else {
+            break;
+        }
+    }
+    ps_expect(TOK_RBRACE, "}");
+    let td = TraitDef { name: name, methods: methods, loc: loc, is_pub: is_pub, type_params: type_params };
+    return td;
+}
+
+// ============ 类型别名解析 ============
+pub kimo parse_type_alias(is_pub: int) -> TypeAlias {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    ps_expect(TOK_TYPE, "type");
+    let name = ps_cur_text();
+    ps_expect(TOK_IDENT, "identifier");
+    ps_expect(TOK_EQ, "=");
+    let aliased = parse_type();
+    ps_expect(TOK_SEMICOLON, ";");
+    let ta = TypeAlias { name: name, target: aliased, loc: loc, is_pub: is_pub };
+    return ta;
+}
+
+// ============ 顶层解析 ============
+pub kimo parse(tokens: array<Token>, file: string) -> Program {
+    ps_tokens = tokens;
+    ps_idx = 0;
+    ps_file = file;
+    ps_macros = [];
+    ps_macro_hyg_counter = 0;
+    ps_defer_list = [];
+    ps_block_depth = 0;
+    ps_no_struct_lit = 0;
+    ps_match_counter = 0;
+    ps_try_depth = 0;
+    ps_cur_fn_ret_ty = type_none_inner();
+    ps_last_arg_name = "";
+    ps_diags = [];
+    ps_diag_ranges = [];
+    ps_err_count = 0;
+    reset_node_ids();
+
+    let functions: array<FuncDef> = [];
+    let structs: array<StructDef> = [];
+    let enums: array<EnumDef> = [];
+    let aliases: array<TypeAlias> = [];
+    let imports: array<string> = [];
+    let globals: array<GlobalVar> = [];
+    let traits: array<TraitDef> = [];
+    let impls: array<ImplDef> = [];
+    let macros: array<MacroDef> = [];
+    let module_name = "";
+    let dsb_seen = 0;
+
+    // dsb <name>; — 必须是文件第一条语句
+    if (ps_at(TOK_DSB) == 1) {
+        ps_adv();
+        module_name = ps_cur_text();
+        ps_expect(TOK_IDENT, "dsb name");
+        ps_expect(TOK_SEMICOLON, ";");
+        dsb_seen = 1;
+    }
+
+    while (ps_at(TOK_EOF) != 1) {
+        if (ps_at(TOK_DSB) == 1) {
+            let msg = "SH-PARSE007: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": 'dsb' must be the first statement in the file";
+            ps_err(msg);
+            ps_sync_stmt();
+            continue;
+        }
+
+        let is_pub = 0;
+        if (ps_at(TOK_PUB) == 1) { ps_adv(); is_pub = 1; }
+
+        // @extern 注解：@extern("c_name")
+        let extern_name = "";
+        if (ps_at(TOK_AT) == 1) {
+            ps_adv();
+            ps_expect(TOK_IDENT, "extern");
+            ps_expect(TOK_LPAREN, "(");
+            extern_name = ps_cur_text();
+            ps_expect(TOK_STRING_LIT, "string");
+            ps_expect(TOK_RPAREN, ")");
+        }
+
+        if (ps_at(TOK_IMPORT) == 1) {
+            ps_adv();
+            let path = ps_cur_text();
+            if (ps_at(TOK_STRING_LIT) == 1) { ps_expect(TOK_STRING_LIT, "string"); }
+            else { ps_expect_path_component(); }
+            // 点分路径: a.b.c → a/b/c
+            while (ps_at(TOK_DOT) == 1) {
+                ps_adv();
+                // §3.8 通配符导入 import a.b.*：等价于「目录=包」形式 import a.b，
+                // 由 main_resolve_in_base 展开目录下全部 .shadow。
+                if (ps_at(TOK_STAR) == 1) {
+                    ps_adv();
+                    break;
+                }
+                path = path + "/" + ps_cur_text();
+                ps_expect_path_component();
+            }
+            if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+            imports = array_push(imports, path);
+            continue;
+        }
+
+        if (ps_at(TOK_KIMO) == 1) {
+            let fd = parse_function(is_pub, extern_name);
+            fd.is_async = 0;
+            functions = array_push(functions, fd);
+            continue;
+        }
+
+        // async kimo foo(...)
+        if (ps_at(TOK_ASYNC) == 1) {
+            ps_adv();
+            let fd = parse_function(is_pub, extern_name);
+            fd.is_async = 1;
+            functions = array_push(functions, fd);
+            continue;
+        }
+
+        if (ps_at(TOK_STRUCT) == 1) {
+            structs = array_push(structs, parse_struct(is_pub));
+            continue;
+        }
+
+        if (ps_at(TOK_ENUM) == 1) {
+            enums = array_push(enums, parse_enum(is_pub));
+            continue;
+        }
+
+        if (ps_at(TOK_TRAIT) == 1 || ps_at(TOK_INTERFACE) == 1) {
+            traits = array_push(traits, parse_trait_def(is_pub));
+            continue;
+        }
+
+        if (ps_at(TOK_TYPE) == 1) {
+            aliases = array_push(aliases, parse_type_alias(is_pub));
+            continue;
+        }
+
+        // 全局 let
+        if (ps_at(TOK_LET) == 1) {
+            ps_adv();
+            let gname = ps_cur_text();
+            let gloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+            ps_expect(TOK_IDENT, "identifier");
+            let gty = type_none_inner();
+            if (ps_at(TOK_COLON) == 1) {
+                ps_adv();
+                gty = parse_type();
+            }
+            let ginit = mk_expr(EXPR_INT, gloc);
+            let g_has_init = 0;
+            if (ps_at(TOK_EQ) == 1) {
+                ps_adv();
+                ginit = parse_expr();
+                g_has_init = 1;
+            }
+            ps_expect(TOK_SEMICOLON, ";");
+            let gv = GlobalVar { name: gname, type_ref: gty, init: ginit, loc: gloc, is_pub: is_pub, is_mut: 0 };
+            if (g_has_init == 0) { gv.init = 0 as Expr; }
+            globals = array_push(globals, gv);
+            continue;
+        }
+
+        // 全局 mut: mut name: type = value;
+        if (ps_at(TOK_MUT) == 1) {
+            ps_adv();
+            let mname = ps_cur_text();
+            let mloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+            ps_expect(TOK_IDENT, "identifier");
+            let mty = type_none_inner();
+            if (ps_at(TOK_COLON) == 1) {
+                ps_adv();
+                mty = parse_type();
+            }
+            let minit = mk_expr(EXPR_INT, mloc);
+            let m_has_init = 0;
+            if (ps_at(TOK_EQ) == 1) {
+                ps_adv();
+                minit = parse_expr();
+                m_has_init = 1;
+            }
+            ps_expect(TOK_SEMICOLON, ";");
+            let gv = GlobalVar { name: mname, type_ref: mty, init: minit, loc: mloc, is_pub: is_pub, is_mut: 1 };
+            if (m_has_init == 0) { gv.init = 0 as Expr; }
+            globals = array_push(globals, gv);
+            continue;
+        }
+
+        // impl 块
+        if (ps_at(TOK_IMPL) == 1) {
+            let impl_loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+            ps_adv();
+            let first_name = ps_cur_text();
+            ps_expect(TOK_IDENT, "identifier");
+            if (ps_at(TOK_FOR) == 1) {
+                // impl Trait for Type { ... } — trait impl，方法 mangle 后进 functions
+                let trait_name = first_name;
+                ps_adv();
+                let type_name = ps_cur_text();
+                ps_expect(TOK_IDENT, "type name");
+                ps_expect(TOK_LBRACE, "{");
+                let impl_methods: array<FuncDef> = [];
+                let mangle_prefix = "__impl__" + type_name + "__" + trait_name + "__";
+                while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+                    let impl_pub = 0;
+                    if (ps_at(TOK_PUB) == 1) { ps_adv(); impl_pub = 1; }
+                    if (ps_at(TOK_KIMO) == 1) {
+                        let m = parse_function(impl_pub, "");
+                        // mangle 副本进 functions
+                        let mc = FuncDef {
+                            name: mangle_prefix + m.name,
+                            params: m.params,
+                            return_type: m.return_type,
+                            body: m.body,
+                            loc: m.loc,
+                            is_pub: m.is_pub,
+                            is_extern: m.is_extern,
+                            extern_name: m.extern_name,
+                            type_params: m.type_params,
+                            is_async: 0,
+                            is_macro: 0,
+                        };
+                        functions = array_push(functions, mc);
+                        impl_methods = array_push(impl_methods, m);
+                    } else {
+                        break;
+                    }
+                }
+                ps_expect(TOK_RBRACE, "}");
+                let id = ImplDef { type_name: type_name, trait_name: trait_name, methods: impl_methods, loc: impl_loc };
+                impls = array_push(impls, id);
+                continue;
+            }
+            // 旧形式：impl Type { ... } — inherent impl
+            ps_expect(TOK_LBRACE, "{");
+            let inh_methods: array<FuncDef> = [];
+            while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+                let impl_pub = 0;
+                if (ps_at(TOK_PUB) == 1) { ps_adv(); impl_pub = 1; }
+                if (ps_at(TOK_KIMO) == 1) {
+                    let m = parse_function(impl_pub, "");
+                    functions = array_push(functions, m);
+                    inh_methods = array_push(inh_methods, m);
+                } else {
+                    break;
+                }
+            }
+            ps_expect(TOK_RBRACE, "}");
+            let id2 = ImplDef { type_name: first_name, trait_name: "", methods: inh_methods, loc: impl_loc };
+            impls = array_push(impls, id2);
+            continue;
+        }
+
+        // macro 声明（新语法 + 旧语法共存）
+        if (ps_at(TOK_MACRO) == 1) {
+            ps_adv();
+            let mname = ps_cur_text();
+            let mloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+            ps_expect(TOK_IDENT, "identifier");
+            // 新语法：macro name(params...) { body_expr }
+            if (ps_at(TOK_LPAREN) == 1) {
+                ps_adv();
+                let mparams: array<MacroParam> = [];
+                if (ps_at(TOK_RPAREN) != 1) {
+                    let pname = ps_cur_text();
+                    ps_expect(TOK_IDENT, "param name");
+                    ps_expect(TOK_COLON, ":");
+                    let pkind = ps_cur_text();
+                    ps_expect(TOK_IDENT, "param kind (expr|ident|tt)");
+                    mparams = array_push(mparams, MacroParam { name: pname, kind: pkind });
+                    while (ps_at(TOK_COMMA) == 1) {
+                        ps_adv();
+                        let pn2 = ps_cur_text();
+                        ps_expect(TOK_IDENT, "param name");
+                        ps_expect(TOK_COLON, ":");
+                        let pk2 = ps_cur_text();
+                        ps_expect(TOK_IDENT, "param kind (expr|ident|tt)");
+                        mparams = array_push(mparams, MacroParam { name: pn2, kind: pk2 });
+                    }
+                }
+                ps_expect(TOK_RPAREN, ")");
+                ps_expect(TOK_LBRACE, "{");
+                let mbody = parse_expr();
+                ps_expect(TOK_RBRACE, "}");
+                let mdef = MacroDef { name: mname, params: mparams, body: mbody, loc: mloc, is_pub: is_pub };
+                ps_macros = array_push(ps_macros, mdef);
+                macros = array_push(macros, mdef);
+                continue;
+            }
+            // 旧语法：macro name { param => body; } — desugar 为函数
+            ps_expect(TOK_LBRACE, "{");
+            let pname = ps_cur_text();
+            ps_expect(TOK_IDENT, "identifier");
+            ps_expect(TOK_FATARROW, "=>");
+            let mbody = parse_expr();
+            if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+            ps_expect(TOK_RBRACE, "}");
+            let mparam = Param { name: pname, type_ref: mk_type(TYPE_INT), loc: mk_loc(ps_file, ps_cur_line(), ps_cur_col()), is_mut: 0, is_variadic: 0, default_value: 0 as Expr };
+            let ret_stmt = mk_stmt(STMT_RETURN, mk_loc(ps_file, ps_cur_line(), ps_cur_col()));
+            ret_stmt.intval = 1;
+            ret_stmt.expr1 = mbody;
+            let mbody_arr: array<Stmt> = [];
+            mbody_arr = array_push(mbody_arr, ret_stmt);
+            let mfunc = FuncDef {
+                name: mname,
+                params: array_push([], mparam),
+                return_type: mk_type(TYPE_INT),
+                body: mk_stmt(STMT_BLOCK, mk_loc(ps_file, ps_cur_line(), ps_cur_col())),
+                loc: mk_loc(ps_file, ps_cur_line(), ps_cur_col()),
+                is_pub: 0,
+                is_extern: 0,
+                extern_name: "",
+                type_params: [],
+                is_async: 0,
+                is_macro: 1,
+            };
+            let mblk = mk_stmt(STMT_BLOCK, mfunc.loc);
+            mblk.items = mbody_arr;
+            mfunc.body = mblk;
+            functions = array_push(functions, mfunc);
+            continue;
+        }
+
+        let msg = "SH-PARSE008: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": unexpected top-level token '" + ps_cur_text() + "'";
+        ps_err(msg);
+        ps_sync_toplevel();
+    }
+
+    if (dsb_seen == 0) {
+        ps_err("Parse error: missing 'dsb' declaration — every file must start with 'dsb <name>;'");
+    }
+
+    if (ps_err_count > 0) {
+        if (ps_fatal_mode == 1) {
+            rt_exit(1);
+        }
+    }
+
+    let prog = Program {
+        funcs: functions,
+        structs: structs,
+        enums: enums,
+        traits: traits,
+        impls: impls,
+        globals: globals,
+        imports: imports,
+        module_name: module_name,
+        type_aliases: aliases,
+        macros: macros,
+    };
+    return prog;
+}

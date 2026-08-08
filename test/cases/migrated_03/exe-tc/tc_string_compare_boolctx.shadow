@@ -1,0 +1,13 @@
+//@desc: string comparisons valid in if / while / else conditions (result is bool)
+//@expect: 4
+dsb tc_string_compare_boolctx;
+kimo main() -> int {
+    let s = "abc";
+    let t = "abd";
+    let n = 0;
+    if (s < t) { n = n + 1; }
+    if (s != t) { n = n + 1; }
+    while (s == s) { n = n + 1; break; }
+    if (s == t) { n = n + 1; } else { n = n + 1; }
+    println(n); return 0;
+}

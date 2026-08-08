@@ -1,0 +1,14 @@
+//@desc: L3 closure — capture long variable (verifies 8-byte env slot)
+dsb cg_closure_capture_long;
+// NOTE: shadow-0.3 inherits 32-bit long literal parsing from bootstrap (shadow-lang 0.2),
+// so we use a value within int32 positive range. Runtime long is still 64-bit (LLVM i64).
+//@expect: 2147483648
+kimo main() -> int {
+    let base: long = 2147483647;
+    let add_one = kimo() -> long {
+        return base + 1;
+    };
+    let r = add_one();
+    println(r);
+    return 0;
+}

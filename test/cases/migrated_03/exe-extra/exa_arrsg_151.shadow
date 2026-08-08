@@ -1,0 +1,13 @@
+//@desc: exe-extra generated case (exa_arrsg_151)
+//@expect: 99
+//@expect: 114
+dsb exa_arrsg_151;
+kimo main() -> int {
+    let a = [5, 5, 5, 5];
+    a[0] = 99;
+    println(a[0]);
+    let total = 0;
+    for (v in a) { total = total + v; }
+    println(total);
+    return 0;
+}

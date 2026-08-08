@@ -1,0 +1,7 @@
+//@desc: import module with struct, use struct type and call function
+dsb tc_import_struct;
+import _struct_helper;
+kimo main() -> int {
+    let b = Box { value: 42 };
+    return get_value(b);
+}

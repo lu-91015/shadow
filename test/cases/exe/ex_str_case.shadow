@@ -1,0 +1,10 @@
+//@mode: exe
+//@desc: str_to_upper / str_to_lower
+//@expect: HELLO
+//@expect: world
+dsb ex_str_case;
+kimo main() -> int {
+    println(str_to_upper("hello"));
+    println(str_to_lower("WORLD"));
+    return 0;
+}

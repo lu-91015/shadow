@@ -1,0 +1,9 @@
+//@ mode: codegen
+//@ desc: pub function from imported module is callable
+//@expect-ir: call
+dsb cg_pub_visibility;
+
+pub kimo public_fn() -> int { return 42; }
+kimo main() -> int {
+    return public_fn();
+}

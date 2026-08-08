@@ -1,0 +1,12 @@
+//@desc: int array literal, index, in-place set, and for-loop sum type-check
+dsb tc_int_array;
+kimo main() -> int {
+    let a = [10, 20, 30];
+    a[0] = 99;
+    let x = a[0];
+    let total = 0;
+    for (i in a) {
+        total = total + i;
+    }
+    return total + x;
+}

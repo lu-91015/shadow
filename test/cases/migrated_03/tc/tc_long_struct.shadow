@@ -1,0 +1,10 @@
+//@ mode: tc
+//@ desc: long type in struct fields type-checks
+//@ expect: typecheck: 1
+dsb tc_long_struct;
+
+struct Point { x: long, y: long }
+kimo main() -> int {
+    let p = Point { x: 100L, y: 200L };
+    return 0;
+}

@@ -1,0 +1,53 @@
+//@desc: any <-> string 往返必须是恒等（裸指针模型），不得走 AnyBox 装箱/拆箱
+//@expect: direct=hello
+//@expect: viacast=world
+//@expect: arr0=alpha
+//@expect: arr1=beta
+//@expect: concat=[gamma]
+//@expect: field=delta
+//@expect: param=epsilon
+//@expect: len5=5
+
+dsb cg_any_string_roundtrip;
+
+struct Holder {
+    slot: any;
+}
+
+kimo take_any(v: any) -> string {
+    return v as string;
+}
+
+kimo main() -> int {
+    // 1) 隐式存储：字符串直接进 any 槽，再 cast 回来
+    let a: any = "hello";
+    println("direct=" + (a as string));
+
+    // 2) 显式 cast 进 any，再 cast 回来（两侧必须配对）
+    let b: any = "world" as any;
+    println("viacast=" + (b as string));
+
+    // 3) array_push 进 any 数组，索引后 cast
+    let arr: any = [];
+    arr = array_push(arr, "alpha");
+    arr = array_push(arr, "beta");
+    println("arr0=" + (arr[0] as string));
+    println("arr1=" + (arr[1] as string));
+
+    // 4) 参与字符串拼接
+    let c: any = "gamma";
+    println("concat=" + "[" + (c as string) + "]");
+
+    // 5) 结构体成员赋值（any 字段）
+    let h = Holder { slot: "delta" };
+    println("field=" + (h.slot as string));
+
+    // 6) 作为实参传递给 any 形参
+    println("param=" + take_any("epsilon"));
+
+    // 7) cast 回来的串必须是真串（长度可用）
+    let d: any = "12345";
+    println("len5=" + to_string(len(d as string)));
+
+    return 0;
+}

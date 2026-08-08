@@ -1,0 +1,4 @@
+//@desc: returning string where int expected is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_type_mismatch;
+kimo main() -> int { let x = "hi"; return x; }

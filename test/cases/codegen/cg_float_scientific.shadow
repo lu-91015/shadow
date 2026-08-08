@@ -1,0 +1,8 @@
+//@mode: codegen
+//@desc: scientific-notation float constant tokenized and emitted in the pool
+//@expect-ir: e+03
+dsb cg_float_scientific;
+kimo main() -> int {
+    let x = 1e3;
+    return 0;
+}

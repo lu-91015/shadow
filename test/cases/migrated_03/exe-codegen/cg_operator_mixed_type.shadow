@@ -1,0 +1,28 @@
+//@desc: operator overloading with mixed types — Point + int via Add trait with non-Self rhs
+//@expect: 50\n45
+dsb cg_operator_mixed_type;
+
+// Add trait with fixed RHS type (int) — enables Point + int
+trait Add {
+    kimo add(self: Self, rhs: int) -> Self;
+}
+
+struct Point {
+    x: int;
+    y: int;
+}
+
+impl Add for Point {
+    kimo add(self: Point, rhs: int) -> Point {
+        return Point { x: self.x + rhs, y: self.y + rhs };
+    }
+}
+
+kimo main() -> int {
+    let p = Point { x: 10, y: 5 };
+    // Point + int — mixed type operator overloading
+    let q = p + 40;
+    println(q.x);   // 50
+    println(q.y);   // 45
+    return 0;
+}

@@ -1,0 +1,12 @@
+//@ mode: codegen
+//@ desc: generic monomorphization — three different instantiations in one program
+//@expect-ir: id__T_int
+dsb cg_mono_repeated_int;
+
+kimo id<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = id(1);
+    let b = id(2);
+    let c = id(3);
+    return a + b + c;
+}

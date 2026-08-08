@@ -1,0 +1,52 @@
+//@desc: enum variants with 2+ payloads: construct + match destructure reads every payload (buffer encoding)
+//@expect: 3
+//@expect: 5
+//@expect: 8
+//@expect: 10
+//@expect: 20
+//@expect: 30
+//@expect: 60
+//@expect: 111
+//@expect: 42
+dsb cg_enum_multi_payload;
+
+enum Msg {
+    Pair(int, int),
+    Triple(int, int, int),
+    One(int)
+}
+
+// 表达式 match 多负载解构
+kimo sum(m: Msg) -> int {
+    let r = match m {
+        Pair(a, b) => a + b,
+        Triple(x, y, z) => x + y + z,
+        One(v) => v
+    };
+    return r;
+}
+
+kimo main() -> int {
+    // 语句 match 多负载解构
+    match Pair(3, 5) {
+        Pair(a, b) => {
+            println(a);
+            println(b);
+            println(a + b);
+        },
+        _ => { }
+    }
+    match Triple(10, 20, 30) {
+        Triple(x, y, z) => {
+            println(x);
+            println(y);
+            println(z);
+            println(x + y + z);
+        },
+        _ => { }
+    }
+    // 表达式 match 多负载 + 跨函数传递 enum 值
+    println(sum(Triple(100, 10, 1)));
+    println(sum(One(42)));
+    return 0;
+}

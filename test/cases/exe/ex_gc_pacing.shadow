@@ -1,0 +1,117 @@
+//@mode: exe
+//@desc: GOGC pacing 验收——大存活集下堆峰值应收敛到 (1+GOGC/100)×存活堆
+//@expect: pacing ok live=4000 rounds=24
+//@timeout: 180
+// ex_gc_pacing.shadow — §5.3 第 3 条「堆峰值 ≈ (1 + GOGC/100) × 存活堆」的被测程序
+//
+// 为什么现有 GC 用例验证不了这一条：它们的存活集只有几十 KB，远在最小堆
+// 阈值（4MB）之下，`next` 恒等于 4194304 —— GOGC 比例模型根本没被触发过，
+// 测出来的"达标"毫无意义。
+//
+// 本用例刻意把存活堆顶到 4MB 以上（4000 × ~1KB ≈ 4.3MB），再持续制造
+// 大量短命垃圾，逼 GC 在 GOGC 比例区间内反复工作。此时：
+//
+//     goal = live × (1 + GOGC/100)
+//
+// 堆峰值是否贴着 goal，取决于两件事协同工作：
+//   · pacing —— 标记必须**提前**于 goal 启动，留出跑道；
+//   · assist —— 分配越猛，分配者自己承担的标记工作越重，
+//                 保证跑道被吃完之前标记已经收敛。
+// 任缺其一，峰值都会击穿 goal（关掉 assist 可现场复现）。
+//
+// 外部度量见 tools/gc_pacing.py：它跑不同 GOGC 并核对 peak/live 比值。
+// 本用例自身只负责两件事：把堆压到位，以及证明这套 pacing 没有回收错东西。
+dsb ex_gc_pacing;
+
+struct Blob {
+    data: string;
+    id: int;
+}
+
+// 持久存活集：全程不释放，构成 GOGC 公式里的 live
+let g_live: array<Blob> = [];
+
+// 倍增构造长度恰为 n 的填充串（n 须为 16 的 2 的幂倍）
+kimo mkpad(n: int) -> string {
+    let s = "0123456789abcdef";
+    while (len(s) < n) {
+        s = s + s;
+    }
+    return s;
+}
+
+kimo main() -> int {
+    let n = 4000;
+    let rounds = 24;
+    let pad = mkpad(1024);
+
+    // ── 阶段 0：把存活堆顶到 4MB 以上，让 GOGC 比例真正接管触发 ──
+    let i = 0;
+    while (i < n) {
+        g_live = array_push(g_live, Blob { data: pad + "#" + int_to_str(i), id: i });
+        i = i + 1;
+    }
+
+    // ── 阶段 1：持续制造短命垃圾 ──
+    // 每轮约 500 × 1KB ≈ 0.5MB 垃圾。存活集纹丝不动，
+    // 于是 live 稳定、goal 稳定，peak/live 比值才有可比性。
+    let round = 0;
+    while (round < rounds) {
+        let junk: array<Blob> = [];
+        let k = 0;
+        while (k < 500) {
+            junk = array_push(junk, Blob { data: pad + "!" + int_to_str(k), id: k });
+            k = k + 1;
+        }
+        // junk 在此彻底失去引用 —— 下一轮 GC 应当全部回收
+        junk = [];
+
+        // 每轮抽查存活集：pacing 调错了会导致提前回收，必须当场发现
+        let probe = round * 137;
+        let j = 0;
+        while (j < 16) {
+            let idx = (probe + j * 251) % n;
+            let b: Blob = g_live[idx];
+            if ((b as any) == 0) {
+                println("ERR live blob reclaimed at " + int_to_str(idx)
+                        + " round=" + int_to_str(round));
+                return 1;
+            }
+            if (b.id != idx) {
+                println("ERR id mismatch at " + int_to_str(idx)
+                        + " got=" + int_to_str(b.id));
+                return 1;
+            }
+            if (len(b.data) != 1025 + len(int_to_str(idx))) {
+                println("ERR data corrupted at " + int_to_str(idx)
+                        + " len=" + int_to_str(len(b.data)));
+                return 1;
+            }
+            j = j + 1;
+        }
+        round = round + 1;
+    }
+
+    // ── 阶段 2：全量校验存活集完好 ──
+    i = 0;
+    while (i < n) {
+        let b2: Blob = g_live[i];
+        if ((b2 as any) == 0) {
+            println("ERR final null at " + int_to_str(i));
+            return 1;
+        }
+        if (b2.id != i) {
+            println("ERR final id at " + int_to_str(i));
+            return 1;
+        }
+        if (str_eq(b2.data, pad + "#" + int_to_str(i)) == 0) {
+            println("ERR final data at " + int_to_str(i));
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    println("pacing ok live=" + int_to_str(len(g_live))
+            + " rounds=" + int_to_str(rounds));
+    return 0;
+}

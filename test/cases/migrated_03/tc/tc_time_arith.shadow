@@ -1,0 +1,19 @@
+//@desc: time type arithmetic typecheck (date±int, date-date, timestamp±long, timestamp-timestamp)
+//@expect: typecheck: 1
+dsb tc_time_arith;
+// 注意：0.2 中 long 是 32 位，timestamp/nanotimestamp 字面量值会被截断，
+// 所以这里只验证类型检查通过，运行时值验证留到 0.4（long 修复后）。
+kimo f_date_add(d: date, n: int) -> date { return d + n; }
+kimo f_date_sub(d: date, n: int) -> date { return d - n; }
+kimo f_date_diff(d1: date, d2: date) -> int { return d2 - d1; }
+kimo f_date_cmp(d1: date, d2: date) -> bool { return d1 < d2; }
+
+kimo f_ts_add(t: timestamp, n: long) -> timestamp { return t + n; }
+kimo f_ts_sub(t: timestamp, n: long) -> timestamp { return t - n; }
+kimo f_ts_diff(t1: timestamp, t2: timestamp) -> long { return t2 - t1; }
+kimo f_ts_cmp(t1: timestamp, t2: timestamp) -> bool { return t1 == t2; }
+
+kimo f_nano_add(n: nanotimestamp, v: long) -> nanotimestamp { return n + v; }
+kimo f_nano_diff(n1: nanotimestamp, n2: nanotimestamp) -> long { return n2 - n1; }
+
+kimo main() -> int { return 0; }

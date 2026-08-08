@@ -1,0 +1,15 @@
+//@mode: exe
+//@desc: str_replace / str_trim
+//@expect: he11o
+//@expect: hi
+//@expect: empty=
+dsb ex_str_replace_trim;
+kimo main() -> int {
+    let r = str_replace("hello", "l", "1");
+    println(r);
+    let t = str_trim("  hi  ");
+    println(t);
+    let e = str_trim("   ");
+    println("empty=");
+    return 0;
+}

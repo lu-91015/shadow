@@ -1,0 +1,7 @@
+//@desc: import file with GC struct alloc, call imported function
+//@expect: 7
+dsb tc_gc_import_struct;
+import _gc_import_helper
+kimo main() -> int {
+    println(make_point(3, 4)); return 0;
+}

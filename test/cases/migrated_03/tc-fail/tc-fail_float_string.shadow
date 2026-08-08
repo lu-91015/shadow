@@ -1,0 +1,8 @@
+//@ mode: tc-fail
+//@ desc: float cannot be multiplied with string
+dsb tc_fail_float_string;
+kimo main() -> int {
+    let f: float = 1.5;
+    let s = f * "hello";
+    return 0;
+}

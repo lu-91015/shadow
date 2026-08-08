@@ -1,0 +1,7 @@
+//@ mode: tc-fail
+//@ desc: dsb name used in redefinition error message
+dsb ns_dsb_name;
+
+kimo foo() -> int { return 1; }
+kimo foo() -> int { return 2; }
+kimo main() -> int { return foo(); }

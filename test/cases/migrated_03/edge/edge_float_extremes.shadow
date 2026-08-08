@@ -1,0 +1,12 @@
+//@mode: codegen
+//@desc: extreme float magnitudes (large / small / negative / pi)
+//@expect-ir: double
+dsb edge_float_extremes;
+kimo main() -> int {
+    let a = 1e308;
+    let b = -1e308;
+    let c = 1e-308;
+    let d = 3.141592653589793;
+    let e = -0.0;
+    return 0;
+}

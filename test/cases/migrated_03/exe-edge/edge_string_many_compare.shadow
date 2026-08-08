@@ -1,0 +1,28 @@
+//@desc: many string equality comparisons
+//@expect: 0
+dsb edge_string_many_compare;
+kimo main() -> int {
+    let s = "base";
+    let t0 = "v0";
+    let t1 = "v1";
+    let t2 = "v2";
+    let t3 = "v3";
+    let t4 = "v4";
+    let t5 = "v5";
+    let t6 = "v6";
+    let t7 = "v7";
+    let t8 = "v8";
+    let t9 = "v9";
+    let n = 0;
+    if (s == t0) { n = n + 1; }
+    if (s == t1) { n = n + 1; }
+    if (s == t2) { n = n + 1; }
+    if (s == t3) { n = n + 1; }
+    if (s == t4) { n = n + 1; }
+    if (s == t5) { n = n + 1; }
+    if (s == t6) { n = n + 1; }
+    if (s == t7) { n = n + 1; }
+    if (s == t8) { n = n + 1; }
+    if (s == t9) { n = n + 1; }
+    println(n); return 0;
+}

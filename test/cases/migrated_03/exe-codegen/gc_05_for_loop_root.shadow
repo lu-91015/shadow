@@ -1,0 +1,11 @@
+//@desc: GC root for for-loop collection
+//@expect: 6
+dsb gc_05_for_loop_root;
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + x;
+    }
+    println(sum); return 0;
+}

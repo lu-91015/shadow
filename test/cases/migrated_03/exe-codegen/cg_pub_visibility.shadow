@@ -1,0 +1,8 @@
+//@expect: 42
+//@ desc: pub function from imported module is callable
+dsb cg_pub_visibility;
+
+pub kimo public_fn() -> int { return 42; }
+kimo main() -> int {
+    println(public_fn()); return 0;
+}

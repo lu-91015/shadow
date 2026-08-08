@@ -1,0 +1,6 @@
+//@desc: referencing an undefined variable reports file:line:col
+//@expect-stderr: undefined variable
+dsb tcf_err_undef_var_loc;
+kimo main() -> int {
+    return undefined_var;
+}

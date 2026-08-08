@@ -1,0 +1,5 @@
+//@desc: logical && / || codegen to and/or, used with bool operands
+//@expect: 0
+dsb codegen_logical;
+kimo l(a: int, b: int) -> int { let r = (a > 0) && (b > 0); if (r) { return 1; } return 0; }
+kimo main() -> int { println(l(1, 0)); return 0; }

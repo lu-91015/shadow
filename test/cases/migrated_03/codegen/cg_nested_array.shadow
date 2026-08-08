@@ -1,0 +1,9 @@
+//@desc: nested (2-D) array lowers to two shadow_array_create_ptrs calls
+//@expect-ir: __rt_shadow_malloc
+dsb cg_nested_array;
+kimo main() -> int {
+    let m = [[1, 2, 3], [4, 5, 6]];
+    let row = m[0];
+    let v = row[1];
+    return v;
+}

@@ -1,0 +1,32 @@
+//@desc: for (k in dict) and for (k, v in dict) iteration
+//@expect: keys:\nfoo\nhello\nvalues:\nbar\nworld\npairs:\nfoo=bar\nhello=world
+dsb cg_dict_for_iter;
+
+kimo main() -> int {
+    let d: dict<string, string> = hashmap_new();
+    hashmap_insert(d, "hello", "world");
+    hashmap_insert(d, "foo", "bar");
+
+    // 单变量迭代 keys
+    println("keys:");
+    for (k in d) {
+        println(k);
+    }
+
+    // 双变量迭代 keys + values
+    println("values:");
+    for (k, v in d) {
+        println(v);
+    }
+
+    // 双变量配对输出
+    println("pairs:");
+    for (k, v in d) {
+        print(k);
+        print("=");
+        println(v);
+    }
+
+    hashmap_free(d);
+    return 0;
+}

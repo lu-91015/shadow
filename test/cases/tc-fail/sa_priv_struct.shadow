@@ -1,0 +1,10 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：跨模块使用私有 struct 应被拒
+//@expect-stderr: unknown struct 'PrivS'
+//@args: --strict
+dsb sa_priv_struct;
+import sa_priv_lib._sa_lib;
+kimo main() -> int {
+    let p = PrivS { v: 1 };
+    return p.v;
+}

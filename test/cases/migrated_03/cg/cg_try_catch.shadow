@@ -1,0 +1,15 @@
+//@mode: exe
+//@desc: Try/Catch/Throw statement code generation
+//@expect-stdout: before
+//@expect-stdout: after
+dsb cg_try_catch;
+
+kimo main() -> int {
+    try {
+        println("before");
+    } catch {
+        println("caught");
+    }
+    println("after");
+    return 0;
+}

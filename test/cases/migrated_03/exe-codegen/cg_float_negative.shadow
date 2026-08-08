@@ -1,0 +1,7 @@
+//@desc: negative float constant uses fsub (no broken i32/double mix)
+//@expect: 0
+dsb cg_float_negative;
+kimo main() -> int {
+    let x = -2.25;
+    println(0); return 0;
+}

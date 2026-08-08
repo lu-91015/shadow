@@ -1,0 +1,13 @@
+//@ mode: codegen
+//@ desc: generic monomorphization with two type params
+//@expect-ir: call
+dsb cg_mono_pair;
+
+kimo make_pair<T, U>(a: T, b: U) -> int {
+    // Returns 1 to avoid needing to return a pair struct
+    return 1;
+}
+kimo main() -> int {
+    let r = make_pair(42, "hello");
+    return r;
+}

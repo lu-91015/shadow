@@ -1,0 +1,16 @@
+//@desc: GC alloc in function called from for loop body
+//@expect: 6
+dsb gc_18_alloc_in_called_fn;
+struct P { x: int, y: int }
+kimo make(x: int) -> int {
+    let p = P { x: x, y: x };
+    return p.x;
+}
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + make(x);
+    }
+    println(sum); return 0;
+}

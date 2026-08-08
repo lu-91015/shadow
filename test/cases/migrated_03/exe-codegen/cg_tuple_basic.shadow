@@ -1,0 +1,39 @@
+//@desc: L7 tuple — literal, field access .0/.1, destructuring let (a,b)=..., multi-return
+//@expect: 1\n2\n3\n3\n2\n10\n7\nhello\n42
+dsb cg_tuple_basic;
+
+kimo make_pair(a: int, b: int) -> (int, int) {
+    return (a, b);
+}
+
+kimo divmod(a: int, b: int) -> (int, int) {
+    let q = a / b;
+    let r = a - q * b;
+    return (q, r);
+}
+
+kimo main() -> int {
+    // 1) 元组字面量 + 字段访问
+    let t = (1, 2, 3);
+    println(t.0);  // 1
+    println(t.1);  // 2
+    println(t.2);  // 3
+
+    // 2) 元组解构
+    let (q, r) = divmod(17, 5);
+    println(q);  // 3 (17/5=3)
+    println(r);  // 2 (17-15=2)
+
+    // 3) 函数返回元组 + 解构
+    let (a, b) = make_pair(10, 7);
+    println(a);  // 10
+    println(b);  // 7
+
+    // 4) 元组携带不同类型（string, int）
+    let pair = ("hello", 42);
+    let (s, n) = pair;
+    println(s);  // hello
+    println(n);  // 42
+
+    return 0;
+}

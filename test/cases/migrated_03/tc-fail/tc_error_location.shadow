@@ -1,0 +1,6 @@
+//@desc: type checker error messages include location info (line:col)
+//@expect-stderr: error: undefined variable
+dsb tc_error_location;
+kimo main() -> int {
+    return undefined_var;
+}

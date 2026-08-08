@@ -1,0 +1,15 @@
+//@desc: nested while loops codegen to nested back-edges
+//@expect: 3
+dsb codegen_nested_while;
+kimo f() -> int {
+    let i = 0;
+    let j = 0;
+    while (i < 3) {
+        while (j < 3) {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+kimo main() -> int { println(f()); return 0; }

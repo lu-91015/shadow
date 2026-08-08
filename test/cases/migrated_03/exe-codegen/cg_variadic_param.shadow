@@ -1,0 +1,50 @@
+//@desc: variadic params (...args: T) packed into array
+//@expect: 10\n0\n3\nHi Alice and Bob
+dsb cg_variadic_param;
+
+// 纯可变参数：求和
+kimo sum_all(...nums: int) -> int {
+    let total = 0;
+    let i = 0;
+    while (i < len(nums)) {
+        total = total + nums[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+// 固定参数 + 可变参数
+kimo greet(prefix: string, ...names: string) -> string {
+    let result = prefix;
+    let i = 0;
+    while (i < len(names)) {
+        if (i == 0) {
+            result = result + " " + names[i];
+        } else {
+            result = result + " and " + names[i];
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// 可变参数为空时仍可调用
+kimo count_args(...items: int) -> int {
+    return len(items);
+}
+
+kimo main() -> int {
+    // 1+2+3+4 = 10
+    println(int_to_str(sum_all(1, 2, 3, 4)));
+
+    // 空可变参数 -> 0
+    println(int_to_str(sum_all()));
+
+    // len(items) = 3
+    println(int_to_str(count_args(10, 20, 30)));
+
+    // 固定 + 可变
+    println(greet("Hi", "Alice", "Bob"));
+
+    return 0;
+}

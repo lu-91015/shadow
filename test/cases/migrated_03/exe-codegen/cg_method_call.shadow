@@ -1,0 +1,10 @@
+//@expect: 42
+//@ desc: method call obj.method(args) desugars to method(obj, args)
+dsb cg_method_call;
+
+struct Point { x: int, y: int }
+kimo get_x(p: Point) -> int { return p.x; }
+kimo main() -> int {
+    let p = Point { x: 42, y: 99 };
+    println(p.get_x()); return 0;
+}

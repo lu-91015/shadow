@@ -1,0 +1,10 @@
+//@ mode: tc-fail
+//@ desc: invalid cast between unrelated types should fail
+//@ expect-stderr: invalid cast
+dsb tc_fail_cast_invalid;
+
+kimo main() -> int {
+    let x: int = 42;
+    let y: string = x as string;
+    return 0;
+}

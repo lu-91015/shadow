@@ -1,0 +1,4 @@
+//@desc: string concat type check — string + int is string (TC already passes)
+//@expect: 0
+dsb cg_str_concat_mixed;
+kimo main() -> int { let s = "count: " + 5; println(0); return 0; }

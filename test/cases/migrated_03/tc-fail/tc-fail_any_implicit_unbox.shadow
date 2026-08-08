@@ -1,0 +1,8 @@
+//@desc: implicit conversion from any to int is forbidden (require explicit `as`)
+//@expect-stderr: error
+dsb tc_fail_any_implicit_unbox;
+kimo main() -> int {
+    let x: any = 1;
+    let y: int = x;  // any -> int 隐式转换，0.3 严格化后应被拒绝
+    return y;
+}

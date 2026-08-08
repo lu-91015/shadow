@@ -1,0 +1,4 @@
+//@desc: missing return value for non-void function is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_return_missing;
+kimo main() -> int { return; }

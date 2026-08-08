@@ -1,0 +1,4 @@
+dsb _publet_private_helper;
+
+let hidden_value: int = 7;
+

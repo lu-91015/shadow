@@ -1,0 +1,9 @@
+//@expect: 2
+//@ desc: array index with long type and nested access
+dsb tc_array_more;
+
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let idx: int = 1;
+    println(arr[idx]); return 0;
+}

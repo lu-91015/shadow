@@ -1,0 +1,8 @@
+//@desc: INT_MAX / INT_MIN literals are accepted and emitted verbatim
+//@expect-ir: 2147483647
+dsb edge_big_int;
+kimo main() -> int {
+    let max = 2147483647;
+    let min = -2147483648;
+    return max;
+}

@@ -1,0 +1,60 @@
+//@desc: statement-level match with enum payload destructuring binds payloads (bug #61)
+//@expect: circle
+//@expect: 7
+//@expect: rect
+//@expect: 3
+//@expect: 5
+//@expect: point
+//@expect: 70
+//@expect: 15
+//@expect: 1
+//@expect: 10
+dsb cg_match_stmt_destructure;
+
+enum Shape {
+    Circle(int),
+    Rect(int, int),
+    Point
+}
+
+kimo describe(s: Shape) -> int {
+    let out = 0;
+    match s {
+        Circle(r) => {
+            println("circle");
+            println(r);
+            out = r * 10;
+        },
+        Rect(w, h) => {
+            println("rect");
+            println(w);
+            println(h);
+            out = w * h;
+        },
+        Point => {
+            println("point");
+            out = 1;
+        }
+    }
+    return out;
+}
+
+// 语句 match 臂内 return（提前退出路径）
+kimo pick(s: Shape) -> int {
+    match s {
+        Rect(w, h) => { return w + h; },
+        _ => { }
+    }
+    return -1;
+}
+
+kimo main() -> int {
+    let a = describe(Circle(7));
+    let b = describe(Rect(3, 5));
+    let c = describe(Point);
+    println(a);
+    println(b);
+    println(c);
+    println(pick(Rect(4, 6)));
+    return 0;
+}

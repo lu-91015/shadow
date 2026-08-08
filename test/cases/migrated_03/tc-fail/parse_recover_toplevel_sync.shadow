@@ -1,0 +1,19 @@
+//@mode: tc-fail
+//@desc: LSP-1 parser error recovery - unexpected top-level token skips to next decl (SH-PARSE008), and a later reserved-keyword error is still reported
+//@expect-stderr: 'yield' is a reserved keyword
+dsb parse_recover_toplevel_sync;
+
+kimo good() -> int {
+    return 1;
+}
+
+42 37 91
+
+kimo later() -> int {
+    let yield = 3;
+    return 0;
+}
+
+kimo main() -> int {
+    return 0;
+}

@@ -1,0 +1,13 @@
+//@desc: multi-parameter macro with inline expansion (new syntax)
+//@expect: 7
+dsb tc_macro_multi_param;
+// 新语法宏：多参数 + 内联展开
+macro add2(a: expr, b: expr) { a + b }
+macro sq(x: expr) { x * x }
+kimo main() -> int {
+    let r = add2(3, 4);
+    let s = sq(5);
+    println(r);
+    println(s);
+    return 0;
+}

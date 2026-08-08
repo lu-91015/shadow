@@ -1,0 +1,9 @@
+//@expect: 0
+//@desc: match-expression returning a string, concatenated with another
+dsb edge_match_expr_string;
+kimo main() -> int {
+    let x = 2;
+    let s = match x { 1 => "one", 2 => "two", 3 => "three" };
+    let t = s + "!";
+    println(0); return 0;
+}

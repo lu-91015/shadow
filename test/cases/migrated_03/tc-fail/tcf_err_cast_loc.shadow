@@ -1,0 +1,9 @@
+//@desc: invalid cast from int to string reports a located error
+//@expect-stderr: invalid cast from
+dsb tcf_err_cast_loc;
+// Note: string as int is now ALLOWED (P2 数据转换放宽); testing the still-rejected
+//       int -> string direction to verify located error reporting.
+kimo main() -> int {
+    let x = 42 as string;
+    return 0;
+}

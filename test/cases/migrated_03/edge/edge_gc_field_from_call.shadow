@@ -1,0 +1,9 @@
+//@desc: GC struct field assigned from function call result
+//@expect-ir: shadow_gc_alloc
+dsb edge_gc_field_from_call;
+struct P { x: int, y: int }
+kimo gen() -> int { return 42; }
+kimo main() -> int {
+    let p = P { x: gen(), y: gen() };
+    return p.x + p.y;
+}

@@ -1,0 +1,28 @@
+//@desc: println/print/to_string dispatch for time types (date→int, timestamp/nanotimestamp→long)
+//@expect: 0
+dsb cg_time_println;
+kimo main() -> int {
+    // date 字面量值在 i32 范围内，println(date) 应分发到 println_int 而非 any_println
+    let d: date = date"2023.01.01";
+    // 预期打印 20230101
+    println(d);
+    print(d);
+    println("");
+
+    // to_string(date) 应分发到 to_string_int
+    let s: string = to_string(d);
+    println(s);
+    if (s != "20230101") { println(1); return 1; }
+
+    // 算术后仍是 date 类型，println 仍应正确分发
+    let d2: date = d + 5;
+    println(d2);
+    if (d2 != 20230106) { println(2); return 2; }
+
+    // 比较结果打印（bool 类型）
+    let b: bool = d < d2;
+    println(b);
+
+    println(0);
+    return 0;
+}

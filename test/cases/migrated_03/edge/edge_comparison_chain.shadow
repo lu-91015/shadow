@@ -1,0 +1,9 @@
+//@desc: chained comparison with && and || codegens to and/or/icmp
+//@expect-ir: icmp
+dsb edge_comparison_chain;
+kimo f(a: int, b: int, c: int) -> int {
+    let r = a < b && b < c || c > a;
+    if (r) { return 1; }
+    return 0;
+}
+kimo main() -> int { return f(1, 2, 3); }

@@ -1,0 +1,10 @@
+//@desc: pub struct and enum from imported module are accessible
+dsb tc_pub_struct_enum;
+import _pub_helper;
+kimo main() -> int {
+    let b = PubBox { value: 42 };
+    let v = get_pub_box_value(b);
+    let c = PubColor.Green;
+    let cv = pub_color_val(c);
+    return v;
+}

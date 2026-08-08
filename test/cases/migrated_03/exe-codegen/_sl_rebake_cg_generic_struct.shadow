@@ -1,0 +1,10 @@
+dsb _sl_rebake_cg_generic_struct;
+
+struct Box<T> { value: T }
+kimo get_value(b: Box) -> any { return b.value; }
+kimo set_value(b: Box, v: any) -> void { b.value = v; }
+kimo main() -> int {
+    let box = Box { value: 42 };
+    let v = get_value(box);
+    println(v); return 0;
+}

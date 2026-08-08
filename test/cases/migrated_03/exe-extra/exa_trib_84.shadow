@@ -1,0 +1,8 @@
+//@desc: exe-extra generated case (exa_trib_84)
+//@expect: 31
+dsb exa_trib_84;
+kimo trib(n: int) -> int { if (n < 3) { return 1; } return trib(n - 1) + trib(n - 2) + trib(n - 3); }
+kimo main() -> int {
+    println(trib(7));
+    return 0;
+}

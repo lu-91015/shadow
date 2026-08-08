@@ -1,0 +1,13 @@
+//@desc: break/continue inside a loop codegen to branch redirects
+//@expect-ir: br
+dsb codegen_break_continue;
+kimo f() -> int {
+    let i = 0;
+    while (i < 10) {
+        if (i == 5) { break; }
+        i = i + 1;
+        continue;
+    }
+    return i;
+}
+kimo main() -> int { return f(); }

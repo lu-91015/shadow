@@ -1,0 +1,7 @@
+//@desc: long string concat chain (10 literals)
+//@expect: 0
+dsb edge_string_many_concat;
+kimo main() -> int {
+    let s = "a" + "b" + "c" + "d" + "e" + "f" + "g" + "h" + "i" + "j";
+    println(0); return 0;
+}

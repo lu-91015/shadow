@@ -1,0 +1,7 @@
+dsb _sl_rebake_cg_nested_array;
+kimo main() -> int {
+    let m = [[1, 2, 3], [4, 5, 6]];
+    let row = m[0];
+    let v = row[1];
+    println(v); return 0;
+}

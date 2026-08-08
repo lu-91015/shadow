@@ -1,0 +1,13 @@
+//@ mode: tc-fail
+//@ desc: L6 `?` on a non-Result/Option operand must be rejected by the type checker
+dsb tc_question_non_result;
+
+kimo plain_int(x: int) -> int {
+    return x * 2;
+}
+
+kimo main() -> int {
+    // int 不是 Result<T,E> / Option<T>，`?` 应报类型错误
+    let v = plain_int(3)?;
+    return v;
+}

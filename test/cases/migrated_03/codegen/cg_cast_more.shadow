@@ -1,0 +1,12 @@
+//@ mode: codegen
+//@ desc: more cast combinations (int->long, long->int)
+//@expect-ir: zext
+//@expect-ir: trunc
+dsb cg_cast_more;
+
+kimo main() -> int {
+    let x: int = 42;
+    let y: long = x as long;
+    let z: int = y as int;
+    return z;
+}

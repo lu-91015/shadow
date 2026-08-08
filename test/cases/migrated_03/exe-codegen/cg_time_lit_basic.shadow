@@ -1,0 +1,32 @@
+//@desc: date type literal value encoded as integer (i32 range, 0.2 long is 32-bit)
+//@expect: 0
+dsb cg_time_lit_basic;
+kimo main() -> int {
+    // date"2023.01.01" → digits concatenated → 20230101 (fits i32)
+    let d: date = date"2023.01.01";
+    if (d != 20230101) { println(1); return 1; }
+
+    // date arithmetic on i32 range
+    let d2: date = date"2023.01.10";
+    if (d2 != 20230110) { println(2); return 2; }
+
+    // date - date -> int
+    let diff: int = d2 - d;
+    if (diff != 9) { println(3); return 3; }
+
+    // date + int -> date
+    let d3: date = d + 5;
+    if (d3 != 20230106) { println(4); return 4; }
+
+    // date - int -> date
+    let d4: date = d2 - 5;
+    if (d4 != 20230105) { println(5); return 5; }
+
+    // comparison
+    if (!(d < d2)) { println(6); return 6; }
+    if (!(d2 > d)) { println(7); return 7; }
+    if (d == d) {} else { println(8); return 8; }
+
+    println(0);
+    return 0;
+}

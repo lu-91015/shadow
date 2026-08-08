@@ -1,0 +1,27 @@
+//@expect: Woof
+//@expect: Meow
+//@desc: L1+ Codegen A — 两类型实现同 trait 验证静态分发（name mangling）
+dsb cg_trait_dispatch;
+
+trait Greeter {
+    kimo greet(self: Self) -> string;
+}
+
+struct Dog { name: string }
+struct Cat { name: string }
+
+impl Greeter for Dog {
+    kimo greet(self: Dog) -> string { return "Woof"; }
+}
+
+impl Greeter for Cat {
+    kimo greet(self: Cat) -> string { return "Meow"; }
+}
+
+kimo main() -> int {
+    let d = Dog { name: "Rex" };
+    let c = Cat { name: "Whiskers" };
+    println(d.greet());
+    println(c.greet());
+    return 0;
+}

@@ -1,0 +1,12 @@
+//@expect: 42
+//@ desc: pub struct field access — read and use field value
+dsb tc_pub_struct_field_access;
+import _pub_helper
+kimo sum_pub_box(b: PubBox) -> int {
+    let v = b.value;
+    return v + 1;
+}
+kimo main() -> int {
+    let b = PubBox { value: 41 };
+    println(sum_pub_box(b)); return 0;
+}

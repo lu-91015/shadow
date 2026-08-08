@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_174)
+//@expect: sunmoon
+//@expect: 7
+//@expect: s
+dsb exa_str_174;
+kimo main() -> int {
+    let s = "sun" + "moon";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

@@ -1,0 +1,9 @@
+//@desc: --exe: arithmetic + println, compiled to native executable
+//@expect: 42
+//@expect: hello from shadow
+dsb exe_arith;
+kimo main() -> int {
+    println(40 + 2);
+    println("hello from shadow");
+    return 0;
+}

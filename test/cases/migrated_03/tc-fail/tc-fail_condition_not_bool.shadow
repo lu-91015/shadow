@@ -1,0 +1,4 @@
+//@desc: non-boolean if condition is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_condition_not_bool;
+kimo main() -> int { if (1) { let x = 1; } return 0; }

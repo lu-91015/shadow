@@ -1,0 +1,22 @@
+//@desc: LSP-2 + LSP-1：语法错误下仍返回部分 AST（后续函数照样被解析出来）
+//@expect: check: stage=check
+//@expect: diag:
+//@expect: SH-PARSE
+//@expect: ok=0
+dsb chk_syntax_recovery;
+
+kimo broken() -> int {
+    let a = ;
+    return a;
+}
+
+// 关键断言：上面的语法错误不得吞掉本文件其余部分。
+// parser 走同步点恢复后继续解析，api_func_count 因此 > 0。
+kimo healthy() -> int {
+    return 7;
+}
+
+kimo main() -> int {
+    println(healthy());
+    return 0;
+}

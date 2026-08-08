@@ -1,0 +1,5 @@
+dsb helper;
+// ver_pkg 包内的 Shadow 模块
+pub kimo get_value() -> int {
+    return 42;
+}

@@ -1,0 +1,10 @@
+//@desc: array index access type-checks against element type
+//@expect: 0
+dsb tc_array;
+kimo f(a: array<int>) -> int {
+    let first = a[0];
+    let second = a[1];
+    let third = a[2];
+    return first + second + third;
+}
+kimo main() -> int { println(0); return 0; }

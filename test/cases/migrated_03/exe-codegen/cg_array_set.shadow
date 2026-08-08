@@ -1,0 +1,9 @@
+//@expect: 99
+//@ desc: array index assignment generates shadow_array_set_int call
+dsb cg_array_set;
+
+kimo main() -> int {
+    let arr = [10, 20, 30];
+    arr[0] = 99;
+    println(arr[0]); return 0;
+}

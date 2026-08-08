@@ -1,0 +1,9 @@
+//@mode: typeat
+//@desc: LSP-4 position-indexed type query — hover on a function signature returns its return type
+//@pos: 7 6
+//@expect: type-at: int
+dsb ta_func;
+
+kimo main() -> int {
+    return 1;
+}

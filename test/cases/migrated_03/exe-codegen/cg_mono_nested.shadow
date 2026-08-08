@@ -1,0 +1,14 @@
+//@desc: Phase 3 - generic calling generic triggers worklist re-entry specialization
+//@expect: 7
+//@expect: shadow
+//@expect: 30
+dsb cg_mono_nested;
+kimo inner<T>(x: T) -> T { return x; }
+kimo outer<T>(x: T) -> T { return inner(x); }
+kimo twice<T: int|long>(x: T) -> T { return inner(x) + outer(x); }
+kimo main() -> int {
+    println(outer(7));
+    println(outer("shadow"));
+    println(twice(15));
+    return 0;
+}

@@ -1,0 +1,5079 @@
+// Shadow 0.4 — 类型检查器（TypeChecker）核心
+// ============================================================
+// 逻辑参考 0.3 type_checker.shadow（5295 行），AST 适配 0.4（零 any）。
+// 关键差异：
+//   - 无 typemap：类型推断结果直接写 e.inferred_type / stmt.inferred_type
+//     （parser 预填：char/date/timestamp 字面量、CAST 目标均直接写 inferred_type）
+//   - 无 any 盒子：错误兜底返回 TYPE_ANY 哨兵；泛型擦除由真单态化消除
+//   - e.intval 三态契约保留：-2=直接调用、-1=闭包间接、>=0=enum 变体索引
+//   - e.str2 保留：模块限定符号
+// 宿主规避规范：函数级作用域（同名变量类型须一致）、arr[i].field 须中间变量、
+// return 表达式含跨模块常量须本地变量（见 utils 头部）。
+dsb core_tc;
+
+// ============ mangle 与基础字符串工具 ============
+pub kimo tc_mangle_private(mod_name: string, name: string) -> string {
+    return "__mod_" + mod_name + "__" + name;
+}
+
+// 判断名字是否已 mangled（以 __mod_ 开头且含 __）
+pub kimo tc_is_mangled(name: string) -> int {
+    if (str_starts_with(name, "__mod_") == 1) { return 1; }
+    return 0;
+}
+
+// 还原 mangled 名：__mod_<mod>__<name> → <name>（取最后一个 __ 之后）。非 mangled 原样返回。
+pub kimo tc_unmangle(name: string) -> string {
+    if (str_starts_with(name, "__mod_") == 0) { return name; }
+    let n = len(name);
+    let i = n - 2;
+    while (i >= 6) {
+        if (str_eq(substr2(name, i, i + 2), "__") == 1) { return substr2(name, i + 2, n); }
+        i = i - 1;
+    }
+    return name;
+}
+
+// 统计字符串中某字符出现次数
+pub kimo tc_count_chars(s: string, ch: string) -> int {
+    let n = len(s);
+    let i = 0;
+    let count = 0;
+    while (i < n) {
+        if (s[i] == ch) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// 按逗号切分（用于 var_names "a,b,c" 等）
+pub kimo tc_split_commas(s: string) -> array<string> {
+    let out: array<string> = [];
+    let cur = "";
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (c == ",") {
+            out = array_push(out, cur);
+            cur = "";
+        } else {
+            cur = cur + c;
+        }
+        i = i + 1;
+    }
+    out = array_push(out, cur);
+    return out;
+}
+
+// ============ ModuleGraph / ModuleNode 操作 ============
+pub kimo tc_mg_new() -> ModuleGraph {
+    return ModuleGraph { nodes: [], name_keys: [], name_vals: [] };
+}
+
+// 按模块名取节点（找不到返回 0 as ModuleNode）
+pub kimo tc_mg_get(mg: ModuleGraph, module_name: string) -> ModuleNode {
+    let i = 0;
+    while (i < len(mg.name_keys)) {
+        let k = mg.name_keys[i] as string;
+        if (str_eq(k, module_name) == 1) {
+            let idx = mg.name_vals[i] as int;
+            let node = mg.nodes[idx] as ModuleNode;
+            return node;
+        }
+        i = i + 1;
+    }
+    let z = 0 as ModuleNode;
+    return z;
+}
+
+// 模块是否已注册
+pub kimo tc_mg_exists(mg: ModuleGraph, module_name: string) -> int {
+    let i = 0;
+    while (i < len(mg.name_keys)) {
+        let k = mg.name_keys[i] as string;
+        if (str_eq(k, module_name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 向图添加节点（已存在则替换；返回更新后的图）
+pub kimo tc_mg_add(mg: ModuleGraph, node: ModuleNode) -> ModuleGraph {
+    let i = 0;
+    let found = 0;
+    while (i < len(mg.name_keys)) {
+        let k = mg.name_keys[i] as string;
+        if (str_eq(k, node.module_name) == 1) {
+            let idx = mg.name_vals[i] as int;
+            mg.nodes[idx] = node;
+            found = 1;
+            break;
+        }
+        i = i + 1;
+    }
+    if (found == 0) {
+        mg.nodes = array_push(mg.nodes, node);
+        let idx = len(mg.nodes) - 1;
+        mg.name_keys = array_push(mg.name_keys, node.module_name);
+        mg.name_vals = array_push(mg.name_vals, idx);
+    }
+    return mg;
+}
+
+// ============ ModuleNode 节点内查找（按注册名） ============
+pub kimo tc_node_lookup_struct(node: ModuleNode, reg_name: string) -> StructDef {
+    let i = 0;
+    while (i < len(node.struct_names)) {
+        let n = node.struct_names[i] as string;
+        if (str_eq(n, reg_name) == 1) {
+            return node.struct_defs[i] as StructDef;
+        }
+        i = i + 1;
+    }
+    let z = 0 as StructDef;
+    return z;
+}
+
+pub kimo tc_node_lookup_enum(node: ModuleNode, reg_name: string) -> EnumDef {
+    let i = 0;
+    while (i < len(node.enum_names)) {
+        let n = node.enum_names[i] as string;
+        if (str_eq(n, reg_name) == 1) {
+            return node.enum_defs[i] as EnumDef;
+        }
+        i = i + 1;
+    }
+    let z = 0 as EnumDef;
+    return z;
+}
+
+pub kimo tc_node_lookup_alias(node: ModuleNode, reg_name: string) -> TypeAlias {
+    let i = 0;
+    while (i < len(node.alias_names)) {
+        let n = node.alias_names[i] as string;
+        if (str_eq(n, reg_name) == 1) {
+            return node.alias_defs[i] as TypeAlias;
+        }
+        i = i + 1;
+    }
+    let z = 0 as TypeAlias;
+    return z;
+}
+
+pub kimo tc_node_lookup_func(node: ModuleNode, reg_name: string) -> FuncDef {
+    let ci = 0;
+    while (ci < 2) {
+        let cname = reg_name;
+        if (ci == 1) {
+            // 兼容态回退：pub 函数跨模块同名冲突方注册为 __mod_<mod>__<name>，模块内裸名
+            // 引用经此命中。严格态严禁回退（私有符号跨模块不可见，回退会泄露 priv_fn）。
+            if (tc_is_strict() == 1) { break; }
+            if (len(node.module_name) == 0) { break; }
+            cname = tc_mangle_private(node.module_name, reg_name);
+        }
+        let i = 0;
+        while (i < len(node.func_names)) {
+            let n = node.func_names[i] as string;
+            if (str_eq(n, cname) == 1) {
+                let cand = node.func_defs[i] as FuncDef;
+                // 回退轮只认「因跨模块同名冲突被 mangle 的 pub 函数」。
+                // 兼容态注册阶段 current_module 恒为主模块，**所有**模块的私有函数
+                // 都注册成 __mod_<主模块>__<name>，与回退名撞形 → 若不加 is_pub 过滤，
+                // A 模块的 private fn 会被 B 模块裸名引用命中，跨模块可见性彻底失守
+                // （tc-fail_pub_priv_* 等负例全部变成 rc==0）。
+                if (ci == 1 && cand.is_pub == 0) { i = i + 1; continue; }
+                return cand;
+            }
+            i = i + 1;
+        }
+        ci = ci + 1;
+    }
+    let z = 0 as FuncDef;
+    return z;
+}
+
+pub kimo tc_node_lookup_trait(node: ModuleNode, reg_name: string) -> TraitDef {
+    let i = 0;
+    while (i < len(node.trait_names)) {
+        let n = node.trait_names[i] as string;
+        if (str_eq(n, reg_name) == 1) {
+            return node.trait_defs[i] as TraitDef;
+        }
+        i = i + 1;
+    }
+    let z = 0 as TraitDef;
+    return z;
+}
+
+// 全局变量查找：require_pub=1 时只匹配 pub。先精确名，再试模块 mangle 名
+//（pub let 跨模块同名冲突方注册为 __mod_<mod>__<name>；模块内裸名引用经此回退命中）。
+pub kimo tc_node_lookup_global(node: ModuleNode, name: string, require_pub: int) -> GlobalVar {
+    let ci = 0;
+    while (ci < 2) {
+        let cname = name;
+        if (ci == 1) {
+            // 兼容态回退：pub let 跨模块同名冲突方注册为 __mod_<mod>__<name>，模块内裸名
+            // 引用经此命中。严格态严禁回退（私有全局跨模块不可见）。
+            if (tc_is_strict() == 1) { break; }
+            if (len(node.module_name) == 0) { break; }
+            cname = tc_mangle_private(node.module_name, name);
+        }
+        let i = 0;
+        while (i < len(node.global_names)) {
+            let n = node.global_names[i] as string;
+            if (str_eq(n, cname) == 1) {
+                // 回退轮同 tc_node_lookup_func：只认冲突 mangle 的 pub 全局，
+                // 否则跨模块私有 let 会被裸名引用泄露（tcf_pub_let_private_import）。
+                if (ci == 1 && node.global_pubs[i] == 0) { i = i + 1; continue; }
+                if (require_pub == 0 || node.global_pubs[i] == 1) {
+                    let g = GlobalVar { name: cname, type_ref: node.global_types[i], init: 0 as Expr, loc: mk_loc("", 0, 0), is_pub: node.global_pubs[i], is_mut: 0 };
+                    return g;
+                }
+            }
+            i = i + 1;
+        }
+        ci = ci + 1;
+    }
+    let z = 0 as GlobalVar;
+    return z;
+}
+
+pub kimo tc_node_lookup_impl(node: ModuleNode, key: string) -> ImplDef {
+    let i = 0;
+    while (i < len(node.impl_keys)) {
+        let k = node.impl_keys[i] as string;
+        if (str_eq(k, key) == 1) {
+            return node.impl_defs[i] as ImplDef;
+        }
+        i = i + 1;
+    }
+    let z = 0 as ImplDef;
+    return z;
+}
+
+// ============ 跨模块查找（全局 pub 回退；当前模块优先） ============
+// 在当前模块查（私有+pub），未命中时遍历 graph 全部节点查 pub 同名。
+// 私有符号只在当前模块内可见；pub 全局可见。
+pub kimo tc_mg_lookup_struct(ctx: CompileContext, name: string) -> StructDef {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    // §3.8 兼容态：点号限定名 → 命名空间 FQN 解析（叠加，仅对带点的名字触发）
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_struct(ctx, name);
+        if (tc_struct_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_struct(cur, priv_name);
+        if (tc_struct_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_struct(cur, name);
+        if (tc_struct_is_none(r2) == 0) { return r2; }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub struct（mangled 名查找）
+        let owners: array<string> = [];
+        let found = 0 as StructDef;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_struct(cur, mname);
+                if (tc_struct_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                    if (tc_struct_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as StructDef;
+            return z;
+        }
+        return found;
+    }
+    // 全局 pub 回退
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_struct(gnode, name);
+        if (tc_struct_is_none(gres) == 0) {
+            if (gres.is_pub == 1) { return gres; }
+        }
+        gi = gi + 1;
+    }
+    let z = 0 as StructDef;
+    return z;
+}
+
+pub kimo tc_mg_lookup_enum(ctx: CompileContext, name: string) -> EnumDef {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_enum(ctx, name);
+        if (tc_enum_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_enum(cur, priv_name);
+        if (tc_enum_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_enum(cur, name);
+        if (tc_enum_is_none(r2) == 0) { return r2; }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub enum（mangled 名查找）
+        let owners: array<string> = [];
+        let found = 0 as EnumDef;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_enum(cur, mname);
+                if (tc_enum_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                    if (tc_enum_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as EnumDef;
+            return z;
+        }
+        return found;
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_enum(gnode, name);
+        if (tc_enum_is_none(gres) == 0) {
+            if (gres.is_pub == 1) { return gres; }
+        }
+        gi = gi + 1;
+    }
+    let z = 0 as EnumDef;
+    return z;
+}
+
+pub kimo tc_mg_lookup_alias(ctx: CompileContext, name: string) -> TypeAlias {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_alias(ctx, name);
+        if (tc_alias_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_alias(cur, priv_name);
+        if (tc_alias_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_alias(cur, name);
+        if (tc_alias_is_none(r2) == 0) { return r2; }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub alias（mangled 名查找）
+        let owners: array<string> = [];
+        let found = 0 as TypeAlias;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_alias(cur, mname);
+                if (tc_alias_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                    if (tc_alias_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as TypeAlias;
+            return z;
+        }
+        return found;
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_alias(gnode, name);
+        if (tc_alias_is_none(gres) == 0) {
+            if (gres.is_pub == 1) { return gres; }
+        }
+        gi = gi + 1;
+    }
+    let z = 0 as TypeAlias;
+    return z;
+}
+
+pub kimo tc_mg_lookup_func(ctx: CompileContext, name: string) -> FuncDef {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_func(ctx, name);
+        if (tc_func_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_func(cur, priv_name);
+        if (tc_func_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_func(cur, name);
+        if (tc_func_is_none(r2) == 0) {
+            // 兼容态：裸名命中的是「先注册者」。若该名进过 pub 冲突名单，说明还有
+            // 别的模块导出同名 pub（已被 mangle），此处必须报 ambiguous 而不是静默取第一个。
+            // 名单通常为空 → tc_pub_conflict_has 立即返回 0，热路径无额外开销。
+            if (ctx.strict == 0 && tc_pub_conflict_has(name) == 1) {
+                let cowners: array<string> = [];
+                cowners = array_push(cowners, tc_module_of_line(ctx, r2.loc.line));
+                let cmj = 0;
+                while (cmj < len(ctx.mod_ns)) {
+                    let cown = ctx.mod_ns[cmj] as string;
+                    let ccand = tc_node_lookup_func(cur, tc_mangle_private(cown, name));
+                    if (tc_func_is_none(ccand) == 0 && ccand.is_pub == 1) {
+                        cowners = array_push(cowners, cown);
+                    }
+                    cmj = cmj + 1;
+                }
+                if (len(cowners) > 1) {
+                    tc_g_ambig_name = name;
+                    tc_g_ambig_mods = cowners;
+                    let zc = 0 as FuncDef;
+                    return zc;
+                }
+            }
+            return r2;
+        }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub 符号（mangled 名查找）。
+        // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous，绝不静默取第一个。
+        let owners: array<string> = [];
+        let found = 0 as FuncDef;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_func(cur, mname);
+                if (tc_func_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                    if (tc_func_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as FuncDef;
+            return z;
+        }
+        return found;
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_func(gnode, name);
+        if (tc_func_is_none(gres) == 0) {
+            if (gres.is_pub == 1) { return gres; }
+        }
+        gi = gi + 1;
+    }
+    let z = 0 as FuncDef;
+    return z;
+}
+
+pub kimo tc_mg_lookup_trait(ctx: CompileContext, name: string) -> TraitDef {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_trait(ctx, name);
+        if (tc_trait_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_trait(cur, priv_name);
+        if (tc_trait_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_trait(cur, name);
+        if (tc_trait_is_none(r2) == 0) { return r2; }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub trait（mangled 名查找）
+        let owners: array<string> = [];
+        let found = 0 as TraitDef;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_trait(cur, mname);
+                if (tc_trait_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                    if (tc_trait_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as TraitDef;
+            return z;
+        }
+        return found;
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_trait(gnode, name);
+        if (tc_trait_is_none(gres) == 0) {
+            if (gres.is_pub == 1) { return gres; }
+        }
+        gi = gi + 1;
+    }
+    let z = 0 as TraitDef;
+    return z;
+}
+
+// 跨模块查找 impl（key = trait@@type；impl 总是 pub 语义，全局可见）
+pub kimo tc_mg_lookup_impl(ctx: CompileContext, key: string) -> ImplDef {
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let r = tc_node_lookup_impl(cur, key);
+        if (tc_impl_is_none(r) == 0) { return r; }
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_impl(gnode, key);
+        if (tc_impl_is_none(gres) == 0) { return gres; }
+        gi = gi + 1;
+    }
+    let z = 0 as ImplDef;
+    return z;
+}
+
+// 跨模块查找全局变量（当前模块私有+pub → 全局 pub）
+pub kimo tc_mg_lookup_global(ctx: CompileContext, name: string) -> GlobalVar {
+    // 每次查找重置歧义状态（一次性消费）
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    if (tc_has_dot(name) == 1) {
+        let r = tc_resolve_fqn_global(ctx, name);
+        if (tc_global_is_none(r) == 0) { return r; }
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let r1 = tc_node_lookup_global(cur, priv_name, 0);
+        if (tc_global_is_none(r1) == 0) { return r1; }
+        let r2 = tc_node_lookup_global(cur, name, 0);
+        if (tc_global_is_none(r2) == 0) { return r2; }
+    }
+    if (ctx.strict == 1) {
+        // 严格态：只按「当前模块显式 import 的模块」解析 pub 全局（mangled 名查找）。
+        // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous。
+        let owners: array<string> = [];
+        let found = 0 as GlobalVar;
+        let mi = 0;
+        while (mi < len(tc_g_mod_ns)) {
+            let owner = tc_g_mod_ns[mi] as string;
+            if (tc_visible_from(ctx.current_module, owner) == 1) {
+                let mname = tc_mangle_private(owner, name);
+                let gres = tc_node_lookup_global(cur, mname, 1);
+                if (tc_global_is_none(gres) == 0) {
+                    if (tc_global_is_none(found) == 1) { found = gres; }
+                    owners = array_push(owners, owner);
+                }
+            }
+            mi = mi + 1;
+        }
+        if (len(owners) > 1) {
+            tc_g_ambig_name = name;
+            tc_g_ambig_mods = owners;
+            let z = 0 as GlobalVar;
+            return z;
+        }
+        return found;
+    }
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let gres = tc_node_lookup_global(gnode, name, 1);
+        if (tc_global_is_none(gres) == 0) { return gres; }
+        gi = gi + 1;
+    }
+    let z = 0 as GlobalVar;
+    return z;
+}
+
+// ============ 空值判断辅助（0 as T 指针判空） ============
+pub kimo tc_node_is_none(n: ModuleNode) -> int {
+    let x = n as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_struct_is_none(s: StructDef) -> int {
+    let x = s as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_enum_is_none(e: EnumDef) -> int {
+    let x = e as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_alias_is_none(a: TypeAlias) -> int {
+    let x = a as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_func_is_none(f: FuncDef) -> int {
+    let x = f as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_trait_is_none(t: TraitDef) -> int {
+    let x = t as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_impl_is_none(i: ImplDef) -> int {
+    let x = i as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+pub kimo tc_global_is_none(g: GlobalVar) -> int {
+    let x = g as any;
+    if (x == 0) { return 1; }
+    return 0;
+}
+
+// ============ §3.8 兼容态命名空间 / FQN 解析（叠加层，不影响 codegen） ============
+// 命名空间树由 tc_build_ns_tree 在 Pass1 后构建，仅用于解析「点号限定名」
+// a.b.c.Symbol。全局 pub 回退保持不变（兼容旧代码与编译器自举）。
+
+pub kimo tc_has_dot(s: string) -> int {
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        if (s[i] == ".") { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 最后一个 '.' 的位置（无则 -1）
+pub kimo tc_last_dot(s: string) -> int {
+    let n = len(s);
+    let i = n - 1;
+    while (i >= 0) {
+        if (s[i] == ".") { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// 第一个 '.' 的位置（无则 -1）
+pub kimo tc_first_dot(s: string) -> int {
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        if (s[i] == ".") { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 某行归属的命名空间：取「起始行 <= line 的最后一个模块」（模块按追加顺序连续出现）
+pub kimo tc_module_of_line(ctx: CompileContext, line: int) -> string {
+    let starts = ctx.mod_starts;
+    let names = ctx.mod_ns;
+    let best = -1;
+    let best_start = -1;
+    let i = 0;
+    while (i < len(names)) {
+        let st = starts[i] as int;
+        if (st <= line) {
+            if (st > best_start) {
+                best = i;
+                best_start = st;
+            }
+        }
+        i = i + 1;
+    }
+    if (best < 0) { return ""; }
+    let r = names[best] as string;
+    return r;
+}
+
+// 还原点链全名（EXPR_MEMBER / EXPR_VAR）；非纯点链返回 ""
+pub kimo tc_expr_dot_path(e: Expr) -> string {
+    if (expr_is_none(e) == 1) { return ""; }
+    let k = e.kind;
+    if (k == EXPR_VAR) { return e.str1; }
+    if (k == EXPR_MEMBER) {
+        let base = e.child1;
+        let bp = tc_expr_dot_path(base);
+        if (len(bp) == 0) { return ""; }
+        return bp + "." + e.str1;
+    }
+    return "";
+}
+
+// 判断 ns 是否是一个已登记的命名空间（用于区分「a.b.c.foo」的 FQN 与普通的「obj.field」）
+// 性能关键：本函数在每个多段点链（obj.a.b、a.b.c.foo）上都会被调用，
+// 因此必须扫描**模块表**（ctx.mod_ns，约十几项）而非 ns_keys（编译器自身上千项）。
+// 二者等价：命名空间集合 == 已加载模块集合；模块无 pub 符号时 FQN 查找自然落空。
+pub kimo tc_is_known_ns(ctx: CompileContext, ns: string) -> int {
+    if (len(ns) == 0) { return 0; }
+    let mods = ctx.mod_ns;
+    let i = 0;
+    while (i < len(mods)) {
+        let m = mods[i] as string;
+        if (str_eq(m, ns) == 1) { return 1; }
+        i = i + 1;
+    }
+    // 兼容态 dsb 别名：0.3 用例以 dsb 名限定访问（dotqual_mod.X）
+    let mp = tc_dsb_to_path(ctx, ns);
+    if (len(mp) > 0) { return 1; }
+    return 0;
+}
+
+// ============ 命名空间树构建（Pass1 后） ============
+pub kimo tc_build_ns_tree(ctx: CompileContext, prog: Program) -> void {
+    ctx.ns_keys = [];
+    ctx.ns_kinds = [];
+    ctx.ns_idx = [];
+    ctx.ns_structs = [];
+    ctx.ns_enums = [];
+    ctx.ns_funcs = [];
+    ctx.ns_aliases = [];
+    ctx.ns_traits = [];
+    ctx.ns_globals = [];
+    // struct (kind 1)
+    let i = 0;
+    while (i < len(prog.structs)) {
+        let sd = prog.structs[i] as StructDef;
+        if (sd.is_pub == 1) {
+            let sloc = sd.loc;
+            let ns = tc_module_of_line(ctx, sloc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns + "::" + tc_unmangle(sd.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 1);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_structs));
+            ctx.ns_structs = array_push(ctx.ns_structs, sd);
+        }
+        i = i + 1;
+    }
+    // enum (kind 2)
+    i = 0;
+    while (i < len(prog.enums)) {
+        let ed = prog.enums[i] as EnumDef;
+        if (ed.is_pub == 1) {
+            let eloc = ed.loc;
+            let ns2 = tc_module_of_line(ctx, eloc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns2 + "::" + tc_unmangle(ed.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 2);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_enums));
+            ctx.ns_enums = array_push(ctx.ns_enums, ed);
+        }
+        i = i + 1;
+    }
+    // func (kind 3)（严格态 fd.name 已带模块前缀，key 还原原名供 FQN 解析匹配）
+    i = 0;
+    while (i < len(prog.funcs)) {
+        let fd = prog.funcs[i] as FuncDef;
+        if (fd.is_pub == 1) {
+            let floc = fd.loc;
+            let ns3 = tc_module_of_line(ctx, floc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns3 + "::" + tc_unmangle(fd.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 3);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_funcs));
+            ctx.ns_funcs = array_push(ctx.ns_funcs, fd);
+        }
+        i = i + 1;
+    }
+    // alias (kind 4)
+    i = 0;
+    while (i < len(prog.type_aliases)) {
+        let ta = prog.type_aliases[i] as TypeAlias;
+        if (ta.is_pub == 1) {
+            let aloc = ta.loc;
+            let ns4 = tc_module_of_line(ctx, aloc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns4 + "::" + tc_unmangle(ta.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 4);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_aliases));
+            ctx.ns_aliases = array_push(ctx.ns_aliases, ta);
+        }
+        i = i + 1;
+    }
+    // trait (kind 5)
+    i = 0;
+    while (i < len(prog.traits)) {
+        let td = prog.traits[i] as TraitDef;
+        if (td.is_pub == 1) {
+            let tloc = td.loc;
+            let ns5 = tc_module_of_line(ctx, tloc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns5 + "::" + tc_unmangle(td.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 5);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_traits));
+            ctx.ns_traits = array_push(ctx.ns_traits, td);
+        }
+        i = i + 1;
+    }
+    // global (kind 6)（严格态 gv.name 已带模块前缀，key 还原原名供 FQN 解析匹配）
+    i = 0;
+    while (i < len(prog.globals)) {
+        let gv = prog.globals[i] as GlobalVar;
+        if (gv.is_pub == 1) {
+            let gloc = gv.loc;
+            let ns6 = tc_module_of_line(ctx, gloc.line);
+            ctx.ns_keys = array_push(ctx.ns_keys, ns6 + "::" + tc_unmangle(gv.name));
+            ctx.ns_kinds = array_push(ctx.ns_kinds, 6);
+            ctx.ns_idx = array_push(ctx.ns_idx, len(ctx.ns_globals));
+            ctx.ns_globals = array_push(ctx.ns_globals, gv);
+        }
+        i = i + 1;
+    }
+}
+
+// ============ FQN 解析器 ============
+// 通用槽位查找：命中返回 ns_idx 槽位下标，未命中 -1
+pub kimo tc_ns_slot(ctx: CompileContext, fqn: string, kind: int) -> int {
+    let dot = tc_last_dot(fqn);
+    if (dot < 0) { return -1; }
+    let ns = substr2(fqn, 0, dot);
+    // 兼容态 dsb 别名：0.3 用例以 dsb 名访问（dotqual_mod.X），模块按路径派生名注册。
+    let mapped = tc_dsb_to_path(ctx, ns);
+    if (len(mapped) > 0) { ns = mapped; }
+    let sym = substr2(fqn, dot + 1, len(fqn));
+    let key = ns + "::" + sym;
+    let keys = ctx.ns_keys;
+    let kinds = ctx.ns_kinds;
+    let idxs = ctx.ns_idx;
+    let i = 0;
+    while (i < len(keys)) {
+        let ki = kinds[i] as int;
+        if (ki == kind) {
+            let ek = keys[i] as string;
+            if (str_eq(ek, key) == 1) {
+                let slot = idxs[i] as int;
+                return slot;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub kimo tc_resolve_fqn_struct(ctx: CompileContext, fqn: string) -> StructDef {
+    let s = tc_ns_slot(ctx, fqn, 1);
+    if (s < 0) { let z = 0 as StructDef; return z; }
+    let arr = ctx.ns_structs;
+    let v = arr[s] as StructDef;
+    return v;
+}
+
+pub kimo tc_resolve_fqn_enum(ctx: CompileContext, fqn: string) -> EnumDef {
+    let s = tc_ns_slot(ctx, fqn, 2);
+    if (s < 0) { let z = 0 as EnumDef; return z; }
+    let arr = ctx.ns_enums;
+    let v = arr[s] as EnumDef;
+    return v;
+}
+
+pub kimo tc_resolve_fqn_func(ctx: CompileContext, fqn: string) -> FuncDef {
+    let s = tc_ns_slot(ctx, fqn, 3);
+    if (s < 0) { let z = 0 as FuncDef; return z; }
+    let arr = ctx.ns_funcs;
+    let v = arr[s] as FuncDef;
+    return v;
+}
+
+pub kimo tc_resolve_fqn_alias(ctx: CompileContext, fqn: string) -> TypeAlias {
+    let s = tc_ns_slot(ctx, fqn, 4);
+    if (s < 0) { let z = 0 as TypeAlias; return z; }
+    let arr = ctx.ns_aliases;
+    let v = arr[s] as TypeAlias;
+    return v;
+}
+
+pub kimo tc_resolve_fqn_trait(ctx: CompileContext, fqn: string) -> TraitDef {
+    let s = tc_ns_slot(ctx, fqn, 5);
+    if (s < 0) { let z = 0 as TraitDef; return z; }
+    let arr = ctx.ns_traits;
+    let v = arr[s] as TraitDef;
+    return v;
+}
+
+pub kimo tc_resolve_fqn_global(ctx: CompileContext, fqn: string) -> GlobalVar {
+    let s = tc_ns_slot(ctx, fqn, 6);
+    if (s < 0) { let z = 0 as GlobalVar; return z; }
+    let arr = ctx.ns_globals;
+    let v = arr[s] as GlobalVar;
+    return v;
+}
+
+// ============ 错误报告 ============
+// Phase 14（LSP）：收集模式。compile_api 以库方式调用 TC 时开启，
+// 错误进入全局数组（不再 println 污染 LSP 协议流）。CLI 模式保持原行为。
+let tc_g_errors: array<string> = [];
+let tc_g_collect: int = 0;   // 0=CLI（println）；1=收集（LSP/库模式）
+
+// §3.8 兼容态命名空间：模块 → combined 源起始行映射（由 main_load_combined 注入）。
+// 存放在 TC 模块内而非 main.shadow，理由：main 的全局对 api/lsp 模块不可见，
+// 且这样 tc_check_program 得以保持单参签名，compile_api 调用点零改动。
+let tc_g_mod_ns: array<string> = [];
+let tc_g_mod_starts: array<int> = [];
+// 闭包提升注册表：闭包字面量提升的 __closure_<n> 函数（tc_check 闭包分支收集，
+// main_compile_source 合并进 prog.funcs 参与 lower+codegen 发射——否则 link undefined symbol）。
+let tc_g_closure_funcs: array<FuncDef> = [];
+
+// 返回闭包提升函数列表（main_compile_source 消费）
+pub kimo tc_closure_funcs_get() -> array<FuncDef> {
+    return tc_g_closure_funcs;
+}
+
+// 注入模块行映射。未调用时两数组为空 → tc_is_known_ns 恒假 → FQN 解析自动降级关闭。
+pub kimo tc_set_mod_map(ns: array<string>, starts: array<int>) -> void {
+    tc_g_mod_ns = ns;
+    tc_g_mod_starts = starts;
+}
+
+// dsb 别名表：兼容态 0.3 用例以 dsb 名访问模块符号（_dotqual_mod 文件访问 dotqual_mod.X），
+// 而模块实际按路径派生名注册（key_to_ns）。main_load_combined 注入。
+let tc_g_mod_dsb_alias: array<string> = [];
+let tc_g_mod_dsb_path: array<string> = [];
+pub kimo tc_set_mod_dsbmap(alias: array<string>, path: array<string>) -> void {
+    tc_g_mod_dsb_alias = alias;
+    tc_g_mod_dsb_path = path;
+}
+pub kimo tc_dsb_to_path(ctx: CompileContext, ns: string) -> string {
+    let i = 0;
+    while (i < len(tc_g_mod_dsb_alias)) {
+        let a = tc_g_mod_dsb_alias[i] as string;
+        if (str_eq(a, ns) == 1) { return tc_g_mod_dsb_path[i] as string; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ============ 严格态（Phase 15）基础设施 ============
+// 开关由 loader 注入：`module strict;` 指令触发。默认 0 = 兼容态（行为完全不变）。
+let tc_g_strict: int = 0;
+pub kimo tc_set_strict(v: int) -> void { tc_g_strict = v; }
+pub kimo tc_is_strict() -> int { return tc_g_strict; }
+
+// Phase 11 函数级增量缓存：缓存命中的模块（源码 hash 匹配 .lu）→ 跳过其函数体检查。
+// 由 loader（main.shadow）在编译前注入；每次编译开始重置（LSP/API 多文档安全）。
+let tc_g_valid_ns: array<string> = [];
+pub kimo tc_set_valid_ns(list: array<string>) -> void { tc_g_valid_ns = list; }
+
+// 函数所在行所属模块是否在缓存命中集合内（兼容态才启用；严格态缓存禁用恒 false）
+pub kimo tc_ns_is_valid(ctx: CompileContext, line: int) -> int {
+    if (ctx.strict == 1) { return 0; }
+    let ns = tc_module_of_line(ctx, line);
+    if (len(ns) == 0) { return 0; }
+    let i = 0;
+    while (i < len(tc_g_valid_ns)) {
+        if (str_eq(tc_g_valid_ns[i] as string, ns) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 歧义检测状态（严格态）：tc_mg_lookup_* 在「2+ 个可见模块导出同名 pub 符号」时置位，
+// 返回 none；调用点在报 undefined 之前取消息并报 ambiguous（Java 通配符导入语义：使用处报错）。
+let tc_g_ambig_name: string = "";
+let tc_g_ambig_mods: array<string> = [];
+
+// 兼容态 pub 跨模块同名冲突名单（register_decls 冲突分支写入）。
+// 兼容态是物理拼接：先注册者占裸名，后来者被 mangle 成 __mod_<owner>__<name>。
+// 若不记录，裸名引用会静默解析到先注册者（0.3 语义要求使用处报 ambiguous）。
+// 用名单而非每次全模块扫描：绝大多数程序该名单为空，查找热路径零开销。
+let tc_g_pub_conflicts: array<string> = [];
+
+pub kimo tc_pub_conflict_add(name: string) -> int {
+    let i = 0;
+    while (i < len(tc_g_pub_conflicts)) {
+        if (str_eq(tc_g_pub_conflicts[i] as string, name) == 1) { return 0; }
+        i = i + 1;
+    }
+    tc_g_pub_conflicts = array_push(tc_g_pub_conflicts, name);
+    return 1;
+}
+
+pub kimo tc_pub_conflict_has(name: string) -> int {
+    let i = 0;
+    while (i < len(tc_g_pub_conflicts)) {
+        if (str_eq(tc_g_pub_conflicts[i] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 被用户函数遮蔽的内置名（register_decls 写入）。
+// 0.3 语义：用户自定义函数遮蔽同名内置（如 cg_string_utils 自定义 str_starts_with，
+// 0.3 发射 @__mod_cg_string_utils__str_starts_with 而非内置裸名）。
+// tc_check_call 的内置白名单分支不改写 e.str1，若用户定义已被 mangle 就会断链。
+// 用名单做 O(1) 前置判空：绝大多数程序不遮蔽内置，热路径无额外查找开销。
+let tc_g_builtin_shadowed: array<string> = [];
+
+pub kimo tc_builtin_shadow_add(name: string) -> int {
+    let i = 0;
+    while (i < len(tc_g_builtin_shadowed)) {
+        if (str_eq(tc_g_builtin_shadowed[i] as string, name) == 1) { return 0; }
+        i = i + 1;
+    }
+    tc_g_builtin_shadowed = array_push(tc_g_builtin_shadowed, name);
+    return 1;
+}
+
+pub kimo tc_builtin_shadowed_has(name: string) -> int {
+    let i = 0;
+    while (i < len(tc_g_builtin_shadowed)) {
+        if (str_eq(tc_g_builtin_shadowed[i] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 生成歧义消息（无歧义返回 ""），并清空状态（一次性消费）
+pub kimo tc_ambig_message(kind: string) -> string {
+    if (len(tc_g_ambig_name) == 0) { return ""; }
+    let m = "ambiguous " + kind + " '" + tc_g_ambig_name + "' (candidates: ";
+    let i = 0;
+    while (i < len(tc_g_ambig_mods)) {
+        if (i > 0) { m = m + ", "; }
+        m = m + tc_g_ambig_mods[i] as string;
+        i = i + 1;
+    }
+    m = m + ")";
+    tc_g_ambig_name = "";
+    tc_g_ambig_mods = [];
+    return m;
+}
+
+// 每模块的 import 列表（loader 注入）：tc_g_mod_imp_ns[i] ↔ tc_g_mod_imp_list[i]。
+// 值为命名空间（. 分隔），由 loader 在解析 import 时把 `a/b` 转 `a.b`。
+let tc_g_mod_imp_ns: array<string> = [];
+let tc_g_mod_imp_list: array<array<string>> = [];
+pub kimo tc_set_mod_imports(ns: array<string>, lists: array<array<string>>) -> void {
+    tc_g_mod_imp_ns = ns;
+    tc_g_mod_imp_list = lists;
+}
+
+// import 路径（/ 分隔）→ 命名空间（. 分隔）
+pub kimo tc_import_to_ns(path: string) -> string {
+    return str_replace(path, "/", ".");
+}
+
+// cur_ns 模块能否看到 owner_ns 的符号（严格态 import 作用域）
+// 取包名（命名空间父段）：core.ast -> core；main -> ""；a.b.c -> a.b；"" -> ""
+pub kimo tc_pkg_of(ns: string) -> string {
+    let last = -1;
+    let i = 0;
+    while (i < len(ns)) {
+        if (str_eq(ns[i], ".") == 1) { last = i; }
+        i = i + 1;
+    }
+    if (last < 0) { return ""; }
+    return substr2(ns, 0, last);
+}
+// 同包判定（命名空间父段相等）：a.b.c 与 a.b.d 同包（a.b）；a.b.c 与 x.y 不同包
+pub kimo tc_same_pkg(a: string, b: string) -> int {
+    return str_eq(tc_pkg_of(a), tc_pkg_of(b));
+}
+pub kimo tc_visible_from(cur_ns: string, owner_ns: string) -> int {
+    if (str_eq(cur_ns, owner_ns) == 1) { return 1; }
+    if (str_eq(owner_ns, "shadow.runtime") == 1) { return 1; }  // 运行时白名单
+    // §3.9 Java package-private：同目录（同包）的未导出符号互相可见
+    if (str_eq(tc_pkg_of(cur_ns), tc_pkg_of(owner_ns)) == 1) { return 1; }
+    let i = 0;
+    while (i < len(tc_g_mod_imp_ns)) {
+        if (str_eq(tc_g_mod_imp_ns[i] as string, cur_ns) == 1) {
+            let lst = tc_g_mod_imp_list[i] as array<string>;
+            let j = 0;
+            while (j < len(lst)) {
+                let imp = lst[j] as string;
+                if (str_eq(imp, owner_ns) == 1) { return 1; }
+                // 通配符 import a.b.* 仅导入直接子包 a.b.X（X 单段），不递归 a.b.c.Y（Java 规则）
+                if (str_starts_with(owner_ns, imp + ".") == 1) {
+                    let rest = substr2(owner_ns, len(imp) + 1, len(owner_ns));
+                    if (str_index_of(rest, ".") < 0) { return 1; }
+                }
+                j = j + 1;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 计算符号的注册名（含严格态模块前缀）。exempt=1 表示 extern/main/__impl__ 等不 mangle。
+pub kimo tc_reg_name_for(ctx: CompileContext, name: string, line: int, is_pub: int, exempt: int) -> string {
+    if (ctx.strict == 0) {
+        // 兼容态私有符号按【所属模块】（按行号定位）加前缀，而非 ctx.current_module（主模块）。
+        // 用主模块前缀会让所有模块的私有符号塌进同一命名空间：
+        //   ① 被 import 模块的私有函数/类型可被主模块裸名引用（tc-fail_pub_priv_* 全部失守）；
+        //   ② 主模块私有 add 与被 import 模块 pub add 争抢同一符号（tc_module_namespace_local）。
+        // 0.3 参照实现即按所属模块 mangle（__mod_<mod>__<name>）。
+        if (is_pub == 0 && exempt == 0) {
+            // mod_starts/mod_ns 为空（LSP/API 直传单 Program，未经 main 的模块收集）时
+            // tc_module_of_line 返回 ""，退回 current_module 保持旧行为，避免 __mod____name。
+            let owner = tc_module_of_line(ctx, line);
+            if (len(owner) == 0) { owner = ctx.current_module; }
+            return tc_mangle_private(owner, name);
+        }
+        return name;
+    }
+    if (exempt == 1) { return name; }
+    let mod = tc_module_of_line(ctx, line);
+    return tc_mangle_private(mod, name);
+}
+
+// 严格态类型名归一：裸类型名 → 注册名（mangled）。非 strict / FQN 原样返回。
+// 供 tc_resolve_type / tc_resolve_type_name 统一改写 Type.name（等价 Java FQN 符号表）。
+pub kimo tc_strict_resolve_name(ctx: CompileContext, name: string) -> string {
+    if (ctx.strict == 0) { return name; }
+    if (tc_has_dot(name) == 1) { return name; }   // FQN 交给 FQN 分支
+    let sd = tc_mg_lookup_struct(ctx, name);
+    if (tc_struct_is_none(sd) == 0) { return sd.name; }
+    let ed = tc_mg_lookup_enum(ctx, name);
+    if (tc_enum_is_none(ed) == 0) { return ed.name; }
+    let ta = tc_mg_lookup_alias(ctx, name);
+    if (tc_alias_is_none(ta) == 0) { return ta.name; }
+    return name;
+}
+
+// 全局 pub 回退的可见性判定（严格态按 import 作用域）。返回是否可作为候选。
+pub kimo tc_candidate_ok(ctx: CompileContext, gres_line: int, is_pub: int, cur_ns: string) -> int {
+    if (ctx.strict == 0) { return is_pub; }
+    if (is_pub == 0) { return 0; }   // 私有跨包不可见
+    let owner = tc_module_of_line(ctx, gres_line);
+    return tc_visible_from(cur_ns, owner);
+}
+
+// 与 tc_g_errors 一一对应的诊断区间，格式 "L:C:EL:EC"（半开终点，取自 AST 节点 loc）。
+// 错误消息文本只带起点（CLI 输出格式必须保持稳定），LSP 需要完整区间 → 旁路携带。
+let tc_g_error_ranges: array<string> = [];
+pub kimo tc_collected_ranges() -> array<string> { return tc_g_error_ranges; }
+
+pub kimo tc_begin_collect() -> void { tc_g_errors = []; tc_g_error_ranges = []; tc_g_collect = 1; }
+pub kimo tc_end_collect() -> array<string> {
+    let e = tc_g_errors;
+    tc_g_errors = [];
+    tc_g_collect = 0;
+    return e;
+}
+pub kimo tc_error_at(ctx: CompileContext, loc: Location, msg: string) -> void {
+    let line = loc.line;
+    if (line < 1) { line = 1; }
+    let col = loc.col;
+    if (col < 1) { col = 1; }
+    let full = loc.file + ":" + int_to_str(line) + ":" + int_to_str(col) + ": SH-TC001: error: " + msg;
+    if (tc_g_collect == 1) {
+        tc_g_errors = array_push(tc_g_errors, full);
+        // 旁路记录 AST 节点区间；终点缺失或早于起点时退化为点区间
+        let el = loc.end_line;
+        let ec = loc.end_col;
+        if (el < line) { el = line; ec = col; }
+        if (el == line) {
+            if (ec < col) { ec = col; }
+        }
+        let rs = int_to_str(line) + ":" + int_to_str(col) + ":" + int_to_str(el) + ":" + int_to_str(ec);
+        tc_g_error_ranges = array_push(tc_g_error_ranges, rs);
+    } else {
+        println(full);
+    }
+    ctx.errors = array_push(ctx.errors, full);
+}
+
+// ============ 类型环境 TEnv ============
+pub kimo tc_env_new() -> TEnv {
+    return TEnv { names: [], types: [] };
+}
+
+pub kimo tc_env_find(env: TEnv, name: string) -> int {
+    let i = 0;
+    while (i < len(env.names)) {
+        let n = env.names[i] as string;
+        if (str_eq(n, name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub kimo tc_env_get(env: TEnv, name: string) -> Type {
+    let i = tc_env_find(env, name);
+    if (i >= 0) {
+        return env.types[i] as Type;
+    }
+    return type_none_inner();
+}
+
+pub kimo tc_env_set(env: TEnv, name: string, t: Type) -> void {
+    let i = tc_env_find(env, name);
+    if (i >= 0) {
+        env.types[i] = t;
+    } else {
+        env.names = array_push(env.names, name);
+        env.types = array_push(env.types, t);
+    }
+}
+
+// 克隆 env（match 臂作用域）
+pub kimo tc_env_clone(env: TEnv) -> TEnv {
+    let ne = TEnv { names: [], types: [] };
+    let i = 0;
+    while (i < len(env.names)) {
+        ne.names = array_push(ne.names, env.names[i]);
+        ne.types = array_push(ne.types, env.types[i]);
+        i = i + 1;
+    }
+    return ne;
+}
+
+// ============ 类型格式化 ============
+pub kimo ty_display_name(t: Type) -> string {
+    let k = t.kind;
+    if (k == TYPE_VOID) { return "void"; }
+    if (k == TYPE_BOOL) { return "bool"; }
+    if (k == TYPE_CHAR) { return "char"; }
+    if (k == TYPE_SHORT) { return "short"; }
+    if (k == TYPE_INT) { return "int"; }
+    if (k == TYPE_LONG) { return "long"; }
+    if (k == TYPE_FLOAT) { return "float"; }
+    if (k == TYPE_DOUBLE) { return "double"; }
+    if (k == TYPE_STRING) { return "string"; }
+    if (k == TYPE_ARRAY) { return "array"; }
+    if (k == TYPE_DICT) { return "dict"; }
+    if (k == TYPE_STRUCT) { return t.name; }
+    if (k == TYPE_ENUM) { return t.name; }
+    if (k == TYPE_ENUM_PAYLOAD) { return t.name; }
+    if (k == TYPE_ANY) { return "any"; }
+    if (k == TYPE_FUNCTION) { return "function"; }
+    if (k == TYPE_INFER) { return "unresolved"; }
+    if (k == TYPE_UNIT) { return "unit"; }
+    if (k == TYPE_DATE) { return "date"; }
+    if (k == TYPE_TIMESTAMP) { return "timestamp"; }
+    if (k == TYPE_NANOTIMESTAMP) { return "nanotimestamp"; }
+    if (k == TYPE_OPAQUE) { return "opaque"; }
+    if (k == TYPE_TUPLE) { return "tuple"; }
+    if (k == TYPE_SET) { return "set"; }
+    if (k == TYPE_FUTURE) { return "future"; }
+    return "unknown";
+}
+
+// 约束列表格式化为 "int|long" 或 "Greet"
+pub kimo tc_format_constraints(constraints: array<string>) -> string {
+    let s = "";
+    let i = 0;
+    while (i < len(constraints)) {
+        s = s + constraints[i];
+        if (i < len(constraints) - 1) { s = s + "|"; }
+        i = i + 1;
+    }
+    return s;
+}
+
+// ============ 类型兼容性 ============
+pub kimo tc_type_compat(ctx: CompileContext, declared: Type, actual: Type) -> int {
+    let dk = declared.kind;
+    let ak = actual.kind;
+    if (dk == TYPE_ANY) { return 1; }
+    if (dk == TYPE_INFER) { return 1; }
+    if (ak == TYPE_INFER) { return 1; }
+    // 类型相等（结构比较）
+    if (type_eq(declared, actual) == 1) { return 1; }
+    // 命名类型族（STRUCT/ENUM/ENUM_PAYLOAD/OPAQUE）同名即兼容：
+    // parser 把 Option<T> 解析为 TYPE_STRUCT，而 tc_enum_type_for 返回
+    // TYPE_ENUM_PAYLOAD——同一声明的不同 kind 视图必须视为同一类型
+    // （如 Option<FuncDef> 字段 vs Some(fd) 构造值）。
+    let d_named = 0;
+    if (dk == TYPE_STRUCT || dk == TYPE_ENUM || dk == TYPE_ENUM_PAYLOAD || dk == TYPE_OPAQUE) { d_named = 1; }
+    let a_named = 0;
+    if (ak == TYPE_STRUCT || ak == TYPE_ENUM || ak == TYPE_ENUM_PAYLOAD || ak == TYPE_OPAQUE) { a_named = 1; }
+    if (d_named == 1 && a_named == 1 && str_eq(declared.name, actual.name) == 1) { return 1; }
+    // int 族互通
+    if (dk == TYPE_INT && (ak == TYPE_SHORT || ak == TYPE_CHAR || ak == TYPE_LONG)) { return 1; }
+    if (dk == TYPE_SHORT && (ak == TYPE_INT || ak == TYPE_CHAR)) { return 1; }
+    if (dk == TYPE_LONG && (ak == TYPE_INT || ak == TYPE_SHORT || ak == TYPE_CHAR)) { return 1; }
+    if (dk == TYPE_CHAR && ak == TYPE_INT) { return 1; }
+    // float 族互通
+    if (dk == TYPE_FLOAT && ak == TYPE_DOUBLE) { return 1; }
+    if (dk == TYPE_DOUBLE && ak == TYPE_FLOAT) { return 1; }
+    if (dk == TYPE_FLOAT && (ak == TYPE_INT || ak == TYPE_LONG)) { return 1; }
+    if (dk == TYPE_DOUBLE && (ak == TYPE_INT || ak == TYPE_LONG || ak == TYPE_FLOAT)) { return 1; }
+    // opaque ↔ any
+    if (dk == TYPE_OPAQUE && ak == TYPE_ANY) { return 1; }
+    if (dk == TYPE_ANY && ak == TYPE_OPAQUE) { return 1; }
+    // 时间类型 ↔ 基础整数
+    if (dk == TYPE_DATE && (ak == TYPE_INT || ak == TYPE_LONG)) { return 1; }
+    if (dk == TYPE_TIMESTAMP && ak == TYPE_LONG) { return 1; }
+    if (dk == TYPE_NANOTIMESTAMP && ak == TYPE_LONG) { return 1; }
+    if ((dk == TYPE_INT || dk == TYPE_LONG) && ak == TYPE_DATE) { return 1; }
+    // 数组：elem 递归比较；空数组字面量（elem_type=none）与任意数组兼容
+    if (dk == TYPE_ARRAY && ak == TYPE_ARRAY) {
+        let de = declared.elem_type;
+        let ae = actual.elem_type;
+        if (type_is_none(de) == 1 || type_is_none(ae) == 1) { return 1; }
+        return tc_type_compat(ctx, de, ae);
+    }
+    // dict：key/val 递归比较；任一侧缺参数化信息则兼容。
+    // hashmap_new() 返回裸 dict（key_type/val_type = none），而注解写作
+    // dict<string,string>，type_eq 逐 key/val 比较必然不等 →
+    // "type mismatch in let binding: variable 'd' is 'dict' but initializer is 'dict'"
+    // （两边 display 名一样，报错本身就说明是参数化信息缺失而非真类型冲突）。
+    if (dk == TYPE_DICT && ak == TYPE_DICT) {
+        let dkey = declared.key_type;
+        let akey = actual.key_type;
+        if (type_is_none(dkey) == 1 || type_is_none(akey) == 1) { return 1; }
+        if (tc_type_compat(ctx, dkey, akey) == 0) { return 0; }
+        let dval = declared.val_type;
+        let aval = actual.val_type;
+        if (type_is_none(dval) == 1 || type_is_none(aval) == 1) { return 1; }
+        return tc_type_compat(ctx, dval, aval);
+    }
+    // set：同理（set_new() 返回裸 set，注解写作 set<int>）
+    if (dk == TYPE_SET && ak == TYPE_SET) {
+        let dse = declared.elem_type;
+        let ase = actual.elem_type;
+        if (type_is_none(dse) == 1 || type_is_none(ase) == 1) { return 1; }
+        return tc_type_compat(ctx, dse, ase);
+    }
+    return 0;
+}
+
+// ============ LUB（最小公共类型） ============
+pub kimo tc_lub(ctx: CompileContext, a: Type, b: Type) -> Type {
+    let ak = a.kind;
+    let bk = b.kind;
+    if (ak == TYPE_ANY || bk == TYPE_ANY) { return mk_type(TYPE_ANY); }
+    if (type_eq(a, b) == 1) { return a; }
+    if (ak == TYPE_OPAQUE || bk == TYPE_OPAQUE) { return mk_type(TYPE_ANY); }
+    // 时间语义保留
+    if (ak == TYPE_DATE || bk == TYPE_DATE) {
+        if (ak == TYPE_DATE && bk == TYPE_DATE) { return a; }
+        if (ak == TYPE_INT || ak == TYPE_LONG) { return mk_type(TYPE_DATE); }
+        if (bk == TYPE_INT || bk == TYPE_LONG) { return mk_type(TYPE_DATE); }
+    }
+    // 数值升格 int → long → float → double
+    let rank = 0;
+    let ar = 1;
+    let br = 1;
+    if (ak == TYPE_INT) { ar = 1; }
+    else if (ak == TYPE_LONG) { ar = 2; }
+    else if (ak == TYPE_FLOAT) { ar = 3; }
+    else if (ak == TYPE_DOUBLE) { ar = 4; }
+    if (bk == TYPE_INT) { br = 1; }
+    else if (bk == TYPE_LONG) { br = 2; }
+    else if (bk == TYPE_FLOAT) { br = 3; }
+    else if (bk == TYPE_DOUBLE) { br = 4; }
+    let is_num = 0;
+    if (ar >= 1 && ar <= 4 && br >= 1 && br <= 4) { is_num = 1; }
+    if (is_num == 1) {
+        if (ar >= br) { return a; }
+        return b;
+    }
+    return mk_type(TYPE_ANY);
+}
+
+// ============ 泛型类型参数工具 ============
+// type_params: array<TypeParam>；判断 t 是否为其中某个类型参数
+pub kimo tc_is_type_param(t: Type, type_params: array<TypeParam>) -> int {
+    let k = t.kind;
+    if (k != TYPE_STRUCT && k != TYPE_ENUM && k != TYPE_ENUM_PAYLOAD) { return 0; }
+    let i = 0;
+    while (i < len(type_params)) {
+        let tp = type_params[i] as TypeParam;
+        if (str_eq(t.name, tp.name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo tc_type_param_index(name: string, type_params: array<TypeParam>) -> int {
+    let i = 0;
+    while (i < len(type_params)) {
+        let tp = type_params[i] as TypeParam;
+        if (str_eq(tp.name, name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// 类型参数是否允许数值运算：约束含数值基本类型（int/long/float/double/short/char/number）返回 1。
+// 约束为空（未限定）或非数值约束返回 0（保持原语义，避免误放宽）。
+pub kimo tc_tparam_constraints_numeric(name: string) -> int {
+    let i = 0;
+    while (i < len(tc_cur_tparams)) {
+        let tp = tc_cur_tparams[i] as TypeParam;
+        if (str_eq(tp.name, name) == 1) {
+            if (len(tp.constraints) == 0) { return 0; }
+            let j = 0;
+            while (j < len(tp.constraints)) {
+                let c = tp.constraints[j] as string;
+                if (str_eq(c, "int") == 1 || str_eq(c, "long") == 1 || str_eq(c, "float") == 1
+                    || str_eq(c, "double") == 1 || str_eq(c, "short") == 1 || str_eq(c, "char") == 1
+                    || str_eq(c, "number") == 1) { return 1; }
+                j = j + 1;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 泛型绑定推断（递归 unify）：declared（含类型参数）↔ actual（具体类型）
+//  - declared 是裸类型参数 → 绑定
+//  - declared 是含 param_types 的命名类型 → 按位递归（不管名字是否 mono 化）
+//  - declared 是 array/dict → 递归槽位
+pub kimo tc_infer_bindings(ctx: CompileContext, declared: Type, actual: Type, tparams: array<TypeParam>) -> void {
+    let dk = declared.kind;
+    if (dk == TYPE_STRUCT || dk == TYPE_ENUM || dk == TYPE_ENUM_PAYLOAD) {
+        // 裸类型参数
+        if (tc_type_param_index(declared.name, tparams) >= 0) {
+            if (tc_name_in_array(ctx.bind_names, declared.name) == 0) {
+                ctx.bind_names = array_push(ctx.bind_names, declared.name);
+                ctx.bind_types = array_push(ctx.bind_types, actual);
+            }
+            return;
+        }
+        // 命名类型带实参（泛型实例）→ 按位递归
+        if (len(declared.param_types) > 0 && len(actual.param_types) > 0) {
+            let i = 0;
+            while (i < len(declared.param_types) && i < len(actual.param_types)) {
+                tc_infer_bindings(ctx, declared.param_types[i], actual.param_types[i], tparams);
+                i = i + 1;
+            }
+        }
+        return;
+    }
+    if (dk == TYPE_ARRAY && actual.kind == TYPE_ARRAY) {
+        tc_infer_bindings(ctx, declared.elem_type, actual.elem_type, tparams);
+        return;
+    }
+    if (dk == TYPE_DICT && actual.kind == TYPE_DICT) {
+        tc_infer_bindings(ctx, declared.key_type, actual.key_type, tparams);
+        tc_infer_bindings(ctx, declared.val_type, actual.val_type, tparams);
+        return;
+    }
+}
+
+// 约束满足：constraints 为空通过；trait 名检查 impl；否则 compat
+pub kimo tc_satisfies_constraint(ctx: CompileContext, actual: Type, constraints: array<string>) -> int {
+    let n = len(constraints);
+    if (n == 0) { return 1; }
+    let i = 0;
+    while (i < n) {
+        let c = constraints[i] as string;
+        let td = tc_mg_lookup_trait(ctx, c);
+        if (tc_trait_is_none(td) == 0) {
+            // trait 约束：actual 为命名类型且实现之
+            let ak = actual.kind;
+            if (ak == TYPE_STRUCT || ak == TYPE_ENUM || ak == TYPE_ENUM_PAYLOAD) {
+                if (tc_type_impls_trait(ctx, actual.name, c) == 1) { return 1; }
+            }
+        } else {
+            // 基础类型约束：与约束类型名比较
+            let ct = mk_named_type(TYPE_STRUCT, c);
+            // 尝试把约束名解析为类型
+            let resolved = tc_resolve_type_name(ctx, c);
+            if (type_is_none(resolved) == 0) {
+                if (tc_type_compat(ctx, resolved, actual) == 1) { return 1; }
+            }
+            // int/long 互通
+            if (str_eq(c, "int") == 1 && actual.kind == TYPE_INT) { return 1; }
+            if (str_eq(c, "long") == 1 && actual.kind == TYPE_LONG) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 把类型名解析为 Type（基础类型名或 struct/enum 名）
+pub kimo tc_resolve_type_name(ctx: CompileContext, name: string) -> Type {
+    if (str_eq(name, "int") == 1) { return mk_type(TYPE_INT); }
+    if (str_eq(name, "long") == 1) { return mk_type(TYPE_LONG); }
+    if (str_eq(name, "float") == 1) { return mk_type(TYPE_FLOAT); }
+    if (str_eq(name, "double") == 1) { return mk_type(TYPE_DOUBLE); }
+    if (str_eq(name, "bool") == 1) { return mk_type(TYPE_BOOL); }
+    if (str_eq(name, "string") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "char") == 1) { return mk_type(TYPE_CHAR); }
+    if (str_eq(name, "short") == 1) { return mk_type(TYPE_SHORT); }
+    if (str_eq(name, "void") == 1) { return mk_type(TYPE_VOID); }
+    if (str_eq(name, "any") == 1) { return mk_type(TYPE_ANY); }
+    let sd = tc_mg_lookup_struct(ctx, name);
+    if (tc_struct_is_none(sd) == 0) {
+        // §3.8：FQN 写法 a.b.C 解析后回落为裸名，保持 codegen 侧符号不变
+        // 严格态：直接用注册名（mangled），保证 Type.name 与定义一致
+        let nm = name;
+        if (tc_has_dot(nm) == 1 || ctx.strict == 1) { nm = sd.name; }
+        let t = mk_named_type(TYPE_STRUCT, nm);
+        return t;
+    }
+    let ed = tc_mg_lookup_enum(ctx, name);
+    if (tc_enum_is_none(ed) == 0) {
+        let en = name;
+        if (tc_has_dot(en) == 1 || ctx.strict == 1) { en = ed.name; }
+        return tc_enum_type_for(ctx, en);
+    }
+    return type_none_inner();
+}
+
+// ============ 类型替换（泛型实例化） ============
+// bind_names/bind_types 平行数组；未绑定的类型参数 → TYPE_ANY
+pub kimo tc_substitute(t: Type, type_params: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> Type {
+    let k = t.kind;
+    // 类型参数（命名类型且名字命中 type_params）
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) {
+        let i = 0;
+        while (i < len(type_params)) {
+            let tp = type_params[i] as TypeParam;
+            if (str_eq(t.name, tp.name) == 1) {
+                // 找绑定
+                let j = 0;
+                while (j < len(bind_names)) {
+                    let bn = bind_names[j] as string;
+                    if (str_eq(t.name, bn) == 1) {
+                        return bind_types[j] as Type;
+                    }
+                    j = j + 1;
+                }
+                return mk_type(TYPE_ANY);
+            }
+            i = i + 1;
+        }
+    }
+    if (k == TYPE_ARRAY) {
+        let nt = mk_type(TYPE_ARRAY);
+        nt.elem_type = tc_substitute(t.elem_type, type_params, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_DICT) {
+        let nt = mk_type(TYPE_DICT);
+        nt.key_type = tc_substitute(t.key_type, type_params, bind_names, bind_types);
+        nt.val_type = tc_substitute(t.val_type, type_params, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_FUNCTION) {
+        let nt = mk_func_type(t.param_types, t.ret_type, t.captured_count);
+        let i = 0;
+        while (i < len(t.param_types)) {
+            nt.param_types[i] = tc_substitute(t.param_types[i], type_params, bind_names, bind_types);
+            i = i + 1;
+        }
+        nt.ret_type = tc_substitute(t.ret_type, type_params, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_TUPLE) {
+        let nt = mk_type(TYPE_TUPLE);
+        let i = 0;
+        while (i < len(t.param_types)) {
+            nt.param_types = array_push(nt.param_types, tc_substitute(t.param_types[i], type_params, bind_names, bind_types));
+            i = i + 1;
+        }
+        return nt;
+    }
+    // 结构体类型实参替换
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) {
+        if (len(t.param_types) > 0) {
+            let nt = mk_named_type(k, t.name);
+            let i = 0;
+            while (i < len(t.param_types)) {
+                nt.param_types = array_push(nt.param_types, tc_substitute(t.param_types[i], type_params, bind_names, bind_types));
+                i = i + 1;
+            }
+            return nt;
+        }
+    }
+    return t;
+}
+
+
+// ============ Prelude：Result<T,E> / Option<T> 预注册 ============
+let tc_prelude_registered: int = 0;
+
+// 注册内置泛型 enum 到当前模块节点（无用户定义时可使用）
+pub kimo tc_register_prelude(ctx: CompileContext) -> void {
+    let node = ctx.cur_node;
+    // Option<T>：Some(T), None
+    let opt_variants: array<EnumVariant> = [];
+    let some_payload: array<Type> = [];
+    some_payload = array_push(some_payload, mk_named_type(TYPE_STRUCT, "T"));
+    opt_variants = array_push(opt_variants, EnumVariant { name: "Some", payloads: some_payload, loc: mk_loc("prelude", 0, 0) });
+    let none_payload: array<Type> = [];
+    opt_variants = array_push(opt_variants, EnumVariant { name: "None", payloads: none_payload, loc: mk_loc("prelude", 0, 0) });
+    let opt_tparams: array<TypeParam> = [];
+    let opt_tp = TypeParam { name: "T", constraints: [] };
+    opt_tparams = array_push(opt_tparams, opt_tp);
+    let opt_def = EnumDef { name: "Option", variants: opt_variants, loc: mk_loc("prelude", 0, 0), is_pub: 1, type_params: opt_tparams };
+    node.enum_names = array_push(node.enum_names, "Option");
+    node.enum_defs = array_push(node.enum_defs, opt_def);
+
+    // Result<T,E>：Ok(T), Err(E)
+    let res_variants: array<EnumVariant> = [];
+    let ok_payload: array<Type> = [];
+    ok_payload = array_push(ok_payload, mk_named_type(TYPE_STRUCT, "T"));
+    res_variants = array_push(res_variants, EnumVariant { name: "Ok", payloads: ok_payload, loc: mk_loc("prelude", 0, 0) });
+    let err_payload: array<Type> = [];
+    err_payload = array_push(err_payload, mk_named_type(TYPE_STRUCT, "E"));
+    res_variants = array_push(res_variants, EnumVariant { name: "Err", payloads: err_payload, loc: mk_loc("prelude", 0, 0) });
+    let res_tparams: array<TypeParam> = [];
+    let res_tp = TypeParam { name: "T", constraints: [] };
+    let res_ep = TypeParam { name: "E", constraints: [] };
+    res_tparams = array_push(res_tparams, res_tp);
+    res_tparams = array_push(res_tparams, res_ep);
+    let res_def = EnumDef { name: "Result", variants: res_variants, loc: mk_loc("prelude", 0, 0), is_pub: 1, type_params: res_tparams };
+    node.enum_names = array_push(node.enum_names, "Result");
+    node.enum_defs = array_push(node.enum_defs, res_def);
+    ctx.cur_node = node;
+}
+
+// ============ Pass 1：声明收集 ============
+pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
+    if (tc_prelude_registered == 0) {
+        tc_register_prelude(ctx);
+        tc_prelude_registered = 1;
+    }
+    let node = ctx.cur_node;
+    let mod_name = prog.module_name;
+
+    // structs（严格态：模块前缀 mangle + 改写定义名；兼容态原名注册不变）
+    let i = 0;
+    while (i < len(prog.structs)) {
+        let sd = prog.structs[i] as StructDef;
+        let reg_name = tc_reg_name_for(ctx, sd.name, sd.loc.line, sd.is_pub, 0);
+        if (ctx.strict == 1) { sd.name = reg_name; }
+        let sdup = tc_node_lookup_struct(node, reg_name);
+        if (tc_struct_is_none(sdup) == 0) {
+            let msg = "redefinition of struct '" + sd.name + "' in module '" + mod_name + "'";
+            tc_error_at(ctx, sd.loc, msg);
+        } else {
+            node.struct_names = array_push(node.struct_names, reg_name);
+            node.struct_defs = array_push(node.struct_defs, sd);
+        }
+        i = i + 1;
+    }
+
+    // enums（严格态：同 struct；prelude 的 Option/Result 硬编码注册不经过此循环）
+    i = 0;
+    while (i < len(prog.enums)) {
+        let ed = prog.enums[i] as EnumDef;
+        let reg_name = tc_reg_name_for(ctx, ed.name, ed.loc.line, ed.is_pub, 0);
+        if (ctx.strict == 1) { ed.name = reg_name; }
+        let edup = tc_node_lookup_enum(node, reg_name);
+        if (tc_enum_is_none(edup) == 0) {
+            let msg = "redefinition of enum '" + ed.name + "' in module '" + mod_name + "'";
+            tc_error_at(ctx, ed.loc, msg);
+        } else {
+            node.enum_names = array_push(node.enum_names, reg_name);
+            node.enum_defs = array_push(node.enum_defs, ed);
+        }
+        i = i + 1;
+    }
+
+    // type aliases（严格态：同 struct）
+    i = 0;
+    while (i < len(prog.type_aliases)) {
+        let ta = prog.type_aliases[i] as TypeAlias;
+        let reg_name = tc_reg_name_for(ctx, ta.name, ta.loc.line, ta.is_pub, 0);
+        if (ctx.strict == 1) { ta.name = reg_name; }
+        let adup = tc_node_lookup_alias(node, reg_name);
+        if (tc_alias_is_none(adup) == 0) {
+            let msg = "redefinition of type alias '" + ta.name + "' in module '" + mod_name + "'";
+            tc_error_at(ctx, ta.loc, msg);
+        } else {
+            node.alias_names = array_push(node.alias_names, reg_name);
+            node.alias_defs = array_push(node.alias_defs, ta);
+        }
+        i = i + 1;
+    }
+
+    // traits（严格态：同 struct）
+    i = 0;
+    while (i < len(prog.traits)) {
+        let td = prog.traits[i] as TraitDef;
+        let reg_name = tc_reg_name_for(ctx, td.name, td.loc.line, td.is_pub, 0);
+        if (ctx.strict == 1) { td.name = reg_name; }
+        let tdup = tc_node_lookup_trait(node, reg_name);
+        if (tc_trait_is_none(tdup) == 0) {
+            let msg = "redefinition of trait '" + td.name + "' in module '" + mod_name + "'";
+            tc_error_at(ctx, td.loc, msg);
+        } else {
+            node.trait_names = array_push(node.trait_names, reg_name);
+            node.trait_defs = array_push(node.trait_defs, td);
+        }
+        i = i + 1;
+    }
+
+    // funcs（含 impl 方法；priv 名 mangling 豁免 extern/main/__impl__*/shadow_*/rt_*）
+    i = 0;
+    while (i < len(prog.funcs)) {
+        let fd = prog.funcs[i] as FuncDef;
+        let exempt = 0;
+        if (len(fd.extern_name) > 0) { exempt = 1; }
+        if (str_eq(fd.name, "main") == 1) { exempt = 1; }
+        if (str_starts_with(fd.name, "__impl__") == 1) { exempt = 1; }
+        // runtime 层符号（shadow_*/rt_*）被 codegen 按原名引用，严格态绝不能 mangle
+        if (str_starts_with(fd.name, "shadow_") == 1) { exempt = 1; }
+        if (str_starts_with(fd.name, "rt_") == 1) { exempt = 1; }
+        // 用户定义遮蔽同名内置（0.3 语义）：用 mangle 前的裸名登记，
+        // 供 tc_check_call 在内置白名单分支之前优先解析到用户定义。
+        if (exempt == 0) {
+            if (type_is_none(tc_builtin_ret_type(fd.name)) == 0) {
+                tc_builtin_shadow_add(fd.name);
+            }
+        }
+        // 源码原名：下面 fd.name 会被回写成 reg_name，而「跨模块 pub 同名避让」与
+        // 重定义诊断都必须基于原名计算，否则会在已 mangle 的名字上再 mangle 一次
+        // （__mod_M____mod_M__foo），把同模块重定义静默放过（ns_redef_fn / ns_dsb_name）。
+        let orig_name = fd.name;
+        let reg_name = tc_reg_name_for(ctx, fd.name, fd.loc.line, fd.is_pub, exempt);
+        // 兼容态也必须回写 fd.name：codegen（hir_lower_func / 调用点）一律用 fd.name 作为
+        // LLVM 符号名。若只改 reg_name（符号表）而 fd.name 保持裸名，本模块私有 add 与
+        // 被 import 模块的 pub add 会塌成同一个 @add，先注册者胜出 → 局部私有函数无法遮蔽
+        // 导入的同名 pub 函数（tc_module_namespace_local 期望 7 却得 13）。
+        // 0.3 参照实现同样发射 @__mod_<mod>__add + @add 两个符号。
+        fd.name = reg_name;
+        // 严格态：预先归一函数签名类型（参数/返回，按函数所属模块作用域）。
+        // 必须在注册时完成——调用点（如 recv.method() 分发）可能在函数体检查之前解析参数类型。
+        if (ctx.strict == 1) {
+            // 关键：register_decls 里所有 push 都在局部 node，末尾才回写 ctx.cur_node——
+            // 此处必须先接上，否则签名 resolve 的 lookup 看不到已注册的 structs/enums
+            ctx.cur_node = node;
+            let saved_mod = ctx.current_module;
+            ctx.current_module = tc_module_of_line(ctx, fd.loc.line);
+            let rpi = 0;
+            while (rpi < len(fd.params)) {
+                // Param 是值类型：必须直接写数组元素，局部变量修改不传播
+                let rp = fd.params[rpi] as Param;
+                let rpt = tc_resolve_type(ctx, rp.type_ref);
+                fd.params[rpi].type_ref = rpt;
+                rpi = rpi + 1;
+            }
+            fd.return_type = tc_resolve_type(ctx, fd.return_type);
+            ctx.current_module = saved_mod;
+        }
+        // 泛型函数：注册 pristine 模板
+        if (len(fd.type_params) > 0) {
+            ctx.mono_tmpl_names = array_push(ctx.mono_tmpl_names, reg_name);
+            ctx.mono_tmpl_defs = array_push(ctx.mono_tmpl_defs, fd);
+            ctx.mono_tmpl_mods = array_push(ctx.mono_tmpl_mods, mod_name);
+            node.func_names = array_push(node.func_names, reg_name);
+            node.func_defs = array_push(node.func_defs, fd);
+        } else {
+            let fdup = tc_node_lookup_func(node, reg_name);
+            if (tc_func_is_none(fdup) == 0) {
+                // extern 声明可重复（C 语义：同一符号多个 extern 声明合法；0.3 用例常自带
+                // @extern 包装声明，与 0.4 runtime_lib 的 extern 同名 → 兼容态拼接重复）。
+                // 非 extern（真实定义）重复 → 错误；兼容态 pub 跨模块同名 → 冲突方 mangle 重试。
+                if (len(fd.extern_name) == 0) {
+                    let fmod = tc_module_of_line(ctx, fd.loc.line);
+                    // 与 tc_reg_name_for 保持同一套模块归属：无模块信息（LSP/API 单 Program）
+                    // 时同样退回 current_module，否则避让名前缀是 __mod____ 与 reg_name 对不上。
+                    if (len(fmod) == 0) { fmod = ctx.current_module; }
+                    // 避让名基于【原名】：fd.name 已被回写成 reg_name，直接再 mangle 会得到
+                    // 双重前缀，使 fdup2 永远查不到 → 同模块重定义被当成「跨模块同名」放行。
+                    // 私有符号的 reg_name 本就含模块前缀，撞名只可能是同模块真重定义，
+                    // 此时 mangled2 == reg_name → fdup2 命中 → 正确报错。
+                    let mangled2 = tc_mangle_private(fmod, orig_name);
+                    let fdup2 = tc_node_lookup_func(node, mangled2);
+                    if (tc_func_is_none(fdup2) == 0) {
+                        let msg = "redefinition of function '" + orig_name + "' in module '" + mod_name + "'";
+                        tc_error_at(ctx, fd.loc, msg);
+                    } else {
+                        // 0.3 语义：pub 函数跨模块同名 → mangle 为 __mod_<mod>__<name>
+                        //（0.3 用 module__name；0.4 统一 tc_mangle_private 格式）。
+                        // 兼容态若冲突双方都是 pub：裸名被先注册者独占，后来者改名后
+                        // 再无人能用裸名引用到它 → 静默取第一个，违反 0.3「ambiguous」语义。
+                        // 记入冲突名单，由 tc_mg_lookup_func 在使用处报 ambiguous。
+                        if (ctx.strict == 0 && fd.is_pub == 1 && fdup.is_pub == 1) {
+                            tc_pub_conflict_add(orig_name);
+                        }
+                        fd.name = mangled2;
+                        node.func_names = array_push(node.func_names, mangled2);
+                        node.func_defs = array_push(node.func_defs, fd);
+                    }
+                }
+            } else {
+                node.func_names = array_push(node.func_names, reg_name);
+                node.func_defs = array_push(node.func_defs, fd);
+            }
+        }
+        i = i + 1;
+    }
+
+    // impls（key = trait@@type；严格态：type/trait 名解析成注册名（mangled），保证与 struct/trait 注册匹配）
+    i = 0;
+    while (i < len(prog.impls)) {
+        let id = prog.impls[i] as ImplDef;
+        if (ctx.strict == 1) {
+            let old_type = id.type_name;
+            let old_trait = id.trait_name;
+            let sd2 = tc_mg_lookup_struct(ctx, id.type_name);
+            if (tc_struct_is_none(sd2) == 0) { id.type_name = sd2.name; }
+            if (len(id.trait_name) > 0) {
+                let td2 = tc_mg_lookup_trait(ctx, id.trait_name);
+                if (tc_trait_is_none(td2) == 0) { id.trait_name = td2.name; }
+            }
+            // 同步改写 trait impl 方法符号：__impl__<type>__<trait>__<method> 的两段
+            let mi2 = 0;
+            while (mi2 < len(id.methods)) {
+                let mf = id.methods[mi2] as FuncDef;
+                if (str_starts_with(mf.name, "__impl__") == 1) {
+                    let body = substr2(mf.name, 8, len(mf.name));   // 去掉 "__impl__"
+                    let d1 = str_index_of(body, "__");
+                    if (d1 >= 0) {
+                        let rest1 = substr2(body, d1 + 2, len(body));
+                        let d2 = str_index_of(rest1, "__");
+                        if (d2 >= 0) {
+                            let method_seg = substr2(rest1, d2 + 2, len(rest1));
+                            mf.name = "__impl__" + id.type_name + "__" + id.trait_name + "__" + method_seg;
+                        }
+                    }
+                }
+                mi2 = mi2 + 1;
+            }
+        }
+        let key = id.trait_name + "@@" + id.type_name;
+        let idup = tc_node_lookup_impl(node, key);
+        if (tc_impl_is_none(idup) == 0) {
+            let msg = "duplicate impl '" + id.trait_name + "' for type '" + id.type_name + "'";
+            tc_error_at(ctx, id.loc, msg);
+        } else {
+            node.impl_keys = array_push(node.impl_keys, key);
+            node.impl_defs = array_push(node.impl_defs, id);
+        }
+        i = i + 1;
+    }
+
+    // globals（无类型注解 → TYPE_INFER 占位；兼容态保持原样：全局从不 mangle）
+    // 严格态：pub+私有全局按所属模块加前缀（同 FUNCS）；豁免 runtime 全局（SHADOW_*/rt_*/shadow_*）
+    i = 0;
+    while (i < len(prog.globals)) {
+        let gv = prog.globals[i] as GlobalVar;
+        let gty = gv.type_ref;
+        if (type_is_none(gty) == 1) { gty = mk_type(TYPE_INFER); }
+        let gexempt = 0;
+        if (str_starts_with(gv.name, "SHADOW_") == 1) { gexempt = 1; }
+        if (str_starts_with(gv.name, "rt_") == 1) { gexempt = 1; }
+        if (str_starts_with(gv.name, "shadow_") == 1) { gexempt = 1; }
+        let reg_name = gv.name;
+        if (ctx.strict == 1 && gexempt == 0) {
+            let gmod = tc_module_of_line(ctx, gv.loc.line);
+            reg_name = tc_mangle_private(gmod, gv.name);
+            gv.name = reg_name;
+        } else if (gexempt == 0 && gv.is_pub == 0) {
+            // 兼容态私有全局：按所属模块 mangle + 回写 gv.name，使 codegen 发射隔离符号、
+            // 调用点（tc_resolve_var_name 的私有分支用 ctx.current_module 算前缀）也能命中。
+            // 否则主模块可裸名引用被 import 模块的私有 let（tcf_pub_let_private_import 失守）。
+            let gmod = tc_module_of_line(ctx, gv.loc.line);
+            if (len(gmod) == 0) { gmod = ctx.current_module; }
+            reg_name = tc_mangle_private(gmod, gv.name);
+            gv.name = reg_name;
+        } else if (gv.is_pub == 1) {
+            // 兼容态：跨模块 pub let 同名（combined 同 node，前面模块已注册）→ 冲突方
+            // mangle 为 __mod_<mod>__<name>（0.3：module__name）。限定访问 module.var 经
+            // FQN 解析改写为注册名；模块内裸名引用经 tc_node_lookup_global 的 mangle 回退命中。
+            let pre = tc_node_lookup_global(node, gv.name, 0);
+            if (tc_global_is_none(pre) == 0) {
+                let gmod2 = tc_module_of_line(ctx, gv.loc.line);
+                reg_name = tc_mangle_private(gmod2, gv.name);
+                gv.name = reg_name;
+            }
+        }
+        node.global_names = array_push(node.global_names, reg_name);
+        node.global_types = array_push(node.global_types, gty);
+        node.global_pubs = array_push(node.global_pubs, gv.is_pub);
+        i = i + 1;
+    }
+
+    // imports
+    i = 0;
+    while (i < len(prog.imports)) {
+        node.imports = array_push(node.imports, prog.imports[i]);
+        i = i + 1;
+    }
+    ctx.cur_node = node;
+}
+
+// ============ 类型查找与解析 ============
+pub kimo tc_struct_lookup(ctx: CompileContext, name: string) -> StructDef {
+    return tc_mg_lookup_struct(ctx, name);
+}
+
+pub kimo tc_enum_lookup(ctx: CompileContext, name: string) -> EnumDef {
+    return tc_mg_lookup_enum(ctx, name);
+}
+
+// 检查 enum 是否至少一个变体带负载
+pub kimo tc_enum_has_payload(ctx: CompileContext, name: string) -> int {
+    let ed = tc_enum_lookup(ctx, name);
+    if (tc_enum_is_none(ed) == 1) { return 0; }
+    let i = 0;
+    while (i < len(ed.variants)) {
+        let v = ed.variants[i] as EnumVariant;
+        if (len(v.payloads) > 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 兼容态用：parser 对所有命名类型一律产出 mk_named_type(TYPE_STRUCT, ident)。
+// 严格态在 tc_check_function 里走 tc_resolve_type 归一，兼容态则原样入 env，
+// 于是「enum 类型的函数参数」kind 停留在 TYPE_STRUCT → tc_check_match 的
+// `sk == TYPE_ENUM || sk == TYPE_ENUM_PAYLOAD` 判定失败 → 报
+// "cannot destructure non-enum type 'X'"，且无负载 enum 会被静默当作 catch-all 绑定。
+// 这里只做最小归一：命名类型若确为已注册 enum，则换成正确的 enum kind；
+// 其余（struct/别名/泛型实例化）保持兼容态原有行为不动。
+pub kimo tc_normalize_enum_named(ctx: CompileContext, t: Type) -> Type {
+    if (t.kind != TYPE_STRUCT) { return t; }
+    if (len(t.name) == 0) { return t; }
+    let sd = tc_struct_lookup(ctx, t.name);
+    if (tc_struct_is_none(sd) == 0) { return t; }
+    let ed = tc_enum_lookup(ctx, t.name);
+    if (tc_enum_is_none(ed) == 1) { return t; }
+    let et = tc_enum_type_for(ctx, t.name);
+    et.param_types = t.param_types;
+    return et;
+}
+
+// enum 名 → 类型 kind（有负载 TYPE_ENUM_PAYLOAD，否则 TYPE_ENUM）
+pub kimo tc_enum_type_for(ctx: CompileContext, name: string) -> Type {
+    if (tc_enum_has_payload(ctx, name) == 1) {
+        return mk_named_type(TYPE_ENUM_PAYLOAD, name);
+    }
+    return mk_named_type(TYPE_ENUM, name);
+}
+
+pub kimo tc_func_lookup(ctx: CompileContext, name: string) -> FuncDef {
+    return tc_mg_lookup_func(ctx, name);
+}
+
+pub kimo tc_alias_lookup(ctx: CompileContext, name: string) -> TypeAlias {
+    return tc_mg_lookup_alias(ctx, name);
+}
+
+pub kimo tc_trait_lookup(ctx: CompileContext, name: string) -> TraitDef {
+    return tc_mg_lookup_trait(ctx, name);
+}
+
+// 在所有已注册 enum 中找含 variant_name 变体的 enum
+pub kimo tc_enum_find_variant_global(ctx: CompileContext, variant_name: string) -> EnumDef {
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let ei = 0;
+        while (ei < len(gnode.enum_defs)) {
+            let ed = gnode.enum_defs[ei] as EnumDef;
+            let vi = 0;
+            while (vi < len(ed.variants)) {
+                let v = ed.variants[vi] as EnumVariant;
+                if (str_eq(v.name, variant_name) == 1) { return ed; }
+                vi = vi + 1;
+            }
+            ei = ei + 1;
+        }
+        gi = gi + 1;
+    }
+    // 当前模块
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let ei2 = 0;
+        while (ei2 < len(cur.enum_defs)) {
+            let ed2 = cur.enum_defs[ei2] as EnumDef;
+            let vi2 = 0;
+            while (vi2 < len(ed2.variants)) {
+                let v2 = ed2.variants[vi2] as EnumVariant;
+                if (str_eq(v2.name, variant_name) == 1) { return ed2; }
+                vi2 = vi2 + 1;
+            }
+            ei2 = ei2 + 1;
+        }
+    }
+    let z = 0 as EnumDef;
+    return z;
+}
+
+// 在指定 enum 中找变体索引（找不到 -1）
+pub kimo tc_enum_variant_index(ed: EnumDef, variant_name: string) -> int {
+    let i = 0;
+    while (i < len(ed.variants)) {
+        let v = ed.variants[i] as EnumVariant;
+        if (str_eq(v.name, variant_name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ============ 类型解析（递归解别名 + 泛型 struct 单态化触发） ============
+pub kimo tc_resolve_type(ctx: CompileContext, t: Type) -> Type {
+    let k = t.kind;
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) {
+        // 严格态：裸类型名先归一为注册名（mangled），后续查找/比较全用注册名（等价 Java FQN 符号表）
+        let name = tc_strict_resolve_name(ctx, t.name);
+        // §3.8 兼容态：FQN 类型名 a.b.C → 归一为裸名后重入（codegen 不感知命名空间）
+        if (tc_has_dot(name) == 1) {
+            let bare = "";
+            let fs = tc_resolve_fqn_struct(ctx, name);
+            if (tc_struct_is_none(fs) == 0) { bare = fs.name; }
+            if (len(bare) == 0) {
+                let fe = tc_resolve_fqn_enum(ctx, name);
+                if (tc_enum_is_none(fe) == 0) { bare = fe.name; }
+            }
+            if (len(bare) == 0) {
+                let fa = tc_resolve_fqn_alias(ctx, name);
+                if (tc_alias_is_none(fa) == 0) { bare = fa.name; }
+            }
+            if (len(bare) > 0) {
+                let bt = mk_named_type(k, bare);
+                bt.param_types = t.param_types;
+                return tc_resolve_type(ctx, bt);
+            }
+        }
+        // 先解别名
+        let ta = tc_alias_lookup(ctx, name);
+        if (tc_alias_is_none(ta) == 0) {
+            let target = ta.target;
+            if (len(t.param_types) > 0 && (k == TYPE_STRUCT)) {
+                // 别名带实参：先替换再解析
+                let nt = mk_named_type(k, name);
+                let i = 0;
+                while (i < len(t.param_types)) {
+                    nt.param_types = array_push(nt.param_types, t.param_types[i]);
+                    i = i + 1;
+                }
+                return tc_resolve_type(ctx, tc_substitute(target, [], [], t.param_types));
+            }
+            return tc_resolve_type(ctx, target);
+        }
+        // 泛型 struct 有实参 → 单态化实例化
+        if (k == TYPE_STRUCT && len(t.param_types) > 0) {
+            let sd = tc_struct_lookup(ctx, name);
+            if (tc_struct_is_none(sd) == 0 && len(sd.type_params) > 0) {
+                let mono_name = tc_struct_mono_instantiate(ctx, name, t.param_types);
+                if (len(mono_name) > 0) {
+                    let mt = mk_named_type(TYPE_STRUCT, mono_name);
+                    // 保留实参（供泛型调用 unify 反推绑定）
+                    mt.param_types = t.param_types;
+                    return mt;
+                }
+            }
+        }
+        // enum 透传 param_types
+        let ed = tc_enum_lookup(ctx, name);
+        if (tc_enum_is_none(ed) == 0) {
+            let et = tc_enum_type_for(ctx, name);
+            et.param_types = t.param_types;
+            return et;
+        }
+        // 严格态：name 已被 tc_strict_resolve_name 归一为注册名（mangled）——
+        // 若改名则必须返回改名副本，否则调用方拿到的仍是裸名（类型比较失配）
+        if (str_eq(name, t.name) == 0) {
+            let nt = mk_named_type(k, name);
+            nt.param_types = t.param_types;
+            return nt;
+        }
+        return t;
+    }
+    if (k == TYPE_ARRAY) {
+        let nt = mk_type(TYPE_ARRAY);
+        nt.elem_type = tc_resolve_type(ctx, t.elem_type);
+        return nt;
+    }
+    if (k == TYPE_DICT) {
+        let nt = mk_type(TYPE_DICT);
+        nt.key_type = tc_resolve_type(ctx, t.key_type);
+        nt.val_type = tc_resolve_type(ctx, t.val_type);
+        return nt;
+    }
+    if (k == TYPE_FUNCTION) {
+        let nt = mk_func_type(t.param_types, t.ret_type, t.captured_count);
+        let i = 0;
+        while (i < len(t.param_types)) {
+            nt.param_types[i] = tc_resolve_type(ctx, t.param_types[i]);
+            i = i + 1;
+        }
+        nt.ret_type = tc_resolve_type(ctx, t.ret_type);
+        return nt;
+    }
+    return t;
+}
+
+// struct 字段的默认值表达式（STRUCT_LIT 缺省字段）
+pub kimo tc_default_field_expr(ctx: CompileContext, ft: Type, loc: Location) -> Expr {
+    let k = ft.kind;
+    if (k == TYPE_INT || k == TYPE_SHORT || k == TYPE_CHAR || k == TYPE_DATE) {
+        let e = mk_expr(EXPR_INT, loc);
+        e.intval = 0;
+        e.inferred_type = ft;
+        return e;
+    }
+    if (k == TYPE_LONG || k == TYPE_TIMESTAMP || k == TYPE_NANOTIMESTAMP) {
+        let e = mk_expr(EXPR_LONG, loc);
+        e.intval = 0;
+        e.inferred_type = ft;
+        return e;
+    }
+    if (k == TYPE_FLOAT || k == TYPE_DOUBLE) {
+        let e = mk_expr(EXPR_FLOAT, loc);
+        e.floatval = 0.0;
+        e.str1 = "0";
+        e.inferred_type = ft;
+        return e;
+    }
+    if (k == TYPE_BOOL) {
+        let e = mk_expr(EXPR_BOOL, loc);
+        e.intval = 0;
+        e.inferred_type = ft;
+        return e;
+    }
+    if (k == TYPE_STRING) {
+        let e = mk_expr(EXPR_STRING, loc);
+        e.str1 = "";
+        e.inferred_type = ft;
+        return e;
+    }
+    // 其余（struct/enum/array/dict/any 等）：null 表达式
+    let e = mk_expr(EXPR_NULL, loc);
+    e.inferred_type = ft;
+    return e;
+}
+
+// ============ trait / impl ============
+// 收集当前模块可见的全部 impl（含导入模块——简化：全局扫）
+pub kimo tc_impl_collect_visible(ctx: CompileContext) -> array<ImplDef> {
+    let out: array<ImplDef> = [];
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let ii = 0;
+        while (ii < len(gnode.impl_defs)) {
+            out = array_push(out, gnode.impl_defs[ii]);
+            ii = ii + 1;
+        }
+        gi = gi + 1;
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let ii2 = 0;
+        while (ii2 < len(cur.impl_defs)) {
+            out = array_push(out, cur.impl_defs[ii2]);
+            ii2 = ii2 + 1;
+        }
+    }
+    return out;
+}
+
+// type_name 是否实现 trait_name（impl 查找）
+pub kimo tc_type_impls_trait(ctx: CompileContext, type_name: string, trait_name: string) -> int {
+    let key = trait_name + "@@" + type_name;
+    let id = tc_mg_lookup_impl(ctx, key);
+    if (tc_impl_is_none(id) == 0) { return 1; }
+    return 0;
+}
+
+// 在可见 impl 中找 (type_name, 方法名) 匹配的 impl 方法，返回 mangled 名（找不到空）
+pub kimo tc_impl_find_method(ctx: CompileContext, type_name: string, method_name: string) -> string {
+    let impls = tc_impl_collect_visible(ctx);
+    let i = 0;
+    while (i < len(impls)) {
+        let id = impls[i] as ImplDef;
+        if (str_eq(id.type_name, type_name) == 1) {
+            let j = 0;
+            while (j < len(id.methods)) {
+                let m = id.methods[j] as FuncDef;
+                if (str_eq(m.name, method_name) == 1) {
+                    let trait_n = id.trait_name;
+                    if (len(trait_n) == 0) { return method_name; }
+                    return "__impl__" + type_name + "__" + trait_n + "__" + method_name;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// impl 完整性检查：trait 每个方法在 impl 中都有实现且签名兼容
+pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, type_name: string) -> array<string> {
+    let errs: array<string> = [];
+    let td = tc_trait_lookup(ctx, trait_name);
+    if (tc_trait_is_none(td) == 1) { return errs; }
+    let key = trait_name + "@@" + type_name;
+    let id = tc_mg_lookup_impl(ctx, key);
+    let i = 0;
+    while (i < len(td.methods)) {
+        let tm = td.methods[i] as FuncDef;
+        let found = 0;
+        if (tc_impl_is_none(id) == 0) {
+            let j = 0;
+            while (j < len(id.methods)) {
+                let im = id.methods[j] as FuncDef;
+                if (str_eq(im.name, tm.name) == 1) {
+                    found = 1;
+                    // 参数数匹配
+                    if (len(im.params) != len(tm.params)) {
+                        let m = "method '" + tm.name + "' has " + int_to_str(len(im.params)) + " params but trait expects " + int_to_str(len(tm.params));
+                        errs = array_push(errs, m);
+                    } else {
+                        // 参数类型匹配（Self → type_name）
+                        let pi = 0;
+                        while (pi < len(tm.params)) {
+                            let tp = tm.params[pi] as Param;
+                            let ip = im.params[pi] as Param;
+                            let t_ty = tp.type_ref;
+                            let i_ty = ip.type_ref;
+                            // Self 或 trait 名（self 参数）→ 匹配实现类型或 any
+                            let is_self = 0;
+                            if (str_eq(t_ty.name, "Self") == 1) { is_self = 1; }
+                            if (str_eq(t_ty.name, trait_name) == 1) { is_self = 1; }
+                            if (is_self == 1) {
+                                let st = mk_named_type(TYPE_STRUCT, type_name);
+                                if (tc_type_compat(ctx, st, i_ty) == 0 && i_ty.kind != TYPE_ANY) {
+                                    let m2 = "method '" + tm.name + "' param " + int_to_str(pi + 1) + " type mismatch";
+                                    errs = array_push(errs, m2);
+                                }
+                            } else if (tc_type_compat(ctx, t_ty, i_ty) == 0) {
+                                let m2 = "method '" + tm.name + "' param " + int_to_str(pi + 1) + " type mismatch";
+                                errs = array_push(errs, m2);
+                            }
+                            pi = pi + 1;
+                        }
+                        // 返回类型匹配（Self → type_name；trait 声明 string 但 impl 返回 int 应拒绝）
+                        let trt = tm.return_type;
+                        let irt = im.return_type;
+                        if (str_eq(trt.name, "Self") == 1) {
+                            let st = mk_named_type(TYPE_STRUCT, type_name);
+                            if (tc_type_compat(ctx, st, irt) == 0 && irt.kind != TYPE_ANY) {
+                                let mr = "method '" + tm.name + "' return type mismatch";
+                                errs = array_push(errs, mr);
+                            }
+                        } else if (tc_type_compat(ctx, trt, irt) == 0 && trt.kind != TYPE_INFER && irt.kind != TYPE_INFER) {
+                            let mr = "method '" + tm.name + "' return type mismatch";
+                            errs = array_push(errs, mr);
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        if (found == 0) {
+            let m = "missing method '" + tm.name + "'";
+            errs = array_push(errs, m);
+        }
+        i = i + 1;
+    }
+    return errs;
+}
+
+
+// ============ 泛型真单态化 ============
+// 特化名：name__T_<tag>__...（tag：struct/enum 用名，array→arr_，dict→dict_k_v）
+pub kimo tc_mono_type_tag(t: Type) -> string {
+    let k = t.kind;
+    if (k == TYPE_INT) { return "int"; }
+    if (k == TYPE_LONG) { return "long"; }
+    if (k == TYPE_FLOAT) { return "float"; }
+    if (k == TYPE_DOUBLE) { return "double"; }
+    if (k == TYPE_BOOL) { return "bool"; }
+    if (k == TYPE_CHAR) { return "char"; }
+    if (k == TYPE_SHORT) { return "short"; }
+    if (k == TYPE_STRING) { return "string"; }
+    if (k == TYPE_VOID) { return "void"; }
+    if (k == TYPE_ANY) { return "any"; }
+    if (k == TYPE_ARRAY) { return "arr_" + tc_mono_type_tag(t.elem_type); }
+    if (k == TYPE_DICT) { return "dict_" + tc_mono_type_tag(t.key_type) + "_" + tc_mono_type_tag(t.val_type); }
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) { return t.name; }
+    if (k == TYPE_DATE) { return "date"; }
+    if (k == TYPE_TIMESTAMP) { return "timestamp"; }
+    if (k == TYPE_NANOTIMESTAMP) { return "nanotimestamp"; }
+    if (k == TYPE_OPAQUE) { return "opaque"; }
+    if (k == TYPE_SET) { return "set_" + tc_mono_type_tag(t.elem_type); }
+    if (k == TYPE_FUTURE) { return "future"; }
+    return "any";
+}
+
+// 是否可绑定（单态化）——FUNCTION/TUPLE 回退擦除
+pub kimo tc_mono_bindable(ctx: CompileContext, t: Type) -> int {
+    let k = t.kind;
+    if (k == TYPE_FUNCTION) { return 0; }
+    if (k == TYPE_TUPLE) { return 0; }
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) {
+        // 是类型参数 → 不可绑定（调用方处理）
+        return 0;
+    }
+    return 1;
+}
+
+// 判断类型是否为未绑定的类型参数（名字命中某模板的参数）
+pub kimo tc_is_unbound_tparam(t: Type, tparams: array<TypeParam>) -> int {
+    let k = t.kind;
+    if (k != TYPE_STRUCT && k != TYPE_ENUM && k != TYPE_ENUM_PAYLOAD) { return 0; }
+    let i = 0;
+    while (i < len(tparams)) {
+        let tp = tparams[i] as TypeParam;
+        if (str_eq(t.name, tp.name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 泛型类型实例化（递归替换槽位；未绑定 → any）
+pub kimo tc_mono_type(t: Type, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> Type {
+    let k = t.kind;
+    if (tc_is_unbound_tparam(t, tparams) == 1) {
+        let i = 0;
+        while (i < len(bind_names)) {
+            let bn = bind_names[i] as string;
+            if (str_eq(t.name, bn) == 1) {
+                return bind_types[i] as Type;
+            }
+            i = i + 1;
+        }
+        return mk_type(TYPE_ANY);
+    }
+    if (k == TYPE_ARRAY) {
+        let nt = mk_type(TYPE_ARRAY);
+        nt.elem_type = tc_mono_type(t.elem_type, tparams, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_DICT) {
+        let nt = mk_type(TYPE_DICT);
+        nt.key_type = tc_mono_type(t.key_type, tparams, bind_names, bind_types);
+        nt.val_type = tc_mono_type(t.val_type, tparams, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_FUNCTION) {
+        let nt = mk_func_type([], mk_type(TYPE_ANY), 0);
+        let i = 0;
+        while (i < len(t.param_types)) {
+            nt.param_types = array_push(nt.param_types, tc_mono_type(t.param_types[i], tparams, bind_names, bind_types));
+            i = i + 1;
+        }
+        nt.ret_type = tc_mono_type(t.ret_type, tparams, bind_names, bind_types);
+        return nt;
+    }
+    if (k == TYPE_TUPLE) {
+        let nt = mk_type(TYPE_TUPLE);
+        let i = 0;
+        while (i < len(t.param_types)) {
+            nt.param_types = array_push(nt.param_types, tc_mono_type(t.param_types[i], tparams, bind_names, bind_types));
+            i = i + 1;
+        }
+        return nt;
+    }
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) {
+        if (len(t.param_types) > 0) {
+            let nt = mk_named_type(k, t.name);
+            let i = 0;
+            while (i < len(t.param_types)) {
+                nt.param_types = array_push(nt.param_types, tc_mono_type(t.param_types[i], tparams, bind_names, bind_types));
+                i = i + 1;
+            }
+            return nt;
+        }
+    }
+    return t;
+}
+
+// 深拷贝 Expr 并做类型替换（单态化克隆）
+pub kimo tc_mono_clone_expr(e: Expr, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> Expr {
+    if (expr_is_none(e) == 1) { return e; }
+    let ne = mk_expr(e.kind, e.loc);
+    ne.str1 = e.str1;
+    ne.str2 = e.str2;
+    ne.intval = e.intval;
+    ne.floatval = e.floatval;
+    if (expr_is_none(e.child1) == 0) { ne.child1 = tc_mono_clone_expr(e.child1, tparams, bind_names, bind_types); }
+    if (expr_is_none(e.child2) == 0) { ne.child2 = tc_mono_clone_expr(e.child2, tparams, bind_names, bind_types); }
+    if (expr_is_none(e.child3) == 0) { ne.child3 = tc_mono_clone_expr(e.child3, tparams, bind_names, bind_types); }
+    let i = 0;
+    while (i < len(e.items)) {
+        ne.items = array_push(ne.items, tc_mono_clone_expr(e.items[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.items2)) {
+        ne.items2 = array_push(ne.items2, tc_mono_clone_expr(e.items2[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.str_items)) {
+        ne.str_items = array_push(ne.str_items, e.str_items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.type_args)) {
+        ne.type_args = array_push(ne.type_args, tc_mono_type(e.type_args[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    let it = e.inferred_type;
+    if (type_is_none(it) == 0) {
+        ne.inferred_type = tc_mono_type(it, tparams, bind_names, bind_types);
+    } else {
+        ne.inferred_type = it;
+    }
+    return ne;
+}
+
+// 深拷贝 Stmt 并做类型替换
+pub kimo tc_mono_clone_stmt(s: Stmt, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> Stmt {
+    if (stmt_is_none(s) == 1) { return s; }
+    let ns = mk_stmt(s.kind, s.loc);
+    ns.str1 = s.str1;
+    ns.str2 = s.str2;
+    ns.intval = s.intval;
+    ns.floatval = s.floatval;
+    if (stmt_is_none(s.child1) == 0) { ns.child1 = tc_mono_clone_stmt(s.child1, tparams, bind_names, bind_types); }
+    if (stmt_is_none(s.child2) == 0) { ns.child2 = tc_mono_clone_stmt(s.child2, tparams, bind_names, bind_types); }
+    if (stmt_is_none(s.child3) == 0) { ns.child3 = tc_mono_clone_stmt(s.child3, tparams, bind_names, bind_types); }
+    let i = 0;
+    while (i < len(s.items)) {
+        ns.items = array_push(ns.items, tc_mono_clone_stmt(s.items[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(s.items2)) {
+        ns.items2 = array_push(ns.items2, tc_mono_clone_stmt(s.items2[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(s.exprs)) {
+        ns.exprs = array_push(ns.exprs, tc_mono_clone_expr(s.exprs[i], tparams, bind_names, bind_types));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(s.str_items)) {
+        ns.str_items = array_push(ns.str_items, s.str_items[i]);
+        i = i + 1;
+    }
+    if (expr_is_none(s.expr1) == 0) { ns.expr1 = tc_mono_clone_expr(s.expr1, tparams, bind_names, bind_types); }
+    if (expr_is_none(s.expr2) == 0) { ns.expr2 = tc_mono_clone_expr(s.expr2, tparams, bind_names, bind_types); }
+    ns.type1 = tc_mono_type(s.type1, tparams, bind_names, bind_types);
+    return ns;
+}
+
+// 深拷贝 FuncDef 并做类型替换（单态化特化）
+pub kimo tc_mono_clone_funcdef(ctx: CompileContext, fd: FuncDef, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> FuncDef {
+    let nf = FuncDef {
+        name: fd.name,
+        params: [],
+        return_type: tc_mono_type(fd.return_type, tparams, bind_names, bind_types),
+        body: fd.body,
+        loc: fd.loc,
+        is_pub: fd.is_pub,
+        is_extern: fd.is_extern,
+        extern_name: fd.extern_name,
+        type_params: [],
+        is_async: fd.is_async,
+        is_macro: fd.is_macro,
+    };
+    // 返回类型替换后 resolve（泛型 struct 实例 → 特化名）
+    let nf_rt = tc_resolve_type(ctx, nf.return_type);
+    nf.return_type = nf_rt;
+    let i = 0;
+    while (i < len(fd.params)) {
+        let p = fd.params[i] as Param;
+        let np = Param {
+            name: p.name,
+            type_ref: tc_mono_type(p.type_ref, tparams, bind_names, bind_types),
+            loc: p.loc,
+            is_mut: p.is_mut,
+            is_variadic: p.is_variadic,
+            default_value: p.default_value,
+        };
+        // 参数类型替换后 resolve（泛型 struct 实例 → 特化名）
+        let np_rt = tc_resolve_type(ctx, np.type_ref);
+        np.type_ref = np_rt;
+        nf.params = array_push(nf.params, np);
+        i = i + 1;
+    }
+    if (stmt_is_none(fd.body) == 0) {
+        nf.body = tc_mono_clone_stmt(fd.body, tparams, bind_names, bind_types);
+    }
+    return nf;
+}
+
+// ============ 泛型结构体单态化 ============
+pub kimo tc_struct_mono_clone(sd: StructDef, bind_names: array<string>, bind_types: array<Type>) -> StructDef {
+    let ns = StructDef {
+        name: sd.name,
+        fields: [],
+        loc: sd.loc,
+        is_pub: sd.is_pub,
+        type_params: [],
+    };
+    let i = 0;
+    while (i < len(sd.fields)) {
+        let f = sd.fields[i] as StructField;
+        let nf = StructField {
+            name: f.name,
+            type_ref: tc_mono_type(f.type_ref, sd.type_params, bind_names, bind_types),
+            loc: f.loc,
+            is_pub: f.is_pub,
+        };
+        ns.fields = array_push(ns.fields, nf);
+        i = i + 1;
+    }
+    return ns;
+}
+
+pub kimo tc_struct_mono_name(base_name: string, type_args: array<Type>) -> string {
+    let s = base_name + "__T_";
+    let i = 0;
+    while (i < len(type_args)) {
+        let t = type_args[i] as Type;
+        s = s + tc_mono_type_tag(t);
+        if (i < len(type_args) - 1) { s = s + "_"; }
+        i = i + 1;
+    }
+    // 防多态递归无限链：截断 ≤240 字符
+    if (len(s) > 240) {
+        let cut = "";
+        let j = 0;
+        while (j < 240) {
+            cut = cut + s[j];
+            j = j + 1;
+        }
+        return cut;
+    }
+    return s;
+}
+
+// 实例化泛型 struct（注册特化副本到当前模块；返回特化名）
+pub kimo tc_struct_mono_instantiate(ctx: CompileContext, base_name: string, type_args: array<Type>) -> string {
+    let mono_name = tc_struct_mono_name(base_name, type_args);
+    // 已实例化缓存
+    let ci = 0;
+    while (ci < len(ctx.struct_mono_cache)) {
+        let c = ctx.struct_mono_cache[ci] as string;
+        if (str_eq(c, mono_name) == 1) { return mono_name; }
+        ci = ci + 1;
+    }
+    // 找模板
+    let ti = 0;
+    let tmpl = 0 as StructDef;
+    let found = 0;
+    while (ti < len(ctx.struct_mono_tmpl_names)) {
+        let tn = ctx.struct_mono_tmpl_names[ti] as string;
+        if (str_eq(tn, base_name) == 1) {
+            tmpl = ctx.struct_mono_tmpl_defs[ti] as StructDef;
+            found = 1;
+            break;
+        }
+        ti = ti + 1;
+    }
+    if (found == 0) { return ""; }
+    // 绑定名（模板参数名 → 实参）
+    let bind_names: array<string> = [];
+    let bind_types: array<Type> = [];
+    let bi = 0;
+    while (bi < len(tmpl.type_params)) {
+        let tp = tmpl.type_params[bi] as TypeParam;
+        bind_names = array_push(bind_names, tp.name);
+        let arg = type_args[bi] as Type;
+        bind_types = array_push(bind_types, arg);
+        bi = bi + 1;
+    }
+    let mono_sd = tc_struct_mono_clone(tmpl, bind_names, bind_types);
+    mono_sd.name = mono_name;
+    // 注册到当前模块（特化名 pub，避免查找歧义）
+    let node = ctx.cur_node;
+    node.struct_names = array_push(node.struct_names, mono_name);
+    node.struct_defs = array_push(node.struct_defs, mono_sd);
+    ctx.cur_node = node;
+    ctx.struct_mono_cache = array_push(ctx.struct_mono_cache, mono_name);
+    return mono_name;
+}
+
+// 泛型函数模板查找（按注册名）
+pub kimo tc_mono_tmpl_find(ctx: CompileContext, name: string) -> int {
+    let i = 0;
+    while (i < len(ctx.mono_tmpl_names)) {
+        let tn = ctx.mono_tmpl_names[i] as string;
+        if (str_eq(tn, name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ============ 闭包捕获分析 ============
+pub kimo tc_name_in_array(names: array<string>, name: string) -> int {
+    let i = 0;
+    while (i < len(names)) {
+        let n = names[i] as string;
+        if (str_eq(n, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo tc_free_vars_add(ctx: CompileContext, name: string) -> void {
+    if (tc_name_in_array(ctx.free_vars_names, name) == 0) {
+        ctx.free_vars_names = array_push(ctx.free_vars_names, name);
+    }
+}
+
+// 递归收集 Expr 中的自由变量（EXPR_VAR）
+pub kimo tc_collect_free_vars_expr(ctx: CompileContext, e: Expr) -> void {
+    if (expr_is_none(e) == 1) { return; }
+    let k = e.kind;
+    if (k == EXPR_VAR) {
+        tc_free_vars_add(ctx, e.str1);
+    }
+    if (expr_is_none(e.child1) == 0) { tc_collect_free_vars_expr(ctx, e.child1); }
+    if (expr_is_none(e.child2) == 0) { tc_collect_free_vars_expr(ctx, e.child2); }
+    if (expr_is_none(e.child3) == 0) { tc_collect_free_vars_expr(ctx, e.child3); }
+    let i = 0;
+    while (i < len(e.items)) {
+        tc_collect_free_vars_expr(ctx, e.items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(e.items2)) {
+        tc_collect_free_vars_expr(ctx, e.items2[i]);
+        i = i + 1;
+    }
+}
+
+// 递归收集 Stmt 中的自由变量
+pub kimo tc_collect_free_vars_stmt(ctx: CompileContext, s: Stmt) -> void {
+    if (stmt_is_none(s) == 1) { return; }
+    if (expr_is_none(s.expr1) == 0) { tc_collect_free_vars_expr(ctx, s.expr1); }
+    if (expr_is_none(s.expr2) == 0) { tc_collect_free_vars_expr(ctx, s.expr2); }
+    let i = 0;
+    while (i < len(s.exprs)) {
+        tc_collect_free_vars_expr(ctx, s.exprs[i]);
+        i = i + 1;
+    }
+    if (stmt_is_none(s.child1) == 0) { tc_collect_free_vars_stmt(ctx, s.child1); }
+    if (stmt_is_none(s.child2) == 0) { tc_collect_free_vars_stmt(ctx, s.child2); }
+    if (stmt_is_none(s.child3) == 0) { tc_collect_free_vars_stmt(ctx, s.child3); }
+    i = 0;
+    while (i < len(s.items)) {
+        tc_collect_free_vars_stmt(ctx, s.items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(s.items2)) {
+        tc_collect_free_vars_stmt(ctx, s.items2[i]);
+        i = i + 1;
+    }
+}
+
+// 闭包本地绑定名收集（排除集）
+pub kimo tc_local_names_add(names: array<string>, name: string) -> array<string> {
+    if (tc_name_in_array(names, name) == 0) {
+        names = array_push(names, name);
+    }
+    return names;
+}
+
+pub kimo tc_local_names_add_commas(names: array<string>, spec: string) -> array<string> {
+    let parts = tc_split_commas(spec);
+    let i = 0;
+    while (i < len(parts)) {
+        names = tc_local_names_add(names, parts[i]);
+        i = i + 1;
+    }
+    return names;
+}
+
+// 从 match 模式收集绑定名
+pub kimo tc_local_names_from_pattern(names: array<string>, pat: Expr) -> array<string> {
+    if (expr_is_none(pat) == 1) { return names; }
+    let k = pat.kind;
+    if (k == EXPR_VAR) {
+        let nm = pat.str1;
+        if (str_eq(nm, "_") == 0) {
+            names = tc_local_names_add(names, nm);
+        }
+    } else if (k == EXPR_ENUM_VARIANT) {
+        let i = 0;
+        while (i < len(pat.str_items)) {
+            names = tc_local_names_add(names, pat.str_items[i]);
+            i = i + 1;
+        }
+    }
+    return names;
+}
+
+// 从语句块收集本地绑定（let/for/闭包参数排除）
+pub kimo tc_collect_local_names_stmt(names: array<string>, s: Stmt) -> array<string> {
+    if (stmt_is_none(s) == 1) { return names; }
+    let k = s.kind;
+    if (k == STMT_LET) {
+        names = tc_local_names_add(names, s.str1);
+    } else if (k == STMT_FOR) {
+        names = tc_local_names_add_commas(names, s.str1);
+    }
+    let i = 0;
+    while (i < len(s.items)) {
+        names = tc_collect_local_names_stmt(names, s.items[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(s.items2)) {
+        names = tc_collect_local_names_stmt(names, s.items2[i]);
+        i = i + 1;
+    }
+    return names;
+}
+
+
+// 当前函数类型参数（全局；单线程编译阶段用，Phase 11 收进 ctx）
+let tc_cur_tparams: array<TypeParam> = [];
+
+pub kimo tc_set_cur_tparams(tps: array<TypeParam>) -> void { tc_cur_tparams = tps; }
+
+// ============ 内置函数白名单 ============
+// 返回内置结果类型（type_none = 非内置）
+pub kimo tc_builtin_ret_type(name: string) -> Type {
+    if (str_eq(name, "println") == 1 || str_eq(name, "print") == 1) { return mk_type(TYPE_UNIT); }
+    if (str_eq(name, "len") == 1) { return mk_type(TYPE_INT); }
+    if (str_eq(name, "to_string") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "int_to_str") == 1 || str_eq(name, "long_to_str") == 1 ||
+        str_eq(name, "float_to_str") == 1 || str_eq(name, "double_to_str") == 1 ||
+        str_eq(name, "bool_to_str") == 1 || str_eq(name, "char_to_str") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "array_push") == 1) { return mk_type(TYPE_ARRAY); }
+    if (str_eq(name, "substr2") == 1 || str_eq(name, "str_replace") == 1 ||
+        str_eq(name, "str_trim") == 1 || str_eq(name, "str_to_upper") == 1 ||
+        str_eq(name, "str_to_lower") == 1 || str_eq(name, "str_char_at") == 1 ||
+        str_eq(name, "str_join") == 1 || str_eq(name, "str_format") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "str_eq") == 1 || str_eq(name, "str_contains") == 1 ||
+        str_eq(name, "str_starts_with") == 1 || str_eq(name, "str_ends_with") == 1 ||
+        str_eq(name, "file_write") == 1 || str_eq(name, "file_exists") == 1 ||
+        str_eq(name, "file_delete") == 1 ||
+        str_eq(name, "dir_create") == 1 || str_eq(name, "dir_delete") == 1 ||
+        str_eq(name, "dir_exists") == 1 || str_eq(name, "path_exists") == 1 ||
+        // dict/set 内置：名字与 0.3 及 cg_builtin_symbol 的映射表严格对齐
+        // （原先 TC 表里的 hashmap_set/hashmap_has/set_has 在 codegen 无映射，
+        //  是死名；而 codegen 支持的 hashmap_insert/contains/size/free、
+        //  set_contains/size/free 反而不在 TC 白名单 → "undefined function"）。
+        str_eq(name, "hashmap_insert") == 1 || str_eq(name, "hashmap_contains") == 1 ||
+        str_eq(name, "hashmap_remove") == 1 || str_eq(name, "hashmap_size") == 1 ||
+        str_eq(name, "hashmap_free") == 1 ||
+        str_eq(name, "set_add") == 1 || str_eq(name, "set_contains") == 1 ||
+        str_eq(name, "set_remove") == 1 || str_eq(name, "set_size") == 1 ||
+        str_eq(name, "set_free") == 1) { return mk_type(TYPE_INT); }
+    // hashmap_get(map, key) -> string（0.3 语义：ShadowDict 存 const char*）
+    if (str_eq(name, "hashmap_get") == 1) { return mk_type(TYPE_STRING); }
+    // 路径工具：codegen 映射到 shadow_path_*，全部返回 string
+    if (str_eq(name, "path_join") == 1 || str_eq(name, "path_dirname") == 1 ||
+        str_eq(name, "path_basename") == 1 || str_eq(name, "path_normalize") == 1) {
+        return mk_type(TYPE_STRING);
+    }
+    // 时间格式化：codegen 映射到 shadow_*_to_str
+    if (str_eq(name, "date_to_str") == 1 || str_eq(name, "timestamp_to_str") == 1 ||
+        str_eq(name, "nanotimestamp_to_str") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "zip_list") == 1 || str_eq(name, "content_hash") == 1) {
+        // zip_list：条目列表（分号分隔字符串）；content_hash：hex 字符串
+        return mk_type(TYPE_STRING);
+    }
+    if (str_eq(name, "zip_pack") == 1 || str_eq(name, "zip_unpack") == 1) {
+        // 成功标志 0/失败 -1（C 层 int32）
+        return mk_type(TYPE_INT);
+    }
+    if (str_eq(name, "file_read") == 1 || str_eq(name, "file_list_dir") == 1) {
+        // file_list_dir：目录条目列表（分号分隔字符串）；误归 int 会把返回的
+        // 指针截断成 i32，下游 str_split 收到野指针崩溃（2026-08-04 实测）。
+        return mk_type(TYPE_STRING);
+    }
+    if (str_eq(name, "str_index_of") == 1) {
+        // 实现（shadow_index_of）返回 int(i32)，非 long；误标 LONG 会让 codegen
+        // 按 i64 读取 i32 返回值，-1 变成大正数 → `if (bi >= 0)` 误判 → 字符串截断
+        // （2026-08-04 实测：sv_parse 的 "1.2.3" 被截成 "1.2"）。
+        return mk_type(TYPE_INT);
+    }
+    if (str_eq(name, "str_split") == 1) {
+        // array<string>：元素类型必须细化，否则 parts[0] 被 codegen 当 int 数组
+        // （shadow_array_get_int + inttoptr → 64 位指针截断崩溃）
+        let t = mk_type(TYPE_ARRAY);
+        t.elem_type = mk_type(TYPE_STRING);
+        return t;
+    }
+    if (str_eq(name, "hashmap_new") == 1) { return mk_type(TYPE_DICT); }
+    if (str_eq(name, "set_new") == 1) { return mk_type(TYPE_SET); }
+    if (str_eq(name, "parse_int") == 1) { return mk_type(TYPE_INT); }
+    if (str_eq(name, "parse_long") == 1) { return mk_type(TYPE_LONG); }
+    if (str_eq(name, "parse_float") == 1) { return mk_type(TYPE_DOUBLE); }
+    if (str_eq(name, "parse_bool") == 1) { return mk_type(TYPE_BOOL); }
+    if (str_eq(name, "file_read") == 1) { return mk_type(TYPE_STRING); }
+    if (str_eq(name, "str") == 1) { return mk_type(TYPE_STRING); }
+    return type_none_inner();
+}
+
+// 内置函数是否要求任意参数数（array_push 等不定长）
+pub kimo tc_builtin_variadic_ok(name: string) -> int {
+    if (str_eq(name, "println") == 1) { return 1; }
+    if (str_eq(name, "print") == 1) { return 1; }
+    if (str_eq(name, "array_push") == 1) { return 1; }
+    return 0;
+}
+
+// ============ 字面量 / 简单表达式 ============
+pub kimo tc_check_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let k = e.kind;
+    let loc = e.loc;
+    if (k == EXPR_INT) {
+        let it = e.inferred_type;
+        let ik = it.kind;
+        if (ik == TYPE_CHAR) { return it; }
+        if (ik == TYPE_DATE) { return it; }
+        let t = mk_type(TYPE_INT);
+        e.inferred_type = t;
+        return t;
+    }
+    if (k == EXPR_LONG) {
+        let it = e.inferred_type;
+        let ik = it.kind;
+        if (ik == TYPE_TIMESTAMP || ik == TYPE_NANOTIMESTAMP) { return it; }
+        let t = mk_type(TYPE_LONG);
+        e.inferred_type = t;
+        return t;
+    }
+    if (k == EXPR_FLOAT) {
+        let t = mk_type(TYPE_FLOAT);
+        e.inferred_type = t;
+        return t;
+    }
+    if (k == EXPR_STRING) {
+        let t = mk_type(TYPE_STRING);
+        e.inferred_type = t;
+        return t;
+    }
+    if (k == EXPR_BOOL) {
+        let t = mk_type(TYPE_BOOL);
+        e.inferred_type = t;
+        return t;
+    }
+    if (k == EXPR_NULL) {
+        let t = mk_type(TYPE_ANY);
+        e.inferred_type = t;
+        return t;
+    }
+    return type_none_inner();
+}
+
+// ============ EXPR_VAR ============
+pub kimo tc_check_var(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let name = e.str1;
+    let loc = e.loc;
+    // 模块限定变量：module.var（str2 非空）
+    let mod_q = e.str2;
+    if (len(mod_q) > 0) {
+        // 在当前模块节点查找 pub global
+        let node = ctx.cur_node;
+        if (tc_node_is_none(node) == 0) {
+            let g = tc_node_lookup_global(node, name, 1);
+            if (tc_global_is_none(g) == 0) {
+                let t = g.type_ref;
+                if (type_is_none(t) == 1) { t = mk_type(TYPE_INFER); }
+                e.inferred_type = t;
+                return t;
+            }
+            // 尝试 mangled 名 mod__name
+            let mangled = tc_mangle_private(mod_q, name);
+            let g2 = tc_node_lookup_global(node, mangled, 1);
+            if (tc_global_is_none(g2) == 0) {
+                e.str1 = mangled;
+                e.str2 = "";
+                let t2 = g2.type_ref;
+                if (type_is_none(t2) == 1) { t2 = mk_type(TYPE_INFER); }
+                e.inferred_type = t2;
+                return t2;
+            }
+        }
+        let msg = "undefined variable '" + name + "' in module '" + mod_q + "'";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 局部 env
+    let et = tc_env_get(env, name);
+    if (type_is_none(et) == 0) {
+        e.inferred_type = et;
+        return et;
+    }
+    // 无负载 enum 变体（Red / None）
+    let ed = tc_enum_find_variant_global(ctx, name);
+    if (tc_enum_is_none(ed) == 0) {
+        let vidx = tc_enum_variant_index(ed, name);
+        if (vidx >= 0) {
+            e.intval = vidx;
+            let et2 = tc_enum_type_for(ctx, ed.name);
+            // 无 payload enum（TYPE_ENUM）：值即 tag int → 改写为 EXPR_INT，
+            // 供 MIR 直接发射常量。有 payload enum 的无负载变体（None）保持 EXPR_VAR，
+            // MIR 侧按 TYPE_ENUM_PAYLOAD && slot<0 构造 AnyBox。
+            if (et2.kind == TYPE_ENUM) {
+                e.kind = EXPR_INT;
+            }
+            e.inferred_type = et2;
+            return et2;
+        }
+    }
+    // 函数引用 → 改写为 EXPR_CLOSURE
+    let fd = tc_func_lookup(ctx, name);
+    if (tc_func_is_none(fd) == 0) {
+        let fty = mk_func_type([], fd.return_type, 0);
+        let i = 0;
+        while (i < len(fd.params)) {
+            let p = fd.params[i] as Param;
+            fty.param_types = array_push(fty.param_types, p.type_ref);
+            i = i + 1;
+        }
+        e.kind = EXPR_CLOSURE;
+        e.closure_def = Some(fd);
+        e.inferred_type = fty;
+        return fty;
+    }
+    // 严格态歧义（函数引用；Java 通配符导入：使用处 ambiguous）
+    let ambig_msg = tc_ambig_message("function");
+    if (len(ambig_msg) > 0) {
+        tc_error_at(ctx, loc, ambig_msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 导入模块 pub let（graph 全局）；严格态 g.name 已带模块前缀 → e.str1 同步改写供 codegen
+    let g = tc_mg_lookup_global(ctx, name);
+    if (tc_global_is_none(g) == 0) {
+        e.str1 = g.name;
+        let t = g.type_ref;
+        if (type_is_none(t) == 1) { t = mk_type(TYPE_INFER); }
+        e.inferred_type = t;
+        return t;
+    }
+    // 当前模块私有 global（mangled）
+    let node2 = ctx.cur_node;
+    if (tc_node_is_none(node2) == 0) {
+        let priv_name = tc_mangle_private(ctx.current_module, name);
+        let gp = tc_node_lookup_global(node2, priv_name, 0);
+        if (tc_global_is_none(gp) == 0) {
+            e.str1 = gp.name;
+            let t = gp.type_ref;
+            if (type_is_none(t) == 1) { t = mk_type(TYPE_INFER); }
+            e.inferred_type = t;
+            return t;
+        }
+    }
+    // 严格态歧义（全局引用；Java 通配符导入：使用处 ambiguous）
+    let ambig_msg = tc_ambig_message("global");
+    if (len(ambig_msg) > 0) {
+        tc_error_at(ctx, loc, ambig_msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    let msg2 = "undefined variable '" + name + "'";
+    tc_error_at(ctx, loc, msg2);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+// ============ EXPR_BINARY ============
+pub kimo tc_check_binary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    // 用 int 读取 op（e.intval 是 long；0.3 宿主跨模块读 long 字段有踩坑记录，
+    // 统一 as int 规避：操作符数值都在 int 范围，截断无损）
+    let op = e.intval as int;
+    let lhs = tc_check_expr(ctx, e.child1, env);
+    let rhs = tc_check_expr(ctx, e.child2, env);
+    let lk = lhs.kind;
+    let rk = rhs.kind;
+    let loc = e.loc;
+
+    // 比较运算 → bool
+    if (op == BIN_EQ || op == BIN_NE || op == BIN_LT || op == BIN_GT || op == BIN_LE || op == BIN_GE) {
+        // 时间类型比较
+        if (lk == TYPE_DATE || lk == TYPE_TIMESTAMP || lk == TYPE_NANOTIMESTAMP) {
+            if (tc_type_compat(ctx, lhs, rhs) == 1 || tc_type_compat(ctx, rhs, lhs) == 1) {
+                let bt = mk_type(TYPE_BOOL);
+                e.inferred_type = bt;
+                return bt;
+            }
+        }
+        if (lk != TYPE_ANY && rk != TYPE_ANY) {
+            if (tc_type_compat(ctx, lhs, rhs) == 0 && tc_type_compat(ctx, rhs, lhs) == 0) {
+                let msg = "type mismatch in comparison: cannot compare '" + ty_display_name(lhs) + "' and '" + ty_display_name(rhs) + "'";
+                tc_error_at(ctx, loc, msg);
+            }
+        }
+        let bt = mk_type(TYPE_BOOL);
+        e.inferred_type = bt;
+        return bt;
+    }
+    // 逻辑运算 → bool
+    if (op == BIN_AND || op == BIN_OR) {
+        if (lk != TYPE_BOOL && lk != TYPE_ANY) {
+            let msg = "logical operator requires bool operands, got '" + ty_display_name(lhs) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        if (rk != TYPE_BOOL && rk != TYPE_ANY) {
+            let msg2 = "logical operator requires bool operands, got '" + ty_display_name(rhs) + "'";
+            tc_error_at(ctx, loc, msg2);
+        }
+        let bt = mk_type(TYPE_BOOL);
+        e.inferred_type = bt;
+        return bt;
+    }
+    // 算术运算
+    // opaque 参与报错
+    if (lk == TYPE_OPAQUE || rk == TYPE_OPAQUE) {
+        let msg3 = "invalid operands for arithmetic: opaque type cannot be used in arithmetic";
+        tc_error_at(ctx, loc, msg3);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 字符串拼接 ADD
+    if (op == BIN_ADD && (lk == TYPE_STRING || rk == TYPE_STRING)) {
+        let st = mk_type(TYPE_STRING);
+        e.inferred_type = st;
+        return st;
+    }
+    // 时间算术
+    if (lk == TYPE_DATE && rk == TYPE_DATE) {
+        let it = mk_type(TYPE_INT);
+        e.inferred_type = it;
+        return it;
+    }
+    if (lk == TYPE_DATE && (rk == TYPE_INT || rk == TYPE_LONG)) {
+        let dt = mk_type(TYPE_DATE);
+        e.inferred_type = dt;
+        return dt;
+    }
+    if ((lk == TYPE_INT || lk == TYPE_LONG) && rk == TYPE_DATE) {
+        let dt = mk_type(TYPE_DATE);
+        e.inferred_type = dt;
+        return dt;
+    }
+    if (lk == TYPE_TIMESTAMP && rk == TYPE_TIMESTAMP) {
+        let it = mk_type(TYPE_INT);
+        e.inferred_type = it;
+        return it;
+    }
+    if (lk == TYPE_TIMESTAMP && (rk == TYPE_INT || rk == TYPE_LONG)) {
+        let dt = mk_type(TYPE_TIMESTAMP);
+        e.inferred_type = dt;
+        return dt;
+    }
+    if ((lk == TYPE_INT || lk == TYPE_LONG) && rk == TYPE_TIMESTAMP) {
+        let dt = mk_type(TYPE_TIMESTAMP);
+        e.inferred_type = dt;
+        return dt;
+    }
+    if (lk == TYPE_NANOTIMESTAMP && rk == TYPE_NANOTIMESTAMP) {
+        let it = mk_type(TYPE_INT);
+        e.inferred_type = it;
+        return it;
+    }
+    if (lk == TYPE_NANOTIMESTAMP && (rk == TYPE_INT || rk == TYPE_LONG)) {
+        let dt = mk_type(TYPE_NANOTIMESTAMP);
+        e.inferred_type = dt;
+        return dt;
+    }
+    if ((lk == TYPE_INT || lk == TYPE_LONG) && rk == TYPE_NANOTIMESTAMP) {
+        let dt = mk_type(TYPE_NANOTIMESTAMP);
+        e.inferred_type = dt;
+        return dt;
+    }
+    // 数值运算：LUB
+    let is_num_l = 0;
+    if (lk == TYPE_INT || lk == TYPE_LONG || lk == TYPE_FLOAT || lk == TYPE_DOUBLE || lk == TYPE_SHORT || lk == TYPE_CHAR) { is_num_l = 1; }
+    let is_num_r = 0;
+    if (rk == TYPE_INT || rk == TYPE_LONG || rk == TYPE_FLOAT || rk == TYPE_DOUBLE || rk == TYPE_SHORT || rk == TYPE_CHAR) { is_num_r = 1; }
+    if (is_num_l == 1 && is_num_r == 1) {
+        let lt = tc_lub(ctx, lhs, rhs);
+        e.inferred_type = lt;
+        return lt;
+    }
+    if (lk == TYPE_ANY && is_num_r == 1) {
+        e.inferred_type = rhs;
+        return rhs;
+    }
+    if (rk == TYPE_ANY && is_num_l == 1) {
+        e.inferred_type = lhs;
+        return lhs;
+    }
+    if (lk == TYPE_ANY && rk == TYPE_ANY) {
+        let at = mk_type(TYPE_ANY);
+        e.inferred_type = at;
+        return at;
+    }
+    // 类型参数（泛型）算术：若类型参数受数值约束，按数值处理，结果取该类型参数
+    // （支持 <T: int|long> 内的 T + T / T * T 等；结果类型为 T，使 return 推断一致）
+    if (tc_is_type_param(lhs, tc_cur_tparams) == 1 || tc_is_type_param(rhs, tc_cur_tparams) == 1) {
+        let lnum = 0;
+        if (tc_is_type_param(lhs, tc_cur_tparams) == 1) { lnum = tc_tparam_constraints_numeric(lhs.name); }
+        let rnum = 0;
+        if (tc_is_type_param(rhs, tc_cur_tparams) == 1) { rnum = tc_tparam_constraints_numeric(rhs.name); }
+        if (lnum == 1 || rnum == 1) {
+            let rt = lhs;
+            if (tc_is_type_param(lhs, tc_cur_tparams) == 0) { rt = rhs; }
+            e.inferred_type = rt;
+            return rt;
+        }
+    }
+    // 运算符重载：LHS 为 struct 且实现 Add/Sub/Mul/Div/Rem
+    if (lk == TYPE_STRUCT && len(lhs.name) > 0) {
+        let trait_n = "";
+        if (op == BIN_ADD) { trait_n = "Add"; }
+        else if (op == BIN_SUB) { trait_n = "Sub"; }
+        else if (op == BIN_MUL) { trait_n = "Mul"; }
+        else if (op == BIN_DIV) { trait_n = "Div"; }
+        else if (op == BIN_REM) { trait_n = "Rem"; }
+        if (len(trait_n) > 0) {
+            let impls = tc_impl_collect_visible(ctx);
+            let i = 0;
+            while (i < len(impls)) {
+                let id = impls[i] as ImplDef;
+                if (str_eq(id.type_name, lhs.name) == 1 && str_eq(id.trait_name, trait_n) == 1) {
+                    let j = 0;
+                    while (j < len(id.methods)) {
+                        let m = id.methods[j] as FuncDef;
+                        let mn = m.name;
+                        let opname = "";
+                        if (op == BIN_ADD) { opname = "add"; }
+                        else if (op == BIN_SUB) { opname = "sub"; }
+                        else if (op == BIN_MUL) { opname = "mul"; }
+                        else if (op == BIN_DIV) { opname = "div"; }
+                        else if (op == BIN_REM) { opname = "rem"; }
+                        if (str_eq(mn, opname) == 1) {
+                            // 改写为 __impl__<Type>__<Trait>__<method> 调用
+                            let mangled = "__impl__" + lhs.name + "__" + trait_n + "__" + opname;
+                            e.kind = EXPR_CALL;
+                            e.str1 = mangled;
+                            let args: array<Expr> = [];
+                            args = array_push(args, e.child1);
+                            args = array_push(args, e.child2);
+                            e.items = args;
+                            let rt = m.return_type;
+                            e.inferred_type = rt;
+                            return rt;
+                        }
+                        j = j + 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    let msg4 = "invalid operands for arithmetic: '" + ty_display_name(lhs) + "' " + int_to_str(op) + " '" + ty_display_name(rhs) + "'";
+    tc_error_at(ctx, loc, msg4);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+// ============ EXPR_UNARY ============
+pub kimo tc_check_unary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let inner = tc_check_expr(ctx, e.child1, env);
+    let ik = inner.kind;
+    let loc = e.loc;
+    let op = e.intval as int;
+    if (op == UN_NOT) {
+        if (ik != TYPE_BOOL && ik != TYPE_ANY) {
+            let msg = "logical not requires bool operand, got '" + ty_display_name(inner) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        let bt = mk_type(TYPE_BOOL);
+        e.inferred_type = bt;
+        return bt;
+    }
+    // UN_NEG
+    if (ik == TYPE_INT || ik == TYPE_LONG || ik == TYPE_FLOAT || ik == TYPE_DOUBLE ||
+        ik == TYPE_SHORT || ik == TYPE_CHAR || ik == TYPE_ANY) {
+        e.inferred_type = inner;
+        return inner;
+    }
+    let msg2 = "unary minus requires numeric operand, got '" + ty_display_name(inner) + "'";
+    tc_error_at(ctx, loc, msg2);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+// ============ EXPR_INDEX ============
+pub kimo tc_check_index(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let base_t = tc_check_expr(ctx, e.child1, env);
+    let idx_t = tc_check_expr(ctx, e.child2, env);
+    let loc = e.loc;
+    let bk = base_t.kind;
+    if (bk == TYPE_ARRAY) {
+        if (idx_t.kind != TYPE_INT && idx_t.kind != TYPE_LONG && idx_t.kind != TYPE_ANY) {
+            let msg = "array index must be int, got '" + ty_display_name(idx_t) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        // 裸 array（无类型实参）元素类型为 unresolved → 按 any 处理，避免下游算术误报
+        let et = base_t.elem_type;
+        if (et.kind == TYPE_INFER) { et = mk_type(TYPE_ANY); }
+        e.inferred_type = et;
+        return et;
+    }
+    if (bk == TYPE_DICT) {
+        e.inferred_type = base_t.val_type;
+        return base_t.val_type;
+    }
+    if (bk == TYPE_STRING) {
+        // 下标必须是整数（与 array 一致；报错文本含 "array index must be integer" 兼容 0.3 断言）
+        if (idx_t.kind != TYPE_INT && idx_t.kind != TYPE_LONG && idx_t.kind != TYPE_ANY) {
+            let msg = "array index must be integer, got '" + ty_display_name(idx_t) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        let st = mk_type(TYPE_STRING);
+        e.inferred_type = st;
+        return st;
+    }
+    if (bk == TYPE_ANY) {
+        let at = mk_type(TYPE_ANY);
+        e.inferred_type = at;
+        return at;
+    }
+    let msg2 = "cannot index non-array type '" + ty_display_name(base_t) + "'";
+    tc_error_at(ctx, loc, msg2);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+// 在所有已知 struct 定义中按字段名查找字段索引（供 any 成员访问使用）。
+// any 值擦除了具体 struct 类型，但字段布局统一（每字段 8 字节，offset=idx*8），
+// 故按字段名在结构体表中定位第一个匹配的字段索引。找不到返回 0。
+// 语义对齐 0.3 tc_any_field_index：先查 cur_node（尚未 add 进 graph 时也要覆盖），
+// 再遍历 graph 全部已添加模块。
+pub kimo tc_any_field_index(ctx: CompileContext, field_name: string) -> int {
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let sds = cur.struct_defs;
+        let si = 0;
+        while (si < len(sds)) {
+            let sd = sds[si] as StructDef;
+            if (tc_struct_is_none(sd) == 0) {
+                let fields = sd.fields;
+                let fi = 0;
+                while (fi < len(fields)) {
+                    let f = fields[fi] as StructField;
+                    if (str_eq(f.name, field_name) == 1) { return fi; }
+                    fi = fi + 1;
+                }
+            }
+            si = si + 1;
+        }
+    }
+    let ni = 0;
+    while (ni < len(ctx.graph.nodes)) {
+        let node = ctx.graph.nodes[ni] as ModuleNode;
+        let sds2 = node.struct_defs;
+        let sj = 0;
+        while (sj < len(sds2)) {
+            let sd2 = sds2[sj] as StructDef;
+            if (tc_struct_is_none(sd2) == 0) {
+                let fs2 = sd2.fields;
+                let fj = 0;
+                while (fj < len(fs2)) {
+                    let f2 = fs2[fj] as StructField;
+                    if (str_eq(f2.name, field_name) == 1) { return fj; }
+                    fj = fj + 1;
+                }
+            }
+            sj = sj + 1;
+        }
+        ni = ni + 1;
+    }
+    return 0;
+}
+
+// ============ EXPR_MEMBER ============
+pub kimo tc_check_member(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let field = e.str1;
+    let base = e.child1;
+    let base_k = base.kind;
+    // §3.8 兼容态：模块限定 FQN 优先（a.b.c.foo 整体作为 模块.符号）
+    // 仅当点链前缀是已登记命名空间时触发；普通 obj.field 模块前缀未登记 → 照常走下方逻辑。
+    // 性能门槛：只有 base 本身还是 MEMBER（即至少 a.b.c 三段）才尝试还原点链——
+    // 单段限定 mod.sym 由下方既有的「base 是模块名」分支处理，而 obj.field 这种
+    // 最高频形态（base 为 EXPR_VAR）在此直接短路，避免每次成员访问都做字符串拼接。
+    let path = "";
+    if (base_k == EXPR_MEMBER) { path = tc_expr_dot_path(e); }
+    if (tc_has_dot(path) == 1) {
+        let pdot = tc_last_dot(path);
+        let pmod = substr2(path, 0, pdot);
+        // Java 规则：局部变量遮蔽包名 —— 根段已绑定为变量时不按 FQN 解释。
+        let mroot = pmod;
+        let md0 = tc_first_dot(pmod);
+        if (md0 >= 0) { mroot = substr2(pmod, 0, md0); }
+        let mrt = tc_env_get(env, mroot);
+        if (tc_is_known_ns(ctx, pmod) == 1 && type_is_none(mrt) == 1) {
+            let ff = tc_resolve_fqn_func(ctx, path);
+            if (tc_func_is_none(ff) == 0) {
+                // 模块限定函数引用：改写为 EXPR_CLOSURE（与 tc_check_var 函数引用同构）
+                let fty = mk_func_type([], ff.return_type, 0);
+                let pi2 = 0;
+                while (pi2 < len(ff.params)) {
+                    let p = ff.params[pi2] as Param;
+                    fty.param_types = array_push(fty.param_types, p.type_ref);
+                    pi2 = pi2 + 1;
+                }
+                e.kind = EXPR_CLOSURE;
+                e.closure_def = Some(ff);
+                e.inferred_type = fty;
+                return fty;
+            }
+            let gv = tc_resolve_fqn_global(ctx, path);
+            if (tc_global_is_none(gv) == 0) {
+                let gt = gv.type_ref;
+                if (type_is_none(gt) == 1) { gt = mk_type(TYPE_INFER); }
+                // 改写为 EXPR_VAR（裸符号名），交由全局 pub 回退定位
+                e.kind = EXPR_VAR;
+                e.str1 = gv.name;
+                e.child1 = 0 as Expr;
+                e.inferred_type = gt;
+                return gt;
+            }
+        }
+    }
+    // 模块限定：base 是 EXPR_VAR 且名字是模块名
+    if (base_k == EXPR_VAR) {
+        let bname = base.str1;
+        // 单段模块限定变量（0.3: module.var）：base 是已登记模块名 → FQN 全局解析，
+        // 改写为 EXPR_VAR(注册名)。必须在「当前模块全局」检查之前（模块名可能与全局同名）。
+        if (tc_is_known_ns(ctx, bname) == 1) {
+            let gvq = tc_resolve_fqn_global(ctx, bname + "." + field);
+            if (tc_global_is_none(gvq) == 0) {
+                e.kind = EXPR_VAR;
+                e.str1 = gvq.name;    // 注册名（跨模块同名冲突时为 __mod_<mod>__<name>）
+                e.child1 = 0 as Expr;
+                let gqt = gvq.type_ref;
+                if (type_is_none(gqt) == 1) { gqt = mk_type(TYPE_INFER); }
+                e.inferred_type = gqt;
+                return gqt;
+            }
+        }
+        // 尝试 base 作为模块限定（如 utils.math 的 utils 是模块名？0.4 简化：先查全局变量名）
+        let g = tc_node_lookup_global(ctx.cur_node, bname, 0);
+        if (tc_global_is_none(g) == 1) {
+            // enum 成员访问 Color.Red（严格态：用注册名 ed.name 保 Type.name 一致）
+            let ed = tc_enum_lookup(ctx, bname);
+            if (tc_enum_is_none(ed) == 0) {
+                let vidx = tc_enum_variant_index(ed, field);
+                if (vidx >= 0) {
+                    let v = ed.variants[vidx] as EnumVariant;
+                    let et = tc_enum_type_for(ctx, ed.name);
+                    if (len(v.payloads) > 0) {
+                        let msg = "enum variant '" + field + "' has payloads; use '" + field + "(...)' constructor syntax";
+                        tc_error_at(ctx, loc, msg);
+                        e.inferred_type = mk_type(TYPE_ANY);
+                        return mk_type(TYPE_ANY);
+                    }
+                    // 无 payload：改写为 EXPR_INT（variant 索引）
+                    e.kind = EXPR_INT;
+                    e.intval = vidx;
+                    e.inferred_type = et;
+                    return et;
+                }
+            }
+        }
+    }
+    // struct 字段访问
+    let base_t = tc_check_expr(ctx, base, env);
+    let bk = base_t.kind;
+    if (bk == TYPE_STRUCT || bk == TYPE_ENUM_PAYLOAD) {
+        let sd = tc_struct_lookup(ctx, base_t.name);
+        if (tc_struct_is_none(sd) == 0) {
+            let i = 0;
+            while (i < len(sd.fields)) {
+                let f = sd.fields[i] as StructField;
+                if (str_eq(f.name, field) == 1) {
+                    e.intval = i;
+                    let ft = tc_resolve_type(ctx, f.type_ref);
+                    e.inferred_type = ft;
+                    return ft;
+                }
+                i = i + 1;
+            }
+            let msg = "struct '" + base_t.name + "' has no field '" + field + "'";
+            tc_error_at(ctx, loc, msg);
+            e.inferred_type = mk_type(TYPE_ANY);
+            return mk_type(TYPE_ANY);
+        }
+    }
+    // tuple 字段 t.0
+    if (bk == TYPE_TUPLE) {
+        let idx = e.intval as int;
+        let n = len(base_t.param_types);
+        if (idx >= 0 && idx < n) {
+            let ft = base_t.param_types[idx] as Type;
+            e.inferred_type = ft;
+            return ft;
+        }
+        let msg2 = "tuple index " + int_to_str(idx) + " out of range";
+        tc_error_at(ctx, loc, msg2);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // any：返回 any
+    if (bk == TYPE_ANY) {
+        // any 擦除了具体 struct 类型；按字段名在结构体表中定位字段索引，
+        // 否则 e.intval 保持 0，导致所有字段都读 offset 0（如 a.y 误读 a.x）。
+        e.intval = tc_any_field_index(ctx, field);
+        let at = mk_type(TYPE_ANY);
+        e.inferred_type = at;
+        return at;
+    }
+    let msg3 = "cannot access field '" + field + "' on type '" + ty_display_name(base_t) + "'";
+    tc_error_at(ctx, loc, msg3);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+// ============ EXPR_CAST ============
+pub kimo tc_check_cast(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let inner = tc_check_expr(ctx, e.child1, env);
+    let loc = e.loc;
+    let target = e.inferred_type;
+    // numeric → string 禁止（提示 int_to_str）
+    let ik = inner.kind;
+    let tk = target.kind;
+    if ((ik == TYPE_INT || ik == TYPE_LONG || ik == TYPE_FLOAT || ik == TYPE_DOUBLE) && tk == TYPE_STRING) {
+        let msg = "cannot cast numeric type to string; use int_to_str/to_string instead";
+        tc_error_at(ctx, loc, msg);
+    }
+    if (ik == TYPE_OPAQUE && tk != TYPE_ANY && tk != TYPE_OPAQUE) {
+        let msg2 = "cannot cast opaque to non-any type";
+        tc_error_at(ctx, loc, msg2);
+    }
+    if (tk == TYPE_OPAQUE && ik != TYPE_ANY && ik != TYPE_OPAQUE) {
+        let msg3 = "cannot cast non-any type to opaque";
+        tc_error_at(ctx, loc, msg3);
+    }
+    let rt = tc_resolve_type(ctx, target);
+    e.inferred_type = rt;
+    return rt;
+}
+
+// ============ EXPR_ARRAY_LIT ============
+pub kimo tc_check_array_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let at = mk_type(TYPE_ARRAY);
+    if (len(e.items) == 0) {
+        at.elem_type = type_none_inner();
+        e.inferred_type = at;
+        return at;
+    }
+    let first_t = tc_check_expr(ctx, e.items[0], env);
+    at.elem_type = first_t;
+    let i = 1;
+    while (i < len(e.items)) {
+        let it = tc_check_expr(ctx, e.items[i], env);
+        i = i + 1;
+    }
+    e.inferred_type = at;
+    return at;
+}
+
+// ============ EXPR_STRUCT_LIT ============
+pub kimo tc_check_struct_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let name = e.str1;
+    // 显式类型实参（泛型 struct 字面量）
+    let type_args = e.type_args;
+    let res_name = name;
+    if (len(type_args) > 0) {
+        let sd0 = tc_struct_lookup(ctx, name);
+        if (tc_struct_is_none(sd0) == 0 && len(sd0.type_params) > 0) {
+            let mono = tc_struct_mono_instantiate(ctx, name, type_args);
+            if (len(mono) > 0) { res_name = mono; }
+        }
+    }
+    let sd = tc_struct_lookup(ctx, res_name);
+    if (tc_struct_is_none(sd) == 1) {
+        // 严格态歧义（struct 引用；Java 通配符导入：使用处 ambiguous）
+        let ambig_msg = tc_ambig_message("struct");
+        if (len(ambig_msg) > 0) {
+            tc_error_at(ctx, loc, ambig_msg);
+            e.inferred_type = mk_type(TYPE_ANY);
+            return mk_type(TYPE_ANY);
+        }
+        let msg = "unknown struct '" + name + "'";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 严格态：e.str1 改写为注册名（mangled）——codegen 的 GC 类型 key / Drop finalizer 名依赖它
+    e.str1 = sd.name;
+    // 字段名校验 + 按声明序重排
+    let fnames = e.str_items;
+    let fvals = e.items;
+    let nf = len(sd.fields);
+    // 检查未知字段
+    let i = 0;
+    while (i < len(fnames)) {
+        let fn = fnames[i] as string;
+        let found = 0;
+        let j = 0;
+        while (j < nf) {
+            let f = sd.fields[j] as StructField;
+            if (str_eq(f.name, fn) == 1) { found = 1; break; }
+            j = j + 1;
+        }
+        if (found == 0) {
+            let msg2 = "unknown field '" + fn + "' in struct '" + name + "'";
+            tc_error_at(ctx, loc, msg2);
+        }
+        i = i + 1;
+    }
+    // 构建按声明序的值数组（缺省补默认值）
+    let ordered: array<Expr> = [];
+    let used: array<int> = [];
+    j = 0;
+    while (j < nf) {
+        used = array_push(used, 0);
+        j = j + 1;
+    }
+    j = 0;
+    while (j < nf) {
+        let f = sd.fields[j] as StructField;
+        let val = tc_default_field_expr(ctx, f.type_ref, loc);
+        let fi = 0;
+        while (fi < len(fnames)) {
+            let fn = fnames[fi] as string;
+            if (str_eq(fn, f.name) == 1) {
+                val = fvals[fi] as Expr;
+                break;
+            }
+            fi = fi + 1;
+        }
+        ordered = array_push(ordered, val);
+        j = j + 1;
+    }
+    // 检查字段值并回写（仅检查字面量显式提供的字段；缺省字段用默认值合法，
+    // 否则 array/struct 字段默认 EXPR_NULL 会被误报 "got 'any'"）
+    j = 0;
+    while (j < nf) {
+        let f = sd.fields[j] as StructField;
+        let val = ordered[j] as Expr;
+        let provided = 0;
+        let fi2 = 0;
+        while (fi2 < len(fnames)) {
+            if (str_eq(fnames[fi2] as string, f.name) == 1) { provided = 1; break; }
+            fi2 = fi2 + 1;
+        }
+        if (provided == 1) {
+            let vt = tc_check_expr(ctx, val, env);
+            // 泛型 struct 字面量：字段类型为类型参数 T 时放行（类型擦除，T 由实参推断）
+            let fk = f.type_ref.kind;
+            let is_tp = 0;
+            if (fk == TYPE_STRUCT) {
+                let ti3 = 0;
+                while (ti3 < len(sd.type_params)) {
+                    let tp3 = sd.type_params[ti3] as TypeParam;
+                    if (str_eq(tp3.name, f.type_ref.name) == 1) { is_tp = 1; break; }
+                    ti3 = ti3 + 1;
+                }
+            }
+            if (tc_type_compat(ctx, f.type_ref, vt) == 0 && f.type_ref.kind != TYPE_INFER && is_tp == 0) {
+                let msg3 = "field '" + f.name + "' expects type '" + ty_display_name(f.type_ref) + "' but got '" + ty_display_name(vt) + "'";
+                tc_error_at(ctx, loc, msg3);
+            }
+        }
+        ordered[j] = val;
+        j = j + 1;
+    }
+    e.items = ordered;
+    // 严格态：用注册名（mangled）作 inferred_type，保证与注解/字段类型比较一致
+    let st = mk_named_type(TYPE_STRUCT, sd.name);
+    st.param_types = e.type_args;
+    e.inferred_type = st;
+    return st;
+}
+
+
+// ============ EXPR_CALL（内置/查找/泛型/单态化） ============
+pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let name = e.str1;
+    let loc = e.loc;
+    let args = e.items;
+    let arg_names = e.str_items;
+
+    // 1. 内置函数白名单
+    let bt = tc_builtin_ret_type(name);
+    if (type_is_none(bt) == 0) {
+        // 1a. 用户自定义函数遮蔽同名内置（0.3 语义）。内置分支不改写 e.str1，
+        // 而用户定义在注册期已被 mangle 成 __mod_<mod>__<name>，若这里直接按内置
+        // 处理，codegen 会发射裸名 @str_starts_with → lld-link undefined symbol。
+        // 名单为空时 tc_builtin_shadowed_has 立即返回 0，不影响正常内置调用的性能。
+        if (tc_builtin_shadowed_has(name) == 1) {
+            let ufd = tc_func_lookup(ctx, name);
+            if (tc_func_is_none(ufd) == 0) {
+                // tc_check_call_fd 自身不改写 e.str1（正常路径在其调用点改），此处必须补上
+                e.str1 = ufd.name;
+                return tc_check_call_fd(ctx, e, env, ufd, args, arg_names);
+            }
+        }
+        let i = 0;
+        while (i < len(args)) {
+            tc_check_expr(ctx, args[i], env);
+            i = i + 1;
+        }
+        // array_push 返回 array（元素类型保持调用侧推断）
+        e.inferred_type = bt;
+        return bt;
+    }
+
+    // 2. 模块限定调用：首实参为 bare IDENT 且是模块名 → 设 str2 移除 receiver
+    let qmod = e.str2;
+    if (len(qmod) > 0) {
+        // 模块限定函数查找：在指定模块节点
+        let fd2 = tc_mg_lookup_func(ctx, name);
+        if (tc_func_is_none(fd2) == 1) {
+            let msg = "undefined function '" + name + "' in module '" + qmod + "'";
+            tc_error_at(ctx, loc, msg);
+            e.inferred_type = mk_type(TYPE_ANY);
+            return mk_type(TYPE_ANY);
+        }
+        return tc_check_call_fd(ctx, e, env, fd2, args, arg_names);
+    }
+
+    // 2.5 §3.8 兼容态：命名空间限定调用 a.b.c.foo(args)。
+    // parse_member_chain 把 obj.m(x) desugar 成 m(obj, x)，故首实参是纯点链 a.b.c。
+    // 若该点链恰是已登记命名空间，则剥离伪 receiver，按 FQN 解析真实函数。
+    // Java 规则：局部变量遮蔽包名 —— 根段若已绑定为变量则不走此路径。
+    if (len(args) > 0 && len(arg_names) == 0) {
+        let recv = args[0] as Expr;
+        let rk0 = recv.kind;
+        // 多段点链（recv 仍是 MEMBER）→ FQN（a.b.c.foo）
+        if (rk0 == EXPR_MEMBER) {
+            let nsp = tc_expr_dot_path(recv);
+            if (tc_is_known_ns(ctx, nsp) == 1) {
+                let root = nsp;
+                let d0 = tc_first_dot(nsp);
+                if (d0 >= 0) { root = substr2(nsp, 0, d0); }
+                let rvt = tc_env_get(env, root);
+                if (type_is_none(rvt) == 1) {
+                    let ffd = tc_resolve_fqn_func(ctx, nsp + "." + name);
+                    if (tc_func_is_none(ffd) == 0) {
+                        let rest: array<Expr> = [];
+                        let ri = 1;
+                        while (ri < len(args)) {
+                            rest = array_push(rest, args[ri]);
+                            ri = ri + 1;
+                        }
+                        e.items = rest;
+                        e.str1 = ffd.name;
+                        return tc_check_call_fd(ctx, e, env, ffd, rest, arg_names);
+                    }
+                }
+            }
+        }
+        // 单段模块限定调用：mod.f(x)（recv 是 EXPR_VAR 且为已登记模块名；0.3 用例
+        // import _dotqual_mod 后以 dsb 名 dotqual_mod.helper() 访问）。局部变量遮蔽包名。
+        else if (rk0 == EXPR_VAR && tc_is_known_ns(ctx, recv.str1) == 1) {
+            let rvt1 = tc_env_get(env, recv.str1);
+            if (type_is_none(rvt1) == 1) {
+                let ffd1 = tc_resolve_fqn_func(ctx, recv.str1 + "." + name);
+                if (tc_func_is_none(ffd1) == 0) {
+                    let rest1: array<Expr> = [];
+                    let ri1 = 1;
+                    while (ri1 < len(args)) {
+                        rest1 = array_push(rest1, args[ri1]);
+                        ri1 = ri1 + 1;
+                    }
+                    e.items = rest1;
+                    e.str1 = ffd1.name;
+                    return tc_check_call_fd(ctx, e, env, ffd1, rest1, arg_names);
+                }
+            }
+        }
+    }
+
+    // 3. 函数查找
+    let fd = tc_func_lookup(ctx, name);
+    if (tc_func_is_none(fd) == 1) {
+        // 3a0. 严格态歧义（Java 通配符导入：使用处 ambiguous，先于一切兜底）
+        let ambig_msg = tc_ambig_message("function");
+        if (len(ambig_msg) > 0) {
+            tc_error_at(ctx, loc, ambig_msg);
+            e.inferred_type = mk_type(TYPE_ANY);
+            return mk_type(TYPE_ANY);
+        }
+        // 3a. trait 方法分发：首参类型为 struct
+        if (len(args) > 0) {
+            let recv_t = tc_check_expr(ctx, args[0], env);
+            if (recv_t.kind == TYPE_STRUCT && len(recv_t.name) > 0) {
+                let mangled = tc_impl_find_method(ctx, recv_t.name, name);
+                if (len(mangled) > 0) {
+                    e.str1 = mangled;
+                    let fd3 = tc_func_lookup(ctx, mangled);
+                    if (tc_func_is_none(fd3) == 0) {
+                        return tc_check_call_fd(ctx, e, env, fd3, args, arg_names);
+                    }
+                }
+            }
+        }
+        // 3b. payload enum 变体构造：Some(v) / Ok(v)
+        let ed = tc_enum_find_variant_global(ctx, name);
+        if (tc_enum_is_none(ed) == 0) {
+            let vidx = tc_enum_variant_index(ed, name);
+            if (vidx >= 0) {
+                let v = ed.variants[vidx] as EnumVariant;
+                let npayload = len(v.payloads);
+                if (len(args) == npayload) {
+                    let i = 0;
+                    while (i < npayload) {
+                        tc_check_expr(ctx, args[i], env);
+                        i = i + 1;
+                    }
+                    // 泛型 enum 从实参推断 param_types
+                    let et = tc_enum_type_for(ctx, ed.name);
+                    if (len(ed.type_params) > 0) {
+                        let inferred: array<Type> = [];
+                        let pi = 0;
+                        while (pi < npayload) {
+                            let pt = v.payloads[pi] as Type;
+                            // 简化：实参类型直接入 param_types（TC 后续 match 解绑使用）
+                            let at = args[pi] as Expr;
+                            inferred = array_push(inferred, at.inferred_type);
+                            pi = pi + 1;
+                        }
+                        et.param_types = inferred;
+                    }
+                    e.intval = vidx;
+                    e.inferred_type = et;
+                    return et;
+                }
+                let msg2 = "enum variant '" + name + "' expects " + int_to_str(npayload) + " args but got " + int_to_str(len(args));
+                tc_error_at(ctx, loc, msg2);
+                e.inferred_type = mk_type(TYPE_ANY);
+                return mk_type(TYPE_ANY);
+            }
+        }
+        // 3c. 闭包间接调用
+        let et2 = tc_env_get(env, name);
+        if (type_is_none(et2) == 0 && et2.kind == TYPE_FUNCTION) {
+            let i2 = 0;
+            while (i2 < len(args)) {
+                tc_check_expr(ctx, args[i2], env);
+                i2 = i2 + 1;
+            }
+            e.intval = -1;
+            e.inferred_type = et2;
+            return et2.ret_type;
+        }
+        if (type_is_none(et2) == 0 && et2.kind == TYPE_ANY) {
+            let i3 = 0;
+            while (i3 < len(args)) {
+                tc_check_expr(ctx, args[i3], env);
+                i3 = i3 + 1;
+            }
+            e.intval = -1;
+            e.inferred_type = et2;
+            return mk_type(TYPE_ANY);
+        }
+        let msg3 = "undefined function '" + name + "'";
+        tc_error_at(ctx, loc, msg3);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 把调用点的名字改写为解析到的注册名（严格态下即带模块前缀，供 codegen 发射正确符号）
+    e.str1 = fd.name;
+    return tc_check_call_fd(ctx, e, env, fd, args, arg_names);
+}
+
+// 函数调用（已找到 FuncDef）：参数处理 + 泛型推断 + 单态化
+pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, args: array<Expr>, arg_names: array<string>) -> Type {
+    let loc = e.loc;
+    let params = fd.params;
+    let nparams = len(params);
+    let nargs = len(args);
+
+    // 命名参数校验：arg_names[i] 必须存在于函数参数列表
+    //（0.3 语义；tc-fail_named_param_wrong_name：f(x:1, nonexistent:2) 应拒绝）
+    let ni = 0;
+    while (ni < len(arg_names)) {
+        let an = arg_names[ni] as string;
+        if (len(an) > 0) {
+            let found_p = 0;
+            let pi5 = 0;
+            while (pi5 < nparams) {
+                let p5 = params[pi5] as Param;
+                if (str_eq(p5.name, an) == 1) { found_p = 1; break; }
+                pi5 = pi5 + 1;
+            }
+            if (found_p == 0) {
+                let msg_n = "unknown named argument '" + an + "' for function '" + fd.name + "'";
+                tc_error_at(ctx, loc, msg_n);
+            }
+        }
+        ni = ni + 1;
+    }
+
+    // 变参调用打包：函数末位参数 is_variadic（type_ref = array<T>）时，把第 var_idx 个
+    // 之后的实参打包成数组字面量实参（新建 Expr，非跨函数复用，安全），并写回 e.items
+    //（引用语义，后续 MIR lower 直接消费打包后的实参数组）。空调用 sum_all() → []。
+    let var_idx = -1;
+    let pv0 = 0;
+    while (pv0 < nparams) {
+        let pp0 = params[pv0] as Param;
+        if (file_exists("build/.qdbg") == 1) {
+            println("DBG varargs param pv0=" + int_to_str(pv0) + " isva=" + int_to_str(pp0.is_variadic) + " nparams=" + int_to_str(nparams));
+        }
+        if (pp0.is_variadic == 1) { var_idx = pv0; }
+        pv0 = pv0 + 1;
+    }
+    if (var_idx >= 0 && nargs >= var_idx) {
+        if (file_exists("build/.qdbg") == 1) {
+            println("DBG varargs PACK idx=" + int_to_str(var_idx) + " nargs=" + int_to_str(nargs));
+        }
+        let pack: array<Expr> = [];
+        let pi6 = var_idx;
+        while (pi6 < nargs) {
+            pack = array_push(pack, args[pi6]);
+            pi6 = pi6 + 1;
+        }
+        let new_args: array<Expr> = [];
+        let pi7 = 0;
+        while (pi7 < var_idx) {
+            new_args = array_push(new_args, args[pi7]);
+            pi7 = pi7 + 1;
+        }
+        let vp = params[var_idx] as Param;
+        let alit = mk_expr(EXPR_ARRAY_LIT, loc);
+        alit.items = pack;
+        alit.inferred_type = vp.type_ref;
+        new_args = array_push(new_args, alit);
+        e.items = new_args;
+        args = new_args;
+        nargs = len(new_args);
+        let new_names: array<string> = [];
+        let pi8 = 0;
+        while (pi8 < var_idx) {
+            let nn = "";
+            if (pi8 < len(arg_names)) { nn = arg_names[pi8] as string; }
+            new_names = array_push(new_names, nn);
+            pi8 = pi8 + 1;
+        }
+        new_names = array_push(new_names, "");
+        arg_names = new_names;
+    }
+
+    // 泛型函数：先做类型实参推断与约束检查
+    let tparams = fd.type_params;
+    ctx.bind_names = [];
+    ctx.bind_types = [];
+    if (len(tparams) > 0) {
+        // 从实参位置推断绑定（递归 unify：形参 Pair<A,B> ↔ 实参 Pair__T_int_string）
+        let pi = 0;
+        while (pi < nparams) {
+            let p = params[pi] as Param;
+            if (pi < nargs) {
+                let arg_t = tc_check_expr(ctx, args[pi], env);
+                tc_infer_bindings(ctx, p.type_ref, arg_t, tparams);
+            }
+            pi = pi + 1;
+        }
+        // 检查约束
+        let ti = 0;
+        while (ti < len(tparams)) {
+            let tp = tparams[ti] as TypeParam;
+            let i = 0;
+            while (i < len(ctx.bind_names)) {
+                let bn = ctx.bind_names[i] as string;
+                if (str_eq(tp.name, bn) == 1) {
+                    let bt2 = ctx.bind_types[i] as Type;
+                    if (tc_satisfies_constraint(ctx, bt2, tp.constraints) == 0) {
+                        let msg = "type argument '" + ty_display_name(bt2) + "' does not satisfy constraint '<" + tp.name + ": " + tc_format_constraints(tp.constraints) + ">'";
+                        tc_error_at(ctx, loc, msg);
+                    }
+                    break;
+                }
+                i = i + 1;
+            }
+            ti = ti + 1;
+        }
+        // 递归检查其余实参（未绑定参数位置）
+        let ai = 0;
+        while (ai < nargs) {
+            tc_check_expr(ctx, args[ai], env);
+            ai = ai + 1;
+        }
+    } else {
+        // 普通函数：逐个检查实参
+        let ai2 = 0;
+        while (ai2 < nargs) {
+            tc_check_expr(ctx, args[ai2], env);
+            ai2 = ai2 + 1;
+        }
+    }
+
+    // 参数数校验（内置除外）
+    if (nargs > nparams) {
+        if (file_exists("build/.qdbg") == 1) {
+            println("DBG varargs CHECK nargs=" + int_to_str(nargs) + " nparams=" + int_to_str(nparams) + " nargs_real=" + int_to_str(len(e.items)));
+        }
+        let msg2 = "function '" + fd.name + "' expects " + int_to_str(nparams) + " args but got " + int_to_str(nargs);
+        tc_error_at(ctx, loc, msg2);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 缺失参数：0.4 尚未实现默认参数展开（codegen 对缺参调用生成越界读 → 运行时 AV；
+    // 曾在 TC 调用处补默认值实参，但默认值 Expr 跨上下文复用触发 AST 大 struct 装箱崩溃）。
+    // 统一在 TC 拒绝：无默认值 → 参数数错误；有默认值 → 明确"未实现"（编译器自身源码/runtime 无默认参数，安全）。
+    let pi2 = nargs;
+    while (pi2 < nparams) {
+        let p = params[pi2] as Param;
+        if (expr_is_none(p.default_value) == 1) {
+            let msg3 = "function '" + fd.name + "' expects " + int_to_str(nparams) + " args but got " + int_to_str(nargs);
+            tc_error_at(ctx, loc, msg3);
+        } else {
+            let msg3b = "default parameter not implemented: '" + p.name + "' has default value";
+            tc_error_at(ctx, loc, msg3b);
+        }
+        break;
+    }
+    // 参数类型检查（已推断泛型）
+    let pi3 = 0;
+    while (pi3 < nparams && pi3 < nargs) {
+        let p = params[pi3] as Param;
+        let arg = args[pi3] as Expr;
+        let arg_t = arg.inferred_type;
+        let pty = p.type_ref;
+        if (len(tparams) > 0) {
+            pty = tc_mono_type(pty, tparams, ctx.bind_names, ctx.bind_types);
+            // 替换后 resolve：触发泛型 struct 单态化（Pair<int,string> → Pair__T_int_string）
+            let rty = tc_resolve_type(ctx, pty);
+            pty = rty;
+        }
+        if (tc_type_compat(ctx, pty, arg_t) == 0 && pty.kind != TYPE_INFER && arg_t.kind != TYPE_INFER) {
+            let msg4 = "argument type mismatch: parameter '" + p.name + "' expects '" + ty_display_name(pty) + "' but got '" + ty_display_name(arg_t) + "'";
+            tc_error_at(ctx, loc, msg4);
+        }
+        pi3 = pi3 + 1;
+    }
+
+    // 返回类型
+    let rt = fd.return_type;
+    if (len(tparams) > 0) {
+        rt = tc_mono_type(rt, tparams, ctx.bind_names, ctx.bind_types);
+        // 泛型*模板*体内的泛型调用不得实例化：`kimo outer<T>(x:T)->T { return inner(x); }`
+        // 检查模板体时 x 的类型就是类型参数 T 本身，实参绑定 = [T] → 特化名退化成
+        // "inner__T_T"（后缀是类型参数名而非具体类型），既是伪特化，又会把调用点
+        // e.str1 就地改写成该伪名。模板 AST 被 tc_mono_clone_stmt 克隆到真实特化
+        // （outer__T_int）后仍指向 "inner__T_T"，第二遍检查即报
+        // "undefined function 'inner__T_T'" + "return type mismatch ... got 'any'"。
+        // 故：绑定里只要还含当前函数的类型参数，就保持 e.str1 = 原名，
+        // 把真正的实例化推迟到特化副本被检查时（那时绑定已是具体类型）。
+        let bind_has_tparam = 0;
+        let bti = 0;
+        while (bti < len(ctx.bind_types)) {
+            let bt2 = ctx.bind_types[bti] as Type;
+            if (tc_is_type_param(bt2, tc_cur_tparams) == 1) { bind_has_tparam = 1; }
+            bti = bti + 1;
+        }
+        if (bind_has_tparam == 1) {
+            e.str1 = fd.name;
+        } else {
+            // 真单态化：实例化特化副本
+            let mono_name = tc_mono_instantiate(ctx, fd, tparams, ctx.bind_names, ctx.bind_types);
+            if (len(mono_name) > 0) {
+                e.str1 = mono_name;
+            }
+        }
+    } else {
+        e.str1 = fd.name;
+    }
+    e.intval = -2;
+    // async 函数 → 改写 EXPR_SPAWN 返回 TYPE_FUTURE
+    if (fd.is_async == 1) {
+        e.kind = EXPR_SPAWN;
+        let fut = mk_type(TYPE_FUTURE);
+        e.inferred_type = fut;
+        return fut;
+    }
+    e.inferred_type = rt;
+    return rt;
+}
+
+// 泛型函数单态化：实例化特化副本加入 worklist，返回特化名（非泛型返回空）
+pub kimo tc_mono_instantiate(ctx: CompileContext, fd: FuncDef, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> string {
+    // 特化名
+    let base = fd.name;
+    let sname = base + "__T_";
+    let i = 0;
+    while (i < len(bind_types)) {
+        let bt3 = bind_types[i] as Type;
+        sname = sname + tc_mono_type_tag(bt3);
+        if (i < len(bind_types) - 1) { sname = sname + "_"; }
+        i = i + 1;
+    }
+    if (len(sname) > 240) {
+        let cut = "";
+        let j = 0;
+        while (j < 240) {
+            cut = cut + sname[j];
+            j = j + 1;
+        }
+        sname = cut;
+    }
+    // 缓存去重
+    let ci = 0;
+    while (ci < len(ctx.mono_cache)) {
+        let c = ctx.mono_cache[ci] as string;
+        if (str_eq(c, sname) == 1) { return sname; }
+        ci = ci + 1;
+    }
+    // 克隆特化并加入 worklist
+    let spec = tc_mono_clone_funcdef(ctx, fd, tparams, bind_names, bind_types);
+    spec.name = sname;
+    ctx.mono_funcs = array_push(ctx.mono_funcs, spec);
+    ctx.mono_func_mods = array_push(ctx.mono_func_mods, ctx.current_module);
+    ctx.mono_cache = array_push(ctx.mono_cache, sname);
+    return sname;
+}
+
+// ============ EXPR_MATCH ============
+pub kimo tc_check_match(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let scrut_t = tc_check_expr(ctx, e.child1, env);
+    let pats = e.items;
+    let bodies = e.items2;
+    // scrutinee 为 enum 时查 EnumDef
+    let ed = 0 as EnumDef;
+    let is_enum = 0;
+    let sk = scrut_t.kind;
+    if (sk == TYPE_ENUM || sk == TYPE_ENUM_PAYLOAD) {
+        ed = tc_enum_lookup(ctx, scrut_t.name);
+        if (tc_enum_is_none(ed) == 0) { is_enum = 1; }
+    }
+    let result_t = mk_type(TYPE_ANY);
+    let covered: array<string> = [];
+    let has_wild = 0;
+    let pi = 0;
+    while (pi < len(pats)) {
+        let pat = pats[pi] as Expr;
+        let arm_env = tc_env_clone(env);
+        let pk = pat.kind;
+        if (pk == EXPR_VAR) {
+            let pname = pat.str1;
+            if (str_eq(pname, "_") == 1) {
+                has_wild = 1;
+            } else if (is_enum == 1) {
+                // 无负载变体名
+                let vidx = tc_enum_variant_index(ed, pname);
+                if (vidx >= 0) {
+                    pat.intval = vidx;
+                    let v = ed.variants[vidx] as EnumVariant;
+                    if (len(v.payloads) > 0) {
+                        let msg = "variant '" + pname + "' has payloads; use '" + pname + "(...)' destructuring pattern";
+                        tc_error_at(ctx, loc, msg);
+                    }
+                    covered = array_push(covered, pname);
+                } else {
+                    // 绑定整个 scrutinee
+                    tc_env_set(arm_env, pname, scrut_t);
+                }
+            } else {
+                tc_env_set(arm_env, pname, scrut_t);
+            }
+        } else if (pk == EXPR_ENUM_VARIANT) {
+            let vname = pat.str1;
+            if (is_enum == 1) {
+                let vidx = tc_enum_variant_index(ed, vname);
+                if (vidx >= 0) {
+                    pat.intval = vidx;
+                    let v = ed.variants[vidx] as EnumVariant;
+                    let nbind = len(pat.str_items);
+                    let npay = len(v.payloads);
+                    if (nbind != npay) {
+                        let msg2 = "variant '" + vname + "' expects " + int_to_str(npay) + " bindings but got " + int_to_str(nbind);
+                        tc_error_at(ctx, loc, msg2);
+                    } else {
+                        // 绑定类型：泛型 enum 用 scrutinee.param_types 索引替换
+                        let bi = 0;
+                        while (bi < nbind) {
+                            let bname = pat.str_items[bi] as string;
+                            let bty = v.payloads[bi] as Type;
+                            if (is_enum == 1 && len(scrut_t.param_types) > 0 && len(ed.type_params) > 0) {
+                                // 替换泛型参数
+                                let tp_idx = 0;
+                                while (tp_idx < len(ed.type_params)) {
+                                    let tp = ed.type_params[tp_idx] as TypeParam;
+                                    if (str_eq(bty.name, tp.name) == 1 && tp_idx < len(scrut_t.param_types)) {
+                                        bty = scrut_t.param_types[tp_idx] as Type;
+                                        break;
+                                    }
+                                    tp_idx = tp_idx + 1;
+                                }
+                            }
+                            pat.bind_types = array_push(pat.bind_types, bty);
+                            tc_env_set(arm_env, bname, bty);
+                            bi = bi + 1;
+                        }
+                    }
+                    covered = array_push(covered, vname);
+                } else {
+                    let msg3 = "unknown variant '" + vname + "' in enum '" + scrut_t.name + "'";
+                    tc_error_at(ctx, loc, msg3);
+                }
+            } else {
+                let msg4 = "cannot destructure non-enum type '" + ty_display_name(scrut_t) + "'";
+                tc_error_at(ctx, loc, msg4);
+            }
+        } else {
+            // 字面量模式
+            let pt = tc_check_expr(ctx, pat, arm_env);
+            if (tc_type_compat(ctx, scrut_t, pt) == 0 && pt.kind != TYPE_ANY) {
+                let msg5 = "match pattern type mismatch: pattern is '" + ty_display_name(pt) + "' but scrutinee is '" + ty_display_name(scrut_t) + "'";
+                tc_error_at(ctx, loc, msg5);
+            }
+        }
+        // 臂体检查
+        let body = bodies[pi] as Expr;
+        let bt2 = tc_check_expr(ctx, body, arm_env);
+        if (pi == 0) {
+            result_t = bt2;
+        } else {
+            result_t = tc_lub(ctx, result_t, bt2);
+        }
+        pi = pi + 1;
+    }
+    // 穷尽性检查
+    if (is_enum == 1 && has_wild == 0) {
+        let missing: array<string> = [];
+        let vi = 0;
+        while (vi < len(ed.variants)) {
+            let v = ed.variants[vi] as EnumVariant;
+            if (tc_name_in_array(covered, v.name) == 0) {
+                missing = array_push(missing, v.name);
+            }
+            vi = vi + 1;
+        }
+        if (len(missing) > 0) {
+            let mlist = "";
+            let mi = 0;
+            while (mi < len(missing)) {
+                mlist = mlist + missing[mi];
+                if (mi < len(missing) - 1) { mlist = mlist + ", "; }
+                mi = mi + 1;
+            }
+            let msg6 = "non-exhaustive match: missing variant(s): '" + mlist + "'";
+            tc_error_at(ctx, loc, msg6);
+        }
+    }
+    e.inferred_type = result_t;
+    return result_t;
+}
+
+// ============ EXPR_CLOSURE ============
+pub kimo tc_check_closure(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let cdef = e.closure_def;
+    let fd = 0 as FuncDef;
+    let is_literal = 1;
+    let copt = cdef as any;
+    if (copt != 0) {
+        let f = match cdef { Some(x) => x, None => 0 as FuncDef };
+        let ff = f as FuncDef;
+        fd = ff;
+        let fname = fd.name;
+        if (len(fname) > 0) { is_literal = 0; }
+    } else {
+        return mk_type(TYPE_ANY);
+    }
+    if (is_literal == 0) {
+        // 函数引用（EXPR_VAR 改写）：已填 name，直接返回 TYPE_FUNCTION
+        let fty = mk_func_type([], fd.return_type, 0);
+        let i = 0;
+        while (i < len(fd.params)) {
+            let p = fd.params[i] as Param;
+            fty.param_types = array_push(fty.param_types, p.type_ref);
+            i = i + 1;
+        }
+        e.inferred_type = fty;
+        return fty;
+    }
+    // 闭包字面量：提升 __closure_<n>
+    let n = ctx.closure_counter;
+    ctx.closure_counter = ctx.closure_counter + 1;
+    let cname = "__closure_" + int_to_str(n);
+    fd.name = cname;
+    // 捕获分析：扫描 body 自由变量，排除参数/本地绑定
+    ctx.free_vars_names = [];
+    // 先收集本地绑定名（let/for 等）
+    let local_names: array<string> = [];
+    let li = 0;
+    while (li < len(fd.params)) {
+        let p = fd.params[li] as Param;
+        local_names = tc_local_names_add(local_names, p.name);
+        li = li + 1;
+    }
+    let body_stmts = fd.body.items;
+    li = 0;
+    while (li < len(body_stmts)) {
+        local_names = tc_collect_local_names_stmt(local_names, body_stmts[li]);
+        li = li + 1;
+    }
+    tc_collect_free_vars_stmt(ctx, fd.body);
+    // 仅保留 env 中可见且非本地的捕获
+    let captures: array<Param> = [];
+    let ci = 0;
+    while (ci < len(ctx.free_vars_names)) {
+        let fv = ctx.free_vars_names[ci] as string;
+        if (tc_name_in_array(local_names, fv) == 0) {
+            let vt = tc_env_get(env, fv);
+            if (type_is_none(vt) == 0) {
+                // 排除全局函数名/变体名
+                let fd2 = tc_func_lookup(ctx, fv);
+                if (tc_func_is_none(fd2) == 1) {
+                    let cp = Param { name: fv, type_ref: vt, loc: loc, is_mut: 0, is_variadic: 0, default_value: 0 as Expr };
+                    captures = array_push(captures, cp);
+                }
+            }
+        }
+        ci = ci + 1;
+    }
+    // 捕获参数插入 params 头部
+    let new_params: array<Param> = [];
+    ci = 0;
+    while (ci < len(captures)) {
+        new_params = array_push(new_params, captures[ci]);
+        ci = ci + 1;
+    }
+    let pi = 0;
+    while (pi < len(fd.params)) {
+        new_params = array_push(new_params, fd.params[pi]);
+        pi = pi + 1;
+    }
+    fd.params = new_params;
+    // 闭包 env：captures + 自身参数
+    let closure_env = tc_env_clone(env);
+    ci = 0;
+    while (ci < len(captures)) {
+        let cp = captures[ci] as Param;
+        tc_env_set(closure_env, cp.name, cp.type_ref);
+        ci = ci + 1;
+    }
+    pi = 0;
+    while (pi < len(fd.params)) {
+        let p = fd.params[pi] as Param;
+        tc_env_set(closure_env, p.name, p.type_ref);
+        pi = pi + 1;
+    }
+    // 检查 body
+    let bi = 0;
+    while (bi < len(body_stmts)) {
+        tc_check_stmt(ctx, body_stmts[bi], closure_env, fd.return_type, 0);
+        bi = bi + 1;
+    }
+    // 注册到模块函数表
+    let node = ctx.cur_node;
+    node.func_names = array_push(node.func_names, cname);
+    node.func_defs = array_push(node.func_defs, fd);
+    ctx.cur_node = node;
+    // 闭包提升注册表：main_compile_source 合并进 prog.funcs 参与 lower+codegen 发射
+    tc_g_closure_funcs = array_push(tc_g_closure_funcs, fd);
+    // 返回 TYPE_FUNCTION
+    let fty2 = mk_func_type([], fd.return_type, len(captures));
+    let ci2 = 0;
+    while (ci2 < len(fd.params)) {
+        let p = fd.params[ci2] as Param;
+        fty2.param_types = array_push(fty2.param_types, p.type_ref);
+        ci2 = ci2 + 1;
+    }
+    e.closure_def = Some(fd);
+    e.inferred_type = fty2;
+    return fty2;
+}
+
+// ============ EXPR_ASSIGN / NEW / IF / TUPLE / RANGE / QUESTION / SPAWN / AWAIT ============
+pub kimo tc_check_assign(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let lhs_t = tc_check_expr(ctx, e.child1, env);
+    let rhs_t = tc_check_expr(ctx, e.child2, env);
+    let loc = e.loc;
+    if (lhs_t.kind != TYPE_INFER && rhs_t.kind != TYPE_INFER &&
+        lhs_t.kind != TYPE_ANY && rhs_t.kind != TYPE_ANY) {
+        if (tc_type_compat(ctx, lhs_t, rhs_t) == 0) {
+            let msg = "cannot assign value of type '" + ty_display_name(rhs_t) + "' to variable of type '" + ty_display_name(lhs_t) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+    }
+    e.inferred_type = lhs_t;
+    return lhs_t;
+}
+
+pub kimo tc_check_new(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let name = e.str1;
+    let res_name = name;
+    if (len(e.type_args) > 0) {
+        let sd0 = tc_struct_lookup(ctx, name);
+        if (tc_struct_is_none(sd0) == 0 && len(sd0.type_params) > 0) {
+            let mono = tc_struct_mono_instantiate(ctx, name, e.type_args);
+            if (len(mono) > 0) { res_name = mono; }
+        }
+    }
+    let sd = tc_struct_lookup(ctx, res_name);
+    if (tc_struct_is_none(sd) == 1) {
+        // 严格态歧义（struct 引用）
+        let ambig_msg = tc_ambig_message("struct");
+        if (len(ambig_msg) > 0) {
+            tc_error_at(ctx, loc, ambig_msg);
+            e.inferred_type = mk_type(TYPE_ANY);
+            return mk_type(TYPE_ANY);
+        }
+        let msg = "unknown struct '" + name + "' in new expression";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    // 严格态：e.str1 改写为注册名（mangled）——codegen 的 GC 类型 key 依赖它
+    e.str1 = sd.name;
+    e.intval = len(sd.fields);
+    let st = mk_named_type(TYPE_STRUCT, sd.name);
+    st.param_types = e.type_args;
+    e.inferred_type = st;
+    return st;
+}
+
+pub kimo tc_check_if(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let cond_t = tc_check_expr(ctx, e.child1, env);
+    let loc = e.loc;
+    let ck = cond_t.kind;
+    if (ck != TYPE_BOOL && ck != TYPE_ANY && ck != TYPE_INT && ck != TYPE_LONG) {
+        let msg = "if condition must be bool, got '" + ty_display_name(cond_t) + "'";
+        tc_error_at(ctx, loc, msg);
+    }
+    let then_t = tc_check_expr(ctx, e.child2, env);
+    let else_t = mk_type(TYPE_ANY);
+    if (expr_is_none(e.child3) == 0) {
+        else_t = tc_check_expr(ctx, e.child3, env);
+    }
+    let rt = tc_lub(ctx, then_t, else_t);
+    e.inferred_type = rt;
+    return rt;
+}
+
+pub kimo tc_check_tuple(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let tt = mk_type(TYPE_TUPLE);
+    let i = 0;
+    while (i < len(e.items)) {
+        let it = tc_check_expr(ctx, e.items[i], env);
+        tt.param_types = array_push(tt.param_types, it);
+        i = i + 1;
+    }
+    e.inferred_type = tt;
+    return tt;
+}
+
+pub kimo tc_check_range(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let s_t = tc_check_expr(ctx, e.child1, env);
+    let e_t = tc_check_expr(ctx, e.child2, env);
+    let loc = e.loc;
+    if (s_t.kind != TYPE_INT && s_t.kind != TYPE_ANY) {
+        let msg = "range start must be int, got '" + ty_display_name(s_t) + "'";
+        tc_error_at(ctx, loc, msg);
+    }
+    if (e_t.kind != TYPE_INT && e_t.kind != TYPE_ANY) {
+        let msg2 = "range end must be int, got '" + ty_display_name(e_t) + "'";
+        tc_error_at(ctx, loc, msg2);
+    }
+    let at = mk_type(TYPE_ARRAY);
+    at.elem_type = mk_type(TYPE_INT);
+    e.inferred_type = at;
+    return at;
+}
+
+pub kimo tc_check_question(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let inner_t = tc_check_expr(ctx, e.child1, env);
+    let loc = e.loc;
+    let rt = tc_resolve_type(ctx, inner_t);
+    let rk = rt.kind;
+    let is_opt = 0;
+    if (str_eq(rt.name, "Result") == 1) { is_opt = 1; }
+    if (str_eq(rt.name, "Option") == 1) { is_opt = 1; }
+    if (is_opt == 1) {
+        let unwrap_t = mk_type(TYPE_ANY);
+        if (len(rt.param_types) > 0) {
+            unwrap_t = rt.param_types[0] as Type;
+        }
+        e.intval = 1;          // 错误变体索引（Result.Err / Option.None 均为 1）
+        e.str1 = rt.name;      // 枚举名（"Result"/"Option"）→ MIR `?` 错误消息用
+        e.inferred_type = unwrap_t;
+        return unwrap_t;
+    }
+    let msg = "cannot use '?' on non-Result/Option type '" + ty_display_name(rt) + "'";
+    tc_error_at(ctx, loc, msg);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+pub kimo tc_check_spawn(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let loc = e.loc;
+    let name = e.str1;
+    let fd = tc_func_lookup(ctx, name);
+    if (tc_func_is_none(fd) == 1) {
+        let msg = "undefined function '" + name + "' in spawn";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_FUTURE);
+        return mk_type(TYPE_FUTURE);
+    }
+    // 关键：codegen（hir_lower_expr EXPR_SPAWN → MIR_SPAWN）用 e.str1 作线程入口的
+    // LLVM 符号名。私有函数注册期已被 mangle 成 __mod_<mod>__<name>，此处若不同步
+    // 改写，spawn w0() 会引用不存在的裸名 @w0 → lld-link: undefined symbol: w0。
+    // 与普通调用路径（tc_check_call 里的 e.str1 = mangled）保持对称。
+    e.str1 = fd.name;
+    // 参数检查
+    let args = e.items;
+    let params = fd.params;
+    let ai = 0;
+    while (ai < len(args)) {
+        tc_check_expr(ctx, args[ai], env);
+        ai = ai + 1;
+    }
+    if (len(args) != len(params)) {
+        let msg2 = "spawn function '" + name + "' expects " + int_to_str(len(params)) + " args but got " + int_to_str(len(args));
+        tc_error_at(ctx, loc, msg2);
+    }
+    // 带参 spawn：inferred_type 存函数类型（TYPE_FUNCTION，param_types+ret_type），
+    // 供 MIR_SPAWN codegen 生成 thunk 打包 env。nullary spawn：TYPE_FUTURE。
+    if (len(args) > 0) {
+        let fty = mk_func_type([], fd.return_type, 0);
+        let pi2 = 0;
+        while (pi2 < len(params)) {
+            let p = params[pi2] as Param;
+            fty.param_types = array_push(fty.param_types, p.type_ref);
+            pi2 = pi2 + 1;
+        }
+        e.inferred_type = fty;
+        return fty;
+    }
+    let fut = mk_type(TYPE_FUTURE);
+    e.inferred_type = fut;
+    return fut;
+}
+
+pub kimo tc_check_await(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let inner_t = tc_check_expr(ctx, e.child1, env);
+    let at = mk_type(TYPE_ANY);
+    e.inferred_type = at;
+    return at;
+}
+
+// ============ EXPR 主分发 ============
+pub kimo tc_check_expr(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    if (expr_is_none(e) == 1) { return mk_type(TYPE_ANY); }
+    let k = e.kind;
+    let t = tc_check_lit(ctx, e, env);
+    if (type_is_none(t) == 0) { return t; }
+    if (k == EXPR_VAR) { return tc_check_var(ctx, e, env); }
+    if (k == EXPR_BINARY) { return tc_check_binary(ctx, e, env); }
+    if (k == EXPR_UNARY) { return tc_check_unary(ctx, e, env); }
+    if (k == EXPR_CALL) { return tc_check_call(ctx, e, env); }
+    if (k == EXPR_INDEX) { return tc_check_index(ctx, e, env); }
+    if (k == EXPR_MEMBER) { return tc_check_member(ctx, e, env); }
+    if (k == EXPR_CAST) { return tc_check_cast(ctx, e, env); }
+    if (k == EXPR_ARRAY_LIT) { return tc_check_array_lit(ctx, e, env); }
+    if (k == EXPR_STRUCT_LIT) { return tc_check_struct_lit(ctx, e, env); }
+    if (k == EXPR_ASSIGN) { return tc_check_assign(ctx, e, env); }
+    if (k == EXPR_MATCH) { return tc_check_match(ctx, e, env); }
+    if (k == EXPR_NEW) { return tc_check_new(ctx, e, env); }
+    if (k == EXPR_IF) { return tc_check_if(ctx, e, env); }
+    if (k == EXPR_TUPLE) { return tc_check_tuple(ctx, e, env); }
+    if (k == EXPR_RANGE) { return tc_check_range(ctx, e, env); }
+    if (k == EXPR_QUESTION) { return tc_check_question(ctx, e, env); }
+    if (k == EXPR_SPAWN) { return tc_check_spawn(ctx, e, env); }
+    if (k == EXPR_AWAIT) { return tc_check_await(ctx, e, env); }
+    if (k == EXPR_CLOSURE) { return tc_check_closure(ctx, e, env); }
+    // EXPR_ENUM_VARIANT 值位置 → any
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
+
+// ============ 语句检查 ============
+pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, in_loop: int) -> void {
+    if (stmt_is_none(s) == 1) { return; }
+    let k = s.kind;
+    let loc = s.loc;
+
+    if (k == STMT_LET) {
+        let name = s.str1;
+        let decl_ty = s.type1;
+        let init = s.expr1;
+        // 无注解无初始化 → 报错
+        if (type_is_none(decl_ty) == 1 && expr_is_none(init) == 1) {
+            let msg = "variable '" + name + "' requires either a type annotation or an initializer";
+            tc_error_at(ctx, loc, msg);
+            tc_env_set(env, name, mk_type(TYPE_ANY));
+            return;
+        }
+        if (expr_is_none(init) == 0) {
+            let init_t = tc_check_expr(ctx, init, env);
+            if (type_is_none(decl_ty) == 0) {
+                let dty = tc_resolve_type(ctx, decl_ty);
+                if (tc_type_compat(ctx, dty, init_t) == 0 && dty.kind != TYPE_INFER && init_t.kind != TYPE_INFER) {
+                    let msg2 = "type mismatch in let binding: variable '" + name + "' is '" + ty_display_name(dty) + "' but initializer is '" + ty_display_name(init_t) + "'";
+                    tc_error_at(ctx, loc, msg2);
+                }
+                tc_env_set(env, name, dty);
+            } else {
+                tc_env_set(env, name, init_t);
+            }
+        } else {
+            let dty2 = tc_resolve_type(ctx, decl_ty);
+            tc_env_set(env, name, dty2);
+        }
+        // 回填 final 类型到 stmt（MIR_STORE_VAR 依赖）
+        let final_ty = tc_env_get(env, name);
+        s.inferred_type = final_ty;
+        return;
+    }
+
+    if (k == STMT_RETURN) {
+        let has_val = s.intval;
+        if (has_val == 0) {
+            let rk = ret_type.kind;
+            if (rk != TYPE_VOID && rk != TYPE_UNIT && rk != TYPE_ANY) {
+                let msg3 = "return type mismatch: function returns '" + ty_display_name(ret_type) + "' but 'return;' has no value";
+                tc_error_at(ctx, loc, msg3);
+            }
+            return;
+        }
+        let val_t = tc_check_expr(ctx, s.expr1, env);
+        let rk2 = ret_type.kind;
+        if (rk2 != TYPE_VOID && rk2 != TYPE_UNIT && rk2 != TYPE_ANY) {
+            if (tc_type_compat(ctx, ret_type, val_t) == 0 && val_t.kind != TYPE_INFER) {
+                let msg4 = "return type mismatch: function returns '" + ty_display_name(ret_type) + "' but got '" + ty_display_name(val_t) + "'";
+                tc_error_at(ctx, loc, msg4);
+            }
+        }
+        return;
+    }
+
+    if (k == STMT_IF) {
+        let cond_t = tc_check_expr(ctx, s.expr1, env);
+        let ck = cond_t.kind;
+        if (ck != TYPE_BOOL && ck != TYPE_ANY) {
+            let msg5 = "if condition must be bool, got '" + ty_display_name(cond_t) + "'";
+            tc_error_at(ctx, loc, msg5);
+        }
+        let i = 0;
+        while (i < len(s.items)) {
+            tc_check_stmt(ctx, s.items[i], env, ret_type, in_loop);
+            i = i + 1;
+        }
+        let j = 0;
+        while (j < len(s.items2)) {
+            tc_check_stmt(ctx, s.items2[j], env, ret_type, in_loop);
+            j = j + 1;
+        }
+        return;
+    }
+
+    if (k == STMT_WHILE) {
+        let cond_t2 = tc_check_expr(ctx, s.expr1, env);
+        let ck2 = cond_t2.kind;
+        if (ck2 != TYPE_BOOL && ck2 != TYPE_ANY && ck2 != TYPE_INT && ck2 != TYPE_LONG) {
+            let msg6 = "while condition must be bool, got '" + ty_display_name(cond_t2) + "'";
+            tc_error_at(ctx, loc, msg6);
+        }
+        let i2 = 0;
+        while (i2 < len(s.items)) {
+            tc_check_stmt(ctx, s.items[i2], env, ret_type, 1);
+            i2 = i2 + 1;
+        }
+        return;
+    }
+
+    if (k == STMT_FOR) {
+        let iter_t = tc_check_expr(ctx, s.expr1, env);
+        let var_names = s.str1;
+        let parts = tc_split_commas(var_names);
+        let nv = len(parts);
+        // 绑定迭代元素类型
+        let ik = iter_t.kind;
+        if (nv == 1) {
+            // 单变量：range → int；array → elem；string → char；dict → key；set → elem
+            let bind_t = mk_type(TYPE_INT);
+            if (ik == TYPE_ARRAY) { bind_t = iter_t.elem_type; }
+            else if (ik == TYPE_STRING) { bind_t = mk_type(TYPE_CHAR); }
+            else if (ik == TYPE_DICT) { bind_t = iter_t.key_type; }
+            else if (ik == TYPE_SET) { bind_t = iter_t.elem_type; }
+            else if (ik == TYPE_ANY) { bind_t = mk_type(TYPE_ANY); }
+            tc_env_set(env, parts[0] as string, bind_t);
+        } else if (nv == 2 && ik == TYPE_DICT) {
+            // dict 双变量是 (key, value)——不是 array 那种 (index, elem)。
+            // MIR 侧发射的正是 shadow_dict_key_at + shadow_dict_get_{string,int}
+            // （见 src/mir/mir.shadow 的 n_vars==2 && is_dict_iter 分支），
+            // 若这里仍按 (int, int) 绑定，println(k)/println(v) 会走整数分派，
+            // 把字符串指针截断成负数打印出来。
+            let kt2 = iter_t.key_type;
+            let vt2 = iter_t.val_type;
+            if (type_is_none(kt2) == 1) { kt2 = mk_type(TYPE_STRING); }
+            if (type_is_none(vt2) == 1) { vt2 = mk_type(TYPE_STRING); }
+            tc_env_set(env, parts[0] as string, kt2);
+            tc_env_set(env, parts[1] as string, vt2);
+        } else if (nv == 2) {
+            // 双变量：i, elem
+            let bind_t2 = mk_type(TYPE_INT);
+            if (ik == TYPE_ARRAY) { bind_t2 = iter_t.elem_type; }
+            else if (ik == TYPE_ANY) { bind_t2 = mk_type(TYPE_ANY); }
+            tc_env_set(env, parts[0] as string, mk_type(TYPE_INT));
+            tc_env_set(env, parts[1] as string, bind_t2);
+        } else {
+            // 多变量：tuple 拆包
+            let bi = 0;
+            while (bi < nv) {
+                let bt = mk_type(TYPE_ANY);
+                if (ik == TYPE_TUPLE && bi < len(iter_t.param_types)) {
+                    bt = iter_t.param_types[bi] as Type;
+                }
+                tc_env_set(env, parts[bi] as string, bt);
+                bi = bi + 1;
+            }
+        }
+        let i3 = 0;
+        while (i3 < len(s.items)) {
+            tc_check_stmt(ctx, s.items[i3], env, ret_type, 1);
+            i3 = i3 + 1;
+        }
+        return;
+    }
+
+    if (k == STMT_BREAK) {
+        if (in_loop == 0) {
+            let msg7 = "break outside loop";
+            tc_error_at(ctx, loc, msg7);
+        }
+        return;
+    }
+
+    if (k == STMT_CONTINUE) {
+        if (in_loop == 0) {
+            let msg8 = "continue outside loop";
+            tc_error_at(ctx, loc, msg8);
+        }
+        return;
+    }
+
+    if (k == STMT_ASSIGN) {
+        let lhs_t = tc_check_expr(ctx, s.expr1, env);
+        let rhs_t = tc_check_expr(ctx, s.expr2, env);
+        if (lhs_t.kind != TYPE_INFER && rhs_t.kind != TYPE_INFER &&
+            lhs_t.kind != TYPE_ANY && rhs_t.kind != TYPE_ANY) {
+            if (tc_type_compat(ctx, lhs_t, rhs_t) == 0) {
+                let msg9 = "cannot assign value of type '" + ty_display_name(rhs_t) + "' to variable of type '" + ty_display_name(lhs_t) + "'";
+                tc_error_at(ctx, loc, msg9);
+            }
+        }
+        return;
+    }
+
+    if (k == STMT_EXPR) {
+        if (expr_is_none(s.expr1) == 0) {
+            tc_check_expr(ctx, s.expr1, env);
+        }
+        return;
+    }
+
+    if (k == STMT_MATCH) {
+        tc_check_stmt_match(ctx, s, env, ret_type, in_loop);
+        return;
+    }
+
+    if (k == STMT_BLOCK) {
+        let i4 = 0;
+        while (i4 < len(s.items)) {
+            tc_check_stmt(ctx, s.items[i4], env, ret_type, in_loop);
+            i4 = i4 + 1;
+        }
+        return;
+    }
+
+    if (k == STMT_PANIC) {
+        if (expr_is_none(s.expr1) == 0) {
+            tc_check_expr(ctx, s.expr1, env);
+        }
+        return;
+    }
+
+    if (k == STMT_THROW) {
+        if (expr_is_none(s.expr1) == 0) {
+            tc_check_expr(ctx, s.expr1, env);
+        }
+        return;
+    }
+
+    if (k == STMT_TRY) {
+        // try 块（parser 已去糖为 STMT_BLOCK + if 守卫）
+        let i5 = 0;
+        while (i5 < len(s.items)) {
+            tc_check_stmt(ctx, s.items[i5], env, ret_type, in_loop);
+            i5 = i5 + 1;
+        }
+        let j2 = 0;
+        while (j2 < len(s.items2)) {
+            tc_check_stmt(ctx, s.items2[j2], env, ret_type, in_loop);
+            j2 = j2 + 1;
+        }
+        return;
+    }
+}
+
+// STMT_MATCH 检查（复用表达式 match 的核心逻辑，但臂体是语句块）
+pub kimo tc_check_stmt_match(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, in_loop: int) -> void {
+    let loc = s.loc;
+    let scrut_t = tc_check_expr(ctx, s.expr1, env);
+    let pats = s.exprs;
+    let arm_blocks = s.items;
+    let ed = 0 as EnumDef;
+    let is_enum = 0;
+    let sk = scrut_t.kind;
+    if (sk == TYPE_ENUM || sk == TYPE_ENUM_PAYLOAD) {
+        ed = tc_enum_lookup(ctx, scrut_t.name);
+        if (tc_enum_is_none(ed) == 0) { is_enum = 1; }
+    }
+    let covered: array<string> = [];
+    let has_wild = 0;
+    let pi = 0;
+    while (pi < len(pats)) {
+        let pat = pats[pi] as Expr;
+        let arm_env = tc_env_clone(env);
+        let pk = pat.kind;
+        if (pk == EXPR_VAR) {
+            let pname = pat.str1;
+            if (str_eq(pname, "_") == 1) {
+                has_wild = 1;
+            } else if (is_enum == 1) {
+                let vidx = tc_enum_variant_index(ed, pname);
+                if (vidx >= 0) {
+                    pat.intval = vidx;
+                    let v = ed.variants[vidx] as EnumVariant;
+                    if (len(v.payloads) > 0) {
+                        let msg = "variant '" + pname + "' has payloads; use destructuring pattern";
+                        tc_error_at(ctx, loc, msg);
+                    }
+                    covered = array_push(covered, pname);
+                } else {
+                    tc_env_set(arm_env, pname, scrut_t);
+                }
+            } else {
+                tc_env_set(arm_env, pname, scrut_t);
+            }
+        } else if (pk == EXPR_ENUM_VARIANT) {
+            let vname = pat.str1;
+            if (is_enum == 1) {
+                let vidx = tc_enum_variant_index(ed, vname);
+                if (vidx >= 0) {
+                    pat.intval = vidx;
+                    let v = ed.variants[vidx] as EnumVariant;
+                    let nbind = len(pat.str_items);
+                    let npay = len(v.payloads);
+                    if (nbind != npay) {
+                        let msg2 = "variant '" + vname + "' expects " + int_to_str(npay) + " bindings but got " + int_to_str(nbind);
+                        tc_error_at(ctx, loc, msg2);
+                    } else {
+                        let bi = 0;
+                        while (bi < nbind) {
+                            let bname = pat.str_items[bi] as string;
+                            let bty = v.payloads[bi] as Type;
+                            if (len(scrut_t.param_types) > 0 && len(ed.type_params) > 0) {
+                                let tp_idx = 0;
+                                while (tp_idx < len(ed.type_params)) {
+                                    let tp = ed.type_params[tp_idx] as TypeParam;
+                                    if (str_eq(bty.name, tp.name) == 1 && tp_idx < len(scrut_t.param_types)) {
+                                        bty = scrut_t.param_types[tp_idx] as Type;
+                                        break;
+                                    }
+                                    tp_idx = tp_idx + 1;
+                                }
+                            }
+                            pat.bind_types = array_push(pat.bind_types, bty);
+                            tc_env_set(arm_env, bname, bty);
+                            bi = bi + 1;
+                        }
+                    }
+                    covered = array_push(covered, vname);
+                } else {
+                    let msg3 = "unknown variant '" + vname + "' in enum '" + scrut_t.name + "'";
+                    tc_error_at(ctx, loc, msg3);
+                }
+            }
+        } else {
+            let pt = tc_check_expr(ctx, pat, arm_env);
+            if (tc_type_compat(ctx, scrut_t, pt) == 0 && pt.kind != TYPE_ANY) {
+                let msg4 = "match pattern type mismatch";
+                tc_error_at(ctx, loc, msg4);
+            }
+        }
+        // 臂体检查
+        let arm = arm_blocks[pi] as Stmt;
+        let bi2 = 0;
+        while (bi2 < len(arm.items)) {
+            tc_check_stmt(ctx, arm.items[bi2], arm_env, ret_type, in_loop);
+            bi2 = bi2 + 1;
+        }
+        pi = pi + 1;
+    }
+    // 穷尽性检查
+    if (is_enum == 1 && has_wild == 0) {
+        let missing: array<string> = [];
+        let vi = 0;
+        while (vi < len(ed.variants)) {
+            let v = ed.variants[vi] as EnumVariant;
+            if (tc_name_in_array(covered, v.name) == 0) {
+                missing = array_push(missing, v.name);
+            }
+            vi = vi + 1;
+        }
+        if (len(missing) > 0) {
+            let mlist = "";
+            let mi = 0;
+            while (mi < len(missing)) {
+                mlist = mlist + missing[mi];
+                if (mi < len(missing) - 1) { mlist = mlist + ", "; }
+                mi = mi + 1;
+            }
+            let msg5 = "non-exhaustive match: missing variant(s): '" + mlist + "'";
+            tc_error_at(ctx, loc, msg5);
+        }
+    }
+}
+
+// ============ 函数检查 ============
+pub kimo tc_check_function(ctx: CompileContext, fd: FuncDef) -> void {
+    if (fd.is_extern == 1) { return; }
+    if (len(fd.extern_name) > 0 && stmt_is_none(fd.body) == 1) { return; }
+    if (stmt_is_none(fd.body) == 1) { return; }
+    let env = tc_env_new();
+    // 注入全局变量
+    let gi = 0;
+    while (gi < len(ctx.graph.nodes)) {
+        let gnode = ctx.graph.nodes[gi] as ModuleNode;
+        let vi = 0;
+        while (vi < len(gnode.global_names)) {
+            let gn = gnode.global_names[vi] as string;
+            let gt = gnode.global_types[vi] as Type;
+            if (type_is_none(gt) == 0) {
+                tc_env_set(env, gn, gt);
+            }
+            vi = vi + 1;
+        }
+        gi = gi + 1;
+    }
+    let cur = ctx.cur_node;
+    if (tc_node_is_none(cur) == 0) {
+        let vi2 = 0;
+        while (vi2 < len(cur.global_names)) {
+            let gn2 = cur.global_names[vi2] as string;
+            let gt2 = cur.global_types[vi2] as Type;
+            if (type_is_none(gt2) == 0) {
+                tc_env_set(env, gn2, gt2);
+            }
+            vi2 = vi2 + 1;
+        }
+    }
+    // 设置当前函数类型参数
+    tc_set_cur_tparams(fd.type_params);
+    // 参数入 env（严格态：参数类型名归一为注册名，保证跨函数比较一致）
+    let pi = 0;
+    while (pi < len(fd.params)) {
+        let p = fd.params[pi] as Param;
+        let pt = p.type_ref;
+        if (ctx.strict == 1) { pt = tc_resolve_type(ctx, pt); fd.params[pi].type_ref = pt; }
+        else { pt = tc_normalize_enum_named(ctx, pt); }
+        tc_env_set(env, p.name, pt);
+        pi = pi + 1;
+    }
+    // 严格态：返回类型归一为注册名
+    if (ctx.strict == 1) {
+        fd.return_type = tc_resolve_type(ctx, fd.return_type);
+    }
+    // 逐语句检查
+    let body = fd.body;
+    let stmts = body.items;
+    let bi = 0;
+    while (bi < len(stmts)) {
+        tc_check_stmt(ctx, stmts[bi], env, fd.return_type, 0);
+        bi = bi + 1;
+    }
+    tc_set_cur_tparams([]);
+}
+
+// ============ 程序检查入口 ============
+pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
+    // 1. 检查全部非 extern 函数
+    let i = 0;
+    while (i < len(prog.funcs)) {
+        let fd = prog.funcs[i] as FuncDef;
+        if (len(fd.extern_name) == 0) {
+            // Phase 11 增量缓存：函数所属模块缓存命中 → 跳过函数体检查（MIR 由 loader 从 .lu 加载）
+            if (tc_ns_is_valid(ctx, fd.loc.line) == 1) {
+                i = i + 1;
+                continue;
+            }
+            // 把当前模块切到「该函数所属模块」，使调用点按 import 作用域解析、
+            // 私有符号按函数所属模块的 mangled 前缀（__mod_<mod>__<name>）命中。
+            // 兼容态同样需要切换：tc_reg_name_for 已改为按所属模块 mangle 私有符号，
+            // 此处若不同步切换，函数体内引用本模块私有符号会算出主模块前缀 → 查不到。
+            // 无模块信息（LSP/API 单 Program）时 tc_module_of_line 返回 ""，保持原值不动。
+            let owner_mod = tc_module_of_line(ctx, fd.loc.line);
+            if (len(owner_mod) > 0) { ctx.current_module = owner_mod; }
+            tc_check_function(ctx, fd);
+        }
+        i = i + 1;
+    }
+    // 2. impl 完整性检查
+    let ii = 0;
+    while (ii < len(prog.impls)) {
+        let id = prog.impls[ii] as ImplDef;
+        let trait_n = id.trait_name;
+        if (len(trait_n) > 0) {
+            // 上一阶段（函数体检查）会把 ctx.current_module 遗留成最后一个函数的所属模块
+            // （通常是拼在最后的 shadow.runtime），此处若不切回 impl 所属模块，
+            // tc_mg_lookup_trait 会用错误前缀 mangle 私有 trait → 查不到 → 完整性检查被静默跳过。
+            let impl_mod = tc_module_of_line(ctx, id.loc.line);
+            if (len(impl_mod) > 0) { ctx.current_module = impl_mod; }
+            let errs = tc_check_impl_completeness(ctx, trait_n, id.type_name);
+            let ei = 0;
+            while (ei < len(errs)) {
+                let msg = "impl " + trait_n + " for " + id.type_name + ": " + errs[ei];
+                tc_error_at(ctx, id.loc, msg);
+                ei = ei + 1;
+            }
+        }
+        ii = ii + 1;
+    }
+    // 3. 泛型单态化 worklist：循环检查特化函数，追加 prog.funcs
+    let wi = 0;
+    while (wi < len(ctx.mono_funcs)) {
+        let spec = ctx.mono_funcs[wi] as FuncDef;
+        let mod_name = ctx.mono_func_mods[wi] as string;
+        // 切换模块上下文（特化属模板模块）
+        let saved_mod = ctx.current_module;
+        ctx.current_module = mod_name;
+        tc_check_function(ctx, spec);
+        ctx.current_module = saved_mod;
+        prog.funcs = array_push(prog.funcs, spec);
+        wi = wi + 1;
+    }
+    // 清空 mono worklist
+    ctx.mono_funcs = [];
+    ctx.mono_func_mods = [];
+    // 返回错误数
+    return len(ctx.errors);
+}
+
+// 共享实现：strict=0 兼容态（物理拼接语义，历史行为），strict=1 严格态（命名空间隔离）。
+// 0.5 迭代时：删掉 tc_check_program 兼容入口，调用点全部改走 tc_check_program_strict。
+pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
+    // 初始化 ctx
+    tc_g_closure_funcs = [];
+    let ctx = CompileContext {
+        cur_node: 0 as ModuleNode,
+        graph: tc_mg_new(),
+        current_module: prog.module_name,
+        strict: strict,
+        errors: [],
+        closure_funcs: [],
+        closure_counter: 0,
+        free_vars_names: [],
+        mono_cache: [],
+        mono_funcs: [],
+        mono_func_mods: [],
+        mono_tmpl_names: [],
+        mono_tmpl_defs: [],
+        mono_tmpl_mods: [],
+        struct_mono_cache: [],
+        struct_mono_tmpl_names: [],
+        struct_mono_tmpl_defs: [],
+        struct_mono_tmpl_mods: [],
+        bind_names: [],
+        bind_types: [],
+        mod_ns: tc_g_mod_ns,
+        mod_starts: tc_g_mod_starts,
+        ns_keys: [],
+        ns_kinds: [],
+        ns_idx: [],
+        ns_structs: [],
+        ns_enums: [],
+        ns_funcs: [],
+        ns_aliases: [],
+        ns_traits: [],
+        ns_globals: [],
+    };
+    // begin_module：创建模块节点
+    let node = ModuleNode {
+        module_name: prog.module_name,
+        struct_names: [],
+        struct_defs: [],
+        enum_names: [],
+        enum_defs: [],
+        alias_names: [],
+        alias_defs: [],
+        func_names: [],
+        func_defs: [],
+        trait_names: [],
+        trait_defs: [],
+        impl_keys: [],
+        impl_defs: [],
+        global_names: [],
+        global_types: [],
+        global_pubs: [],
+        imports: [],
+    };
+    ctx.cur_node = node;
+    ctx.current_module = prog.module_name;
+    // Pass 1：声明收集
+    tc_register_decls(ctx, prog);
+    // 注册泛型 struct 模板（必须在 register_decls 之后：严格态下 sd.name 已带模块前缀，
+    // 否则 a.Pair/b.Pair 模板同裸名冲突，单态化会选错模板）
+    let si = 0;
+    while (si < len(prog.structs)) {
+        let sd = prog.structs[si] as StructDef;
+        if (len(sd.type_params) > 0) {
+            ctx.struct_mono_tmpl_names = array_push(ctx.struct_mono_tmpl_names, sd.name);
+            ctx.struct_mono_tmpl_defs = array_push(ctx.struct_mono_tmpl_defs, sd);
+            let tmod = prog.module_name;
+            if (ctx.strict == 1) { tmod = tc_module_of_line(ctx, sd.loc.line); }
+            ctx.struct_mono_tmpl_mods = array_push(ctx.struct_mono_tmpl_mods, tmod);
+        }
+        si = si + 1;
+    }
+    // §3.8 兼容态：构建命名空间树（FQN 解析用；不影响 codegen）
+    tc_build_ns_tree(ctx, prog);
+    // 加入图
+    ctx.graph = tc_mg_add(ctx.graph, ctx.cur_node);
+    // Pass 2：函数体检查
+    tc_check_bodies(ctx, prog);
+    // Phase 11：编译结束清理缓存命中集合（下次编译由 main 重新注入；LSP/API 不残留）
+    tc_g_valid_ns = [];
+    return len(ctx.errors);
+}
+
+// 兼容态入口：单 Program 物理拼接语义（§3.8 历史行为）。0.5 迭代时删除。
+pub kimo tc_check_program(prog: Program) -> int {
+    return tc_check_program_mode(prog, 0);
+}
+
+// 严格态入口：命名空间隔离（同名跨模块共存、import 作用域、私有跨包不可见）。0.5 后唯一入口。
+pub kimo tc_check_program_strict(prog: Program) -> int {
+    return tc_check_program_mode(prog, 1);
+}

@@ -1,0 +1,17 @@
+//@desc: ternary operator cond ? then : else (desugar to EXPR_IF)
+//@expect: 20\n30\n100
+dsb cg_ternary;
+
+kimo main() -> int {
+    let x = 5;
+    // 三元运算符 — 条件为真
+    let a = x > 3 ? 20 : 10;
+    println(a);
+    // 三元运算符 — 条件为假
+    let b = x > 10 ? 20 : 30;
+    println(b);
+    // 嵌套三元
+    let c = x > 3 ? (x > 4 ? 100 : 200) : 300;
+    println(c);
+    return 0;
+}

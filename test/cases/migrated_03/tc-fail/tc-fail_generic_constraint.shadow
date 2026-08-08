@@ -1,0 +1,8 @@
+//@ mode: tc-fail
+//@ desc: generic constraint violation — string does not satisfy int|long
+dsb tc_fail_generic_constraint;
+kimo add<T: int|long>(a: T, b: T) -> T { return a + b; }
+kimo main() -> int {
+    let r = add("hello", "world");
+    return 0;
+}

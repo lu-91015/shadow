@@ -1,0 +1,4 @@
+//@desc: if/else codegens to a real conditional branch (regression for dropped branches)
+//@expect-ir: br
+dsb codegen_if;
+kimo main() -> int { let x = 0; if (1 > 0) { x = 1; } else { x = 2; } return x; }

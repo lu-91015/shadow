@@ -1,0 +1,13 @@
+//@expect: 50
+//@ desc: generic monomorphization — same call site triggers two instantiations
+dsb cg_mono_two_calls;
+
+kimo choose<T>(cond: int, a: T, b: T) -> T {
+    if (cond == 1) { return a; }
+    return b;
+}
+kimo main() -> int {
+    let x = choose(1, 10, 20);
+    let y = choose(0, 30, 40);
+    println(x + y); return 0;
+}

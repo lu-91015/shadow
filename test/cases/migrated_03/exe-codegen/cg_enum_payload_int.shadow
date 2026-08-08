@@ -1,0 +1,18 @@
+//@expect: 42
+//@desc: L2 enum payload — construct Some(int) and destructure via match
+dsb cg_enum_payload_int;
+
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+kimo main() -> int {
+    let x = Some(42);
+    let r = match x {
+        Some(v) => v,
+        None => 0,
+    };
+    println(r);
+    return 0;
+}

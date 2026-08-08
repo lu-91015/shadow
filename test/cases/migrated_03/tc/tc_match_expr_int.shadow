@@ -1,0 +1,7 @@
+//@desc: match-expression yields an int value usable in arithmetic and return
+dsb tc_match_expr_int;
+kimo main() -> int {
+    let x = 2;
+    let r = match x { 1 => 10, 2 => 20, 3 => 30 };
+    return r + 1;
+}

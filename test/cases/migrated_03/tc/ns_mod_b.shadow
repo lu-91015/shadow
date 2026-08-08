@@ -1,0 +1,8 @@
+// 模块 B 的私有函数（与模块 A 同名但返回不同值）
+dsb ns_mod_b;
+
+kimo helper() -> int { return 20; }
+
+pub kimo get_b() -> int {
+    return helper();
+}

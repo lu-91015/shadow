@@ -1,0 +1,9 @@
+//@desc: P2 semver — pre-release version 1.0.0-rc.1 satisfies constraint >=1.0.0-rc.1
+//@expect: 42
+dsb main;
+import ver_pkg.helper
+
+kimo main() -> int {
+    println(get_value());
+    return 0;
+}

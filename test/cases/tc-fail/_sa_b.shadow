@@ -1,0 +1,3 @@
+// 严格态库 B：同样导出 pub dup()（与 A 冲突）
+dsb _sa_b;
+pub kimo dup() -> int { return 2; }

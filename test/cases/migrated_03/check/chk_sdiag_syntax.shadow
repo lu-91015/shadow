@@ -1,0 +1,16 @@
+//@desc: LSP-6：语法错误产出结构化诊断（code/severity/source/range/message 分离），区间精确到出错 token
+//@expect: sdiag: SH-PARSE006 error parse 10:13-10:14
+//@expect: sdiag: SH-PARSE002 error parse 11:5-11:11
+//@expect: check: errors=2 sdiags=2 ok=0
+dsb chk_sdiag_syntax;
+
+// 结构化诊断的核心断言不是"有没有报错"，而是**字段是否可分别消费**：
+// 错误码、严重级别、产生阶段、半开区间各自独立，message 里不再重复位置。
+kimo broken() -> int {
+    let a = ;
+    return a;
+}
+
+kimo main() -> int {
+    return 0;
+}

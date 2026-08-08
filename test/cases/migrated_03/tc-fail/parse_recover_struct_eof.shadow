@@ -1,0 +1,7 @@
+//@mode: tc-fail
+//@desc: LSP-1 parser error recovery - incomplete struct at EOF must terminate cleanly (no infinite loop), reporting SH-PARSE002
+//@expect-stderr: SH-PARSE002
+dsb parse_recover_struct_eof;
+
+struct Incomplete {
+    x: int

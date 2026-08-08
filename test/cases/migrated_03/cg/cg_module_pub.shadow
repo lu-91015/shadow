@@ -1,0 +1,17 @@
+//@mode: codegen
+//@desc: Module namespace and pub visibility - functions imported with namespace prefix
+dsb cg_module_pub;
+
+import utils.math;
+
+kimo main() -> int {
+    let a = utils.math.add(10, 20);
+    let b = utils.math.multiply(6, 7);
+    let c = utils.math.negate(42);
+    let d = utils.math.abs_val(-100);
+    println(to_string(a));
+    println(to_string(b));
+    println(to_string(c));
+    println(to_string(d));
+    return 0;
+}

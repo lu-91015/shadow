@@ -1,0 +1,9 @@
+//@desc: GC alloc basic struct on heap
+//@expect-ir: shadow_gc_alloc
+//@expect-ir: shadow_gc_root_
+dsb gc_01_basic_alloc;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 10, y: 20 };
+    return p.x;
+}

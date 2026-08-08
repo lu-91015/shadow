@@ -1,0 +1,31 @@
+// ex_gc_any.shadow — GC v1：any 盒大量分配/解包，验证 ANYBOX 扫描保活
+dsb ex_gc_any;
+
+kimo main() -> int {
+    let round = 0;
+    while (round < 200) {
+        let keep: array<any> = [];
+        let i = 0;
+        while (i < 3000) {
+            let s: string = "data-" + int_to_str(i);
+            let a: any = s;
+            if (i % 2 == 0) {
+                keep = array_push(keep, a);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < len(keep)) {
+            let v = keep[i] as any;
+            let s2: string = v as string;
+            if (str_contains(s2, "data-") == 0) {
+                println("ERR any lost");
+                return 1;
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    println("any ok rounds=200");
+    return 0;
+}

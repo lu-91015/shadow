@@ -1,0 +1,12 @@
+//@desc: stage12 transitive dependency resolution — main imports mylib which imports sublib
+//@expect: 100\n200\ntransitive_ok
+dsb transitive_test;
+import mylib._mylib_helper
+import sublib._sublib_helper
+
+kimo main() -> int {
+    println(mylib_value());       // 100
+    println(sublib_value());      // 200
+    println("transitive_ok");
+    return 0;
+}

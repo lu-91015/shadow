@@ -1,0 +1,11 @@
+//@mode: exe
+//@desc: Phase 11 模块机制：主模块自身子包 import（§3.8.3 路径①）
+//@expect: modpkg ok 42
+dsb ex_mod_pkg;
+import modpkg.util;
+kimo main() -> int {
+    let v = modpkg_double(21);
+    if (v != 42) { println("ERR " + int_to_str(v)); return 1; }
+    println("modpkg ok " + int_to_str(v));
+    return 0;
+}

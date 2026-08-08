@@ -1,0 +1,7 @@
+//@desc: break outside of any loop reports a located error
+//@expect-stderr: break/continue outside loop
+dsb tcf_err_break_loc;
+kimo main() -> int {
+    break;
+    return 0;
+}

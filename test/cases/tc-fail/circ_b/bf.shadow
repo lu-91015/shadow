@@ -1,0 +1,3 @@
+dsb circ_bf;
+import circ_a.af;
+kimo circ_fb() -> int { return circ_fa(); }

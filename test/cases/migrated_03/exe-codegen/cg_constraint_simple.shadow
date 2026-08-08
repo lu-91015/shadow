@@ -1,0 +1,8 @@
+//@expect: 42
+//@ desc: generic with simple type constraint
+dsb cg_constraint_simple;
+kimo identity<T: int>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    println(a); return 0;
+}

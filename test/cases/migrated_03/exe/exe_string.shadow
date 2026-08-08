@@ -1,0 +1,13 @@
+//@desc: --exe: string concat, len, and character subscript in a native exe
+//@expect: abcd
+//@expect: 4
+//@expect: a
+dsb exe_string;
+kimo main() -> int {
+    let s = "ab" + "cd";
+    println(s);
+    println(len(s));
+    let ch = s[0];
+    println(ch);
+    return 0;
+}

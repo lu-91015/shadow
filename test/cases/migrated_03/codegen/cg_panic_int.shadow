@@ -1,0 +1,10 @@
+//@ mode: codegen
+//@ desc: panic statement - int argument (converted to string)
+//@expect-ir: shadow_panic
+//@expect-ir: __rt_shadow_int_to_cstr
+dsb cg_panic_int;
+kimo main() -> int {
+    let x = 42;
+    panic x;
+    return 0;
+}

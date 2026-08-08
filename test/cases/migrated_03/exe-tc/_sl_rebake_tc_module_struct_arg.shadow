@@ -1,0 +1,7 @@
+dsb _sl_rebake_tc_module_struct_arg;
+import _mod_a_helper
+kimo sum_pair(p: Pair) -> int { return p.x + p.y; }
+kimo main() -> int {
+    let p = make_pair(3, 4);
+    println(sum_pair(p)); return 0;
+}

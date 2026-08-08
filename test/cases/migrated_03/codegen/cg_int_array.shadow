@@ -1,0 +1,7 @@
+//@desc: int array literal lowers to shadow_array_create_ints (integer buffer path)
+//@expect-ir: __rt_shadow_malloc
+dsb cg_int_array;
+kimo main() -> int {
+    let a = [1, 2, 3];
+    return a[0];
+}

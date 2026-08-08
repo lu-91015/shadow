@@ -1,0 +1,77 @@
+//@desc: L6 `?` forms — expr?; statement, lhs = expr?; assignment, Option propagation
+//@expect: 2\n99\n3\n7\nside: 0\nside: 0
+dsb cg_question_forms;
+
+// 新语义：`?` 仅作用于 Result<T,E> / Option<T>。
+// 副作用跟踪：用全局变量记录"Err/None 传播后的语句是否被跳过"
+
+let g_side: int = 0;
+
+kimo may_fail(cond: int) -> Result<int, string> {
+    if (cond == 0) {
+        return Err("fail");
+    }
+    return Ok(cond);
+}
+
+kimo may_none(cond: int) -> Option<int> {
+    if (cond == 0) {
+        return None;
+    }
+    return Some(cond);
+}
+
+// 表达式语句形式：expr?;（仅求值 + 解包检查，丢弃解包值）
+kimo expr_stmt_form(cond: int) -> int {
+    may_fail(cond)?;
+    g_side = 2;  // Err 时不执行
+    return 99;
+}
+
+// 赋值形式：x = expr?;
+kimo assign_form(cond: int) -> int {
+    let r: int = 0;
+    r = may_fail(cond)?;
+    g_side = 3;  // Err 时不执行
+    return r;
+}
+
+// Option 传播形式
+kimo option_form(cond: int) -> int {
+    let v = may_none(cond)?;
+    g_side = 4;  // None 时不执行
+    return v;
+}
+
+kimo main() -> int {
+    // 正常路径：expr? 不触发传播
+    g_side = 0;
+    let a = expr_stmt_form(1);
+    println(g_side);  // 2（g_side = 2 被执行）
+    println(a);       // 99
+
+    // 赋值形式正常路径
+    g_side = 0;
+    let b = assign_form(7);  // r = 7, g_side = 3
+    println(g_side);  // 3
+    println(b);       // 7
+
+    // 表达式语句形式 Err 路径：? 传播，g_side = 2 未执行
+    g_side = 0;
+    try {
+        expr_stmt_form(0);
+    } catch {
+    }
+    print("side: ");
+    println(g_side);  // 0
+
+    // Option None 路径：? 传播，g_side = 4 未执行
+    g_side = 0;
+    try {
+        option_form(0);
+    } catch {
+    }
+    print("side: ");
+    println(g_side);  // 0
+    return 0;
+}

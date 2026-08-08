@@ -1,0 +1,10 @@
+//@desc: unary minus and logical-not type-check
+//@expect: typecheck: 1
+dsb tc_unary;
+kimo f(x: int) -> int {
+    let y = -x;
+    let z = (x > 0);
+    if (!z) { return y; }
+    return 0;
+}
+kimo main() -> int { return f(5); }

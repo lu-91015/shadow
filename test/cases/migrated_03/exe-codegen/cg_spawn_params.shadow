@@ -1,0 +1,14 @@
+//@desc: spawn with parameters — thunk packs args into env, await returns result
+//@expect: 30
+dsb cg_spawn_params;
+
+kimo add_task(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    let f = spawn add_task(12, 18);
+    let v = await f;
+    println(v as int);
+    return 0;
+}

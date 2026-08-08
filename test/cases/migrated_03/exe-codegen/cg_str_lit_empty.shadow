@@ -1,0 +1,4 @@
+//@desc: string literal codegen — empty string should still be a valid global
+//@expect: 0
+dsb cg_str_lit_empty;
+kimo main() -> int { let s = ""; println(0); return 0; }

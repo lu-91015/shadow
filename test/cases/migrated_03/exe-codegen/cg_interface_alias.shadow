@@ -1,0 +1,29 @@
+//@desc: L1 interface keyword as trait alias — interface defines API, impl provides body
+//@expect: 3\n13
+dsb cg_interface_alias;
+
+interface Numeric {
+    kimo value(self: Self) -> int;
+    kimo combine(self: Self, other: int) -> int;
+}
+
+struct IntBox {
+    n: int;
+}
+
+impl Numeric for IntBox {
+    kimo value(self: IntBox) -> int {
+        return self.n;
+    }
+    kimo combine(self: IntBox, other: int) -> int {
+        return self.n + other * 2;
+    }
+}
+
+kimo main() -> int {
+    let b = IntBox { n: 3 };
+    // interface method dispatch — same path as trait
+    println(b.value());
+    println(b.combine(5));
+    return 0;
+}

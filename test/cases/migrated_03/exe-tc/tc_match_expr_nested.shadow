@@ -1,0 +1,9 @@
+//@expect: 7
+//@desc: nested match-expression (match inside a match arm body)
+dsb tc_match_expr_nested;
+kimo main() -> int {
+    let a = 1;
+    let b = 2;
+    let r = match a { 1 => match b { 2 => 7, 3 => 8 }, 2 => 9 };
+    println(r); return 0;
+}

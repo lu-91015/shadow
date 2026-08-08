@@ -1,0 +1,9 @@
+//@ mode: tc-fail
+//@ desc: P0 assignment type check — x:int = "s" should fail
+dsb tc_fail_assign_type_mismatch;
+
+kimo main() -> int {
+    let x: int = 0;
+    x = "s";
+    return x;
+}

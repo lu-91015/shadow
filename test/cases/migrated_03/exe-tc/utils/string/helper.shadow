@@ -1,0 +1,17 @@
+dsb helper;
+// Nested module: utils.string.helper
+// Provides string manipulation functions
+
+pub kimo repeat_str(s: string, count: int) -> string {
+    let result = "";
+    let i = 0;
+    while (i < count) {
+        result = result + s;
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo str_len_approx(s: string) -> int {
+    return len(s);
+}

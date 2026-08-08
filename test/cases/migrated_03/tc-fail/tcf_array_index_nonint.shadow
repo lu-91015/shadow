@@ -1,0 +1,7 @@
+//@desc: array subscript with a non-integer index is rejected
+//@expect-stderr: array index must be integer
+dsb tcf_array_index_nonint;
+kimo f(a: array<int>) -> int {
+    return a["x"];
+}
+kimo main() -> int { return 0; }

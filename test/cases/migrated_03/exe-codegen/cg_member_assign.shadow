@@ -1,0 +1,10 @@
+//@expect: 99
+//@ desc: struct member assignment generates llvmStore via GEP
+dsb cg_member_assign;
+
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 1, y: 2 };
+    p.x = 99;
+    println(p.x); return 0;
+}

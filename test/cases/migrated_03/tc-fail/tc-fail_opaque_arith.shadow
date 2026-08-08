@@ -1,0 +1,10 @@
+//@desc: opaque type cannot participate in arithmetic (avoids 64->32 bit truncation)
+//@expect-stderr: opaque type cannot participate in arithmetic
+dsb tc_fail_opaque_arith;
+@extern("my_opaque_open") kimo my_opaque_open() -> opaque { return null as opaque; }
+
+kimo main() -> int {
+    let p = my_opaque_open();
+    let bad = p + 1;
+    return 0;
+}

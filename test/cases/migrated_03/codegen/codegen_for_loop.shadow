@@ -1,0 +1,11 @@
+//@desc: for loop codegens with shadow_array_len/get calls
+//@expect-ir: shadow_array_len
+dsb codegen_for_loop;
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + x;
+    }
+    return sum;
+}

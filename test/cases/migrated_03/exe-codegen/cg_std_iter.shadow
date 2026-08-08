@@ -1,0 +1,58 @@
+//@desc: L3+ std.iter — import std.iter, chain map/filter/take/skip/fold/reduce/zip/any/all/find/enumerate
+//@expect: 24\n6\n12\n15\n33\n1\n1\n2\n2
+dsb cg_std_iter;
+
+import std.iter
+
+kimo main() -> int {
+    let arr: any = [1, 2, 3, 4, 5];
+
+    // 1) map *2 → [2,4,6,8,10], filter >4 → [6,8,10], fold sum → 24
+    let doubled = array_map(arr, kimo(x: int) -> int { return x * 2; });
+    let big = array_filter(doubled, kimo(x: int) -> int { if (x > 4) { return 1; } return 0; });
+    let sum = array_fold(big, 0, kimo(acc: int, x: int) -> int { return acc + x; }) as int;
+    println(sum);  // 24
+
+    // 2) take 3 of [1..5] → [1,2,3], fold sum → 6
+    let first3 = array_take(arr, 3);
+    let sum3 = array_fold(first3, 0, kimo(acc: int, x: int) -> int { return acc + x; }) as int;
+    println(sum3);  // 6
+
+    // 3) skip 2 of [1..5] → [3,4,5], fold sum → 12
+    let rest = array_skip(arr, 2);
+    let sumRest = array_fold(rest, 0, kimo(acc: int, x: int) -> int { return acc + x; }) as int;
+    println(sumRest);  // 12
+
+    // 4) reduce [1..5] with + → 15
+    let red = array_reduce(arr, kimo(a: int, b: int) -> int { return a + b; }) as int;
+    println(red);  // 15
+
+    // 5) zip [1,2] [10,20] → [[1,10],[2,20]], fold sum of pairs → 33
+    let a: any = [1, 2];
+    let b: any = [10, 20];
+    let zipped = array_zip(a, b);
+    let zipSum = array_fold(zipped, 0, kimo(acc: int, p: any) -> int {
+        let x = p[0] as int;
+        let y = p[1] as int;
+        return acc + x + y;
+    }) as int;
+    println(zipSum);  // 33
+
+    // 6) any: [1,2,3] has element > 2 → 1
+    let has = array_any(arr, kimo(x: int) -> int { if (x > 2) { return 1; } return 0; });
+    println(has);  // 1
+
+    // 7) all: [1,2,3] all > 0 → 1
+    let ok = array_all(arr, kimo(x: int) -> int { if (x > 0) { return 1; } return 0; });
+    println(ok);  // 1
+
+    // 8) find: first element > 1 in [1,2,3,4,5] → 2
+    let found = array_find(arr, kimo(x: int) -> int { if (x > 1) { return 1; } return 0; }) as int;
+    println(found);  // 2
+
+    // 9) enumerate [1,2] → [[0,1],[1,2]], length 2
+    let en = array_enumerate(a);
+    println(len(en));  // 2
+
+    return 0;
+}

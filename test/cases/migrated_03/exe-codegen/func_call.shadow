@@ -1,0 +1,17 @@
+//@desc: regression — function with params must codegen without segfault
+//@expect: 3
+dsb func_call;
+// Repro for the crash where shadow-lang.exe's codegen called the real
+// LLVM-C LLVMFunctionType/LLVMBuildCall2 (which ignore the shared buffer
+// and read a garbage array arg), producing a function type with garbage
+// param types so LLVMGetParam dereferenced garbage and segfaulted on any
+// function that had >=1 parameter. Fixed by binding llvmFnTy/llvmCall to
+// the buffer-based runtime wrappers shadow_llvm_fn_type / shadow_llvm_build_call.
+kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    let x = add(1, 2);
+    println(x); return 0;
+}

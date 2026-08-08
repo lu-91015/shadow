@@ -1,0 +1,8 @@
+//@ desc: local pub struct shadows imported one (no name conflict in same file)
+dsb tc_pub_local_struct;
+pub struct LocalBox { value: int }
+kimo make_local(v: int) -> LocalBox { return LocalBox { value: v }; }
+kimo main() -> int {
+    let b = make_local(7);
+    return b.value;
+}

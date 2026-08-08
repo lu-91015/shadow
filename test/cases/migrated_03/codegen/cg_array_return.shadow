@@ -1,0 +1,12 @@
+//@mode: codegen
+//@desc: function returning array<int>; caller indexes boundary elements
+//@expect-ir: shadow_array_get
+dsb cg_array_return;
+kimo make() -> array<int> {
+    let a = [1, 2, 3];
+    return a;
+}
+kimo main() -> int {
+    let a = make();
+    return a[0] + a[len(a) - 1];
+}

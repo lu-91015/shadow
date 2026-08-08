@@ -1,0 +1,14 @@
+//@desc: macro expanded multiple times (hygiene: fresh nodes per expansion)
+//@expect: 12
+dsb cg_macro_repeat;
+// 同一宏多次展开：每次展开分配独立 NodeId 与卫生后缀，互不干扰
+macro twice(x: expr) { x + x }
+kimo main() -> int {
+    let a = twice(3);
+    let b = twice(10);
+    let c = twice(a);
+    println(a);
+    println(b);
+    println(c);
+    return 0;
+}

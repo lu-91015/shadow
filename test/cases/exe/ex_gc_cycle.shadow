@@ -1,0 +1,31 @@
+// ex_gc_cycle.shadow — GC v1：循环引用链表，验证标记-清扫不误回收
+dsb ex_gc_cycle;
+
+struct Node {
+    val: int;
+    next: Node;
+}
+
+kimo main() -> int {
+    // 创建 2 万节点环形链表（循环引用，纯引用计数会泄漏）
+    let head: Node = Node { val: 0, next: 0 as Node };
+    let cur: Node = head;
+    let i = 0;
+    while (i < 20000) {
+        let n: Node = Node { val: i + 1, next: 0 as Node };
+        cur.next = n;
+        cur = n;
+        i = i + 1;
+    }
+    cur.next = head;  // 成环
+    // 沿环遍历 21000 步确认结构完整
+    let p: Node = head;
+    let cnt = 0;
+    while (cnt < 21000) {
+        if ((p as any) == 0) { break; }
+        p = p.next;
+        cnt = cnt + 1;
+    }
+    println("cycle ok cnt=" + int_to_str(cnt));
+    return 0;
+}

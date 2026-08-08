@@ -1,0 +1,6 @@
+//@desc: 'trait' is a reserved keyword, cannot be used as a type name
+dsb tc_fail_reserved_trait_type;
+kimo main() -> int {
+    let x: trait = 1;
+    return 0;
+}

@@ -1,0 +1,9 @@
+//@desc: string equality compiled to shadow_string_compare call + icmp
+//@expect: 0
+dsb cg_string_compare;
+kimo main() -> int {
+    let s = "a";
+    let t = "b";
+    if (s == t) { println(1); return 0; }
+    println(0); return 0;
+}

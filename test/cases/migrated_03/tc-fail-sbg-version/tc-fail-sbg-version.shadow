@@ -1,0 +1,9 @@
+//@desc: P1 version check — constraint >=0.4.0 does not match package version 0.3.5
+//@expect-stderr: does not satisfy required
+dsb tc_fail_sbg_version;
+import ver_pkg.helper
+
+kimo main() -> int {
+    println(get_value());
+    return 0;
+}

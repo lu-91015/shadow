@@ -1,0 +1,7 @@
+//@desc: access field on bool variable should fail
+//@expect-stderr: Type check failed
+dsb tcf_gc_field_on_bool;
+kimo main() -> int {
+    let b = true;
+    return b.value;
+}

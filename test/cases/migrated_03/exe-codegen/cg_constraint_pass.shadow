@@ -1,0 +1,8 @@
+//@expect: 30
+//@ desc: generic with type constraint — int satisfies int|long
+dsb cg_constraint_pass;
+kimo add_num<T: int|long>(a: T, b: T) -> T { return a + b; }
+kimo main() -> int {
+    let x = add_num(10, 20);
+    println(x); return 0;
+}

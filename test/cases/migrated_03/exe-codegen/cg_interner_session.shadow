@@ -1,0 +1,173 @@
+//@desc: SymbolInterner + CompilerSession end-to-end test (self-contained)
+// symbol id 是 0-based（si_intern 先取 si.count 再自增），重复 intern 复用旧 id。
+// "hello"->0, "world"->1, "hello"->0；session 侧 "foo"->0, "bar"->1, "foo"->0 ⇒ 共 2 个符号。
+//@expect: ok=0
+//@expect: ok=1
+//@expect: ok=0
+//@expect: dup=1
+//@expect: dup=2
+//@expect: err=1
+//@expect: warn=1
+//@expect: sym=2
+//@expect: errcnt=1
+//@expect: warncnt=1
+
+dsb cg_interner_session;
+
+// ---- Inline helper (from core.utils) ----
+kimo str_eq(a: string, b: string) -> int {
+    if (len(a) != len(b)) { return 0; }
+    let i = 0;
+    while (i < len(a)) {
+        if (a[i] != b[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ---- Inline SymbolInterner (mirrors src/core/interner.shadow) ----
+struct SymbolInterner {
+    strings: any;
+    count: int;
+}
+
+kimo si_new() -> SymbolInterner {
+    return SymbolInterner { strings: [], count: 0 };
+}
+
+kimo si_find(si: SymbolInterner, s: string) -> int {
+    let i = 0;
+    while (i < si.count) {
+        let candidate = si.strings[i] as string;
+        if (str_eq(candidate, s) == 1) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+kimo si_intern(si: SymbolInterner, s: string) -> int {
+    let existing = si_find(si, s);
+    if (existing >= 0) {
+        return existing;
+    }
+    si.strings = array_push(si.strings, s);
+    let id = si.count;
+    si.count = si.count + 1;
+    return id;
+}
+
+kimo si_get(si: SymbolInterner, id: int) -> string {
+    return si.strings[id] as string;
+}
+
+kimo si_len(si: SymbolInterner) -> int {
+    return si.count;
+}
+
+// ---- Inline CompilerSession (mirrors src/core/session.shadow) ----
+struct CompilerSession {
+    interner: any;
+    errors: any;
+    error_count: int;
+    warn_count: int;
+}
+
+kimo cs_new() -> CompilerSession {
+    return CompilerSession {
+        interner: si_new(),
+        errors: [],
+        error_count: 0,
+        warn_count: 0
+    };
+}
+
+kimo cs_error(cs: CompilerSession, msg: string) -> void {
+    cs.errors = array_push(cs.errors, msg);
+    cs.error_count = cs.error_count + 1;
+}
+
+kimo cs_warn(cs: CompilerSession, msg: string) -> void {
+    cs.errors = array_push(cs.errors, msg);
+    cs.warn_count = cs.warn_count + 1;
+}
+
+kimo cs_has_errors(cs: CompilerSession) -> int {
+    if (cs.error_count > 0) { return 1; }
+    return 0;
+}
+
+kimo cs_error_count(cs: CompilerSession) -> int {
+    return cs.error_count;
+}
+
+kimo cs_warn_count(cs: CompilerSession) -> int {
+    return cs.warn_count;
+}
+
+kimo cs_intern(cs: CompilerSession, s: string) -> int {
+    let si = cs.interner as SymbolInterner;
+    return si_intern(si, s);
+}
+
+kimo cs_symbol_count(cs: CompilerSession) -> int {
+    let si = cs.interner as SymbolInterner;
+    return si_len(si);
+}
+
+// ---- Test main ----
+kimo main() -> int {
+    // --- SymbolInterner tests ---
+    let si = si_new();
+
+    let id1 = si_intern(si, "hello");
+    let id2 = si_intern(si, "world");
+    let id3 = si_intern(si, "hello");  // duplicate
+
+    println("ok=" + to_string(id1));
+    println("ok=" + to_string(id2));
+    println("ok=" + to_string(id3));
+
+    if (id1 == id3) {
+        println("dup=1");
+    } else {
+        println("dup=0");
+    }
+
+    let s1 = si_get(si, id1);
+    let s2 = si_get(si, id2);
+    if (str_eq(s1, "hello") == 1 && str_eq(s2, "world") == 1) {
+        println("dup=2");
+    } else {
+        println("dup=0");
+    }
+
+    // --- CompilerSession tests ---
+    let cs = cs_new();
+
+    cs_error(cs, "type mismatch");
+    cs_warn(cs, "unused variable");
+
+    if (cs_has_errors(cs) == 1) {
+        println("err=1");
+    } else {
+        println("err=0");
+    }
+
+    if (cs_warn_count(cs) == 1) {
+        println("warn=1");
+    } else {
+        println("warn=0");
+    }
+
+    let sid1 = cs_intern(cs, "foo");
+    let sid2 = cs_intern(cs, "bar");
+    let sid3 = cs_intern(cs, "foo");  // duplicate
+    println("sym=" + to_string(cs_symbol_count(cs)));
+
+    println("errcnt=" + to_string(cs_error_count(cs)));
+    println("warncnt=" + to_string(cs_warn_count(cs)));
+
+    return 0;
+}

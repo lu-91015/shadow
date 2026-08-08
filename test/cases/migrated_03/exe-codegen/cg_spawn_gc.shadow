@@ -1,0 +1,25 @@
+//@desc: spawn tasks that allocate/build GC strings on real OS threads (std::thread);
+//       per-thread GC root sets must keep each task's string alive through GC.
+//       Each task grows a string past the GC threshold so a collection runs in
+//       its own thread; the surviving length proves the root was traced.
+//@expect: 3002
+dsb cg_spawn_gc;
+
+kimo mk(c: string) -> int {
+    let s = c;            // task-local GC string, rooted in this thread's GC set
+    let i = 0;
+    while (i < 1500) {    // ~1500 allocations > GC_COLLECT_THRESHOLD → forces GC here
+        s = s + c;
+        i = i + 1;
+    }
+    return len(s);        // s must survive GC → len = 1501
+}
+
+kimo main() -> int {
+    let f1 = spawn mk("a");
+    let f2 = spawn mk("b");
+    let n1 = await f1;
+    let n2 = await f2;
+    println((n1 as int) + (n2 as int));
+    return 0;
+}

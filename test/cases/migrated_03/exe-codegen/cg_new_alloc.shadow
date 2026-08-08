@@ -1,0 +1,10 @@
+//@desc: new TypeName heap allocation codegen
+//@expect: 0
+dsb cg_new_alloc;
+struct Point { x: int; y: int }
+kimo main() -> int {
+    let p = new Point;
+    p.x = 10;
+    p.y = 20;
+    println(p.x + p.y); return 0;
+}

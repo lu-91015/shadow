@@ -1,0 +1,8 @@
+//@desc: array boxed into `any`, indexed via reflection then unboxed
+dsb tc_any_index;
+kimo main() -> int {
+    let m = [10, 20, 30];
+    let a = m as any;
+    let v = a[0] as int;
+    return v;
+}

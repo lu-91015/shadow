@@ -1,0 +1,550 @@
+// Shadow 0.4 — HIR 管道（AST → HIR：去糖化、名字解析）
+// ============================================================
+// HIR 主要工作：
+//   1. 变量名 → slot 索引（每个函数独立 slot 空间）
+//   2. 类型从 Expr.inferred_type 迁移到 HirExpr.inferred_type
+//   3. 复合赋值拆解（a += b → a = a + b，parser 已完成）
+//   4. 函数体扁平化（嵌套块展开）
+//   5. if/match/&&/||/闭包/`?` 的结果临时 slot 分配
+//
+// 与 0.3 的差异（0.4 架构）：
+//   - 无 typemap：类型直接存 HirExpr.inferred_type（0 as Type = 无）
+//   - 无 any 盒子：children/body 全部具体类型
+//   - 闭包捕获从 fd.params 头部前 captured_count 个参数读取
+//     （captured_count = e.inferred_type.captured_count，TC 已填充）
+//   - EXPR_ENUM_VARIANT 模式绑定类型来自 pe.bind_types（TC 已填充）
+dsb hir;
+
+// ============ HIR 名字环境：name → slot ============
+let hir_tmp_counter: int = 0;
+
+pub kimo hir_env_new() -> HirEnv {
+    return HirEnv { names: [], slots: [], counter: 0 };
+}
+
+pub kimo hir_env_lookup(env: HirEnv, name: string) -> int {
+    let i = 0;
+    while (i < len(env.names)) {
+        let n = env.names[i] as string;
+        if (str_eq(n, name) == 1) { return env.slots[i] as int; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub kimo hir_env_bind(env: HirEnv, name: string) -> int {
+    let existing = hir_env_lookup(env, name);
+    if (existing >= 0) { return existing; }
+    let slot = env.counter;
+    env.names = array_push(env.names, name);
+    env.slots = array_push(env.slots, slot);
+    env.counter = env.counter + 1;
+    return slot;
+}
+
+// 构造 HIR 表达式（空类型 = 0 as Type）
+pub kimo hir_mk_expr(kind: int) -> HirExpr {
+    let e = HirExpr { id: 0, kind: kind, op: 0, str1: "", intval: 0, floatval: 0.0,
+                      slot: -1, children: [], inferred_type: 0 as Type, fn_ty: 0 as Type };
+    return e;
+}
+
+pub kimo hir_mk_stmt(kind: int) -> HirStmt {
+    let s = HirStmt { id: 0, kind: kind, str1: "", int1: 0, slot: -1,
+                      child: 0 as HirExpr, body: [], else_body: [], rhs: 0 as HirExpr,
+                      extra_slots: [], pats: [], arm_blocks: [], inferred_type: 0 as Type };
+    return s;
+}
+
+// 从 AST Expr 取类型：未推断（TYPE_INFER 哨兵）→ 0 as Type（空）
+pub kimo hir_type_of_expr(e: Expr) -> Type {
+    let t = e.inferred_type;
+    if (type_is_none(t) == 1) { return 0 as Type; }
+    return t;
+}
+
+// 从 AST Stmt 取类型
+pub kimo hir_type_of_stmt(s: Stmt) -> Type {
+    let t = s.inferred_type;
+    if (type_is_none(t) == 1) {
+        // STMT_LET：用类型注解（type1）
+        if (s.kind == STMT_LET && type_is_none(s.type1) == 0) { return s.type1; }
+        return 0 as Type;
+    }
+    return t;
+}
+
+// ============ 表达式 lowering ============
+pub kimo hir_lower_expr(e: Expr, env: HirEnv) -> HirExpr {
+    let k = e.kind;
+    let h = hir_mk_expr(k);
+    h.id = e.id;
+    h.op = e.intval as int;
+    h.str1 = e.str1;
+    // ⚠️ long 字面量不可 cast int（截断）：1000000000000L 会溢出成 3567587328。
+    // 旧注释"跨模块 long 字段读规避"已不适用（单进程编译无跨模块；.lu 序列化 8B raw 无损）。
+    // op 字段（操作符枚举）仍 as int（82 行，int 语义）。
+    h.intval = e.intval;
+    h.floatval = e.floatval;
+    h.inferred_type = hir_type_of_expr(e);
+
+    if (k == EXPR_VAR) {
+        let slot = hir_env_lookup(env, e.str1);
+        h.slot = slot;
+        return h;
+    }
+
+    if (k == EXPR_BINARY || k == EXPR_UNARY || k == EXPR_INDEX || k == EXPR_MEMBER || k == EXPR_CAST || k == EXPR_ASSIGN) {
+        let children: array<HirExpr> = [];
+        if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
+        if (expr_is_none(e.child2) == 0) { children = array_push(children, hir_lower_expr(e.child2, env)); }
+        if (expr_is_none(e.child3) == 0) { children = array_push(children, hir_lower_expr(e.child3, env)); }
+        h.children = children;
+        // &&/|| 短路求值需要结果临时 slot（MIR 去糖为 condbr 控制流）
+        if (k == EXPR_BINARY) {
+            if (h.op == BIN_AND || h.op == BIN_OR) {
+                hir_tmp_counter = hir_tmp_counter + 1;
+                h.slot = hir_env_bind(env, "$sctmp." + int_to_str(hir_tmp_counter));
+            }
+        }
+        return h;
+    }
+
+    if (k == EXPR_CALL) {
+        let children: array<HirExpr> = [];
+        let args = e.items;
+        let i = 0;
+        while (i < len(args)) {
+            children = array_push(children, hir_lower_expr(args[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        // 间接调用（op == -1）：str1 是闭包变量名，slot 是其变量 slot
+        if (h.op == -1) {
+            h.slot = hir_env_lookup(env, e.str1);
+        }
+        return h;
+    }
+
+    if (k == EXPR_ARRAY_LIT) {
+        let children: array<HirExpr> = [];
+        let elems = e.items;
+        let i = 0;
+        while (i < len(elems)) {
+            children = array_push(children, hir_lower_expr(elems[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        return h;
+    }
+
+    if (k == EXPR_STRUCT_LIT) {
+        let children: array<HirExpr> = [];
+        let fields = e.items;
+        let i = 0;
+        while (i < len(fields)) {
+            children = array_push(children, hir_lower_expr(fields[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        return h;
+    }
+
+    // 元组字面量 — 复用 struct 字面量路径
+    if (k == EXPR_TUPLE) {
+        let children: array<HirExpr> = [];
+        let elems = e.items;
+        let i = 0;
+        while (i < len(elems)) {
+            children = array_push(children, hir_lower_expr(elems[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        return h;
+    }
+
+    // for 循环 range 字面量 a..b — 透传 start/end 给 MIR
+    if (k == EXPR_RANGE) {
+        let children: array<HirExpr> = [];
+        if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
+        if (expr_is_none(e.child2) == 0) { children = array_push(children, hir_lower_expr(e.child2, env)); }
+        h.children = children;
+        return h;
+    }
+
+    // spawn <funcname>(args) — fn_ty 从 inferred_type 读取（TC 已填 TYPE_FUNCTION/TYPE_FUTURE）
+    if (k == EXPR_SPAWN) {
+        let children: array<HirExpr> = [];
+        let args = e.items;
+        let i = 0;
+        while (i < len(args)) {
+            children = array_push(children, hir_lower_expr(args[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        h.fn_ty = hir_type_of_expr(e);
+        return h;
+    }
+
+    // await <expr>
+    if (k == EXPR_AWAIT) {
+        let children: array<HirExpr> = [];
+        if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
+        h.children = children;
+        return h;
+    }
+
+    // if 表达式：condbr → then/else 写结果 slot → merge load
+    if (k == EXPR_IF) {
+        let children: array<HirExpr> = [];
+        if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
+        if (expr_is_none(e.child2) == 0) { children = array_push(children, hir_lower_expr(e.child2, env)); }
+        if (expr_is_none(e.child3) == 0) { children = array_push(children, hir_lower_expr(e.child3, env)); }
+        h.children = children;
+        hir_tmp_counter = hir_tmp_counter + 1;
+        h.slot = hir_env_bind(env, "$iftmp." + int_to_str(hir_tmp_counter));
+        return h;
+    }
+
+    // match 表达式：children 布局 [0]=scrutinee, 之后交替 pat,body
+    if (k == EXPR_MATCH) {
+        let children: array<HirExpr> = [];
+        let scrut_h = hir_lower_expr(e.child1, env);
+        children = array_push(children, scrut_h);
+        let scrut_ty = hir_type_of_hir_expr(scrut_h);
+        let pats = e.items;
+        let bodies = e.items2;
+        let i = 0;
+        while (i < len(pats)) {
+            let pe = pats[i];
+            let ph = hir_mk_expr(EXPR_VAR);
+            if (pe.kind == EXPR_VAR && str_eq(pe.str1, "_") == 1) {
+                ph.str1 = "_";
+            } else if (pe.kind == EXPR_ENUM_VARIANT) {
+                // 解构模式 Some(x)：注册绑定 slot，children 存绑定信息
+                let phe = hir_mk_expr(EXPR_ENUM_VARIANT);
+                phe.id = pe.id;
+                phe.str1 = pe.str1;        // 变体名
+                phe.intval = pe.intval;    // 变体索引（TC 回填）
+                phe.inferred_type = scrut_ty;
+                let bind_children: array<HirExpr> = [];
+                let bind_names = pe.str_items;
+                let bind_types = pe.bind_types;   // TC 回填（与 bind_names 并行）
+                let bi = 0;
+                while (bi < len(bind_names)) {
+                    let bname = bind_names[bi] as string;
+                    let bslot = hir_env_bind(env, bname);
+                    let bh = hir_mk_expr(EXPR_VAR);
+                    bh.id = next_node_id();
+                    bh.str1 = bname;
+                    bh.slot = bslot;
+                    bh.intval = bi;   // 负载索引（0-based），MIR 提取对应槽位
+                    let bty = mk_type(TYPE_ANY);
+                    if (bi < len(bind_types)) { bty = bind_types[bi] as Type; }
+                    bh.inferred_type = bty;
+                    bind_children = array_push(bind_children, bh);
+                    bi = bi + 1;
+                }
+                phe.children = bind_children;
+                ph = phe;
+            } else {
+                // 字面量/普通模式：lower + 用 scrutinee 类型回填
+                let phe = hir_lower_expr(pe, env);
+                if ((phe.inferred_type as any) == 0) { phe.inferred_type = scrut_ty; }
+                ph = phe;
+            }
+            children = array_push(children, ph);
+            children = array_push(children, hir_lower_expr(bodies[i], env));
+            i = i + 1;
+        }
+        h.children = children;
+        hir_tmp_counter = hir_tmp_counter + 1;
+        h.slot = hir_env_bind(env, "$matchtmp." + int_to_str(hir_tmp_counter));
+        return h;
+    }
+
+    // 闭包字面量 / 函数引用：str1 = 提升函数名，children = 捕获变量引用
+    if (k == EXPR_CLOSURE) {
+        let cdef = e.closure_def;
+        let fd = 0 as FuncDef;
+        let copt = cdef as any;
+        if (copt == 0) {
+            return h;
+        }
+        let f = match cdef { Some(x) => x, None => 0 as FuncDef };
+        let ff = f as FuncDef;
+        fd = ff;
+        h.str1 = fd.name;
+        let cap_count = 0;
+        let ety = e.inferred_type;
+        if (type_is_none(ety) == 0) { cap_count = ety.captured_count; }
+        let children: array<HirExpr> = [];
+        let i = 0;
+        while (i < cap_count) {
+            let p = fd.params[i] as Param;
+            let cap_h = hir_mk_expr(EXPR_VAR);
+            cap_h.id = next_node_id();
+            cap_h.str1 = p.name;
+            cap_h.slot = hir_env_lookup(env, p.name);
+            cap_h.inferred_type = p.type_ref;
+            children = array_push(children, cap_h);
+            i = i + 1;
+        }
+        h.children = children;
+        return h;
+    }
+
+    // `?` 错误传播：递归 inner 并分配临时 slot
+    if (k == EXPR_QUESTION) {
+        h.slot = hir_env_bind(env, "$qtmp." + int_to_str(hir_tmp_counter));
+        hir_tmp_counter = hir_tmp_counter + 1;
+        if (expr_is_none(e.child1) == 0) {
+            let ch = hir_lower_expr(e.child1, env);
+            h.children = array_push(h.children, ch);
+        }
+        return h;
+    }
+
+    // 字面量：直接返回
+    return h;
+}
+
+// 从 HIR 表达式取类型（0 as Type = 无）
+pub kimo hir_type_of_hir_expr(h: HirExpr) -> Type {
+    return h.inferred_type;
+}
+
+// ============ 语句 lowering ============
+pub kimo hir_lower_stmt(s: Stmt, env: HirEnv) -> HirStmt {
+    let k = s.kind;
+    let h = hir_mk_stmt(k);
+    // 0.4 Stmt 无 NodeId（typemap 已废），HirStmt.id 固定 0
+    h.str1 = s.str1;
+    h.int1 = s.intval as int;
+    h.inferred_type = hir_type_of_stmt(s);
+
+    if (k == STMT_LET) {
+        let slot = hir_env_bind(env, s.str1);
+        h.slot = slot;
+        if (type_is_none(s.type1) == 0) { h.inferred_type = s.type1; }
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        return h;
+    }
+
+    if (k == STMT_EXPR) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        return h;
+    }
+
+    if (k == STMT_RETURN) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        return h;
+    }
+
+    if (k == STMT_IF) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        let then_body: array<HirStmt> = [];
+        let then_block = s.items;
+        let i = 0;
+        while (i < len(then_block)) {
+            then_body = array_push(then_body, hir_lower_stmt(then_block[i], env));
+            i = i + 1;
+        }
+        h.body = then_body;
+        let else_body: array<HirStmt> = [];
+        let else_block = s.items2;
+        let j = 0;
+        while (j < len(else_block)) {
+            else_body = array_push(else_body, hir_lower_stmt(else_block[j], env));
+            j = j + 1;
+        }
+        h.else_body = else_body;
+        return h;
+    }
+
+    if (k == STMT_WHILE) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        let body: array<HirStmt> = [];
+        let body_block = s.items;
+        let i = 0;
+        while (i < len(body_block)) {
+            body = array_push(body, hir_lower_stmt(body_block[i], env));
+            i = i + 1;
+        }
+        h.body = body;
+        return h;
+    }
+
+    if (k == STMT_FOR) {
+        // for (vars in iter) { body }
+        //   h.child = 迭代对象表达式；h.slot = 第一个循环变量 slot
+        //   h.int1 = 隐藏索引 slot；h.str1 = 逗号分隔变量名列表
+        //   h.extra_slots = 额外变量 slot（第二及之后）
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        h.str1 = s.str1;
+        let var_names = tc_split_commas(s.str1);
+        let n_vars = len(var_names);
+        if (n_vars == 1) {
+            h.slot = hir_env_bind(env, var_names[0] as string);
+        } else if (n_vars >= 2) {
+            h.slot = hir_env_bind(env, var_names[0] as string);
+            let extra_slots: array<int> = [];
+            let vi = 1;
+            while (vi < n_vars) {
+                extra_slots = array_push(extra_slots, hir_env_bind(env, var_names[vi] as string));
+                vi = vi + 1;
+            }
+            h.extra_slots = extra_slots;
+        }
+        hir_tmp_counter = hir_tmp_counter + 1;
+        h.int1 = hir_env_bind(env, "$foridx." + int_to_str(hir_tmp_counter));
+        let body: array<HirStmt> = [];
+        let body_block = s.items;
+        let i = 0;
+        while (i < len(body_block)) {
+            body = array_push(body, hir_lower_stmt(body_block[i], env));
+            i = i + 1;
+        }
+        h.body = body;
+        return h;
+    }
+
+    if (k == STMT_BREAK || k == STMT_CONTINUE) {
+        return h;
+    }
+
+    if (k == STMT_ASSIGN) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        if (expr_is_none(s.expr2) == 0) {
+            let rhs_h = hir_lower_expr(s.expr2, env);
+            h.rhs = rhs_h;
+        }
+        return h;
+    }
+
+    if (k == STMT_BLOCK) {
+        let body: array<HirStmt> = [];
+        let body_block = s.items;
+        let i = 0;
+        while (i < len(body_block)) {
+            body = array_push(body, hir_lower_stmt(body_block[i], env));
+            i = i + 1;
+        }
+        h.body = body;
+        return h;
+    }
+
+    // 语句级 match（含 enum 解构臂）：
+    //   h.child = scrutinee；h.pats = 模式（HirExpr）；h.arm_blocks = 臂块
+    if (k == STMT_MATCH) {
+        if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
+        let scrut_h = h.child;
+        let scrut_ty = hir_type_of_hir_expr(scrut_h);
+        let pats = s.exprs;
+        let blocks = s.items;   // 每臂块为 STMT_BLOCK
+        let hpats: array<HirExpr> = [];
+        let hblocks: array<HirBlock> = [];
+        let i = 0;
+        while (i < len(pats)) {
+            let pe = pats[i];
+            let ph = hir_mk_expr(EXPR_VAR);
+            if (pe.kind == EXPR_VAR && str_eq(pe.str1, "_") == 1) {
+                ph.str1 = "_";
+            } else if (pe.kind == EXPR_ENUM_VARIANT) {
+                let phe = hir_mk_expr(EXPR_ENUM_VARIANT);
+                phe.id = pe.id;
+                phe.str1 = pe.str1;
+                phe.intval = pe.intval;
+                phe.inferred_type = scrut_ty;
+                let bind_children: array<HirExpr> = [];
+                let bind_names = pe.str_items;
+                let bind_types = pe.bind_types;
+                let bi = 0;
+                while (bi < len(bind_names)) {
+                    let bname = bind_names[bi] as string;
+                    let bslot = hir_env_bind(env, bname);
+                    let bh = hir_mk_expr(EXPR_VAR);
+                    bh.id = next_node_id();
+                    bh.str1 = bname;
+                    bh.slot = bslot;
+                    bh.intval = bi;
+                    let bty = mk_type(TYPE_ANY);
+                    if (bi < len(bind_types)) { bty = bind_types[bi] as Type; }
+                    bh.inferred_type = bty;
+                    bind_children = array_push(bind_children, bh);
+                    bi = bi + 1;
+                }
+                phe.children = bind_children;
+                ph = phe;
+            } else {
+                let phe = hir_lower_expr(pe, env);
+                if ((phe.inferred_type as any) == 0) { phe.inferred_type = scrut_ty; }
+                ph = phe;
+            }
+            hpats = array_push(hpats, ph);
+            // 臂块：取对应 STMT_BLOCK 的 items
+            let hblk = hir_mk_stmt(STMT_BLOCK);
+            if (i < len(blocks)) {
+                let blk = blocks[i];
+                let inner = blk.items;
+                let bj = 0;
+                while (bj < len(inner)) {
+                    hblk.body = array_push(hblk.body, hir_lower_stmt(inner[bj], env));
+                    bj = bj + 1;
+                }
+            }
+            hblocks = array_push(hblocks, HirBlock { stmts: hblk.body });
+            i = i + 1;
+        }
+        h.pats = hpats;
+        h.arm_blocks = hblocks;
+        return h;
+    }
+
+    return h;
+}
+
+// ============ 函数 lowering ============
+pub kimo hir_lower_func(fd: FuncDef) -> HirFunc {
+    let env = hir_env_new();
+    let params_h: array<HirParam> = [];
+    let params = fd.params;
+    let i = 0;
+    while (i < len(params)) {
+        let p = params[i] as Param;
+        let slot = hir_env_bind(env, p.name);
+        params_h = array_push(params_h, HirParam { name: p.name, slot: slot, ty: p.type_ref });
+        i = i + 1;
+    }
+    let body_h: array<HirStmt> = [];
+    let body = fd.body;
+    if ((body as any) != 0) {
+        let stmts = body.items;
+        let j = 0;
+        while (j < len(stmts)) {
+            body_h = array_push(body_h, hir_lower_stmt(stmts[j], env));
+            j = j + 1;
+        }
+    }
+    let hf = HirFunc {
+        name: fd.name,
+        params: params_h,
+        return_type: fd.return_type,
+        body: body_h,
+        n_slots: env.counter,
+        extern_name: fd.extern_name
+    };
+    return hf;
+}
+
+// 程序 lowering：返回 array<HirFunc>
+pub kimo hir_lower_program(prog: Program) -> array<HirFunc> {
+    let hfuncs: array<HirFunc> = [];
+    let funcs = prog.funcs;
+    let i = 0;
+    while (i < len(funcs)) {
+        hfuncs = array_push(hfuncs, hir_lower_func(funcs[i]));
+        i = i + 1;
+    }
+    return hfuncs;
+}

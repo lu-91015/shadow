@@ -1,0 +1,17 @@
+//@desc: statement-level match destructuring with wrong binding count is rejected
+//@expect-stderr: bindings
+dsb tcf_match_stmt_bad_bindings;
+
+enum Pair {
+    Two(int, int),
+    None
+}
+
+kimo main() -> int {
+    let p = Two(1, 2);
+    match p {
+        Two(x) => { println(x); },
+        _ => { }
+    }
+    return 0;
+}

@@ -1,0 +1,15 @@
+//@desc: --exe: int array literal, in-place set, and for-loop sum
+//@expect: 99
+//@expect: 149
+dsb exe_int_array;
+kimo main() -> int {
+    let a = [10, 20, 30];
+    a[0] = 99;
+    println(a[0]);
+    let total = 0;
+    for (i in a) {
+        total = total + i;
+    }
+    println(total);
+    return 0;
+}

@@ -1,0 +1,6 @@
+//@desc: AST reports one struct definition
+//@skip: 0.4 no --ast mode
+//@expect: structs: 1
+dsb ast_struct_count;
+struct Point { x: int; y: int }
+kimo main() -> int { return 0; }

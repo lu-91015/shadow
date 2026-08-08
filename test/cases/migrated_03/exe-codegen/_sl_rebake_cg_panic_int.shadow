@@ -1,0 +1,6 @@
+dsb _sl_rebake_cg_panic_int;
+kimo main() -> int {
+    let x = 42;
+    panic x;
+    println(0); return 0;
+}

@@ -1,0 +1,9 @@
+//@desc: match with only a `_` wildcard arm (always matches)
+//@expect-ir: br label
+dsb edge_match_wildcard_only;
+kimo main() -> int {
+    let r = match 99 {
+        _ => 7,
+    };
+    return r;
+}

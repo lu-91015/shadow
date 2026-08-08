@@ -1,0 +1,10 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：跨模块调用私有函数应被拒（私有符号不进命名空间树）
+//@expect-stderr: undefined function 'priv_fn'
+//@args: --strict
+dsb sa_priv_fn;
+import sa_priv_lib._sa_lib;
+kimo main() -> int {
+    let a = priv_fn();
+    return 0;
+}

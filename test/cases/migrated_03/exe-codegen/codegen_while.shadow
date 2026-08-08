@@ -1,0 +1,4 @@
+//@desc: while loop codegens to a real loop (regression for dropped loop body)
+//@expect: 5
+dsb codegen_while;
+kimo main() -> int { let i = 0; while (i < 5) { i = i + 1; } println(i); return 0; }

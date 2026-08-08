@@ -1,0 +1,5 @@
+//@desc: function call with params type-checks
+//@expect: typecheck: 1
+dsb tc_func_call;
+kimo add(a: int, b: int) -> int { return a + b; }
+kimo main() -> int { return add(1, 2); }

@@ -1,0 +1,20 @@
+//@mode: exe
+//@desc: Phase 11 §3.8 兼容态命名空间：FQN 限定类型名 + FQN 限定函数调用
+//@expect: ns fqn ok 12
+dsb ex_ns_fqn;
+import nsdemo.geom;
+
+kimo main() -> int {
+    // 命名空间由文件路径派生：nsdemo\geom.shadow → nsdemo.geom
+    // 1) FQN 限定类型名（Java 式 a.b.C）
+    let p: nsdemo.geom.Point = nsdemo.geom.mk_point(3, 4);
+    // 2) FQN 限定函数调用
+    let a = nsdemo.geom.area(p);
+    if (a != 12) { println("ERR area " + int_to_str(a)); return 1; }
+    // 3) 兼容态：裸名仍可用（全局 pub 回退不受影响）
+    let q = mk_point(2, 5);
+    let b = area(q);
+    if (b != 10) { println("ERR bare " + int_to_str(b)); return 1; }
+    println("ns fqn ok " + int_to_str(a));
+    return 0;
+}

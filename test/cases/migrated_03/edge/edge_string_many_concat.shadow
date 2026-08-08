@@ -1,0 +1,8 @@
+//@mode: codegen
+//@desc: long string concat chain (10 literals)
+//@expect-ir: shadow_string_concat
+dsb edge_string_many_concat;
+kimo main() -> int {
+    let s = "a" + "b" + "c" + "d" + "e" + "f" + "g" + "h" + "i" + "j";
+    return 0;
+}

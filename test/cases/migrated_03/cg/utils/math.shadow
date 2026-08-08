@@ -1,0 +1,23 @@
+dsb math;
+// utils/math.shadow - test module for pub/visibility and namespace
+pub kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+pub kimo multiply(a: int, b: int) -> int {
+    return a * b;
+}
+
+pub kimo negate(x: int) -> int {
+    return 0 - x;
+}
+
+pub kimo abs_val(x: int) -> int {
+    if (x < 0) { return 0 - x; }
+    return x;
+}
+
+// private function - not documented as pub
+kimo internal_double(x: int) -> int {
+    return x * 2;
+}

@@ -1,0 +1,9 @@
+//@desc: two modules with same pub function name → ambiguous symbol error
+//@expect_stderr: ambiguous symbol
+dsb ns_ambiguous_pub;
+import _ns_ambig_mod_a
+import _ns_ambig_mod_b
+
+kimo main() -> int {
+    return same_func();
+}

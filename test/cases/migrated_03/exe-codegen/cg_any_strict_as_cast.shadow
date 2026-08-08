@@ -1,0 +1,17 @@
+//@desc: explicit `as` cast from any to concrete type is allowed under any strictness
+//@expect: 0
+dsb cg_any_strict_as_cast;
+kimo main() -> int {
+    let x: any = 42;
+    // any -> int 必须显式 as 转换（0.3 严格化）
+    let y: int = x as int;
+    if (y != 42) { println(1); return 1; }
+
+    // concrete -> any 隐式允许（装箱安全）
+    let z: any = y;
+    let w: int = z as int;
+    if (w != 42) { println(2); return 2; }
+
+    println(0);
+    return 0;
+}

@@ -1,0 +1,8 @@
+//@expect: 42
+//@ desc: generic with union type constraint
+dsb cg_constraint_union;
+kimo identity<T: int|long>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    println(a); return 0;
+}

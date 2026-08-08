@@ -1,0 +1,11 @@
+dsb cg_generic_struct_pair;
+
+struct Pair<K, V> {
+    first: K;
+    second: V
+}
+
+kimo main() -> int {
+    let p = Pair<int, string>{first: 7, second: "hello"};
+    return p.first;
+}

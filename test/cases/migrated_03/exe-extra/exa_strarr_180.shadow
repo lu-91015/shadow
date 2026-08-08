@@ -1,0 +1,14 @@
+//@desc: exe-extra generated case (exa_strarr_180)
+//@expect: a
+//@expect: b!
+//@expect: c
+dsb exa_strarr_180;
+kimo main() -> int {
+    let names = ["a", "b", "c"];
+    println(names[0]);
+    let g = names[1] + "!";
+    println(g);
+    names[2] = "c";
+    println(names[2]);
+    return 0;
+}

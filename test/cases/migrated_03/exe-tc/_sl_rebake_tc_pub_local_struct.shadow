@@ -1,0 +1,7 @@
+dsb _sl_rebake_tc_pub_local_struct;
+pub struct LocalBox { value: int }
+kimo make_local(v: int) -> LocalBox { return LocalBox { value: v }; }
+kimo main() -> int {
+    let b = make_local(7);
+    println(b.value); return 0;
+}

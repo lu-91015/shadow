@@ -1,0 +1,11 @@
+//@expect: 30
+//@desc: match expression with a `_` wildcard arm type-checks
+dsb tc_match_wildcard;
+kimo main() -> int {
+    let r = match 3 {
+        1 => 10,
+        2 => 20,
+        _ => 30,
+    };
+    println(r); return 0;
+}

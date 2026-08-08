@@ -1,0 +1,4 @@
+//@desc: long type codegen — long literal should use i64
+//@expect: 0
+dsb cg_long_var;
+kimo main() -> int { let x: long = 100000; println(0); return 0; }

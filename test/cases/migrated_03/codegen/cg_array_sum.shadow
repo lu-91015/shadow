@@ -1,0 +1,20 @@
+//@desc: array as function parameter with arithmetic on elements
+//@expect-ir: shadow_array_get
+dsb cg_array_sum;
+
+kimo sum_arr(arr: array) -> int {
+    let total = 0;
+    let i = 0;
+    while (i < len(arr)) {
+        total = total + arr[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+kimo main() -> int {
+    let data = [1, 2, 3];
+    let s = sum_arr(data);
+    println(to_string(s));
+    return 0;
+}

@@ -1,0 +1,10 @@
+//@mode: codegen
+//@desc: string equality compiled to shadow_string_eq call + icmp
+//@expect-ir: shadow_string_eq
+dsb cg_string_compare;
+kimo main() -> int {
+    let s = "a";
+    let t = "b";
+    if (s == t) { return 1; }
+    return 0;
+}

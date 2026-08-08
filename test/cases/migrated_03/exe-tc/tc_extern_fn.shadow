@@ -1,0 +1,6 @@
+//@desc: @extern function type check — callable with correct argument types
+//@expect: 5
+dsb tc_extern_fn;
+@extern("shadow_abs")
+kimo my_abs(x: int) -> int { return 0; }
+kimo main() -> int { println(my_abs(-5)); return 0; }

@@ -1,0 +1,51 @@
+//@desc: L6 error propagation `?` — let x = may_fail()?; unwraps Ok, propagates Err to caller
+//@expect: 110\ncaught: 1\nchain: 1
+dsb cg_question_basic;
+
+// 新语义（0.4 方向）：`?` 仅作用于 Result<T,E> / Option<T>。
+// Ok(v)/Some(v) → 解包出 v；Err(e)/None → 置异常标志并从当前函数返回
+// （与 Rust 一致：`?` 向调用方传播，由调用方的 try/catch 捕获）。
+
+kimo may_fail_double(x: int) -> Result<int, string> {
+    if (x == 0) {
+        return Err("zero not allowed");
+    }
+    return Ok(x * 2);
+}
+
+// 使用 ? 解包：may_fail_double(5)? 成功 → r = 10 → 返回 110
+kimo try_propagate_ok() -> int {
+    let r = may_fail_double(5)?;
+    return r + 100;  // 110
+}
+
+// 使用 ? 传播：may_fail_double(0)? 为 Err → 异常向调用方传播
+kimo try_propagate_err() -> int {
+    let r = may_fail_double(0)?;
+    return r + 100;  // 不会执行
+}
+
+// 两级传播：middle 用 ? 把 Err 继续向上抛
+kimo middle() -> int {
+    let r = may_fail_double(0)?;
+    return r;  // 不会执行
+}
+
+kimo main() -> int {
+    println(try_propagate_ok());    // 110
+
+    // Err 路径：? 在被调函数中抛出，在 main 的 try/catch 捕获
+    try {
+        try_propagate_err();
+    } catch {
+        println("caught: 1");
+    }
+
+    // 两级调用链传播：may_fail → middle(?) → main(try/catch)
+    try {
+        middle();
+    } catch {
+        println("chain: 1");
+    }
+    return 0;
+}

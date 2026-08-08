@@ -1,0 +1,12 @@
+//@ mode: tc
+//@ desc: different modules can have same-named private functions (namespace isolation)
+//@args: --strict
+dsb ns_isolation_test;
+import ns_mod_a;
+import ns_mod_b;
+
+kimo main() -> int {
+    let a = get_a();
+    let b = get_b();
+    return a + b;
+}

@@ -1,0 +1,13 @@
+//@ desc: pub enum used as function parameter with multiple variants
+dsb tc_pub_enum_param;
+import _pub_helper;
+kimo describe_color(c: PubColor) -> int {
+    if (c == PubColor.Red) { return 10; }
+    if (c == PubColor.Green) { return 20; }
+    if (c == PubColor.Blue) { return 30; }
+    return -1;
+}
+kimo main() -> int {
+    let c = PubColor.Green;
+    return describe_color(c);
+}

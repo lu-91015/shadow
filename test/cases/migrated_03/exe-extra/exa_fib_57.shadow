@@ -1,0 +1,8 @@
+//@desc: exe-extra generated case (exa_fib_57)
+//@expect: 377
+dsb exa_fib_57;
+kimo fib(n: int) -> int { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+kimo main() -> int {
+    println(fib(14));
+    return 0;
+}

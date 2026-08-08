@@ -1,0 +1,10 @@
+//@expect: 42
+//@ desc: more cast combinations (int->long, long->int)
+dsb cg_cast_more;
+
+kimo main() -> int {
+    let x: int = 42;
+    let y: long = x as long;
+    let z: int = y as int;
+    println(z); return 0;
+}

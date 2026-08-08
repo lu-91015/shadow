@@ -1,0 +1,8 @@
+//@desc: basic macro definition and usage
+dsb tc_macro_basic;
+macro inc { x => x + 1; }
+kimo main() -> int {
+    let x = 5;
+    let y = inc(x);
+    return y;
+}

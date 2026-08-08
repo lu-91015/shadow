@@ -1,0 +1,12 @@
+//@desc: Phase 3 - generic function is truly monomorphized per concrete type argument
+//@expect: 42
+//@expect: hi
+//@expect: true
+dsb cg_mono_basic;
+kimo id<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    println(id(42));
+    println(id("hi"));
+    println(id(true));
+    return 0;
+}

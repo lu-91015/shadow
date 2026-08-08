@@ -1,0 +1,12 @@
+//@desc: named param with non-existent param name should fail
+//@expect: unknown named argument
+dsb tc_fail_named_param_wrong_name;
+
+kimo f(x: int, y: int) -> int {
+    return x + y;
+}
+
+kimo main() -> int {
+    let r = f(x: 1, nonexistent: 2);
+    return r;
+}

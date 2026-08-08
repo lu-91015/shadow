@@ -1,0 +1,11 @@
+//@ mode: codegen
+//@ desc: generic monomorphization — identity<T>(x: T) -> T instantiated for int and string
+//@expect-ir: call
+dsb cg_mono_identity;
+
+kimo identity<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    let b = identity("hello");
+    return a;
+}

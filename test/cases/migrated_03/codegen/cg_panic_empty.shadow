@@ -1,0 +1,8 @@
+//@ mode: codegen
+//@ desc: panic statement - no argument
+//@expect-ir: shadow_panic
+dsb cg_panic_empty;
+kimo main() -> int {
+    panic;
+    return 0;
+}

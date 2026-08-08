@@ -1,0 +1,5 @@
+//@desc: import non-existent module fails (file not found)
+//@expect-stderr: Type check failed
+dsb import_unimplemented;
+import math
+kimo main() -> int { return math.max(1, 2); }

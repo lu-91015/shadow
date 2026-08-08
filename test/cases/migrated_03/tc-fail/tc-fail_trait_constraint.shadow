@@ -1,0 +1,26 @@
+//@ mode: tc-fail
+//@ desc: L1 trait constraint violation — Bar does not impl Greet
+dsb tc_fail_trait_constraint;
+
+trait Greet {
+    kimo greet(self: any) -> string;
+}
+
+struct Foo { x: int; }
+struct Bar { y: int; }
+
+impl Greet for Foo {
+    kimo greet(self: any) -> string {
+        return "hello";
+    }
+}
+
+kimo call_greet<T: Greet>(x: T) -> int {
+    return 0;
+}
+
+kimo main() -> int {
+    let b = Bar { y: 2 };
+    let r = call_greet(b);  // Bar 不实现 Greet，应失败
+    return 0;
+}

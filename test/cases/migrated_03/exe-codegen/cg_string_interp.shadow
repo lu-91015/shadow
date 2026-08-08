@@ -1,0 +1,28 @@
+//@desc: string interpolation "x=${expr}" desugars to concatenation chain
+//@expect: Hello, Alice!\nAge: 30\nSum: 15\nAlice
+dsb cg_string_interp;
+
+kimo main() -> int {
+    let name = "Alice";
+    let age = 30;
+    let a = 5;
+    let b = 10;
+
+    // 基本插值：字符串 + 变量
+    let s1 = "Hello, ${name}!";
+    println(s1);
+
+    // int 插值
+    let s2 = "Age: ${age}";
+    println(s2);
+
+    // 表达式插值
+    let s3 = "Sum: ${a + b}";
+    println(s3);
+
+    // 纯插值（首段为表达式）
+    let s4 = "${name}";
+    println(s4);
+
+    return 0;
+}

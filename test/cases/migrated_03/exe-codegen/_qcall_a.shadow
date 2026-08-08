@@ -1,0 +1,5 @@
+dsb qcall_a;
+
+pub kimo shared() -> int {
+    return 42;
+}

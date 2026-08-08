@@ -1,0 +1,14 @@
+//@desc: --exe: string array literal, index, concat, and in-place set
+//@expect: alice
+//@expect: alice!
+//@expect: zoe
+dsb exe_string_array;
+kimo main() -> int {
+    let names = ["alice", "bob", "carol"];
+    println(names[0]);
+    let greet = names[0] + "!";
+    println(greet);
+    names[0] = "zoe";
+    println(names[0]);
+    return 0;
+}

@@ -1,0 +1,2 @@
+dsb math_add;
+pub kimo mod_add3(a: int, b: int, c: int) -> int { return a + b + c; }

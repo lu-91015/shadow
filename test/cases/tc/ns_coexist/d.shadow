@@ -1,0 +1,9 @@
+dsb d;
+import ns_coexist.pa.lib;
+// d 用 a 的：Pt(x,y) + inherent 方法 tag() + enum 变体声明
+// run() = c(1) + g(10) + tag(7) + 11 = 29
+pub kimo run() -> int {
+    let p = Pt { x: 3, y: 7 };
+    let col = Color.Red;
+    return c() + g + p.tag() + 11;
+}

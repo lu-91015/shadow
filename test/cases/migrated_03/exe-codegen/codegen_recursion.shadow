@@ -1,0 +1,5 @@
+//@desc: recursive call codegens to a self-call
+//@expect: 120
+dsb codegen_recursion;
+kimo fact(n: int) -> int { if (n <= 1) { return 1; } return n * fact(n - 1); }
+kimo main() -> int { println(fact(5)); return 0; }

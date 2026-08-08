@@ -1,0 +1,5 @@
+//@desc: macro definition and call expansion at compile time
+//@expect: 6
+dsb tc_macro_inc;
+macro inc { x => x + 1; }
+kimo main() -> int { let a = 5; let b = inc(a); println(b); return 0; }

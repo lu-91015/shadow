@@ -1,0 +1,18 @@
+//@expect: hello
+//@desc: L2 enum payload — Option<string> construct Some(string) and destructure
+dsb cg_enum_option_string;
+
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+kimo main() -> int {
+    let x = Some("hello");
+    let r = match x {
+        Some(v) => v,
+        None => "none",
+    };
+    println(r);
+    return 0;
+}

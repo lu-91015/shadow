@@ -1,0 +1,7 @@
+//@mode: tc
+//@desc: Phase 15 严格态：a.Pair<T>/b.Pair<T> 泛型 struct 模板共存（register_decls 后 mangle，模板不同名）
+//@args: --strict
+dsb ns_coexist_generic_main;
+import ns_coexist.pa.lib;
+import ns_coexist.pb.lib;
+kimo main() -> int { return 0; }

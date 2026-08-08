@@ -1,0 +1,12 @@
+//@desc: bool_to_str explicit conversion (true / false)
+//@expect: BT=true
+//@expect: BF=false
+dsb bool_to_str_basic;
+
+kimo main() -> int {
+    let t: string = bool_to_str(1);
+    println("BT=" + t);
+    let f: string = bool_to_str(0);
+    println("BF=" + f);
+    return 0;
+}

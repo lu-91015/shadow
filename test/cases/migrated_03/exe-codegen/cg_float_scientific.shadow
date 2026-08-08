@@ -1,0 +1,7 @@
+//@desc: scientific-notation float constant tokenized and emitted in the pool
+//@expect: 0
+dsb cg_float_scientific;
+kimo main() -> int {
+    let x = 1e3;
+    println(0); return 0;
+}

@@ -1,0 +1,8 @@
+//@desc: comparing a string with an int is a type mismatch
+//@expect-stderr: type mismatch in comparison
+dsb tcf_string_compare_with_int;
+kimo main() -> int {
+    let s = "hello";
+    if (s == 5) { return 0; }
+    return 1;
+}

@@ -1,0 +1,35 @@
+//@desc: time runtime primitives — rt_date_now returns YYYYMMDD, rt_date_to_str formats it
+//@expect: 0
+dsb cg_time_now;
+kimo main() -> int {
+    // rt_date_now() 返回当前日期的 YYYYMMDD 整数（如 20260725）
+    // int 与 date 兼容（tc_type_compat 时间类型规则）
+    let today: date = rt_date_now();
+
+    // date 应该是一个 8 位数字（YYYYMMDD），范围 20000000..21000000
+    // （2020-2099 年范围，足够验证逻辑）
+    if (today < 20000000) { println(1); return 1; }
+    if (today > 21000000) { println(2); return 2; }
+
+    // date 算术：今天 + 1 = 明天的整数编码（跨月/跨年不精确，但同月内正确）
+    let tomorrow: date = today + 1;
+    if (tomorrow != today + 1) { println(3); return 3; }
+
+    // rt_date_to_str 将 YYYYMMDD 转为 "YYYY.MM.DD"
+    // 注意：@extern 返回 any（C 字符串指针），用 any 接收
+    let s: any = rt_date_to_str(today);
+    // 字符串应以 "20" 开头（2020 年代），len 对 any 字符串有效
+    if (len(s) < 10) { println(4); return 4; }
+
+    // 比较两个 date
+    let d2: date = today;
+    if (today != d2) { println(5); return 5; }
+    if (!(today <= tomorrow)) { println(6); return 6; }
+
+    // 打印 date 值（分发到 println_int）
+    print(today);
+    println("");
+
+    println(0);
+    return 0;
+}

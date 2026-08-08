@@ -1,0 +1,13 @@
+//@expect: 1
+//@ desc: pub enum variants are usable in expressions after import
+dsb tc_pub_enum_variants;
+import _pub_helper
+kimo main() -> int {
+    let r = PubColor.Red;
+    let g = PubColor.Green;
+    let b = PubColor.Blue;
+    if (r == PubColor.Red) { println(1); return 0; }
+    if (g == PubColor.Green) { println(2); return 0; }
+    if (b == PubColor.Blue) { println(3); return 0; }
+    println(0); return 0;
+}

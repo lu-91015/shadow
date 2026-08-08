@@ -1,0 +1,10 @@
+dsb _pub_helper;
+// Helper module for pub visibility negative tests
+pub struct PubBox { value: int }
+struct PrivBox { value: int }
+pub enum PubColor { Red, Green, Blue }
+enum PrivColor { A, B, C }
+pub kimo get_pub_box_value(b: PubBox) -> int { return b.value; }
+pub kimo pub_color_val(c: PubColor) -> int { return 0; }
+kimo get_priv_box_value(b: PrivBox) -> int { return b.value; }
+kimo priv_color_val(c: PrivColor) -> int { return 0; }

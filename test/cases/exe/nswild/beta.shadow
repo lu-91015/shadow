@@ -1,0 +1,3 @@
+dsb nswild_beta;
+
+pub kimo beta_val() -> int { return 4; }

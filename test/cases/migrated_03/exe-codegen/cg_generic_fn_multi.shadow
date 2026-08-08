@@ -1,0 +1,11 @@
+//@expect: 42
+//@ desc: generic function with two type params, type-erased to any
+dsb cg_generic_fn_multi;
+
+kimo first<T, U>(a: T, b: U) -> T { return a; }
+kimo second<T, U>(a: T, b: U) -> U { return b; }
+kimo main() -> int {
+    let a = first(42, "hello");
+    let b = second(42, "hello");
+    println(a); return 0;
+}

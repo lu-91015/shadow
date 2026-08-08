@@ -1,0 +1,9 @@
+//@expect: 42
+//@ desc: if-expression evaluates to a value using alloca+store+load
+dsb cg_if_expr;
+
+kimo main() -> int {
+    let flag = 1;
+    let x = if (flag) { 42 } else { 99 };
+    println(x); return 0;
+}

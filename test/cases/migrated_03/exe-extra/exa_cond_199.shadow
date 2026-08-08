@@ -1,0 +1,11 @@
+//@desc: exe-extra generated case (exa_cond_199)
+//@expect: 7
+//@expect: 1
+dsb exa_cond_199;
+kimo main() -> int {
+    let x = 1;
+    let y = 8;
+    if (x > y) { println(x - y); } else { println(y - x); }
+    if (x == y) { println(0); } else { println(1); }
+    return 0;
+}

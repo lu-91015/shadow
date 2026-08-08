@@ -1,0 +1,12 @@
+//@expect: 42
+//@expect: 99
+//@ desc: module.func() qualified call resolves same-name functions in different modules
+dsb cg_qualified_call;
+import _qcall_a;
+import _qcall_b;
+
+kimo main() -> int {
+    println(qcall_a.shared());
+    println(qcall_b.shared());
+    return 0;
+}

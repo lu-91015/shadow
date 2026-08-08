@@ -1,0 +1,10 @@
+//@mode: tc-fail
+//@desc: private top-level let from imported module is not visible
+//@expect-stderr: undefined variable
+dsb tcf_pub_let_private_import;
+import _publet_private_helper
+
+kimo main() -> int {
+    return hidden_value;
+}
+

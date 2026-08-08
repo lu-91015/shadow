@@ -1,0 +1,7 @@
+dsb _gc_import_helper;
+// Helper for import + GC test — NOT a standalone test case.
+pub struct P { x: int, y: int }
+pub kimo make_point(a: int, b: int) -> int {
+    let p = P { x: a, y: b };
+    return p.x + p.y;
+}

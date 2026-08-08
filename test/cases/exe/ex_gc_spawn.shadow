@@ -1,0 +1,192 @@
+//@mode: exe
+//@desc: §5.2.7 并发标记——多线程 spawn/await 下 GC 不误回收、不悬垂
+//@expect: spawn gc ok workers=8 nodes=1600
+//@env: SHADOW_GC_STRESS=64 SHADOW_GC_VERIFY=1
+//@timeout: 300
+// ex_gc_spawn.shadow — §5.2.7「GC 与多线程（spawn/await）整合」的被测程序。
+//
+// 这个用例要压出的四类 bug（都只在多线程下才暴露）：
+//   1) 帧根错乱 —— 帧根若是全局单栈，两条线程交替 frame_enter/frame_leave 会
+//      互相截断对方的根，随机的活对象被回收。
+//   2) 挂起线程的栈漏扫 —— worker 线程栈上的活对象若不被 GC 扫描，
+//      别的线程触发的 GC 会把它们回收，worker 继续用就是 use-after-free。
+//      注意 SuspendThread 是异步的，必须靠 GetThreadContext 同步；少了这一步
+//      读到的是半更新的栈，症状同样是随机漏标。
+//   3) 跨线程移交的无根窗口 —— worker 的返回值写进 Future 之后、被 await
+//      取走之前，唯一持有者是非 GC 内存；没有槽根就会被回收。
+//   4) 并发写屏障失序 —— 多条线程同时置灰，共享灰队列若不串行化就会写坏。
+//
+// 每个 worker 同时做三件事：
+//   · 长命链表（build_chain 200 节点）—— 必须活到最后，验证 1/2；
+//   · 短命垃圾 —— 驱动 GC 高频触发，制造"多线程都在跑时回收"的时刻；
+//   · 私有对象池的搬出/搬回 —— 复刻 ex_gc_barrier 的 Wilson 漏标窗口，
+//     但八条线程并发地做，验证 4。池是**线程局部**的，所以同时也在压 1。
+dsb ex_gc_spawn;
+
+struct Node {
+    tag: string;
+    next: Node;
+}
+
+struct Cell {
+    tag: string;
+    id: int;
+}
+
+struct Slot {
+    c: Cell;
+    id: int;
+}
+
+// 造一条 n 节点的链表，返回头节点。
+kimo build_chain(n: int, seed: int) -> Node {
+    let head: Node = 0 as Node;
+    let i = 0;
+    while (i < n) {
+        let nd: Node = Node { tag: "n-" + int_to_str(seed) + "-" + int_to_str(i), next: head };
+        head = nd;
+        i = i + 1;
+    }
+    return head;
+}
+
+// 沿链走一遍，统计节点数；顺带校验 tag 没被回收/污染。
+kimo walk_chain(head: Node, seed: int) -> int {
+    let cur: Node = head;
+    let count = 0;
+    while ((cur as any) != 0) {
+        if (str_contains(cur.tag, "n-" + int_to_str(seed) + "-") == 0) {
+            return 0 - 1;
+        }
+        cur = cur.next;
+        count = count + 1;
+    }
+    return count;
+}
+
+// 深递归 + 每层造串：冲掉栈上残留的指针副本，免得保守栈扫描顺手救活
+// 本该隐身的对象，把漏标掩盖过去。
+kimo clobber(depth: int, acc: int) -> int {
+    if (depth <= 0) { return acc; }
+    let pad = "x" + int_to_str(depth) + "-" + int_to_str(acc);
+    return clobber(depth - 1, acc + len(pad));
+}
+
+// worker：长命链表 + 短命垃圾 + 并发写屏障压力，最后返回链表长度。
+kimo worker_body(seed: int) -> int {
+    // 长命对象图：必须活过后面所有的 GC。
+    let keep: Node = build_chain(200, seed);
+
+    // 线程私有的持久对象池：建成后不再新建，每个 GC 周期启动时都是"白"的
+    //（"分配即黑"只覆盖周期内新生对象，救不了它们）。
+    let pool: array<Slot> = [];
+    let i = 0;
+    while (i < 120) {
+        pool = array_push(pool,
+            Slot { c: Cell { tag: "c-" + int_to_str(seed) + "-" + int_to_str(i), id: i },
+                   id: i });
+        i = i + 1;
+    }
+
+    let round = 0;
+    while (round < 40) {
+        // 短命垃圾：驱动 GC 触发。
+        let junk: array<string> = [];
+        i = 0;
+        while (i < 60) {
+            junk = array_push(junk,
+                "junk-" + int_to_str(seed) + "-" + int_to_str(round) + "-" + int_to_str(i));
+            i = i + 1;
+        }
+
+        // ── 搬出：白 Cell 进黑数组（插入屏障点），同时摧毁灰路径（删除屏障点）──
+        let stash: array<Cell> = [];
+        i = 0;
+        while (i < 120) {
+            let s: Slot = pool[i];
+            let c: Cell = s.c;
+            if ((c as any) == 0) { return 0 - 2; }
+            s.c = 0 as Cell;
+            stash = array_push(stash, c);
+            i = i + 1;
+        }
+        if (clobber(120, round) < 0) { return 0 - 3; }
+
+        // ── 搬回：目标 Slot 此时可能已变黑，于是继续隐身 ──
+        i = 0;
+        while (i < 120) {
+            let s2: Slot = pool[i];
+            s2.c = stash[i];
+            i = i + 1;
+        }
+        stash = [];
+        if (clobber(120, round) < 0) { return 0 - 3; }
+
+        // ── 逐条校验池内容完好 ──
+        i = 0;
+        while (i < 120) {
+            let s3: Slot = pool[i];
+            let c3: Cell = s3.c;
+            if ((c3 as any) == 0) { return 0 - 4; }
+            if (c3.id != i) { return 0 - 5; }
+            if (str_eq(c3.tag, "c-" + int_to_str(seed) + "-" + int_to_str(i)) == 0) {
+                return 0 - 6;
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+
+    // 长命链表必须完好无损。
+    return walk_chain(keep, seed);
+}
+
+kimo w0() -> int { return worker_body(0); }
+kimo w1() -> int { return worker_body(1); }
+kimo w2() -> int { return worker_body(2); }
+kimo w3() -> int { return worker_body(3); }
+kimo w4() -> int { return worker_body(4); }
+kimo w5() -> int { return worker_body(5); }
+kimo w6() -> int { return worker_body(6); }
+kimo w7() -> int { return worker_body(7); }
+
+kimo main() -> int {
+    let f0 = spawn w0();
+    let f1 = spawn w1();
+    let f2 = spawn w2();
+    let f3 = spawn w3();
+    let f4 = spawn w4();
+    let f5 = spawn w5();
+    let f6 = spawn w6();
+    let f7 = spawn w7();
+
+    // 主线程在 worker 跑的同时也制造分配压力：让 GC 在"多线程都在跑"的
+    // 时刻触发，而不是等到所有 worker 都 join 完的安静时刻。
+    let round = 0;
+    while (round < 200) {
+        let junk: array<string> = [];
+        let i = 0;
+        while (i < 50) {
+            junk = array_push(junk, "main-" + int_to_str(round) + "-" + int_to_str(i));
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+
+    let total = 0;
+    total = total + (await f0) as int;
+    total = total + (await f1) as int;
+    total = total + (await f2) as int;
+    total = total + (await f3) as int;
+    total = total + (await f4) as int;
+    total = total + (await f5) as int;
+    total = total + (await f6) as int;
+    total = total + (await f7) as int;
+
+    if (total != 1600) {
+        println("ERR total=" + int_to_str(total) + " expected 1600");
+        return 1;
+    }
+    println("spawn gc ok workers=8 nodes=1600");
+    return 0;
+}

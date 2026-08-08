@@ -1,0 +1,14 @@
+//@expect: 0
+//@ desc: char and short types are accepted in variable declarations, arithmetic, and function signatures
+dsb tc_char_short;
+kimo half(s: short) -> short { return s / 2; }
+kimo next_char(c: char) -> char { return c + 1; }
+kimo main() -> int {
+    let a: short = 100;
+    let b: char = 65;
+    let sum_s = a + 50;
+    let sum_c = b + 1;
+    let h = half(a);
+    let n = next_char(b);
+    println(0); return 0;
+}

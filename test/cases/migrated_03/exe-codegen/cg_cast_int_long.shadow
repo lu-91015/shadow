@@ -1,0 +1,9 @@
+//@desc: explicit cast (as Type) codegens to sext/trunc/sitofp/fptosi
+//@expect: 5
+dsb cg_cast_int_long;
+kimo f(x: int) -> int {
+    let y = x as long;
+    let z = y as int;
+    return z;
+}
+kimo main() -> int { println(f(5)); return 0; }

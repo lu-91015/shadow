@@ -1,0 +1,10 @@
+//@desc: exe-extra generated case (exa_forsum_110)
+//@expect: 60
+dsb exa_forsum_110;
+kimo main() -> int {
+    let a = [10, 20, 30];
+    let total = 0;
+    for (v in a) { total = total + v; }
+    println(total);
+    return 0;
+}

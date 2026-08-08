@@ -1,0 +1,35 @@
+//@desc: dict value >1024 bytes (was truncated by g_str_buf[1024])
+//@expect: 2048\n2048\nok
+dsb cg_dict_long_string;
+
+kimo main() -> int {
+    let d: dict<string, string> = hashmap_new();
+
+    // 构造 >1024 字节的字符串（之前被 g_str_buf[1024] 静默截断）
+    let big = "";
+    let i = 0;
+    while (i < 2048) {
+        big = big + "x";
+        i = i + 1;
+    }
+    hashmap_insert(d, "key", big);
+
+    // shadow_string_len 验证长度（d["key"] 走 shadow_dict_get_string，已是 strdup 无截断）
+    let v = d["key"];
+    println(shadow_string_len(v));  // 2048
+
+    // 再验证通过 shadow_dict_get 路径（any 模型），之前此处被 1024 截断
+    let v2 = shadow_dict_get_helper(d, "key");
+    println(shadow_string_len(v2));  // 2048（修复后）
+
+    // 验证内容正确（首尾字符）
+    if (shadow_string_len(v) == 2048 && shadow_string_len(v2) == 2048) {
+        println("ok");
+    }
+
+    hashmap_free(d);
+    return 0;
+}
+
+// 包装 @extern shadow_dict_get 以便在 Shadow 代码中调用
+@extern("shadow_dict_get") kimo shadow_dict_get_helper(d: any, key: string) -> any { return 0 as any; }

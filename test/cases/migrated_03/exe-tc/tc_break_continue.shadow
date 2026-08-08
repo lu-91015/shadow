@@ -1,0 +1,13 @@
+//@desc: break/continue inside a loop type-check (in_loop scope)
+//@expect: 5
+dsb tc_break_continue;
+kimo f() -> int {
+    let i = 0;
+    while (i < 10) {
+        if (i == 5) { break; }
+        i = i + 1;
+        continue;
+    }
+    return i;
+}
+kimo main() -> int { println(f()); return 0; }

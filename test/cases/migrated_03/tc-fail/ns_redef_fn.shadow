@@ -1,0 +1,6 @@
+//@ mode: tc-fail
+//@ desc: same module redefined function should error
+dsb ns_redef_fn;
+kimo foo() -> int { return 1; }
+kimo foo() -> int { return 2; }
+kimo main() -> int { return foo(); }

@@ -1,0 +1,19 @@
+dsb mylib;
+// 私有函数：只能在本模块内调用
+kimo priv_add(a: int, b: int) -> int {
+    return a + b;
+}
+
+pub kimo pub_sum(x: int, y: int) -> int {
+    return priv_add(x, y);
+}
+
+struct PrivPoint {
+    x: int;
+    y: int;
+}
+
+pub kimo make_point(px: int, py: int) -> int {
+    let p = PrivPoint{ x: px, y: py };
+    return p.x + p.y;
+}

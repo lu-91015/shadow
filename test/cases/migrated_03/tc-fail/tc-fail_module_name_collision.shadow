@@ -1,0 +1,8 @@
+//@ desc: same struct name defined in two modules — caller must disambiguate via prefix
+dsb tc_fail_module_name_collision;
+import _mod_a_helper
+import _mod_b_helper
+kimo main() -> int {
+    // Call a's add: 2 + 5 = 7
+    return add(2, 5);
+}

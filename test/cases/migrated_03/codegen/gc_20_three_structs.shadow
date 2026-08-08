@@ -1,0 +1,10 @@
+//@desc: GC alloc with all field values being literals
+//@expect-ir: shadow_gc_alloc
+dsb gc_20_three_structs;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let p = P { x: 0, y: 0 };
+    let q = P { x: 1, y: 1 };
+    let r = P { x: 2, y: 2 };
+    return p.x + q.y + r.x;
+}

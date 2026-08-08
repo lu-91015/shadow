@@ -1,0 +1,9 @@
+//@desc: string subscript s[i] is typed as string and comparable to a literal
+dsb tc_string_subscript;
+kimo main() -> int {
+    let s = "hello";
+    let ch = s[0];
+    if (ch == "h") { return 1; }
+    if (ch != "z") { return 2; }
+    return 0;
+}

@@ -1,0 +1,4 @@
+dsb _b;
+pub let g: int = 2;
+pub struct Pt { v: int }
+pub kimo c() -> int { return 2; }

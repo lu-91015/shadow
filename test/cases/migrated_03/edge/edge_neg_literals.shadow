@@ -1,0 +1,10 @@
+//@desc: negative literals and unary minus codegen to sub from zero
+//@expect-ir: sub
+dsb edge_neg_literals;
+kimo main() -> int {
+    let a = -1;
+    let b = -2;
+    let c = -100;
+    let d = -(a + b + c);
+    return d;
+}

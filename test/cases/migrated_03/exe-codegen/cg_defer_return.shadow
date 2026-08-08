@@ -1,0 +1,20 @@
+//@desc: defer runs before early return — return rewritten to (deferred body; return)
+//@expect: entered\ncleanup\nreturned:42
+dsb cg_defer_return;
+
+kimo work(early: int) -> int {
+    defer {
+        println("cleanup");
+    }
+    println("entered");
+    if (early == 1) {
+        return 42;
+    }
+    return 0;
+}
+
+kimo main() -> int {
+    let r = work(1);
+    println("returned:" + int_to_str(r));
+    return 0;
+}

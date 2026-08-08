@@ -1,0 +1,11 @@
+//@desc: nested if/else codegens to nested branches
+//@expect: 2
+dsb codegen_nested_if;
+kimo f(x: int) -> int {
+    if (x > 0) {
+        if (x > 10) { return 1; }
+        return 2;
+    }
+    return 3;
+}
+kimo main() -> int { println(f(5)); return 0; }

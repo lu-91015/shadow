@@ -1,0 +1,23 @@
+//@mode: exe
+//@desc: Phase 12 semver 2.0.0：解析/比较/约束匹配（caret/区间/pre）
+//@expect: semver ok 5
+dsb ex_semver;
+import core.semver;
+kimo main() -> int {
+    let v = sv_parse("1.2.3-alpha.1+build.5");
+    if (v.major != 1 || v.minor != 2 || v.patch != 3) { println("ERR parse"); return 1; }
+    if (str_eq(v.pre, "alpha.1") == 0 || str_eq(v.build, "build.5") == 0) { println("ERR pre/build"); return 1; }
+    let v1 = sv_parse("1.2.3");
+    let v2 = sv_parse("1.2.4");
+    if (sv_cmp(v1, v2) >= 0) { println("ERR cmp1"); return 1; }
+    if (sv_match("^1.2.0", "1.2.3") == 0) { println("ERR caret"); return 1; }
+    if (sv_match("^1.2.0", "2.0.0") == 1) { println("ERR caret2"); return 1; }
+    if (sv_match(">=1.2.0,<2.0.0", "1.9.9") == 0) { println("ERR range"); return 1; }
+    if (sv_match(">=1.2.0,<2.0.0", "2.0.0") == 1) { println("ERR range2"); return 1; }
+    if (sv_match("*", "99.0.0") == 0) { println("ERR star"); return 1; }
+    let pa = sv_parse("1.0.0-alpha");
+    let pb = sv_parse("1.0.0");
+    if (sv_cmp(pa, pb) >= 0) { println("ERR pre"); return 1; }
+    println("semver ok 5");
+    return 0;
+}

@@ -1,0 +1,26 @@
+//@mode: exe
+//@desc: Float and Double type code generation
+//@expect-stdout: 3.14
+//@expect-stdout: 6.28
+//@expect-stdout: 2
+//@expect-stdout: 1
+dsb cg_float_double;
+
+kimo print_double(d: double) -> void {
+    println(to_string(d as int));
+}
+
+kimo main() -> int {
+    let f: float = 3.14;
+    let d: double = 6.28;
+    let sum = f + d;
+    print_double(sum);
+    print_double(d);
+    
+    let cmp1 = (f < d);
+    let cmp2 = (d == 6.28);
+    println(to_string(cmp1));
+    println(to_string(cmp2));
+    
+    return 0;
+}

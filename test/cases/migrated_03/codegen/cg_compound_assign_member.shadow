@@ -1,0 +1,13 @@
+//@ mode: codegen
+//@ desc: compound assignment on struct member (p.x += 5) desugars to p.x = p.x + 5
+//@expect-ir: ptrtoint
+//@expect-ir: store
+dsb cg_compound_assign_member;
+
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 10, y: 20 };
+    p.x += 5;
+    p.y -= 3;
+    return p.x;
+}

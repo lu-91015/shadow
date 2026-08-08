@@ -1,0 +1,9 @@
+//@desc: string subscript result concatenated into a new string
+dsb tc_string_subscript_used;
+kimo main() -> int {
+    let s = "abc";
+    let first = s[0];
+    let combo = first + "X";
+    if (combo == "aX") { return 1; }
+    return 0;
+}

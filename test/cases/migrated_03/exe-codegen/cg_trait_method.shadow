@@ -1,0 +1,32 @@
+//@desc: L1 trait/impl — trait method dispatch via obj.method() syntax (static dispatch)
+//@expect: hi\n30
+dsb cg_trait_method;
+
+trait Greeter {
+    kimo greet(self: Self) -> string;
+    kimo add(self: Self, n: int) -> int;
+}
+
+struct Counter {
+    value: int;
+    label: string;
+}
+
+impl Greeter for Counter {
+    kimo greet(self: Counter) -> string {
+        return self.label;
+    }
+    kimo add(self: Counter, n: int) -> int {
+        return self.value + n;
+    }
+}
+
+kimo main() -> int {
+    let c = Counter { value: 10, label: "hi" };
+    // trait method dispatch — rewritten to __impl__Counter__Greeter__greet
+    let s = c.greet();
+    println(s);
+    let r = c.add(20);
+    println(r);
+    return 0;
+}

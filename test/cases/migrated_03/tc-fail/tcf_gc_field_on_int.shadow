@@ -1,0 +1,7 @@
+//@desc: access field on non-struct type (int) should fail
+//@expect-stderr: Type check failed
+dsb tcf_gc_field_on_int;
+kimo main() -> int {
+    let x = 42;
+    return x.y;
+}

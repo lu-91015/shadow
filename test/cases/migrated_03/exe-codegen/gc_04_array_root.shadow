@@ -1,0 +1,7 @@
+//@desc: GC root_add for array literal
+//@expect: 0
+dsb gc_04_array_root;
+kimo main() -> int {
+    let arr = [10, 20, 30];
+    println(0); return 0;
+}

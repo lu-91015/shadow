@@ -1,0 +1,6 @@
+//@desc: struct definition is accepted by parser/type-checker
+//@expect: 0
+dsb tc_struct_def;
+struct Point { x: int, y: int }
+struct Rect { a: Point, b: Point }
+kimo main() -> int { println(0); return 0; }

@@ -1,0 +1,6 @@
+//@desc: enum definition is accepted by parser/type-checker
+//@expect: typecheck: 1
+dsb tc_enum_def;
+enum Color { Red, Green, Blue }
+enum Suit { Spades, Hearts, Diamonds, Clubs }
+kimo main() -> int { return 0; }

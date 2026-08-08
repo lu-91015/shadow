@@ -1,0 +1,5 @@
+//@desc: unary minus codegens to a sub from zero
+//@expect-ir: sub
+dsb codegen_unary;
+kimo f(x: int) -> int { let y = -x; if (y < 0) { return 1; } return 0; }
+kimo main() -> int { return f(5); }

@@ -1,0 +1,4 @@
+//@desc: arithmetic expression type-checks
+//@expect: typecheck: 1
+dsb tc_arith;
+kimo main() -> int { let x = 1 + 2 * 3 - 4; return x; }

@@ -1,0 +1,9 @@
+//@desc: empty if/else and while bodies codegen (no dead terminator crash)
+//@expect-ir: br
+dsb edge_empty_blocks;
+kimo f() -> int {
+    if (1 > 0) { } else { }
+    while (1 > 0) { }
+    return 0;
+}
+kimo main() -> int { return f(); }

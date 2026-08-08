@@ -1,0 +1,12 @@
+//@desc: GC alloc inside while loop body
+//@expect: 0
+dsb gc_12_while_loop;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let i = 0;
+    while (i < 3) {
+        let p = P { x: i, y: i };
+        i = i + 1;
+    }
+    println(0); return 0;
+}

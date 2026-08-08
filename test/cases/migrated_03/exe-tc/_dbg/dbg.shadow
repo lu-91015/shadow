@@ -1,0 +1,3 @@
+//@desc: debug single-file pipeline
+dsb dbg;
+kimo main() -> int { let x = 1 + 2 * 3 - 4; println(x); return 0; }

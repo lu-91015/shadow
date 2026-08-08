@@ -1,0 +1,10 @@
+//@desc: struct literal type inference allows field access
+//@expect: 3
+dsb tc_gc_struct_lit_type;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let p = P { x: 1, y: 2 };
+    let a = p.x;
+    let b = p.y;
+    println(a + b); return 0;
+}

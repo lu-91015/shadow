@@ -1,0 +1,7 @@
+//@expect: 0
+//@ desc: top-level constant declaration
+dsb cg_global_const;
+let MAX_SIZE: int = 100;
+kimo main() -> int {
+    println(MAX_SIZE); return 0;
+}

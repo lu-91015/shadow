@@ -1,0 +1,14 @@
+//@desc: arrays become eligible for GC after reassignment
+//@expect: 0
+dsb tc_gc_basic;
+@extern("shadow_gc_collect") kimo gc_collect() -> long { return 0; }
+kimo main() -> int {
+    let a = [1, 2, 3];
+    let b = [4, 5, 6];
+    a = [];
+    b = [];
+    let freed = gc_collect();
+    if (freed > 0) { println(freed); return 0; }
+    println(0);
+    return 0;
+}

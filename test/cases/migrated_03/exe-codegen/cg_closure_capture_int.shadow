@@ -1,0 +1,12 @@
+//@desc: L3 closure — capture single int variable (by-value)
+//@expect: 42
+dsb cg_closure_capture_int;
+kimo main() -> int {
+    let x = 40;
+    let f = kimo() -> int {
+        return x + 2;
+    };
+    let r = f();
+    println(r);
+    return 0;
+}

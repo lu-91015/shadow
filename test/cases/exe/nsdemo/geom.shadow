@@ -1,0 +1,11 @@
+dsb nsdemo_geom;
+
+pub struct Point { x: int; y: int; }
+
+pub kimo mk_point(a: int, b: int) -> Point {
+    return Point { x: a, y: b };
+}
+
+pub kimo area(p: Point) -> int {
+    return p.x * p.y;
+}

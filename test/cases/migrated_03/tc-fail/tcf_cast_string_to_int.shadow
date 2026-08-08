@@ -1,0 +1,10 @@
+//@desc: casting an int directly to string is rejected (use int_to_str / to_string instead)
+dsb tcf_cast_string_to_int;
+// Note: string as int is now ALLOWED (P2 数据转换放宽 — dispatches to parse_int).
+//       The reverse direction (int as string) is still rejected to avoid ambiguity
+//       with int_to_str; users should call int_to_str() / to_string() explicitly.
+kimo main() -> int {
+    let n: int = 42;
+    let s = n as string;
+    return 0;
+}

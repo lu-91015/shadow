@@ -1,0 +1,252 @@
+// Shadow 0.4 — semver 2.0.0 实现（Phase 12a）
+// ============================================================
+// 语义版本：MAJOR.MINOR.PATCH[-prerelease][+build]
+// 约束：*（任意）/ 裸版本（精确 =）/ ^MAJOR.MINOR.PATCH（caret）/
+//       >=ver / <=ver / >ver / <ver / >=a,<b（区间，逗号分隔）
+// 比较规则（semver 2.0.0）：
+//   - 主序：major/minor/patch 数值比较；
+//   - 预发布：无 pre > 有 pre；pre 逐标识符比较：纯数字按数值、字母按字典序、
+//     数字标识符 < 字母标识符；
+//   - build 元数据不参与优先级比较。
+// 宿主规避：无嵌套数组索引；结构体数组可正常使用。
+dsb core_semver;
+
+// 解析后的版本
+pub struct SemVer {
+    major: int;
+    minor: int;
+    patch: int;
+    pre: string;      // 预发布段（"alpha.1" 或 ""）
+    build: string;    // build 元数据（"+..." 内容或 ""）
+}
+
+// 按 . 拆分（保留 pre 原样）
+pub kimo sv_split_dot(s: string) -> array<string> {
+    let out: array<string> = [];
+    let cur = "";
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, ".") == 1) {
+            out = array_push(out, cur);
+            cur = "";
+        } else {
+            cur = cur + c;
+        }
+        i = i + 1;
+    }
+    out = array_push(out, cur);
+    return out;
+}
+
+// 字符串转 int（无符号，纯数字）
+pub kimo sv_atoi(s: string) -> int {
+    let n = len(s);
+    let v = 0;
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "0") == 1) { v = v * 10 + 0; }
+        else if (str_eq(c, "1") == 1) { v = v * 10 + 1; }
+        else if (str_eq(c, "2") == 1) { v = v * 10 + 2; }
+        else if (str_eq(c, "3") == 1) { v = v * 10 + 3; }
+        else if (str_eq(c, "4") == 1) { v = v * 10 + 4; }
+        else if (str_eq(c, "5") == 1) { v = v * 10 + 5; }
+        else if (str_eq(c, "6") == 1) { v = v * 10 + 6; }
+        else if (str_eq(c, "7") == 1) { v = v * 10 + 7; }
+        else if (str_eq(c, "8") == 1) { v = v * 10 + 8; }
+        else if (str_eq(c, "9") == 1) { v = v * 10 + 9; }
+        i = i + 1;
+    }
+    return v;
+}
+
+// 解析 "1.2.3-alpha.1+build.5" → SemVer；非法返回 major=-1
+pub kimo sv_parse(v: string) -> SemVer {
+    let z = SemVer { major: -1, minor: 0, patch: 0, pre: "", build: "" };
+    let n = len(v);
+    if (n == 0) { return z; }
+    // 拆 build
+    let core = v;
+    let bi = str_index_of(v, "+");
+    if (bi >= 0) {
+        let bii = bi as int;
+        core = substr2(v, 0, bii);
+        z.build = substr2(v, bii + 1, n);
+    }
+    // 拆 pre
+    let main_part = core;
+    let pi = str_index_of(core, "-");
+    if (pi >= 0) {
+        let pii = pi as int;
+        main_part = substr2(core, 0, pii);
+        z.pre = substr2(core, pii + 1, len(core));
+    }
+    // 拆 major.minor.patch
+    let parts = sv_split_dot(main_part);
+    let np = len(parts);
+    if (np < 1 || np > 3) { return z; }
+    let mj = parts[0] as string;
+    if (len(mj) == 0) { return z; }
+    z.major = sv_atoi(mj);
+    if (np >= 2) { z.minor = sv_atoi(parts[1] as string); }
+    if (np >= 3) { z.patch = sv_atoi(parts[2] as string); }
+    return z;
+}
+
+// pre 标识符是否为纯数字
+pub kimo sv_is_numeric(id: string) -> int {
+    let n = len(id);
+    if (n == 0) { return 0; }
+    let i = 0;
+    while (i < n) {
+        let c = id[i];
+        if (str_eq(c, "0") == 0 && str_eq(c, "1") == 0 && str_eq(c, "2") == 0 &&
+            str_eq(c, "3") == 0 && str_eq(c, "4") == 0 && str_eq(c, "5") == 0 &&
+            str_eq(c, "6") == 0 && str_eq(c, "7") == 0 && str_eq(c, "8") == 0 &&
+            str_eq(c, "9") == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// pre 比较：a vs b → -1/0/1（空 = 无 pre，优先级最高）
+pub kimo sv_cmp_pre(a: string, b: string) -> int {
+    let al = len(a);
+    let bl = len(b);
+    if (al == 0 && bl == 0) { return 0; }
+    if (al == 0) { return 1; }   // 无 pre > 有 pre
+    if (bl == 0) { return -1; }
+    let ap = sv_split_dot(a);
+    let bp = sv_split_dot(b);
+    let ai = 0;
+    while (ai < len(ap)) {
+        if (ai >= len(bp)) { return 1; }   // a 更长 → a 更大
+        let x = ap[ai] as string;
+        let y = bp[ai] as string;
+        let xn = sv_is_numeric(x);
+        let yn = sv_is_numeric(y);
+        let r = 0;
+        if (xn == 1 && yn == 1) {
+            let xv = sv_atoi(x);
+            let yv = sv_atoi(y);
+            if (xv < yv) { r = -1; }
+            else if (xv > yv) { r = 1; }
+            else { r = 0; }
+        } else if (xn == 1 && yn == 0) {
+            r = -1;   // 数字 < 字母
+        } else if (xn == 0 && yn == 1) {
+            r = 1;
+        } else {
+            let c = rt_str_cmp(x, y);
+            if (c < 0) { r = -1; }
+            else if (c > 0) { r = 1; }
+            else { r = 0; }
+        }
+        if (r != 0) { return r; }
+        ai = ai + 1;
+    }
+    if (len(bp) > len(ap)) { return -1; }
+    return 0;
+}
+
+// 版本比较：a vs b → -1/0/1（含 pre；build 不参与）
+pub kimo sv_cmp(a: SemVer, b: SemVer) -> int {
+    if (a.major < b.major) { return -1; }
+    if (a.major > b.major) { return 1; }
+    if (a.minor < b.minor) { return -1; }
+    if (a.minor > b.minor) { return 1; }
+    if (a.patch < b.patch) { return -1; }
+    if (a.patch > b.patch) { return 1; }
+    return sv_cmp_pre(a.pre, b.pre);
+}
+
+// 约束是否匹配版本（constraint：裸版本 / ^x / >=x / <=x / >x / <x / * / 区间 ">=a,<b"）
+pub kimo sv_match(constraint: string, version: string) -> int {
+    let c = str_trim(constraint);
+    if (len(c) == 0) { return 0; }
+    if (str_eq(c, "*") == 1) { return 1; }
+    // 区间：逗号分隔多个子约束（全部满足）
+    let ci = str_index_of(c, ",");
+    if (ci >= 0) {
+        let a = str_trim(substr2(c, 0, ci as int));
+        let cii = ci as int;
+        let b = str_trim(substr2(c, cii + 1, len(c)));
+        if (sv_match(a, version) == 0) { return 0; }
+        if (sv_match(b, version) == 0) { return 0; }
+        return 1;
+    }
+    // 前缀操作符
+    let op = "";
+    let rest = c;
+    if (len(c) >= 2) {
+        let p2 = substr2(c, 0, 2);
+        if (str_eq(p2, ">=") == 1 || str_eq(p2, "<=") == 1) {
+            op = p2;
+            rest = substr2(c, 2, len(c));
+        }
+    }
+    if (len(op) == 0 && len(c) >= 1) {
+        let p1 = substr2(c, 0, 1);
+        if (str_eq(p1, ">") == 1 || str_eq(p1, "<") == 1 || str_eq(p1, "^") == 1 ||
+            str_eq(p1, "=") == 1) {
+            op = p1;
+            rest = substr2(c, 1, len(c));
+        }
+    }
+    let v = sv_parse(version);
+    if (v.major < 0) { return 0; }
+    if (len(op) == 0) {
+        // 裸版本 = 精确
+        let tc = sv_parse(c);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(tc, v) == 0 ? 1 : 0;
+    }
+    if (str_eq(op, "=") == 1) {
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(tc, v) == 0 ? 1 : 0;
+    }
+    if (str_eq(op, "^") == 1) {
+        // caret：不改变 [MAJOR, MINOR, PATCH] 最左非零段；>= 版本 且 < 下一主版本边界
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        if (sv_cmp(v, tc) < 0) { return 0; }
+        let hi = SemVer { major: tc.major + 1, minor: 0, patch: 0, pre: "", build: "" };
+        if (tc.major > 0) {
+            // ^1.2.3 → <2.0.0
+        } else if (tc.minor > 0) {
+            // ^0.2.3 → >=0.2.3 <0.3.0
+            hi.major = 0;
+            hi.minor = tc.minor + 1;
+        } else {
+            // ^0.0.3 → >=0.0.3 <0.0.4
+            hi.major = 0;
+            hi.minor = 0;
+            hi.patch = tc.patch + 1;
+        }
+        return sv_cmp(v, hi) < 0 ? 1 : 0;
+    }
+    if (str_eq(op, ">=") == 1) {
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(v, tc) >= 0 ? 1 : 0;
+    }
+    if (str_eq(op, "<=") == 1) {
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(v, tc) <= 0 ? 1 : 0;
+    }
+    if (str_eq(op, ">") == 1) {
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(v, tc) > 0 ? 1 : 0;
+    }
+    if (str_eq(op, "<") == 1) {
+        let tc = sv_parse(rest);
+        if (tc.major < 0) { return 0; }
+        return sv_cmp(v, tc) < 0 ? 1 : 0;
+    }
+    return 0;
+}

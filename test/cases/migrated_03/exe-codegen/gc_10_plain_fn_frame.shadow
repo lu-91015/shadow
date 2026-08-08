@@ -1,0 +1,7 @@
+//@desc: GC frame leave on function with no GC objects
+//@expect: 43
+dsb gc_10_plain_fn_frame;
+kimo plain(x: int) -> int { return x + 1; }
+kimo main() -> int {
+    println(plain(42)); return 0;
+}

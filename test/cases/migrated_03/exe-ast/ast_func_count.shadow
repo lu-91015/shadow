@@ -1,0 +1,5 @@
+//@desc: AST reports two function definitions
+//@expect: 0
+dsb ast_func_count;
+kimo f() -> int { return 0; }
+kimo main() -> int { println(0); return 0; }

@@ -1,0 +1,10 @@
+//@mode: typeat
+//@desc: LSP-4 position-indexed type query — hover on a comparison reports bool
+//@pos: 8 15
+//@expect: type-at: bool
+dsb ta_bool;
+
+kimo main() -> int {
+    let c = 3 > 5;
+    return 0;
+}

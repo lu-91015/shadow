@@ -1,0 +1,12 @@
+//@ mode: codegen
+//@ desc: method call with additional arguments obj.method(arg1, arg2)
+//@expect-ir: call
+dsb cg_method_call_args;
+
+struct Counter { value: int }
+kimo add(c: Counter, n: int) -> int { return c.value + n; }
+kimo main() -> int {
+    let c = Counter { value: 10 };
+    let r = c.add(5);
+    return r;
+}

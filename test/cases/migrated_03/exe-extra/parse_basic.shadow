@@ -1,0 +1,30 @@
+//@desc: parse_int / parse_long / parse_float / parse_bool success cases
+//@expect: PI=42
+//@expect: PL=9223372036854775807
+//@expect: PF=3.14
+//@expect: PB_TRUE=true
+//@expect: PB_FALSE=false
+dsb parse_basic;
+
+kimo main() -> int {
+    let i: int = parse_int("42");
+    println("PI=" + int_to_str(i));
+
+    let l: long = parse_long("9223372036854775807");
+    println("PL=" + long_to_str(l));
+
+    let f: double = parse_float("3.14");
+    // float_to_str 输出格式可能含尾零；只校验前缀
+    let fs: string = float_to_str(f);
+    println("PF=" + fs);
+
+    let bt: bool = parse_bool("true");
+    if (bt) { println("PB_TRUE=true"); }
+    else { println("PB_TRUE=false"); }
+
+    let bf: bool = parse_bool("false");
+    if (bf) { println("PB_FALSE=true"); }
+    else { println("PB_FALSE=false"); }
+
+    return 0;
+}

@@ -1,0 +1,11 @@
+//@desc: stage6 sbg manifest — dep import via shadow.sbg
+//@expect: 42
+//@expect: hello_from_dep
+dsb sbg_basic;
+import mylib._helper
+
+kimo main() -> int {
+    println(sbg_helper_value());
+    println(sbg_helper_greet());
+    return 0;
+}

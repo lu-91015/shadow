@@ -1,0 +1,21 @@
+//@desc: StringBuilder-backed int_to_str / long_to_str — exercise 0, positive, negative, and multi-digit values
+//@expect: zero=0
+//@expect: one=1
+//@expect: neg1=-1
+//@expect: fortytwo=42
+//@expect: big=123456789
+//@expect: negbig=-123456789
+//@expect: longval=1000000000000
+//@expect: neglong=-1000000000000
+dsb cg_sb_int_to_str;
+kimo main() -> int {
+    println("zero=" + to_string(0));
+    println("one=" + to_string(1));
+    println("neg1=" + to_string(-1));
+    println("fortytwo=" + to_string(42));
+    println("big=" + to_string(123456789));
+    println("negbig=" + to_string(-123456789));
+    println("longval=" + to_string(1000000000000L));
+    println("neglong=" + to_string(-1000000000000L));
+    return 0;
+}

@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_169)
+//@expect: golang
+//@expect: 6
+//@expect: g
+dsb exa_str_169;
+kimo main() -> int {
+    let s = "go" + "lang";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

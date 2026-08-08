@@ -1,0 +1,10 @@
+//@ mode: codegen
+//@ desc: long type arithmetic and variables
+//@expect-ir: i64
+dsb cg_long_struct;
+
+kimo main() -> int {
+    let x: long = 123456789012345L;
+    let y: long = x + 1L;
+    return 0;
+}

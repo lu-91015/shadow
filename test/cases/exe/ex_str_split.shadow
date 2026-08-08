@@ -1,0 +1,21 @@
+//@mode: exe
+//@desc: str_split 切分 + 尾部空段
+//@expect: a
+//@expect: b
+//@expect: c
+//@expect: last=
+dsb ex_str_split;
+kimo main() -> int {
+    let parts = str_split("a,b,c,", ",");
+    let i = 0;
+    while (i < len(parts)) {
+        if (i == 3) {
+            println("last=");
+        }
+        else {
+            println(parts[i] as string);
+        }
+        i = i + 1;
+    }
+    return 0;
+}

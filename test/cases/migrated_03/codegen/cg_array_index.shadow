@@ -1,0 +1,9 @@
+//@desc: array index access codegens to shadow_array_get call
+//@expect-ir: shadow_array_get
+dsb cg_array_index;
+kimo main() -> int {
+    let arr = [10, 20, 30];
+    let x = arr[0];
+    let y = arr[1];
+    return x + y;
+}

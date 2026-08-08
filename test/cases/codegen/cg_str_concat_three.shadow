@@ -1,0 +1,4 @@
+//@desc: string concat codegen — three strings "a" + "b" + "c"
+//@expect-ir: shadow_string_concat
+dsb cg_str_concat_three;
+kimo main() -> int { let s = "a" + "b" + "c"; return 0; }

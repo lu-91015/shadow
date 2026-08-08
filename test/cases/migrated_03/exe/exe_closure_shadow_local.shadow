@@ -1,0 +1,41 @@
+//@desc: --exe: closure-local `let` shadowing an outer variable must NOT become a captured var
+//@expect: fold=33
+//@expect: outer x=7
+//@expect: outer y=9
+dsb exe_closure_shadow_local;
+
+// 高阶函数：闭包以 any 传递 —— codegen 按 captured_count=0 调用（不传 env 指针）
+kimo apply_fold(items: any, init: any, f: any) -> any {
+    let acc = init;
+    let i = 0;
+    while (i < len(items)) {
+        acc = f(acc, items[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+kimo main() -> int {
+    // 外层作用域存在 x / y
+    let x = 7;
+    let y = 9;
+
+    let pairs: any = [];
+    pairs = array_push(pairs, [1, 10]);
+    pairs = array_push(pairs, [2, 20]);
+
+    // 闭包体内用 `let x` / `let y` 声明同名局部变量。
+    // 回归点：自由变量分析必须把它们当作本地绑定排除，
+    //         否则闭包会被生成多余的前置 env 参数 → arity 错位 → 运行时 AV。
+    let sum = apply_fold(pairs, 0, kimo(acc: int, p: any) -> int {
+        let x = p[0] as int;
+        let y = p[1] as int;
+        return acc + x + y;
+    }) as int;
+    println("fold=" + to_string(sum));
+
+    // 外层变量不受影响
+    println("outer x=" + to_string(x));
+    println("outer y=" + to_string(y));
+    return 0;
+}

@@ -1,0 +1,3 @@
+dsb nswild_alpha;
+
+pub kimo alpha_val() -> int { return 3; }

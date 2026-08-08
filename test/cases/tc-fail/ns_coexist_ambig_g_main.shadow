@@ -1,0 +1,11 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：同时 import 两个都有 pub let g 的模块 → 使用处 ambiguous global
+//@expect-stderr: ambiguous global 'g'
+//@args: --strict
+dsb ns_coexist_ambig_g_main;
+import ns_coexist_ambig._a;
+import ns_coexist_ambig._b;
+kimo main() -> int {
+    let y = g;
+    return 0;
+}

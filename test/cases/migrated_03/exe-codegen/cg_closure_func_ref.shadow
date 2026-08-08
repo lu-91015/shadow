@@ -1,0 +1,13 @@
+//@desc: L3 closure — function reference (no capture): assign function to variable and call indirectly
+//@expect: 7
+dsb cg_closure_func_ref;
+kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    let f = add;
+    let r = f(3, 4);
+    println(r);
+    return 0;
+}

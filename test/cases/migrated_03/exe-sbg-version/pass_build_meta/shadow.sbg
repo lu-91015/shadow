@@ -1,0 +1,9 @@
+# shadow.sbg — P2 build metadata 测试
+# 约束 =0.3.0（精确版本），包内 version=0.3.0+build.5
+# 验证 P2：build metadata 不参与比较，0.3.0+build.5 视为等于 0.3.0
+[package]
+name = "ver_test_build"
+version = "0.3.0"
+
+[deps]
+ver_pkg = "ver_pkg.spk@=0.3.0"

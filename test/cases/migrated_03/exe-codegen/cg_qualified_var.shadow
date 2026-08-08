@@ -1,0 +1,11 @@
+//@expect: 7
+//@expect: hi
+//@ desc: module.var qualified access to pub let variables
+dsb cg_qualified_var;
+import _qvar_mod;
+
+kimo main() -> int {
+    println(qvar_mod.ANSWER);
+    println(qvar_mod.GREETING);
+    return 0;
+}

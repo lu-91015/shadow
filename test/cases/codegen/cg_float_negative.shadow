@@ -1,0 +1,8 @@
+//@mode: codegen
+//@desc: negative float constant uses fsub (no broken i32/double mix)
+//@expect-ir: -2.25
+dsb cg_float_negative;
+kimo main() -> int {
+    let x = -2.25;
+    return 0;
+}

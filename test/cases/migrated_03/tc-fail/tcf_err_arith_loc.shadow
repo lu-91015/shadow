@@ -1,0 +1,7 @@
+//@desc: arithmetic on a non-numeric (string minus int) reports a located error
+//@expect-stderr: invalid operands for arithmetic
+dsb tcf_err_arith_loc;
+kimo main() -> int {
+    let s = "x";
+    return s - 1;
+}

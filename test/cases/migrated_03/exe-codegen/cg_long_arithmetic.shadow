@@ -1,0 +1,5 @@
+//@desc: long type arithmetic codegen — add of two longs uses add nsw i64
+//@expect: 0
+dsb cg_long_arithmetic;
+kimo add_longs(a: long, b: long) -> long { return a + b; }
+kimo main() -> int { println(0); return 0; }

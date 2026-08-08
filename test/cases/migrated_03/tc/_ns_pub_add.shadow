@@ -1,0 +1,3 @@
+dsb _ns_pub_add;
+// Helper module with a pub add function
+pub kimo add(a: int, b: int) -> int { return a + b; }

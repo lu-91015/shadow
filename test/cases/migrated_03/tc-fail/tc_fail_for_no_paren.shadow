@@ -1,0 +1,10 @@
+//@desc: for loop without parentheses should be rejected
+//@expect-stderr: expected (
+dsb tc_fail_for_no_paren;
+kimo main() -> int {
+    let a = [1, 2, 3];
+    for x in a {
+        println(x);
+    }
+    return 0;
+}

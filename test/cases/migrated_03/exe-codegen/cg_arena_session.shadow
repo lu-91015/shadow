@@ -1,0 +1,38 @@
+//@desc: Runtime-backed arena bump allocation smoke test
+//@expect: used=40
+//@expect: value=123
+//@expect: used2=24
+//@expect: high=40
+//@expect: used3=0
+
+dsb cg_arena_session;
+
+@extern("shadow_arena_create") kimo arena_create(block_size: int) -> any { return 0 as any; }
+@extern("shadow_arena_alloc") kimo arena_alloc(arena: any, size: int) -> any { return 0 as any; }
+@extern("shadow_arena_mark") kimo arena_mark(arena: any) -> int { return 0; }
+@extern("shadow_arena_rewind") kimo arena_rewind(arena: any, mark: int) -> void {}
+@extern("shadow_arena_reset") kimo arena_reset(arena: any) -> void {}
+@extern("shadow_arena_destroy") kimo arena_destroy(arena: any) -> void {}
+@extern("shadow_arena_used") kimo arena_used(arena: any) -> int { return 0; }
+@extern("shadow_arena_high_water") kimo arena_high_water(arena: any) -> int { return 0; }
+@extern("__rt_shadow_store_int") kimo rt_store_int(p: any, off: int, val: int) -> void {}
+@extern("__rt_shadow_load_int") kimo rt_load_int(p: any, off: int) -> int { return 0; }
+
+kimo main() -> int {
+    let ar = arena_create(64);
+    let p1 = arena_alloc(ar, 16);
+    rt_store_int(p1, 0, 123);
+    let mark = arena_mark(ar);
+    let p2 = arena_alloc(ar, 24);
+    println("used=" + to_string(arena_used(ar)));
+    println("value=" + to_string(rt_load_int(p1, 0)));
+    arena_rewind(ar, mark);
+    let p3 = arena_alloc(ar, 8);
+    rt_store_int(p3, 0, 7);
+    println("used2=" + to_string(arena_used(ar)));
+    println("high=" + to_string(arena_high_water(ar)));
+    arena_reset(ar);
+    println("used3=" + to_string(arena_used(ar)));
+    arena_destroy(ar);
+    return 0;
+}

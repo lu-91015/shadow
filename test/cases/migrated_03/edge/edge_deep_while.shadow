@@ -1,0 +1,33 @@
+//@desc: deeply nested while (12 levels) codegens without crashing
+//@expect-ir: br
+dsb edge_deep_while;
+kimo f() -> int {
+    let a = 0;
+    while (a < 1) {
+        while (a < 1) {
+            while (a < 1) {
+                while (a < 1) {
+                    while (a < 1) {
+                        while (a < 1) {
+                            while (a < 1) {
+                                while (a < 1) {
+                                    while (a < 1) {
+                                        while (a < 1) {
+                                            while (a < 1) {
+                                                while (a < 1) {
+                                                    a = a + 1;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return a;
+}
+kimo main() -> int { return f(); }

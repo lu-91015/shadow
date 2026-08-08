@@ -1,0 +1,10 @@
+//@desc: GC multiple struct allocations in one function
+//@expect: 10
+dsb gc_06_multiple_structs;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let a = P { x: 1, y: 2 };
+    let b = P { x: 3, y: 4 };
+    let c = P { x: 5, y: 6 };
+    println(a.x + b.y + c.x); return 0;
+}

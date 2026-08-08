@@ -1,0 +1,13 @@
+//@desc: function returns array<int>; caller indexes boundary elements
+//@expect: 4
+dsb tc_array_return;
+kimo make() -> array<int> {
+    let a = [1, 2, 3];
+    return a;
+}
+kimo main() -> int {
+    let a = make();
+    let first = a[0];
+    let last = a[len(a) - 1];
+    println(first + last); return 0;
+}

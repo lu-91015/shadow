@@ -1,0 +1,8 @@
+//@ mode: tc-fail
+//@ desc: char cannot be multiplied with string
+dsb tc_fail_char_short_mismatch;
+kimo main() -> int {
+    let c: char = 65;
+    let x = c * "hello";
+    return 0;
+}

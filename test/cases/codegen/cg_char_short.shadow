@@ -1,0 +1,32 @@
+//@ mode: codegen
+//@ desc: char and short types - arithmetic, comparisons, assignments, function params/returns
+//@ expect-ir: i8
+//@ expect-ir: i16
+dsb cg_char_short;
+
+kimo add_short(a: short, b: short) -> short {
+    return a + b;
+}
+
+kimo char_val(c: char) -> char {
+    return c;
+}
+
+kimo main() -> int {
+    let s: short = 100;
+    let s2: short = 50;
+    let sum_s = s + s2;
+    let diff_s = s - s2;
+    
+    let c: char = 65;
+    let c2: char = 10;
+    let sum_c = c + c2;
+    
+    s = 200;
+    c = 97;
+    
+    let fn_s = add_short(s, 50);
+    let fn_c = char_val(c);
+    
+    return sum_s + sum_c + fn_s + fn_c;
+}

@@ -1,0 +1,10 @@
+//@mode: typeat
+//@desc: LSP-4 position-indexed type query — hover on an array-typed variable
+//@pos: 9 16
+//@expect: type-at: array<int>
+dsb ta_array;
+
+kimo main() -> int {
+    let xs = [1, 2, 3];
+    return len(xs);
+}

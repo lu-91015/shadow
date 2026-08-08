@@ -1,0 +1,13 @@
+//@desc: try/catch with type error in catch body is detected
+//@expect-stderr: Type check failed
+dsb tc_fail_catch_type_error;
+
+kimo main() -> int {
+    try {
+        println("try");
+    } catch {
+        // Type error in catch body should be caught by type checker
+        let x = 1 + true;
+    }
+    return 0;
+}

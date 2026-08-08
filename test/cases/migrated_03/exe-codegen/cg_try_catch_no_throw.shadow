@@ -1,0 +1,13 @@
+//@expect: 10
+//@ desc: try/catch without throw executes try body and skips catch
+dsb cg_try_catch_no_throw;
+
+kimo main() -> int {
+    let result = 0;
+    try {
+        result = 10;
+    } catch {
+        result = 99;
+    }
+    println(result); return 0;
+}

@@ -1,0 +1,695 @@
+// Shadow 0.4 — MIR 序列化（.lu 二进制格式）
+// ============================================================
+// 将 MirFunc[] 序列化为紧凑的二进制 .lu 文件，用于跨文件 MIR 缓存。
+// 导入模块时可直接加载 .lu 跳过 lex/parse/tc/hir/mir，加速编译。
+//
+// 格式（所有整数用 LEB128，long/double 用 raw 8 字节 little-endian）：
+//   Header:  magic="LU"(2B) version(1B) n_funcs=ULEB128
+//   per FuncDef: name_len/name, extern_name_len/extern_name,
+//                return_type_kind, n_regs, n_slots, n_params,
+//                params[slot=SLEB128, type_kind=ULEB128],
+//                n_blocks, blocks[label, n_insts, insts, has_term, term?]
+//   per MirInst: op, dst=SLEB128, arg1=SLEB128, arg2=SLEB128,
+//                longval=8B raw, floatval=8B raw, ty,
+//                strval_len/strval, strval2_len/strval2,
+//                n_args, args[SLEB128]
+// 尾部：n_globals, globals[name, type_kind, is_pub, is_ext, init_tag, init...]
+//
+// 编解码 LEB128 的全局状态：mir_ser_off / mir_ser_val
+dsb mir_ser;
+
+let MIR_SER_MAGIC0: int = 76;   // 'L'
+let MIR_SER_MAGIC1: int = 85;   // 'U'
+let MIR_SER_VERSION: int = 9;   // v9：0.4 函数级增量缓存（Phase 11）——拒绝 s03 旧 v8 缓存（格式有细微差异，避免错读）
+let MIR_SER_BUF_SIZE: int = 4194304;  // 4MB 初始 buffer（不足时自动按精确尺寸重分配）
+
+let mir_ser_buf: any = 0 as any;
+let mir_ser_buf_len: int = 0;
+let mir_ser_off: int = 0;
+let mir_ser_val: long = 0;   // long：全局初始化 long 字面量（-1000000000000L）缓存往返不截断
+
+// --- 写入边界防护（修复 850KB 单文件编译 0xc0000005）---
+// 旧实现：mir_cache_store 一次性分配固定 4MB，之后 53 处写入零检查，
+// 大模块（≥约 3000 函数）序列化超 4MB → 越界写 → AV。
+// 新实现：所有字节写入经 mir_ser_put 过滤——越界时【不写，只置溢出标志】，
+// 但 off 照常累加。于是第一遍跑完 off 就是【精确所需字节数】，
+// mir_cache_store 据此重分配再跑一遍即可。好处：13 处调用点签名全不用改。
+let mir_ser_cap: int = 0;   // 当前 buffer 容量；0 = 不设限（兼容潜在的其他调用方）
+let mir_ser_ovf: int = 0;   // 本轮是否发生过越界
+
+// 安全写单字节：越界只记账不落笔
+pub kimo mir_ser_put(buf: any, off: int, b: int) -> void {
+    if (off < 0) { mir_ser_ovf = 1; return; }
+    if (mir_ser_cap > 0 && off >= mir_ser_cap) { mir_ser_ovf = 1; return; }
+    rt_set_byte(buf, off, b);
+}
+
+// 安全写字符串原始字节：容量不够时整体跳过，仅推进 off
+pub kimo mir_ser_put_bytes(s: string, buf: any, off: int) -> int {
+    let n = len(s);
+    if (off < 0) { mir_ser_ovf = 1; return off + n; }
+    if (mir_ser_cap > 0 && off + n > mir_ser_cap) {
+        mir_ser_ovf = 1;
+        return off + n;
+    }
+    return rt_str_to_bytes(s, buf, off);
+}
+
+// 安全写 8 字节 long：容量不足（off+8 越界）时整体跳过，仅推进 off
+pub kimo mir_ser_store_long(buf: any, off: int, v: long) -> void {
+    if (off < 0) { mir_ser_ovf = 1; return; }
+    if (mir_ser_cap > 0 && off + 8 > mir_ser_cap) { mir_ser_ovf = 1; return; }
+    rt_store_long(buf, off, v);
+}
+
+// 安全写 8 字节 float：同上
+pub kimo mir_ser_store_float(buf: any, off: int, v: double) -> void {
+    if (off < 0) { mir_ser_ovf = 1; return; }
+    if (mir_ser_cap > 0 && off + 8 > mir_ser_cap) { mir_ser_ovf = 1; return; }
+    rt_store_float(buf, off, v);
+}
+
+// --- ULEB128 编码（无符号）---
+pub kimo leb_enc_uint(buf: any, off: int, val: int) -> int {
+    let v = val;
+    if (v < 0) { v = 0; }
+    while (true) {
+        let byte = v % 128;
+        v = v / 128;
+        if (v != 0) { byte = byte + 128; }
+        mir_ser_put(buf, off, byte);
+        off = off + 1;
+        if (v == 0) { break; }
+    }
+    return off;
+}
+
+// --- ULEB128 解码 ---
+pub kimo leb_dec_uint(buf: any, off: int) -> void {
+    let val = 0;
+    let mul = 1;
+    while (true) {
+        let byte = rt_get_byte(buf, off);
+        off = off + 1;
+        let data = byte % 128;
+        val = val + data * mul;
+        mul = mul * 128;
+        if (byte < 128) { break; }
+    }
+    mir_ser_val = val as long;
+    mir_ser_off = off;
+}
+
+// --- SLEB128 编码（有符号）---
+pub kimo leb_enc_int(buf: any, off: int, val: int) -> int {
+    let v = val;
+    while (true) {
+        let byte = v % 128;
+        if (byte < 0) { byte = byte + 128; }
+        let v2 = v / 128;
+        if (v < 0 && v % 128 != 0) { v2 = v2 - 1; }
+        let more = 1;
+        if (v2 == 0 && byte < 64) {
+            more = 0;
+        } else if (v2 == -1 && byte >= 64) {
+            more = 0;
+        }
+        if (more == 1) { byte = byte + 128; }
+        mir_ser_put(buf, off, byte);
+        off = off + 1;
+        v = v2;
+        if (more == 0) { break; }
+    }
+    return off;
+}
+
+// --- SLEB128 解码 ---
+pub kimo leb_dec_int(buf: any, off: int) -> void {
+    let val = 0;
+    let mul = 1;
+    let sign = 0;
+    while (true) {
+        let byte = rt_get_byte(buf, off);
+        off = off + 1;
+        let data = byte % 128;
+        val = val + data * mul;
+        mul = mul * 128;
+        if (byte < 128) {
+            if (byte >= 64) { sign = 1; }
+            break;
+        }
+    }
+    if (sign == 1) { val = val - mul; }
+    mir_ser_val = val as long;
+    mir_ser_off = off;
+}
+
+// --- SLEB128 编码/解码（64 位；全局初始化 long 字面量如 -1000000000000L 缓存往返不截断）---
+pub kimo leb_enc_long(buf: any, off: int, val: long) -> int {
+    let v = val;
+    while (true) {
+        let byte = v % 128;
+        if (byte < 0) { byte = byte + 128; }
+        let v2 = v / 128;
+        if (v < 0 && v % 128 != 0) { v2 = v2 - 1; }
+        let more = 1;
+        if (v2 == 0 && byte < 64) {
+            more = 0;
+        } else if (v2 == -1 && byte >= 64) {
+            more = 0;
+        }
+        if (more == 1) { byte = byte + 128; }
+        mir_ser_put(buf, off, byte);
+        off = off + 1;
+        v = v2;
+        if (more == 0) { break; }
+    }
+    return off;
+}
+
+pub kimo leb_dec_long(buf: any, off: int) -> void {
+    let val: long = 0;
+    let mul: long = 1;
+    let sign = 0;
+    while (true) {
+        let byte = rt_get_byte(buf, off);
+        off = off + 1;
+        let data = byte % 128;
+        val = val + (data as long) * mul;
+        mul = mul * 128;
+        if (byte < 128) {
+            if (byte >= 64) { sign = 1; }
+            break;
+        }
+    }
+    if (sign == 1) { val = val - mul; }
+    mir_ser_val = val;
+    mir_ser_off = off;
+}
+
+// --- 辅助：写入 string（ULEB128 长度 + 原始字节）---
+pub kimo mir_ser_write_str(buf: any, off: int, s: string) -> int {
+    let slen = len(s);
+    off = leb_enc_uint(buf, off, slen);
+    off = mir_ser_put_bytes(s, buf, off);
+    return off;
+}
+
+// --- 辅助：读取 string ---
+pub kimo mir_ser_read_str(buf: any, off: int) -> string {
+    leb_dec_uint(buf, off);
+    let slen = mir_ser_val;
+    off = mir_ser_off;
+    if (slen <= 0) {
+        mir_ser_off = off;
+        return "";
+    }
+    let s = rt_bytes_to_str(buf, off, slen);
+    mir_ser_off = off + slen;
+    return s;
+}
+
+// --- 辅助：写入 Type（0 as Type = 空；TYPE_FUNCTION/TYPE_TUPLE 含 param_types；array/dict/set 递归）---
+pub kimo mir_ser_write_type(buf: any, off: int, t: Type) -> int {
+    if ((t as any) == 0) {
+        mir_ser_put(buf, off, 0);
+        return off + 1;
+    }
+    mir_ser_put(buf, off, 1);
+    off = off + 1;
+    off = leb_enc_uint(buf, off, t.kind);
+    if (t.kind == TYPE_FUNCTION) {
+        off = leb_enc_uint(buf, off, t.captured_count);
+        let rt_ty = t.ret_type;
+        if ((rt_ty as any) == 0) {
+            off = leb_enc_uint(buf, off, TYPE_VOID);
+        } else {
+            off = leb_enc_uint(buf, off, rt_ty.kind);
+        }
+        let pts = t.param_types;
+        let n_pts = len(pts);
+        off = leb_enc_uint(buf, off, n_pts);
+        let i = 0;
+        while (i < n_pts) {
+            let pt = pts[i] as Type;
+            off = leb_enc_uint(buf, off, pt.kind);
+            i = i + 1;
+        }
+    }
+    if (t.kind == TYPE_TUPLE) {
+        let pts = t.param_types;
+        let n_pts = len(pts);
+        off = leb_enc_uint(buf, off, n_pts);
+        let i = 0;
+        while (i < n_pts) {
+            let pt = pts[i] as Type;
+            off = leb_enc_uint(buf, off, pt.kind);
+            i = i + 1;
+        }
+    }
+    if (t.kind == TYPE_ARRAY) {
+        off = mir_ser_write_type(buf, off, t.elem_type);
+    }
+    if (t.kind == TYPE_DICT) {
+        off = mir_ser_write_type(buf, off, t.key_type);
+        off = mir_ser_write_type(buf, off, t.val_type);
+    }
+    if (t.kind == TYPE_SET) {
+        off = mir_ser_write_type(buf, off, t.elem_type);
+    }
+    if (t.kind == TYPE_STRUCT || t.kind == TYPE_ENUM || t.kind == TYPE_ENUM_PAYLOAD) {
+        off = mir_ser_write_str(buf, off, t.name);
+    }
+    return off;
+}
+
+// --- 辅助：读取 Type ---
+pub kimo mir_ser_read_type(buf: any, off: int) -> Type {
+    let has_ty = rt_get_byte(buf, off);
+    off = off + 1;
+    if (has_ty == 0) {
+        mir_ser_off = off;
+        return 0 as Type;
+    }
+    leb_dec_uint(buf, off);
+    off = mir_ser_off;
+    let kind = mir_ser_val;
+    let t = mk_type(kind);
+    if (kind == TYPE_FUNCTION) {
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        t.captured_count = mir_ser_val;
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        let rt_kind = mir_ser_val;
+        t.ret_type = mk_type(rt_kind);
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        let n_pts = mir_ser_val;
+        let pts: array<Type> = [];
+        let i = 0;
+        while (i < n_pts) {
+            leb_dec_uint(buf, off); off = mir_ser_off;
+            pts = array_push(pts, mk_type(mir_ser_val));
+            i = i + 1;
+        }
+        t.param_types = pts;
+    }
+    if (kind == TYPE_TUPLE) {
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        let n_pts = mir_ser_val;
+        let pts: array<Type> = [];
+        let i = 0;
+        while (i < n_pts) {
+            leb_dec_uint(buf, off); off = mir_ser_off;
+            pts = array_push(pts, mk_type(mir_ser_val));
+            i = i + 1;
+        }
+        t.param_types = pts;
+    }
+    if (kind == TYPE_ARRAY) {
+        t.elem_type = mir_ser_read_type(buf, off);
+        off = mir_ser_off;
+    }
+    if (kind == TYPE_DICT) {
+        t.key_type = mir_ser_read_type(buf, off);
+        off = mir_ser_off;
+        t.val_type = mir_ser_read_type(buf, off);
+        off = mir_ser_off;
+    }
+    if (kind == TYPE_SET) {
+        t.elem_type = mir_ser_read_type(buf, off);
+        off = mir_ser_off;
+    }
+    if (kind == TYPE_STRUCT || kind == TYPE_ENUM || kind == TYPE_ENUM_PAYLOAD) {
+        t.name = mir_ser_read_str(buf, off);
+        off = mir_ser_off;
+    }
+    mir_ser_off = off;
+    return t;
+}
+
+// --- 辅助：写入 MirInst ---
+pub kimo mir_ser_write_inst(buf: any, off: int, inst: MirInst) -> int {
+    off = leb_enc_uint(buf, off, inst.op);
+    off = leb_enc_int(buf, off, inst.dst);
+    off = leb_enc_int(buf, off, inst.arg1);
+    off = leb_enc_int(buf, off, inst.arg2);
+    mir_ser_store_long(buf, off, inst.longval);
+    off = off + 8;
+    mir_ser_store_float(buf, off, inst.floatval);
+    off = off + 8;
+    off = mir_ser_write_type(buf, off, inst.ty);
+    off = mir_ser_write_str(buf, off, inst.strval);
+    off = mir_ser_write_str(buf, off, inst.strval2);
+    let args = inst.args;
+    let n_args = len(args);
+    off = leb_enc_uint(buf, off, n_args);
+    let i = 0;
+    while (i < n_args) {
+        off = leb_enc_int(buf, off, args[i] as int);
+        i = i + 1;
+    }
+    return off;
+}
+
+// --- 辅助：读取 MirInst ---
+pub kimo mir_ser_read_inst(buf: any, off: int) -> MirInst {
+    leb_dec_uint(buf, off);
+    off = mir_ser_off;
+    let op = mir_ser_val;
+    leb_dec_int(buf, off); off = mir_ser_off;
+    let dst = mir_ser_val;
+    leb_dec_int(buf, off); off = mir_ser_off;
+    let arg1 = mir_ser_val;
+    leb_dec_int(buf, off); off = mir_ser_off;
+    let arg2 = mir_ser_val;
+    let longval = rt_load_long(buf, off);
+    off = off + 8;
+    let floatval = rt_load_float(buf, off);
+    off = off + 8;
+    let ty = mir_ser_read_type(buf, off);
+    off = mir_ser_off;
+    let strval = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    let strval2 = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let n_args = mir_ser_val;
+    let args: array<int> = [];
+    let i = 0;
+    while (i < n_args) {
+        leb_dec_int(buf, off); off = mir_ser_off;
+        args = array_push(args, mir_ser_val);
+        i = i + 1;
+    }
+    mir_ser_off = off;
+    let inst = MirInst { op: op, ty: ty, dst: dst, arg1: arg1, arg2: arg2,
+                         longval: longval, floatval: floatval,
+                         strval: strval, strval2: strval2, args: args };
+    return inst;
+}
+
+// --- 序列化单个 MirFunc ---
+pub kimo mir_ser_write_func(buf: any, off: int, mf: MirFunc) -> int {
+    off = mir_ser_write_str(buf, off, mf.name);
+    off = mir_ser_write_str(buf, off, mf.extern_name);
+    off = leb_enc_uint(buf, off, mf.return_type_kind);
+    off = leb_enc_uint(buf, off, mf.n_regs);
+    off = leb_enc_uint(buf, off, mf.n_slots);
+    let params = mf.params;
+    let n_params = len(params);
+    off = leb_enc_uint(buf, off, n_params);
+    let i = 0;
+    while (i < n_params) {
+        let p = params[i];
+        off = leb_enc_int(buf, off, p.slot);
+        off = leb_enc_uint(buf, off, p.type_kind);
+        i = i + 1;
+    }
+    let blocks = mf.blocks;
+    let n_blocks = len(blocks);
+    off = leb_enc_uint(buf, off, n_blocks);
+    i = 0;
+    while (i < n_blocks) {
+        let blk = blocks[i];
+        off = mir_ser_write_str(buf, off, blk.label);
+        let insts = blk.insts;
+        let n_insts = len(insts);
+        off = leb_enc_uint(buf, off, n_insts);
+        let j = 0;
+        while (j < n_insts) {
+            off = mir_ser_write_inst(buf, off, insts[j]);
+            j = j + 1;
+        }
+        let term = blk.terminator;
+        if ((term as any) == 0) {
+            mir_ser_put(buf, off, 0);
+            off = off + 1;
+        } else {
+            mir_ser_put(buf, off, 1);
+            off = off + 1;
+            off = mir_ser_write_inst(buf, off, term);
+        }
+        i = i + 1;
+    }
+    return off;
+}
+
+// --- 反序列化单个 MirFunc ---
+pub kimo mir_ser_read_func(buf: any, off: int) -> MirFunc {
+    let name = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    let extern_name = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let return_type_kind = mir_ser_val;
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let n_regs = mir_ser_val;
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let n_slots = mir_ser_val;
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let n_params = mir_ser_val;
+    let params: array<MirParam> = [];
+    let i = 0;
+    while (i < n_params) {
+        leb_dec_int(buf, off); off = mir_ser_off;
+        let slot = mir_ser_val;
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        let kind = mir_ser_val;
+        params = array_push(params, MirParam { slot: slot, type_kind: kind });
+        i = i + 1;
+    }
+    leb_dec_uint(buf, off); off = mir_ser_off;
+    let n_blocks = mir_ser_val;
+    let blocks: array<MirBlock> = [];
+    i = 0;
+    while (i < n_blocks) {
+        let label = mir_ser_read_str(buf, off);
+        off = mir_ser_off;
+        leb_dec_uint(buf, off); off = mir_ser_off;
+        let n_insts = mir_ser_val;
+        let insts: array<MirInst> = [];
+        let j = 0;
+        while (j < n_insts) {
+            let inst = mir_ser_read_inst(buf, off);
+            off = mir_ser_off;
+            insts = array_push(insts, inst);
+            j = j + 1;
+        }
+        let has_term = rt_get_byte(buf, off);
+        off = off + 1;
+        let term = 0 as MirInst;
+        if (has_term == 1) {
+            term = mir_ser_read_inst(buf, off);
+            off = mir_ser_off;
+        }
+        blocks = array_push(blocks, MirBlock { label: label, insts: insts, terminator: term });
+        i = i + 1;
+    }
+    mir_ser_off = off;
+    let mf = MirFunc { name: name, params: params, return_type_kind: return_type_kind,
+                       blocks: blocks, n_regs: n_regs, n_slots: n_slots,
+                       extern_name: extern_name };
+    return mf;
+}
+
+// --- 序列化 MirFunc[] + 全局变量到 .lu 文件 ---
+// 返回 1 成功，0 失败（原子写入：先 .tmp 再 rename）
+// 把一份完整 .lu 镜像写进 buf，返回写完后的偏移（= 所需字节数）。
+// 若中途容量不足，mir_ser_ovf 会被置 1，但 off 仍精确累加 → 调用方据此重分配。
+pub kimo mir_ser_emit_all(buf: any, module_name: string, source_hash_str: string, funcs: array<MirFunc>, globals: array<GlobalVar>) -> int {
+    let off = 0;
+    mir_ser_put(buf, 0, MIR_SER_MAGIC0); off = 1;
+    mir_ser_put(buf, 1, MIR_SER_MAGIC1); off = 2;
+    mir_ser_put(buf, 2, MIR_SER_VERSION); off = 3;
+    off = mir_ser_write_str(buf, off, source_hash_str);
+    off = mir_ser_write_str(buf, off, module_name);
+    let n_funcs = len(funcs);
+    off = leb_enc_uint(buf, off, n_funcs);
+    let i = 0;
+    while (i < n_funcs) {
+        off = mir_ser_write_func(buf, off, funcs[i]);
+        i = i + 1;
+    }
+    // 全局变量（GlobalVar 结构）
+    let n_globals = len(globals);
+    off = leb_enc_uint(buf, off, n_globals);
+    i = 0;
+    while (i < n_globals) {
+        let gv = globals[i];
+        off = mir_ser_write_str(buf, off, gv.name);
+        let gk = TYPE_INT;
+        if ((gv.type_ref as any) != 0) { gk = gv.type_ref.kind; }
+        off = leb_enc_uint(buf, off, gk);
+        mir_ser_put(buf, off, gv.is_pub);
+        off = off + 1;
+        mir_ser_put(buf, off, 0);  // is_ext（0.4 GlobalVar 无 extern 标记，恒 0）
+        off = off + 1;
+        // 常量初始值（字面量可无损还原；非字面量 → 作废缓存强制重编）
+        // init_ival 用 long：EXPR_LONG 字面量（如 -1000000000000L）不可 as int 截断（缓存往返保持 64 位）。
+        let init_tag = LU_INIT_NONE;
+        let init_ival: long = 0;
+        let init_sval = "";
+        if (expr_is_none(gv.init) == 0) {
+            let ie = gv.init;
+            if (ie.kind == EXPR_INT) { init_tag = LU_INIT_INT; init_ival = ie.intval; }
+            if (ie.kind == EXPR_LONG) { init_tag = LU_INIT_INT; init_ival = ie.intval; }
+            if (ie.kind == EXPR_BOOL) { init_tag = LU_INIT_INT; init_ival = ie.intval; }
+            if (ie.kind == EXPR_STRING) { init_tag = LU_INIT_STR; init_sval = ie.str1; }
+            if (ie.kind == EXPR_FLOAT) { init_tag = LU_INIT_UNSUP; }
+        }
+        mir_ser_put(buf, off, init_tag);
+        off = off + 1;
+        if (init_tag == LU_INIT_INT) {
+            off = leb_enc_long(buf, off, init_ival);
+        }
+        if (init_tag == LU_INIT_STR) {
+            off = mir_ser_write_str(buf, off, init_sval);
+        }
+        i = i + 1;
+    }
+    return off;
+}
+
+// --- 序列化 MirFunc[] + 全局变量到 .lu 文件 ---
+// 返回 1 成功，0 失败（原子写入：先 .tmp 再 rename）
+// 容量策略：先用 4MB 试写；若溢出，第一遍返回的 off 即精确所需字节数，
+// 按 off + 余量重分配后再写一遍。超大模块最多两遍，正常模块一遍。
+pub kimo mir_cache_store(source_path: string, module_name: string, source_hash_str: string, funcs: array<MirFunc>, globals: array<GlobalVar>) -> int {
+    let cap = MIR_SER_BUF_SIZE;
+    let buf = rt_buf_alloc(cap);
+    if ((buf as any) == 0) { return 0; }
+    mir_ser_cap = cap;
+    mir_ser_ovf = 0;
+    let off = mir_ser_emit_all(buf, module_name, source_hash_str, funcs, globals);
+    if (mir_ser_ovf == 1) {
+        // 第一遍溢出：off 已是精确尺寸，加 64KB 余量后重来一遍
+        cap = off + 65536;
+        buf = rt_buf_alloc(cap);
+        if ((buf as any) == 0) { mir_ser_cap = 0; return 0; }
+        mir_ser_cap = cap;
+        mir_ser_ovf = 0;
+        off = mir_ser_emit_all(buf, module_name, source_hash_str, funcs, globals);
+        if (mir_ser_ovf == 1) {
+            // 理论不可达（第二遍容量必然够）；保底放弃写缓存而非越界
+            mir_ser_cap = 0;
+            return 0;
+        }
+    }
+    mir_ser_cap = 0;
+    let lu_path = source_path + ".lu";
+    let tmp_path = lu_path + ".tmp";
+    let rc = rt_write_bytes(tmp_path, buf, off);
+    if (rc == 0) {
+        rt_delete_file(tmp_path);
+        return 0;
+    }
+    let rrc = rt_rename_file(tmp_path, lu_path);
+    if (rrc == 0) {
+        rc = rt_write_bytes(lu_path, buf, off);
+        rt_delete_file(tmp_path);
+        return rc;
+    }
+    return 1;
+}
+
+// --- 从 .lu 加载 MirFunc[] + 全局变量 ---
+// 返回包装结构 [module_name, source_hash_str, mfuncs, globals]；失败返回 null
+pub kimo mir_cache_load(source_path: string) -> any {
+    let lu_path = source_path + ".lu";
+    let buf = rt_read_bytes(lu_path);
+    if ((buf as any) == 0) {
+        return 0 as any;
+    }
+    let total = rt_buf_len(buf);
+    if (total < 4) {
+        return 0 as any;
+    }
+    let m0 = rt_get_byte(buf, 0);
+    let m1 = rt_get_byte(buf, 1);
+    let ver = rt_get_byte(buf, 2);
+    if (m0 != MIR_SER_MAGIC0 || m1 != MIR_SER_MAGIC1) {
+        return 0 as any;
+    }
+    if (ver < MIR_SER_VERSION) {
+        // 严格版本匹配：v9 只读 v9（旧 s03 v8 缓存一律作废，避免格式错读）
+        return 0 as any;
+    }
+    let off = 3;
+    let source_hash_str = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    let module_name = mir_ser_read_str(buf, off);
+    off = mir_ser_off;
+    leb_dec_uint(buf, off);
+    off = mir_ser_off;
+    let n_funcs = mir_ser_val;
+    let mfuncs: array<MirFunc> = [];
+    let i = 0;
+    while (i < n_funcs) {
+        let mf = mir_ser_read_func(buf, off);
+        off = mir_ser_off;
+        mfuncs = array_push(mfuncs, mf);
+        i = i + 1;
+    }
+    // 全局变量
+    let globals: array<GlobalVar> = [];
+    leb_dec_uint(buf, off);
+    off = mir_ser_off;
+    let n_globals = mir_ser_val;
+    i = 0;
+    while (i < n_globals) {
+        let gname = mir_ser_read_str(buf, off);
+        off = mir_ser_off;
+        leb_dec_uint(buf, off);
+        off = mir_ser_off;
+        let gkind = mir_ser_val;
+        let is_pub = rt_get_byte(buf, off);
+        off = off + 1;
+        let is_ext = rt_get_byte(buf, off);
+        off = off + 1;
+        let dummy_loc = mk_loc("lu_cache", 0, 0);
+        let init_expr = 0 as Expr;
+        let itag = rt_get_byte(buf, off);
+        off = off + 1;
+        if (itag == LU_INIT_UNSUP) {
+            return 0 as any;
+        }
+        if (itag == LU_INIT_INT) {
+            leb_dec_long(buf, off);
+            off = mir_ser_off;
+            // 读取值可能是 long（全局 long 字面量），mk_expr 类型由消费侧按全局类型还原
+            let ie = mk_expr(EXPR_INT, dummy_loc);
+            ie.intval = mir_ser_val;
+            init_expr = ie;
+        }
+        if (itag == LU_INIT_STR) {
+            let sv = mir_ser_read_str(buf, off);
+            off = mir_ser_off;
+            let se = mk_expr(EXPR_STRING, dummy_loc);
+            se.str1 = sv;
+            init_expr = se;
+        }
+        let gv = GlobalVar { name: gname, type_ref: mk_type(gkind), init: init_expr,
+                             loc: dummy_loc, is_pub: is_pub, is_mut: 0 };
+        globals = array_push(globals, gv);
+        i = i + 1;
+    }
+    let r: any = [module_name, source_hash_str, mfuncs, globals];
+    return r;
+}
+
+// 从 mir_cache_load 返回值提取字段
+pub kimo mir_cache_mod_name(mod: any) -> string {
+    return mod[0] as string;
+}
+
+pub kimo mir_cache_mod_hash(mod: any) -> string {
+    return mod[1] as string;
+}
+
+pub kimo mir_cache_mod_funcs(mod: any) -> any {
+    return mod[2];
+}
+
+pub kimo mir_cache_mod_globals(mod: any) -> any {
+    if (len(mod) < 4) { return []; }
+    return mod[3];
+}

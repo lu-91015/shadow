@@ -1,0 +1,9 @@
+# shadow.sbg — .spk 包测试用例
+# 验证 shadow-0.3 的 .spk 打包格式与 import 集成
+# dep 路径指向 .spk 文件，编译器会自动解包到 <name>_spk_extracted/ 缓存目录
+[package]
+name = "spk_test_pkg"
+version = "0.3.0"
+
+[deps]
+mylib = "mylib.spk"

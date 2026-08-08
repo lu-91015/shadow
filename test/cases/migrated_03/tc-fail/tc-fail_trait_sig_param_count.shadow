@@ -1,0 +1,20 @@
+//@ mode: tc-fail
+//@ desc: B2 trait signature check — impl method parameter count mismatch (expected 2, got 1)
+dsb tc_fail_trait_sig_param_count;
+
+trait Greeter {
+    kimo greet(self: Self, n: int) -> string;
+}
+
+struct Foo { x: int; }
+
+// impl 方法 greet 缺少参数 n — 应失败
+impl Greeter for Foo {
+    kimo greet(self: Foo) -> string {
+        return "hi";
+    }
+}
+
+kimo main() -> int {
+    return 0;
+}

@@ -1,0 +1,8 @@
+//@desc: exe-extra generated case (exa_pow_74)
+//@expect: 2187
+dsb exa_pow_74;
+kimo pw(a: int, b: int) -> int { if (b <= 0) { return 1; } return a * pw(a, b - 1); }
+kimo main() -> int {
+    println(pw(3, 7));
+    return 0;
+}

@@ -1,0 +1,19 @@
+//@desc: defer statement — defer { body } runs LIFO at block end
+//@expect: step1\nstep2\ndefer2\ndefer1\ndone
+dsb cg_defer_basic;
+
+kimo main() -> int {
+    println("step1");
+    {
+        defer {
+            println("defer1");
+        }
+        defer {
+            println("defer2");
+        }
+        println("step2");
+    }
+    // After block: defer2 then defer1 (LIFO)
+    println("done");
+    return 0;
+}

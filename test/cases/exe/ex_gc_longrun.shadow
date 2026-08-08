@@ -1,0 +1,205 @@
+//@mode: exe
+//@desc: 长驻稳定性验收——LSP 式 4000 次文档编辑后堆无单调增长
+//@expect: longrun ok docs=2000 edits=4000
+//@timeout: 300
+// ex_gc_longrun.shadow — §5.3 第 4 条「LSP 服务器连续处理 1000+ 文档编辑，
+// 内存稳定无单调增长」的被测程序。
+//
+// 为什么不直接跑 LSP：那样验收依赖 LSP 协议栈、编辑器客户端和文件 IO，
+// 一旦不稳定就分不清是 GC 的问题还是 LSP 的问题。这里抽出 LSP 长驻场景
+// 对 GC 而言唯一重要的那个特征 ——
+//
+//     **存活集大小恒定，但集合内部的对象在持续整批轮换**
+//
+// 文档数固定（打开的文件不会变多），每次编辑替换掉某个文档的正文与
+// token 表，旧正文、旧 token 数组、旧 token 串同时变成垃圾。这对 GC 是
+// 一个相当刁钻的组合：
+//   · 存活集恒定 → live 应当收敛到常数，任何单调上涨都是泄漏；
+//   · 内部持续轮换 → 每一轮 GC 都要正确区分"刚被替换掉的旧值"和
+//     "刚写进去的新值"，这正是**删除写屏障**的战场：被覆盖的旧 text
+//     若在标记期漏掉，就是悬垂引用；新 text 若被误判成垃圾，正文就没了。
+//
+// 内存是否稳定由用例**自己判定**，不依赖外部工具：通过 @extern 直接读
+// 运行时的堆字节。判据见下方 min1/min2 处的注释。
+dsb ex_gc_longrun;
+
+// 直接读 GC 内部计量。堆字节远小于 2GB，i32 读 i64 返回值的低 32 位无损。
+@extern("shadow_gc_alloc_count") kimo gc_heap_bytes() -> int { return 0; }
+
+struct Doc {
+    uri: string;
+    text: string;
+    ver: int;
+    toks: array<string>;
+}
+
+// 打开的文档表：全程存活，构成恒定的 live 基线
+let g_docs: array<Doc> = [];
+
+// 倍增构造长度恰为 n 的填充串（n 须为 16 的 2 的幂倍）
+kimo mkpad(n: int) -> string {
+    let s = "0123456789abcdef";
+    while (len(s) < n) {
+        s = s + s;
+    }
+    return s;
+}
+
+// 模拟一次重新词法分析：整张 token 表都是新对象，旧表整体成为垃圾
+kimo mktoks(ver: int, n: int) -> array<string> {
+    let a: array<string> = [];
+    let k = 0;
+    while (k < n) {
+        a = array_push(a, "t" + int_to_str(ver) + "_" + int_to_str(k));
+        k = k + 1;
+    }
+    return a;
+}
+
+// 文档正文的长度是 ver 的确定函数 —— 校验时据此判断内容是否完好
+kimo text_len(padlen: int, ver: int, uri: string) -> int {
+    return padlen + 2 + len(int_to_str(ver)) + 1 + len(uri);
+}
+
+kimo main() -> int {
+    let ndocs = 2000;
+    let padlen = 2048;
+    let ntoks = 8;
+    let warm = 500;     // 预热：跳过启动期，等 pacing 控制器收敛
+    // §5.3 只要求 1000+ 次编辑，这里取 4000。理由是周期数而非编辑数才是
+    // 长驻验收的有效样本量：1200 次编辑只跑出 6 个 GC 周期，前后半程各
+    // 3 轮，谷底采样的统计意义太弱 —— 泄漏还没积累到能被 10% 判据抓住。
+    // 4000 次约 20 个周期，前后半各 10 轮，足以让任何每轮固定泄漏显形。
+    let edits = 4000;
+    let pad = mkpad(padlen);
+
+    // ── 阶段 0：打开 2000 个文档 ≈ 4.2MB 存活堆 ──
+    // 必须顶过 4MB 最小堆阈值，否则 GOGC 比例模型不接管，
+    // 测的就不是真实长驻行为而是"小程序永不 GC"。
+    let i = 0;
+    while (i < ndocs) {
+        let uri = "f" + int_to_str(i);
+        g_docs = array_push(g_docs, Doc {
+            uri: uri,
+            text: pad + "#v0#" + uri,
+            ver: 0,
+            toks: mktoks(0, ntoks)
+        });
+        i = i + 1;
+    }
+
+    // ── 阶段 1：连续编辑 ──
+    let half = warm + (edits - warm) / 2;
+    let min1 = 0;   // 前半程堆谷底
+    let min2 = 0;   // 后半程堆谷底
+    let maxh = 0;   // 全程堆峰值
+    let e = 0;
+    while (e < edits) {
+        // 613 与 2000 互质，保证编辑均匀散布而不是反复改同一篇
+        let idx = (e * 613) % ndocs;
+        let d: Doc = g_docs[idx];
+
+        // 一次编辑：正文与 token 表整体替换。三处字段写都会经过写屏障，
+        // 被覆盖的旧值（上一版正文/token 数组/8 个 token 串）成为垃圾。
+        d.ver = d.ver + 1;
+        d.text = pad + "#v" + int_to_str(d.ver) + "#" + d.uri;
+        d.toks = mktoks(d.ver, ntoks);
+
+        // 就地校验：新写入的内容必须完好（插入屏障失效会在这里暴露）
+        if (len(d.text) != text_len(padlen, d.ver, d.uri)) {
+            println("ERR edited text corrupted at " + int_to_str(idx)
+                    + " ver=" + int_to_str(d.ver) + " len=" + int_to_str(len(d.text)));
+            return 1;
+        }
+        if (len(d.toks) != ntoks) {
+            println("ERR edited toks at " + int_to_str(idx)
+                    + " n=" + int_to_str(len(d.toks)));
+            return 1;
+        }
+
+        // 抽查另一篇未参与本次编辑的文档：它不该受任何影响。
+        // 删除屏障漏标会让上一轮刚被替换的正文被误回收，
+        // 而误回收的内存随即被复用 —— 这里读到的长度就会不对。
+        let pidx = (e * 977 + 31) % ndocs;
+        let p: Doc = g_docs[pidx];
+        if ((p as any) == 0) {
+            println("ERR probe doc reclaimed at " + int_to_str(pidx)
+                    + " edit=" + int_to_str(e));
+            return 1;
+        }
+        if (len(p.text) != text_len(padlen, p.ver, p.uri)) {
+            println("ERR probe text corrupted at " + int_to_str(pidx)
+                    + " ver=" + int_to_str(p.ver) + " len=" + int_to_str(len(p.text)));
+            return 1;
+        }
+
+        // ── 采样堆字节 ──
+        // 关键在于取**谷底**而非瞬时值：GOGC=100 时堆在 [live, 2×live]
+        // 之间来回振荡，任取一点比较都会被相位差淹没。谷底出现在清扫刚
+        // 结束的时刻，最接近真实存活量，是判断"是否泄漏"唯一可靠的量。
+        if (e >= warm) {
+            let hb = gc_heap_bytes();
+            if (hb > maxh) { maxh = hb; }
+            if (e < half) {
+                if (min1 == 0) { min1 = hb; }
+                if (hb < min1) { min1 = hb; }
+            } else {
+                if (min2 == 0) { min2 = hb; }
+                if (hb < min2) { min2 = hb; }
+            }
+        }
+        e = e + 1;
+    }
+
+    // ── 阶段 2：全量校验 ──
+    i = 0;
+    let ver_sum = 0;
+    while (i < ndocs) {
+        let f: Doc = g_docs[i];
+        if ((f as any) == 0) {
+            println("ERR final doc null at " + int_to_str(i));
+            return 1;
+        }
+        if (len(f.text) != text_len(padlen, f.ver, f.uri)) {
+            println("ERR final text at " + int_to_str(i)
+                    + " ver=" + int_to_str(f.ver) + " len=" + int_to_str(len(f.text)));
+            return 1;
+        }
+        if (len(f.toks) != ntoks) {
+            println("ERR final toks at " + int_to_str(i));
+            return 1;
+        }
+        ver_sum = ver_sum + f.ver;
+        i = i + 1;
+    }
+    // 每次编辑恰好让某篇的 ver 加一，总和必须等于编辑次数 ——
+    // 这条能抓住"编辑写到了错误的对象上"这类指针串位问题。
+    if (ver_sum != edits) {
+        println("ERR version sum " + int_to_str(ver_sum)
+                + " expected " + int_to_str(edits));
+        return 1;
+    }
+
+    // ── 判据：后半程谷底不得比前半程谷底高出 10% ──
+    // 存活集恒定，所以真实 live 应当持平；留 10% 余量是因为谷底采样
+    // 依赖采样点恰好落在清扫结束后，稀疏时会略微偏高。
+    // 真正的泄漏（每轮编辑漏回收一份正文）在 1000 次编辑后会是数 MB 量级，
+    // 远远撞穿这条线。
+    if (min1 == 0 || min2 == 0) {
+        println("ERR no heap samples collected");
+        return 1;
+    }
+    if (min2 > min1 + min1 / 10) {
+        println("ERR heap floor grew: first=" + int_to_str(min1)
+                + " second=" + int_to_str(min2)
+                + " peak=" + int_to_str(maxh));
+        return 1;
+    }
+
+    println("longrun floor first=" + int_to_str(min1)
+            + " second=" + int_to_str(min2)
+            + " peak=" + int_to_str(maxh));
+    println("longrun ok docs=" + int_to_str(ndocs)
+            + " edits=" + int_to_str(edits));
+    return 0;
+}

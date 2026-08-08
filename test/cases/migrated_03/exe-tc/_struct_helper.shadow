@@ -1,0 +1,4 @@
+dsb _struct_helper;
+// Helper module with struct definition
+pub struct Box { value: int }
+pub kimo get_value(b: Box) -> int { return b.value; }

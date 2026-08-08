@@ -1,0 +1,5 @@
+dsb _publet_helper;
+
+pub let exported_value: int = 40;
+let hidden_value: int = 2;
+

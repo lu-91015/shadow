@@ -1,0 +1,10 @@
+//@desc: `any as string` 拆箱 AnyBox(tag=3) 还原原始字符串指针
+//@expect: a
+dsb cg_cast_any_as_string;
+kimo main() -> int {
+    let s: string = "a";
+    let x: any = s as any;
+    let y: string = x as string;
+    println(y);
+    return 0;
+}

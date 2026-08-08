@@ -1,0 +1,10 @@
+//@desc: enum value reference (TypeName.Variant) codegen
+//@expect: 0
+dsb cg_enum_ref;
+enum Color { Red; Green; Blue }
+kimo main() -> int {
+    let c = Color.Red;
+    if (c == Color.Green) { println(1); return 0; }
+    if (c == Color.Red) { println(0); return 0; }
+    println(2); return 0;
+}

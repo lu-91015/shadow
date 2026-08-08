@@ -1,0 +1,24 @@
+//@desc: named + default params combined
+//@xfail: default param not implemented in 0.4
+//@expect: 6\n1\n42
+dsb cg_named_default_param;
+
+kimo compute(x: int, y: int = 0, z: int = 1) -> int {
+    return x + y + z;
+}
+
+kimo main() -> int {
+    // 命名参数 + 默认参数混合：x=1, z=5, y=0(default)
+    let a = compute(x: 1, z: 5);
+    println(int_to_str(a));
+
+    // 只传命名参数 x，其余用默认值
+    let b = compute(x: 0);
+    println(int_to_str(b));
+
+    // 位置 + 命名 + 默认：x=40, z=2, y=0(default)
+    let c = compute(40, z: 2);
+    println(int_to_str(c));
+
+    return 0;
+}

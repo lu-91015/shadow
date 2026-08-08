@@ -1,0 +1,19 @@
+//@ mode: tc-fail
+//@ desc: P1-2 match exhaustiveness — missing variant should fail
+dsb tc_fail_match_non_exhaustive;
+
+enum Color {
+    Red,
+    Green,
+    Blue
+}
+
+kimo main() -> int {
+    let c = Red;
+    let v = match c {
+        Red => 1,
+        Green => 2,
+        // missing Blue — should fail
+    };
+    return v;
+}

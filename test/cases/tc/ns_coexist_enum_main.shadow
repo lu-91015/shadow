@@ -1,0 +1,10 @@
+//@mode: tc
+//@desc: Phase 15 严格态：enum 变体访问 Color.Red（严格态 ed.name 一致性）
+//@args: --strict
+dsb ns_coexist_enum_main;
+import ns_coexist.pa.lib;
+kimo main() -> int {
+    let col = Color.Red;
+    let c2 = Color.Blue;
+    return 0;
+}

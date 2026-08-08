@@ -1,0 +1,12 @@
+//@desc: multi-param macro inline expansion at runtime
+//@expect: 24
+dsb cg_macro_multiparam;
+macro add2(a: expr, b: expr) { a + b }
+macro mul3(a: expr, b: expr, c: expr) { a * b * c }
+kimo main() -> int {
+    let x = add2(2, 3);
+    let y = mul3(2, 3, 4);
+    println(x);
+    println(y);
+    return 0;
+}

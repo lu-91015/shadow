@@ -1,0 +1,11 @@
+//@ desc: float and double types in arithmetic and function signatures
+dsb tc_float_double;
+kimo add_float(a: float, b: float) -> float { return a + b; }
+kimo add_double(a: double, b: double) -> double { return a + b; }
+kimo main() -> int {
+    let f: float = 1.5;
+    let d: double = 2.5;
+    let r1 = add_float(f, 0.5);
+    let r2 = add_double(d, 1.5);
+    return 0;
+}

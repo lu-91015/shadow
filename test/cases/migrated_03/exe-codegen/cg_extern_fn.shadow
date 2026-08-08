@@ -1,0 +1,6 @@
+//@desc: @extern attribute — parser should recognize @extern("c_name") on function decl
+//@expect: 65
+dsb cg_extern_fn;
+@extern("shadow_putchar")
+kimo my_putchar(c: int) -> int { return 0; }
+kimo main() -> int { println(my_putchar(65)); return 0; }

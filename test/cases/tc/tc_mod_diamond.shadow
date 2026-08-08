@@ -1,0 +1,8 @@
+//@mode: tc
+//@desc: Phase 11 模块机制：菱形依赖合法，d 只编译一次（§3.8.3）
+dsb tc_mod_diamond;
+import dia_a.af;
+kimo main() -> int {
+    let v = dia_fa();
+    return v == 82 ? 0 : 1;
+}

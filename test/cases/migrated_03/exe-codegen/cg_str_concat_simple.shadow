@@ -1,0 +1,4 @@
+//@desc: string concat codegen — "a" + "b" should call shadow_string_concat
+//@expect: 0
+dsb cg_str_concat_simple;
+kimo main() -> int { let s = "hello" + "world"; println(0); return 0; }

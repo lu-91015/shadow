@@ -1,0 +1,11 @@
+dsb cg_generic_struct_let_no_init;
+
+struct Box<T> {
+    value: T
+}
+
+kimo main() -> int {
+    let b: Box<int>;
+    b.value = 7;
+    return b.value;
+}

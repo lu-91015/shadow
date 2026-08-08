@@ -1,0 +1,33 @@
+//@desc: for (x in set<int>) iteration — sum elements (unordered)
+//@expect: 3\n6\nok
+dsb cg_set_for_iter_int;
+
+kimo main() -> int {
+    let s: set<int> = set_new();
+    set_add(s, 1);
+    set_add(s, 2);
+    set_add(s, 3);
+    // 重复元素不增加 size
+    set_add(s, 2);
+
+    // 迭代计数
+    let count = 0;
+    for (x in s) {
+        count = count + 1;
+    }
+    println(count);  // 3
+
+    // 迭代求和（顺序不确定，但和确定 = 1+2+3 = 6）
+    let sum = 0;
+    for (x in s) {
+        sum = sum + x;
+    }
+    println(sum);  // 6
+
+    if (count == 3 && sum == 6) {
+        println("ok");
+    }
+
+    set_free(s);
+    return 0;
+}

@@ -1,0 +1,4 @@
+//@desc: len(string) codegen — should emit shadow_string_len call
+//@expect-ir: shadow_string_len
+dsb cg_len_string;
+kimo main() -> int { let n = len("hello"); return n; }

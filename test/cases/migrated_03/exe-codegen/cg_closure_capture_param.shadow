@@ -1,0 +1,12 @@
+//@desc: L3 closure — capture with parameter and use captured variable inside body
+//@expect: 25
+dsb cg_closure_capture_param;
+kimo main() -> int {
+    let factor = 5;
+    let multiply = kimo(n: int) -> int {
+        return n * factor;
+    };
+    let r = multiply(5);
+    println(r);
+    return 0;
+}

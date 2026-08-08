@@ -1,0 +1,10 @@
+//@desc: explicit cast (as Type) type-checks
+//@expect: typecheck: 1
+dsb tc_cast;
+kimo f(x: int) -> int {
+    let y = x as long;
+    let z = x as int;
+    if (y == z) { return x; }
+    return 0;
+}
+kimo main() -> int { return f(5); }

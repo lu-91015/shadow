@@ -1,0 +1,5 @@
+//@desc: recursive call codegens to a self-call
+//@expect-ir: call i32 @__mod_codegen_recursion__fact
+dsb codegen_recursion;
+kimo fact(n: int) -> int { if (n <= 1) { return 1; } return n * fact(n - 1); }
+kimo main() -> int { return fact(5); }

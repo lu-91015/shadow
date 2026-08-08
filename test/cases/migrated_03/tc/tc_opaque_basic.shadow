@@ -1,0 +1,13 @@
+//@desc: opaque type basic usage — 64-bit handle stored without truncation
+dsb tc_opaque_basic;
+@extern("my_opaque_open") kimo my_opaque_open(path: string) -> opaque { return null as opaque; }
+@extern("my_opaque_close") kimo my_opaque_close(h: opaque) -> void { return; }
+
+pub struct Handle { ptr: opaque, size: int }
+
+kimo main() -> int {
+    let h = my_opaque_open("test");
+    let wrapper = Handle { ptr: h, size: 100 };
+    my_opaque_close(wrapper.ptr);
+    return 0;
+}

@@ -1,0 +1,4 @@
+//@desc: if/else branch type-checks
+//@expect: 1
+dsb tc_if_else;
+kimo main() -> int { let x = 0; if (1 > 0) { x = 1; } else { x = 2; } println(x); return 0; }

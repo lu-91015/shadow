@@ -1,0 +1,8 @@
+//@desc: string array literal, index, and concat type-check
+dsb tc_string_array;
+kimo main() -> int {
+    let names = ["alice", "bob", "carol"];
+    let first = names[0];
+    let greet = first + "!";
+    return 0;
+}

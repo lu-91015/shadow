@@ -1,0 +1,42 @@
+//@desc: L4 dir/path IO — path helpers plus directory create/list/delete roundtrip
+//@expect: test/_s03_l4_dir_io
+//@expect: _s03_l4_dir_io
+//@expect: test/_s03_l4_dir_io
+//@expect: 0
+//@expect: 1
+//@expect: 1
+//@expect: 1
+//@expect: 1
+//@expect: 1
+//@expect: file.txt
+//@expect: 1
+//@expect: 1
+//@expect: 0
+dsb cg_dir_path_io;
+
+kimo main() -> int {
+    let dir = path_join("test", "_s03_l4_dir_io");
+    let file = path_join(dir, "file.txt");
+
+    // Clean up any leftover from a failed previous run.
+    file_delete(file);
+    dir_delete(dir);
+
+    println(path_normalize("test\\_s03_l4_dir_io"));
+    println(path_basename(dir));
+    println(path_dirname(file));
+
+    println(path_exists(dir));          // 0
+    println(dir_create(dir));           // 1
+    println(path_exists(dir));          // 1
+
+    println(file_write(file, "ok"));    // 1
+    println(file_exists(file));         // 1
+    println(path_exists(file));         // 1
+    println(file_list_dir(dir));        // file.txt
+
+    println(file_delete(file));         // 1
+    println(dir_delete(dir));           // 1
+    println(path_exists(dir));          // 0
+    return 0;
+}

@@ -1,0 +1,98 @@
+//@mode: exe
+//@desc: GC 综合拷问——全局根 / 深递归栈根 / 寄存器根 / 长短生命周期混合
+//@expect: mixed ok registry=960
+//@timeout: 60
+// ex_gc_mixed.shadow — GC v1 综合拷问：一次覆盖四类此前暴露过 bug 的根来源
+//
+//   1) 全局根（g_globals）：g_registry 跨轮次长期存活，
+//      验证 frame_leave 截断 g_roots 时不会把全局根一并丢掉。
+//   2) 深递归栈根：递归 400 层构造字符串，栈跨多页，
+//      验证栈扫描覆盖 [rsp, StackBase) 全区间（含最高页 main 帧）。
+//   3) 寄存器根：中间结果仅在调用边界的寄存器里存活（未落栈槽），
+//      验证 RtlCaptureContext 捕获的寄存器组被当作根。
+//   4) 长短生命周期混合 + 嵌套引用：老对象持有新对象，
+//      验证标记的可达性传播与分配器 size class 归还的正确性。
+dsb ex_gc_mixed;
+
+struct Entry {
+    name: string;
+    tags: array<string>;
+    score: int;
+}
+
+// —— 1) 全局长期存活注册表 ——
+let g_registry: array<Entry> = [];
+let g_checksum: int = 0;
+
+// —— 2) 深递归：每层都产生新字符串并向下传递 ——
+kimo deep(depth: int, acc: string) -> string {
+    if (depth <= 0) { return acc; }
+    let s = acc + "/" + int_to_str(depth);
+    // 只保留尾部，避免字符串无限增长
+    if (len(s) > 64) { s = substr2(s, len(s) - 32, len(s)); }
+    return deep(depth - 1, s);
+}
+
+// —— 3) 返回值只经寄存器传递给下一个调用 ——
+kimo make_entry(i: int, round: int) -> Entry {
+    let tags: array<string> = [];
+    tags = array_push(tags, "t" + int_to_str(i % 7));
+    tags = array_push(tags, "r" + int_to_str(round));
+    return Entry { name: "entry-" + int_to_str(i) + "@" + int_to_str(round),
+                   tags: tags, score: i + round };
+}
+
+kimo verify(e: Entry) -> int {
+    if (str_contains(e.name, "entry-") == 0) { return 0; }
+    if (len(e.tags) != 2) { return 0; }
+    if (str_contains(e.tags[0] as string, "t") == 0) { return 0; }
+    return 1;
+}
+
+kimo main() -> int {
+    let round = 0;
+    while (round < 120) {
+        // 4) 每轮制造大量短命对象，只有 1/50 进入全局注册表
+        let i = 0;
+        while (i < 400) {
+            // make_entry 的返回值直接喂给 verify —— 中间无局部变量落栈
+            if (verify(make_entry(i, round)) == 0) {
+                println("ERR entry corrupted round=" + int_to_str(round));
+                return 1;
+            }
+            if (i % 50 == 0) {
+                g_registry = array_push(g_registry, make_entry(i, round));
+            }
+            i = i + 1;
+        }
+
+        // 2) 深递归撑开栈，期间触发 GC
+        let tail = deep(400, "root");
+        if (len(tail) == 0) {
+            println("ERR deep returned empty");
+            return 1;
+        }
+        g_checksum = g_checksum + len(tail);
+
+        // 1) 全量复查全局注册表 —— 任何一条被误回收/踩坏都会被发现
+        let k = 0;
+        while (k < len(g_registry)) {
+            let e: Entry = g_registry[k];
+            if (verify(e) == 0) {
+                println("ERR registry corrupted at " + int_to_str(k)
+                        + " round=" + int_to_str(round));
+                return 1;
+            }
+            k = k + 1;
+        }
+        round = round + 1;
+    }
+
+    if (len(g_registry) != 960) {
+        println("ERR registry len=" + int_to_str(len(g_registry)));
+        return 1;
+    }
+    println("mixed ok registry=" + int_to_str(len(g_registry))
+            + " checksum=" + int_to_str(g_checksum));
+    return 0;
+}

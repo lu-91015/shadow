@@ -1,0 +1,8 @@
+//@desc: GC single field struct allocation
+//@expect: 42
+dsb edge_gc_single_field;
+struct Singleton { val: int }
+kimo main() -> int {
+    let s = Singleton { val: 42 };
+    println(s.val); return 0;
+}

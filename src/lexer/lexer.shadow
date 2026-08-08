@@ -1,0 +1,446 @@
+// Shadow 0.4 — 词法分析器（Lexer）
+// ============================================================
+// 语法完全复刻 shadow-0.3。Token 携带完整区间 [line:col, end_line:end_col)
+// （半开，1-based），parser 用它回填 AST 节点 Location 终点。
+//
+// 编程规范（实测确认）：
+//   - 模块级全局变量 lx_src/lx_pos/lx_line/lx_col 跨函数共享（宿主支持）
+//   - 字符串逐字符累积 `text = text + c` 属 token 级短拼接（0.3 同款，可接受）
+//   - 跨模块引用 core 的 pub 符号（Token/TOK_*）依赖 P0.4-1 全局 pub 回退
+dsb lexer;
+
+// 词法状态（模块级全局变量，tokenize 时初始化）
+let lx_src: string = "";
+let lx_len: int = 0;      // ⚡ 源码长度快照，见下方性能说明
+let lx_pos: int = 0;
+let lx_line: int = 1;
+let lx_col: int = 1;
+
+// ⚡ 性能：字节码 → 单字符字符串 记忆表（256 项）
+//
+// 背景（实测确认，2026-08-06）：宿主 runtime 的字符串是 C 风格 NUL 结尾串，
+//   shadow_string_len(s)         = strlen(s)                   → O(串长)
+//   shadow_string_subscript(s,i) = strlen(s) + dup_str(2 字节) → O(串长) + 每次 malloc（永不释放）
+// 词法器持有**整份拼接源码**（自举时 763KB）并逐字符访问，原实现每读一个字符
+// 要全扫源码两遍再 malloc 一次 → 整体退化成 O(n²)，实测 tokenize 独占 135s。
+//
+// 修复三件套：
+//   ① 串长用 lx_len 快照（O(1)），不再每次 strlen；
+//   ② 取字节用 rt_get_byte（C 层 `((unsigned char*)p)[off]`，O(1) 且零分配）；
+//   ③ 再经本表把字节码映射回单字符字符串——真正调 subscript 的慢路径**最多 256 次**，
+//      之后全是 O(1) 数组下标。
+// 关键收益：下游所有 `c == " "` 形式的字符串比较**一行都不用改**。
+// 缓存条目由 dup_str 裸 malloc 而来、生命周期永久，故可跨 tokenize 调用复用。
+let lx_ctab: array<string> = [];   // 字节码 → 单字符串
+let lx_chas: array<int> = [];      // 该字节码是否已缓存（1 = 是）
+
+// 初始化 256 项记忆表（仅首次真正执行；字节→字符映射是全局不变量，可跨源码复用）
+pub kimo lx_ctab_init() -> void {
+    if (len(lx_ctab) == 256) { return; }
+    lx_ctab = [];
+    lx_chas = [];
+    let i = 0;
+    while (i < 256) {
+        lx_ctab = array_push(lx_ctab, "");
+        lx_chas = array_push(lx_chas, 0);
+        i = i + 1;
+    }
+}
+
+// 字节码 b（出现在 idx 处）→ 单字符字符串。摊还 O(1)。
+pub kimo lx_chr(b: int, idx: int) -> string {
+    // 注意：宿主不支持 `expr as T == v` 连写（与 `(expr as T).field` 同源限制），须经中间变量
+    let hit = lx_chas[b] as int;
+    if (hit == 1) { return lx_ctab[b] as string; }
+    let c = lx_src[idx];       // 慢路径：整个进程生命周期最多走 256 次
+    lx_ctab[b] = c;
+    lx_chas[b] = 1;
+    return c;
+}
+
+// 当前字符（越界返回 ""）
+pub kimo lx_cur() -> string {
+    if (lx_pos >= lx_len) { return ""; }
+    return lx_chr(rt_get_byte(lx_src, lx_pos), lx_pos);
+}
+
+// 向前看 n 个字符（越界返回 ""）
+// ⚠️ p < 0 的判断不可省：旧实现走 shadow_string_subscript，它内部对负下标返回 ""；
+//    而 rt_get_byte 不做任何边界检查，负偏移会直接越界读。本函数是 pub，须自己兜住。
+pub kimo lx_peek(n: int) -> string {
+    let p = lx_pos + n;
+    if (p < 0) { return ""; }
+    if (p >= lx_len) { return ""; }
+    return lx_chr(rt_get_byte(lx_src, p), p);
+}
+
+// 前进一个字符，维护行列
+pub kimo lx_adv() -> void {
+    if (lx_pos < lx_len) {
+        if (rt_get_byte(lx_src, lx_pos) == 10) { lx_line = lx_line + 1; lx_col = 1; }
+        else { lx_col = lx_col + 1; }
+        lx_pos = lx_pos + 1;
+    }
+}
+
+// 标点/运算符 token 构造器。
+// 调用约定：调用点**先 lx_adv() 消费完字符再调它**，所以此刻的
+// (lx_line, lx_col) 是 token 的**结束**位置。start = 当前列 - len(text)。
+pub kimo lx_make_tok(kind: int, text: string) -> Token {
+    let tl = len(text);
+    let start_col = lx_col - tl;
+    if (start_col < 1) { start_col = 1; }
+    return Token { kind: kind, text: text, line: lx_line, col: start_col,
+                   end_line: lx_line, end_col: lx_col };
+}
+
+// 跳过空白与注释（// 行注释、/* */ 块注释）
+pub kimo lx_skip_ws() -> void {
+    while (true) {
+        let c = lx_cur();
+        if (c == " " || c == "\t" || c == "\r" || c == "\n") { lx_adv(); }
+        else if (c == "/" && lx_peek(1) == "/") {
+            while (lx_cur() != "" && lx_cur() != "\n") { lx_adv(); }
+        }
+        else if (c == "/" && lx_peek(1) == "*") {
+            lx_adv(); lx_adv();
+            while (true) {
+                if (lx_cur() == "") { break; }
+                if (lx_cur() == "*" && lx_peek(1) == "/") {
+                    lx_adv(); lx_adv();
+                    break;
+                }
+                lx_adv();
+            }
+        }
+        else { break; }
+    }
+}
+
+// 数字字面量：十进制、float（.5、科学计数）、long 后缀 L/l
+pub kimo lx_read_num() -> Token {
+    let start_line = lx_line;
+    let start_col = lx_col;
+    let text = "";
+    let is_float = 0;
+    let is_long = 0;
+    while (true) {
+        let c = lx_cur();
+        if (c >= "0" && c <= "9") { text = text + c; lx_adv(); }
+        else if (c == "." && lx_peek(1) >= "0" && lx_peek(1) <= "9") {
+            is_float = 1; text = text + c; lx_adv();
+        }
+        else { break; }
+    }
+    // 科学计数法：1e3, 1.0e-4, 2E10
+    let ce = lx_cur();
+    if (ce == "e" || ce == "E") {
+        let n1 = lx_peek(1);
+        let n2 = lx_peek(2);
+        let has_exp = 0;
+        if (n1 >= "0" && n1 <= "9") { has_exp = 1; }
+        else if ((n1 == "+" || n1 == "-") && n2 >= "0" && n2 <= "9") { has_exp = 1; }
+        if (has_exp == 1) {
+            is_float = 1;
+            text = text + lx_cur(); lx_adv();
+            let cs = lx_cur();
+            if (cs == "+" || cs == "-") { text = text + cs; lx_adv(); }
+            while (lx_cur() >= "0" && lx_cur() <= "9") { text = text + lx_cur(); lx_adv(); }
+        }
+    }
+    // long 后缀
+    let cl = lx_cur();
+    if (cl == "L" || cl == "l") { is_long = 1; lx_adv(); }
+    let kind = TOK_INT_LIT;
+    if (is_float == 1) { kind = TOK_FLOAT_LIT; }
+    else if (is_long == 1) { kind = TOK_LONG_LIT; }
+    return Token { kind: kind, text: text, line: start_line, col: start_col,
+                   end_line: lx_line, end_col: lx_col };
+}
+
+// 标识符/关键字
+pub kimo lx_read_id() -> Token {
+    let start_line = lx_line;
+    let start_col = lx_col;
+    let text = "";
+    while (true) {
+        let c = lx_cur();
+        if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") ||
+            (c >= "0" && c <= "9") || c == "_") {
+            text = text + c;
+            lx_adv();
+        } else { break; }
+    }
+    let kind = TOK_IDENT;
+    let k0 = TOK_KIMO;
+    if (str_eq(text, "kimo") == 1) { kind = k0; }
+    else if (str_eq(text, "let") == 1) { kind = TOK_LET; }
+    else if (str_eq(text, "if") == 1) { kind = TOK_IF; }
+    else if (str_eq(text, "else") == 1) { kind = TOK_ELSE; }
+    else if (str_eq(text, "while") == 1) { kind = TOK_WHILE; }
+    else if (str_eq(text, "for") == 1) { kind = TOK_FOR; }
+    else if (str_eq(text, "return") == 1) { kind = TOK_RETURN; }
+    else if (str_eq(text, "break") == 1) { kind = TOK_BREAK; }
+    else if (str_eq(text, "continue") == 1) { kind = TOK_CONTINUE; }
+    else if (str_eq(text, "true") == 1) { kind = TOK_TRUE; }
+    else if (str_eq(text, "false") == 1) { kind = TOK_FALSE; }
+    else if (str_eq(text, "as") == 1) { kind = TOK_AS; }
+    else if (str_eq(text, "struct") == 1) { kind = TOK_STRUCT; }
+    else if (str_eq(text, "enum") == 1) { kind = TOK_ENUM; }
+    else if (str_eq(text, "import") == 1) { kind = TOK_IMPORT; }
+    else if (str_eq(text, "pub") == 1) { kind = TOK_PUB; }
+    else if (str_eq(text, "in") == 1) { kind = TOK_IN; }
+    else if (str_eq(text, "type") == 1) { kind = TOK_TYPE; }
+    else if (str_eq(text, "null") == 1) { kind = TOK_NULL; }
+    else if (str_eq(text, "int") == 1) { kind = TOK_INT_TY; }
+    else if (str_eq(text, "long") == 1) { kind = TOK_LONG_TY; }
+    else if (str_eq(text, "float") == 1) { kind = TOK_FLOAT_TY; }
+    else if (str_eq(text, "double") == 1) { kind = TOK_DOUBLE_TY; }
+    else if (str_eq(text, "bool") == 1) { kind = TOK_BOOL_TY; }
+    else if (str_eq(text, "string") == 1) { kind = TOK_STRING_TY; }
+    else if (str_eq(text, "void") == 1) { kind = TOK_VOID_TY; }
+    else if (str_eq(text, "any") == 1) { kind = TOK_ANY_TY; }
+    else if (str_eq(text, "char") == 1) { kind = TOK_CHAR_TY; }
+    else if (str_eq(text, "short") == 1) { kind = TOK_SHORT_TY; }
+    else if (str_eq(text, "match") == 1) { kind = TOK_MATCH; }
+    else if (str_eq(text, "new") == 1) { kind = TOK_NEW; }
+    else if (str_eq(text, "mut") == 1) { kind = TOK_MUT; }
+    else if (str_eq(text, "impl") == 1) { kind = TOK_IMPL; }
+    else if (str_eq(text, "try") == 1) { kind = TOK_TRY; }
+    else if (str_eq(text, "catch") == 1) { kind = TOK_CATCH; }
+    else if (str_eq(text, "throw") == 1) { kind = TOK_THROW; }
+    else if (str_eq(text, "panic") == 1) { kind = TOK_PANIC; }
+    else if (str_eq(text, "macro") == 1) { kind = TOK_MACRO; }
+    // 预留关键字
+    else if (str_eq(text, "async") == 1) { kind = TOK_ASYNC; }
+    else if (str_eq(text, "await") == 1) { kind = TOK_AWAIT; }
+    else if (str_eq(text, "spawn") == 1) { kind = TOK_SPAWN; }
+    else if (str_eq(text, "yield") == 1) { kind = TOK_YIELD; }
+    else if (str_eq(text, "trait") == 1) { kind = TOK_TRAIT; }
+    else if (str_eq(text, "interface") == 1) { kind = TOK_INTERFACE; }
+    else if (str_eq(text, "do") == 1) { kind = TOK_DO; }
+    // set 已解锁为普通标识符（支持 set<T> 语法），不作为关键字
+    // 时间类型关键字
+    else if (str_eq(text, "date") == 1) { kind = TOK_DATE_TY; }
+    else if (str_eq(text, "timestamp") == 1) { kind = TOK_TIMESTAMP_TY; }
+    else if (str_eq(text, "nanotimestamp") == 1) { kind = TOK_NANOTIMESTAMP_TY; }
+    else if (str_eq(text, "opaque") == 1) { kind = TOK_OPAQUE_TY; }
+    // with / dsb / defer
+    else if (str_eq(text, "with") == 1) { kind = TOK_WITH; }
+    else if (str_eq(text, "dsb") == 1) { kind = TOK_DSB; }
+    else if (str_eq(text, "defer") == 1) { kind = TOK_DEFER; }
+    return Token { kind: kind, text: text, line: start_line, col: start_col,
+                   end_line: lx_line, end_col: lx_col };
+}
+
+// 字符串字面量（含转义）
+pub kimo lx_read_str() -> Token {
+    let start_line = lx_line;
+    let start_col = lx_col;
+    lx_adv();  // 跳过开头 "
+    let text = "";
+    while (true) {
+        let c = lx_cur();
+        if (c == "" || c == "\"") {
+            if (c == "\"") { lx_adv(); }
+            break;
+        }
+        if (c == "\\") {
+            lx_adv();
+            let esc = lx_cur();
+            if (esc == "n") { text = text + "\n"; }
+            else if (esc == "t") { text = text + "\t"; }
+            else if (esc == "r") { text = text + "\r"; }
+            else if (esc == "\\") { text = text + "\\"; }
+            else if (esc == "\"") { text = text + "\""; }
+            else if (esc == "0") { text = text + "\0"; }
+            else { text = text + esc; }
+            lx_adv();
+        } else {
+            text = text + c;
+            lx_adv();
+        }
+    }
+    return Token { kind: TOK_STRING_LIT, text: text, line: start_line, col: start_col,
+                   end_line: lx_line, end_col: lx_col };
+}
+
+// 字符字面量（含转义）
+pub kimo lx_read_char() -> Token {
+    let start_line = lx_line;
+    let start_col = lx_col;
+    lx_adv();  // 跳过开头 '
+    let text = "";
+    let ch = lx_cur();
+    if (ch == "\\") {
+        lx_adv();
+        let esc = lx_cur();
+        if (esc == "n") { text = "\n"; }
+        else if (esc == "t") { text = "\t"; }
+        else if (esc == "r") { text = "\r"; }
+        else if (esc == "\\") { text = "\\"; }
+        else if (esc == "'") { text = "'"; }
+        else if (esc == "0") { text = "\0"; }
+        else { text = esc; }
+        lx_adv();
+    } else {
+        text = ch;
+        lx_adv();
+    }
+    if (lx_cur() == "'") { lx_adv(); }
+    return Token { kind: TOK_CHAR_LIT, text: text, line: start_line, col: start_col,
+                   end_line: lx_line, end_col: lx_col };
+}
+
+// 完整 tokenize：源码 → array<Token>
+pub kimo tokenize(source: string, file: string) -> array<Token> {
+    return tokenize_with_offset(source, file, 1);
+}
+
+// 带行号偏移的 tokenize（用于拼接多个文件时保持行号）
+pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) -> array<Token> {
+    lx_src = source;
+    lx_len = len(source);   // ⚡ 只算一次 strlen，热路径不再全扫（见 lx_ctab 说明）
+    lx_ctab_init();
+    lx_pos = 0;
+    lx_line = line_offset;
+    lx_col = 1;
+    let tokens: array<Token> = [];
+
+    while (true) {
+        lx_skip_ws();
+        let c = lx_cur();
+        if (c == "") { break; }
+
+        if (c >= "0" && c <= "9") {
+            tokens = array_push(tokens, lx_read_num());
+        }
+        // `.digit` 仅在表达式起始位置（前一 token 非值/右括号）才作 float 字面量
+        // 在 `t.0`（前一 IDENT）或 `foo().0`（前一 RPAREN）中 `.` 必须是 TOK_DOT
+        else if (c == "." && lx_peek(1) >= "0" && lx_peek(1) <= "9") {
+            let prev_is_value = 0;
+            let n_toks = len(tokens);
+            if (n_toks > 0) {
+                // 宿主不支持 (expr as T).field 连写，须经中间变量
+                let prev_tok = tokens[n_toks - 1] as Token;
+                let pk = prev_tok.kind;
+                let v1 = TOK_IDENT;
+                let v2 = TOK_RPAREN;
+                let v3 = TOK_RBRACKET;
+                let v4 = TOK_INT_LIT;
+                let v5 = TOK_LONG_LIT;
+                let v6 = TOK_FLOAT_LIT;
+                let v7 = TOK_STRING_LIT;
+                let v8 = TOK_CHAR_LIT;
+                if (pk == v1 || pk == v2 || pk == v3 || pk == v4 ||
+                    pk == v5 || pk == v6 || pk == v7 || pk == v8) {
+                    prev_is_value = 1;
+                }
+            }
+            if (prev_is_value == 1) {
+                lx_adv();
+                tokens = array_push(tokens, lx_make_tok(TOK_DOT, "."));
+            } else {
+                tokens = array_push(tokens, lx_read_num());
+            }
+        }
+        else if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_") {
+            tokens = array_push(tokens, lx_read_id());
+        }
+        else if (c == "\"") {
+            tokens = array_push(tokens, lx_read_str());
+        }
+        else if (c == "'") {
+            tokens = array_push(tokens, lx_read_char());
+        }
+        else if (c == "+") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PLUSEQ, "+=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_PLUS, "+")); }
+        }
+        else if (c == "-") {
+            lx_adv();
+            if (lx_cur() == ">") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_ARROW, "->")); }
+            else if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_MINUSEQ, "-=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_MINUS, "-")); }
+        }
+        else if (c == "*") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_STAREQ, "*=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_STAR, "*")); }
+        }
+        else if (c == "/") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SLASHEQ, "/=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_SLASH, "/")); }
+        }
+        else if (c == "%") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PERCENT, "%")); }
+        else if (c == "=") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_EQEQ, "==")); }
+            else if (lx_cur() == ">") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_FATARROW, "=>")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_EQ, "=")); }
+        }
+        else if (c == "!") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_BANGEQ, "!=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_BANG, "!")); }
+        }
+        else if (c == "<") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LE, "<=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_LT, "<")); }
+        }
+        else if (c == ">") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_GE, ">=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_GT, ">")); }
+        }
+        else if (c == "&") {
+            lx_adv();
+            if (lx_cur() == "&") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_AND, "&&")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_AND, "&")); }
+        }
+        else if (c == "|") {
+            lx_adv();
+            if (lx_cur() == "|") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_OR, "||")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_OR, "|")); }
+        }
+        else if (c == "(") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LPAREN, "(")); }
+        else if (c == ")") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_RPAREN, ")")); }
+        else if (c == "{") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LBRACE, "{")); }
+        else if (c == "}") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_RBRACE, "}")); }
+        else if (c == "[") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LBRACKET, "[")); }
+        else if (c == "]") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_RBRACKET, "]")); }
+        else if (c == ",") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_COMMA, ",")); }
+        else if (c == ":") {
+            lx_adv();
+            if (lx_cur() == ":") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_COLONCOLON, "::")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_COLON, ":")); }
+        }
+        else if (c == ";") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SEMICOLON, ";")); }
+        else if (c == "@") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_AT, "@")); }
+        else if (c == ".") {
+            lx_adv();
+            // range 字面量 `..`（半开区间 a..b）
+            if (lx_cur() == ".") {
+                lx_adv();
+                // 可变参数 `...`
+                if (lx_cur() == ".") {
+                    lx_adv();
+                    tokens = array_push(tokens, lx_make_tok(TOK_ELLIPSIS, "..."));
+                } else {
+                    tokens = array_push(tokens, lx_make_tok(TOK_RANGE, ".."));
+                }
+            } else {
+                tokens = array_push(tokens, lx_make_tok(TOK_DOT, "."));
+            }
+        }
+        // 错误传播 `?`
+        else if (c == "?") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_QUESTION, "?")); }
+        else { lx_adv(); }
+    }
+
+    tokens = array_push(tokens, lx_make_tok(TOK_EOF, ""));
+    return tokens;
+}

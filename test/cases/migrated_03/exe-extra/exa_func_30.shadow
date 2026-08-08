@@ -1,0 +1,14 @@
+//@desc: exe-extra generated case (exa_func_30)
+//@expect: 2
+//@expect: 3
+//@expect: -1
+dsb exa_func_30;
+kimo mul(a: int, b: int) -> int { return a * b; }
+kimo add(a: int, b: int) -> int { return a + b; }
+kimo sub(a: int, b: int) -> int { return a - b; }
+kimo main() -> int {
+    println(mul(1, 2));
+    println(add(1, 2));
+    println(sub(1, 2));
+    return 0;
+}

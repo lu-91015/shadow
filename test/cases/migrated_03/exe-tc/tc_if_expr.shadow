@@ -1,0 +1,8 @@
+//@expect: 50
+//@ desc: if-expression type checks correctly
+dsb tc_if_expr;
+kimo main() -> int {
+    let x = if (1 == 1) { 10 } else { 20 };
+    let y = if (0 == 1) { 30 } else { 40 };
+    println(x + y); return 0;
+}

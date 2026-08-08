@@ -1,0 +1,8 @@
+//@expect: 20
+//@desc: match-expression emits icmp eq per arm
+dsb cg_match_expr;
+kimo main() -> int {
+    let x = 2;
+    let r = match x { 1 => 10, 2 => 20, 3 => 30 };
+    println(r); return 0;
+}

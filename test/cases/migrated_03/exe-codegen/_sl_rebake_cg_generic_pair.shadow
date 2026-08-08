@@ -1,0 +1,11 @@
+dsb _sl_rebake_cg_generic_pair;
+
+struct Pair<T, U> { first: T, second: U }
+kimo get_first(p: Pair) -> any { return p.first; }
+kimo get_second(p: Pair) -> any { return p.second; }
+kimo main() -> int {
+    let p = Pair { first: 10, second: 20 };
+    let a = get_first(p);
+    let b = get_second(p);
+    println(a); return 0;
+}

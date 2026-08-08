@@ -1,0 +1,10 @@
+//@expect: 99
+//@desc: assign into a nested array via a bound row variable type-checks
+dsb tc_nested_array_assign;
+kimo main() -> int {
+    let m = [[1, 2], [3, 4]];
+    let row = m[0];
+    row[1] = 99;
+    let v = row[1];
+    println(v); return 0;
+}

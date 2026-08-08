@@ -1,0 +1,1652 @@
+// Shadow 0.4 — MIR 管道（HIR → MIR：线性指令 + 显式基本块）
+// ============================================================
+// 将 HIR 树状结构 lower 为线性指令序列，控制流显式化为基本块。
+// 每个函数生成若干 MirBlock，每个块以 br/condbr/ret 终止。
+//
+// 与 0.3 的差异（0.4 架构）：
+//   - 无 typemap：指令类型直接读 h.inferred_type（0 as Type = 无）
+//   - 无 any 盒子：children/args 全具体类型
+//   - 无 payload enum 变体（Red）已在 TC 改写为 EXPR_INT；此处 EXPR_VAR
+//     仅处理 TYPE_ENUM_PAYLOAD 的无负载变体（None）→ MIR_ENUM_CONSTRUCT
+dsb mir;
+
+// MIR builder 全局状态（每次 mir_lower_func 重置）
+let mir_blocks: array<MirBlock> = [];
+let mir_cur_label: string = "";
+let mir_cur_insts: array<MirInst> = [];
+let mir_cur_terminator: MirInst = 0 as MirInst;
+let mir_n_regs: int = 0;
+let mir_label_counter: int = 0;
+let mir_loop_break_labels: array<string> = [];
+let mir_loop_continue_labels: array<string> = [];
+let mir_n_slots: int = 0;
+
+// 检查是否已有终止符
+pub kimo mir_has_terminator() -> int {
+    if ((mir_cur_terminator as any) == 0) { return 0; }
+    return 1;
+}
+
+pub kimo mir_new_reg() -> int {
+    let r = mir_n_regs;
+    mir_n_regs = mir_n_regs + 1;
+    return r;
+}
+
+pub kimo mir_new_label() -> string {
+    let l = "bb" + int_to_str(mir_label_counter);
+    mir_label_counter = mir_label_counter + 1;
+    return l;
+}
+
+pub kimo mir_mk(op: int) -> MirInst {
+    let i = MirInst { op: op, ty: 0 as Type, dst: -1, arg1: -1, arg2: -1,
+                      longval: 0, floatval: 0.0, strval: "", strval2: "", args: [] };
+    return i;
+}
+
+pub kimo mir_type_of_hir_expr(h: HirExpr) -> Type {
+    return h.inferred_type;
+}
+
+// 封存当前块，开始新块
+pub kimo mir_seal_and_begin(new_label: string) -> void {
+    let blk = MirBlock { label: mir_cur_label, insts: mir_cur_insts, terminator: mir_cur_terminator };
+    mir_blocks = array_push(mir_blocks, blk);
+    mir_cur_label = new_label;
+    mir_cur_insts = [];
+    mir_cur_terminator = 0 as MirInst;
+}
+
+// 仅封存当前块（用于函数末尾）
+pub kimo mir_seal_last() -> void {
+    let blk = MirBlock { label: mir_cur_label, insts: mir_cur_insts, terminator: mir_cur_terminator };
+    mir_blocks = array_push(mir_blocks, blk);
+    mir_cur_insts = [];
+    mir_cur_terminator = 0 as MirInst;
+}
+
+// 发射指令（当前块已有终止符则丢弃不可达代码）
+pub kimo mir_emit(inst: MirInst) -> void {
+    if (mir_has_terminator() == 1) { return; }
+    mir_cur_insts = array_push(mir_cur_insts, inst);
+}
+
+// 设置终止符
+pub kimo mir_set_term(inst: MirInst) -> void {
+    if (mir_has_terminator() == 1) { return; }
+    mir_cur_terminator = inst;
+}
+
+// 无条件跳转（便捷封装）
+pub kimo mir_emit_br(target: string) -> void {
+    let br = mir_mk(MIR_BR);
+    br.strval = target;
+    mir_set_term(br);
+}
+
+// 推入/弹出 loop 上下文
+pub kimo mir_push_loop(brk: string, cont: string) -> void {
+    mir_loop_break_labels = array_push(mir_loop_break_labels, brk);
+    mir_loop_continue_labels = array_push(mir_loop_continue_labels, cont);
+}
+
+pub kimo mir_pop_loop() -> void {
+    let n = len(mir_loop_break_labels);
+    let new_brk: array<string> = [];
+    let new_cont: array<string> = [];
+    let i = 0;
+    while (i < n - 1) {
+        new_brk = array_push(new_brk, mir_loop_break_labels[i]);
+        new_cont = array_push(new_cont, mir_loop_continue_labels[i]);
+        i = i + 1;
+    }
+    mir_loop_break_labels = new_brk;
+    mir_loop_continue_labels = new_cont;
+}
+
+// --- 表达式 lowering：返回结果寄存器编号 ---
+pub kimo mir_lower_expr(h: HirExpr) -> int {
+    let k = h.kind;
+
+    if (k == EXPR_INT || k == EXPR_LONG || k == EXPR_BOOL) {
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CONST_INT);
+        inst.dst = r;
+        // ⚠️ long 常量不可 cast int（截断）：1000000000000L 会溢出。longval 字段是 long（64 位），直接存。
+        inst.longval = h.intval;
+        inst.ty = h.inferred_type;
+        // 兜底：inferred_type 未填（缓存跳过 TC 的字面量）→ int，避免 cg 生成 i0 非法类型。
+        if ((inst.ty as any) == 0) {
+            if (k == EXPR_LONG) { inst.ty = mk_type(TYPE_LONG); }
+            else { inst.ty = mk_type(TYPE_INT); }
+        }
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_FLOAT) {
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CONST_FLOAT);
+        inst.dst = r;
+        inst.floatval = h.floatval;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_STRING) {
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CONST_STR);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_NULL) {
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CONST_NULL);
+        inst.dst = r;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_VAR) {
+        // 无负载 payload-enum 变体（如 None）：slot<0 且类型为 TYPE_ENUM_PAYLOAD
+        // → 构造无负载 AnyBox（h.intval = 变体索引）
+        let hty = h.inferred_type;
+        let is_enum_ctor = 0;
+        if ((hty as any) != 0) {
+            if (hty.kind == TYPE_ENUM_PAYLOAD && h.slot < 0) {
+                is_enum_ctor = 1;
+            }
+        }
+        if (is_enum_ctor == 1) {
+            let r = mir_new_reg();
+            let inst = mir_mk(MIR_ENUM_CONSTRUCT);
+            inst.dst = r;
+            inst.longval = h.intval;
+            inst.strval = h.str1;
+            inst.args = [];
+            inst.ty = hty;
+            mir_emit(inst);
+            return r;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_LOAD_VAR);
+        inst.dst = r;
+        inst.arg1 = h.slot;
+        inst.strval = h.str1;  // 变量名，供全局引用（slot=-1）按名查找
+        inst.ty = hty;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_BINARY) {
+        let children = h.children;
+        // &&/|| 短路求值：去糖为 condbr 控制流
+        if (h.op == BIN_AND || h.op == BIN_OR) {
+            let tmp_slot = h.slot;
+            let sc_ty = h.inferred_type;
+            if ((sc_ty as any) == 0) { sc_ty = mk_type(TYPE_BOOL); }
+            let lhs_sc = mir_lower_expr(children[0]);
+            let rhs_label = mir_new_label();
+            let short_label = mir_new_label();
+            let merge_label = mir_new_label();
+
+            let condbr = mir_mk(MIR_CONDBR);
+            condbr.arg1 = lhs_sc;
+            if (h.op == BIN_AND) {
+                condbr.strval = rhs_label;
+                condbr.strval2 = short_label;
+            } else {
+                condbr.strval = short_label;
+                condbr.strval2 = rhs_label;
+            }
+            mir_set_term(condbr);
+
+            // rhs 块：求值 rhs 写入结果 slot
+            mir_seal_and_begin(rhs_label);
+            let rhs_sc = mir_lower_expr(children[1]);
+            let st_r = mir_mk(MIR_STORE_VAR);
+            st_r.arg1 = rhs_sc;
+            st_r.arg2 = tmp_slot;
+            st_r.ty = sc_ty;
+            mir_emit(st_r);
+            mir_emit_br(merge_label);
+
+            // short 块：写短路常量（&&: 0 / ||: 1）
+            mir_seal_and_begin(short_label);
+            let scr = mir_new_reg();
+            let scc = mir_mk(MIR_CONST_INT);
+            scc.dst = scr;
+            scc.longval = 0;
+            if (h.op == BIN_OR) { scc.longval = 1; }
+            scc.ty = sc_ty;
+            mir_emit(scc);
+            let st_s = mir_mk(MIR_STORE_VAR);
+            st_s.arg1 = scr;
+            st_s.arg2 = tmp_slot;
+            st_s.ty = sc_ty;
+            mir_emit(st_s);
+            mir_emit_br(merge_label);
+
+            // merge 块：load 结果
+            mir_seal_and_begin(merge_label);
+            let r_sc = mir_new_reg();
+            let ld_sc = mir_mk(MIR_LOAD_VAR);
+            ld_sc.dst = r_sc;
+            ld_sc.arg1 = tmp_slot;
+            ld_sc.ty = sc_ty;
+            mir_emit(ld_sc);
+            return r_sc;
+        }
+        let lhs = mir_lower_expr(children[0]);
+        let rhs = mir_lower_expr(children[1]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_BINOP);
+        inst.dst = r;
+        inst.arg1 = lhs;
+        inst.arg2 = rhs;
+        inst.longval = h.op;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_UNARY) {
+        let children = h.children;
+        let operand = mir_lower_expr(children[0]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_UNOP);
+        inst.dst = r;
+        inst.arg1 = operand;
+        inst.longval = h.op;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_CALL && h.op != -1) {
+        // enum 变体构造（如 Some(42)）：调用名是 enum 变体，h.intval = 变体索引
+        let callee_ty = h.inferred_type;
+        let is_enum_ctor = 0;
+        if ((callee_ty as any) != 0) {
+            let ct = callee_ty;
+            if (ct.kind == TYPE_ENUM_PAYLOAD && h.op >= 0) { is_enum_ctor = 1; }
+        }
+        if (is_enum_ctor == 1) {
+            let arg_regs: array<int> = [];
+            let args = h.children;
+            let i = 0;
+            while (i < len(args)) {
+                let ar = mir_lower_expr(args[i]);
+                arg_regs = array_push(arg_regs, ar);
+                i = i + 1;
+            }
+            let r = mir_new_reg();
+            let inst = mir_mk(MIR_ENUM_CONSTRUCT);
+            inst.dst = r;
+            inst.longval = h.intval as int;
+            inst.strval = h.str1;
+            inst.args = arg_regs;
+            inst.ty = callee_ty;
+            mir_emit(inst);
+            return r;
+        }
+        let arg_regs: array<int> = [];
+        let args = h.children;
+        let i = 0;
+        while (i < len(args)) {
+            let ar = mir_lower_expr(args[i]);
+            arg_regs = array_push(arg_regs, ar);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CALL);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.args = arg_regs;
+        inst.ty = callee_ty;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_CALL && h.op == -1) {
+        // 闭包间接调用：h.slot = 闭包变量 slot，h.inferred_type = 闭包类型
+        let closure_reg = mir_new_reg();
+        let load_inst = mir_mk(MIR_LOAD_VAR);
+        load_inst.dst = closure_reg;
+        load_inst.arg1 = h.slot;
+        load_inst.strval = h.str1;
+        load_inst.ty = mk_type(TYPE_FUNCTION);
+        mir_emit(load_inst);
+        let arg_regs: array<int> = [];
+        let args = h.children;
+        let i = 0;
+        while (i < len(args)) {
+            let ar = mir_lower_expr(args[i]);
+            arg_regs = array_push(arg_regs, ar);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CALL_INDIRECT);
+        inst.dst = r;
+        inst.arg1 = closure_reg;
+        inst.args = arg_regs;
+        inst.ty = h.inferred_type;  // 闭包类型（captured_count/param_types/ret_type）
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_CLOSURE) {
+        let cap_regs: array<int> = [];
+        let children = h.children;
+        let i = 0;
+        while (i < len(children)) {
+            let cr = mir_lower_expr(children[i]);
+            cap_regs = array_push(cap_regs, cr);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_MAKE_CLOSURE);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.args = cap_regs;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_CAST) {
+        let children = h.children;
+        let operand = mir_lower_expr(children[0]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_CAST);
+        inst.dst = r;
+        inst.arg1 = operand;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_INDEX) {
+        let children = h.children;
+        let arr = mir_lower_expr(children[0]);
+        let idx = mir_lower_expr(children[1]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_INDEX);
+        inst.dst = r;
+        inst.arg1 = arr;
+        inst.arg2 = idx;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_MEMBER) {
+        let children = h.children;
+        let obj = mir_lower_expr(children[0]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_MEMBER);
+        inst.dst = r;
+        inst.arg1 = obj;
+        inst.strval = h.str1;
+        inst.longval = h.intval as int;  // 字段索引
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_ARRAY_LIT) {
+        let elem_regs: array<int> = [];
+        let elems = h.children;
+        let i = 0;
+        while (i < len(elems)) {
+            let er = mir_lower_expr(elems[i]);
+            elem_regs = array_push(elem_regs, er);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_ARRAY_LIT);
+        inst.dst = r;
+        inst.args = elem_regs;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    if (k == EXPR_STRUCT_LIT) {
+        let field_regs: array<int> = [];
+        let fields = h.children;
+        let i = 0;
+        while (i < len(fields)) {
+            let fr = mir_lower_expr(fields[i]);
+            field_regs = array_push(field_regs, fr);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_STRUCT_LIT);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.args = field_regs;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    // 元组字面量 — 复用 MIR_STRUCT_LIT，strval 留空（"" 表示元组）
+    if (k == EXPR_TUPLE) {
+        let elem_regs: array<int> = [];
+        let elems = h.children;
+        let i = 0;
+        while (i < len(elems)) {
+            let er = mir_lower_expr(elems[i]);
+            elem_regs = array_push(elem_regs, er);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_STRUCT_LIT);
+        inst.dst = r;
+        inst.strval = "";
+        inst.args = elem_regs;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    // range 在非 for 上下文：防御性返回 0
+    if (k == EXPR_RANGE) {
+        let r = mir_new_reg();
+        let zc = mir_mk(MIR_CONST_INT);
+        zc.dst = r;
+        zc.longval = 0;
+        zc.ty = mk_type(TYPE_INT);
+        mir_emit(zc);
+        return r;
+    }
+
+    // spawn：nullary → TYPE_FUTURE；带参 → fn_ty（TYPE_FUNCTION）
+    if (k == EXPR_SPAWN) {
+        let arg_regs: array<int> = [];
+        let children = h.children;
+        let i = 0;
+        while (i < len(children)) {
+            let ar = mir_lower_expr(children[i]);
+            arg_regs = array_push(arg_regs, ar);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_SPAWN);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.args = arg_regs;
+        if (len(arg_regs) > 0) {
+            inst.ty = h.fn_ty;
+        } else {
+            inst.ty = mk_type(TYPE_FUTURE);
+        }
+        mir_emit(inst);
+        return r;
+    }
+
+    // await：降低 Future 表达式，发射 MIR_AWAIT 取值
+    if (k == EXPR_AWAIT) {
+        let children = h.children;
+        let fut_reg = mir_lower_expr(children[0]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_AWAIT);
+        inst.dst = r;
+        inst.arg1 = fut_reg;
+        inst.ty = mk_type(TYPE_ANY);
+        mir_emit(inst);
+        return r;
+    }
+
+    // new Type：分配零初始化 struct（h.intval = 字段数，TC 回填）
+    if (k == EXPR_NEW) {
+        let n_fields = h.intval as int;
+        let int_ty = mk_type(TYPE_INT);
+        let field_regs: array<int> = [];
+        let i = 0;
+        while (i < n_fields) {
+            let zr = mir_new_reg();
+            let z = mir_mk(MIR_CONST_INT);
+            z.dst = zr;
+            z.longval = 0;
+            z.ty = int_ty;
+            mir_emit(z);
+            field_regs = array_push(field_regs, zr);
+            i = i + 1;
+        }
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_STRUCT_LIT);
+        inst.dst = r;
+        inst.strval = h.str1;
+        inst.args = field_regs;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
+    // if 表达式：condbr → then/else 各写结果 slot → merge load
+    if (k == EXPR_IF) {
+        let children = h.children;
+        let tmp_slot = h.slot;
+        let cond = mir_lower_expr(children[0]);
+        let then_label = mir_new_label();
+        let else_label = mir_new_label();
+        let merge_label = mir_new_label();
+
+        let condbr = mir_mk(MIR_CONDBR);
+        condbr.arg1 = cond;
+        condbr.strval = then_label;
+        condbr.strval2 = else_label;
+        mir_set_term(condbr);
+
+        mir_seal_and_begin(then_label);
+        let then_val = mir_lower_expr(children[1]);
+        let st1 = mir_mk(MIR_STORE_VAR);
+        st1.arg1 = then_val;
+        st1.arg2 = tmp_slot;
+        st1.ty = h.inferred_type;
+        mir_emit(st1);
+        mir_emit_br(merge_label);
+
+        mir_seal_and_begin(else_label);
+        let else_val = -1;
+        if (len(children) > 2) {
+            else_val = mir_lower_expr(children[2]);
+        } else {
+            let z = mir_mk(MIR_CONST_INT);
+            let zr = mir_new_reg();
+            z.dst = zr;
+            z.longval = 0;
+            z.ty = h.inferred_type;
+            mir_emit(z);
+            else_val = zr;
+        }
+        let st2 = mir_mk(MIR_STORE_VAR);
+        st2.arg1 = else_val;
+        st2.arg2 = tmp_slot;
+        st2.ty = h.inferred_type;
+        mir_emit(st2);
+        mir_emit_br(merge_label);
+
+        mir_seal_and_begin(merge_label);
+        let r = mir_new_reg();
+        let ld = mir_mk(MIR_LOAD_VAR);
+        ld.dst = r;
+        ld.arg1 = tmp_slot;
+        ld.ty = h.inferred_type;
+        mir_emit(ld);
+        return r;
+    }
+
+    // match 表达式：children 布局 [0]=scrutinee, 之后交替 pat,body
+    if (k == EXPR_MATCH) {
+        let children = h.children;
+        let tmp_slot = h.slot;
+        let scrut = mir_lower_expr(children[0]);
+        let merge_label = mir_new_label();
+        let n = len(children);
+        let bool_ty = mk_type(TYPE_BOOL);
+        let i = 1;
+        while (i < n) {
+            let pat_h = children[i];
+            let body_h = children[i + 1];
+            let is_wild = 0;
+            if (pat_h.kind == EXPR_VAR && str_eq(pat_h.str1, "_") == 1) { is_wild = 1; }
+            if (is_wild == 1) {
+                let bvw = mir_lower_expr(body_h);
+                let stw = mir_mk(MIR_STORE_VAR);
+                stw.arg1 = bvw;
+                stw.arg2 = tmp_slot;
+                stw.ty = h.inferred_type;
+                mir_emit(stw);
+                mir_emit_br(merge_label);
+                i = n;
+            } else if (pat_h.kind == EXPR_ENUM_VARIANT) {
+                let variant_idx = pat_h.intval as int;
+                let tag_r = mir_new_reg();
+                let tag_inst = mir_mk(MIR_ENUM_GET_TAG);
+                tag_inst.dst = tag_r;
+                tag_inst.arg1 = scrut;
+                tag_inst.ty = mk_type(TYPE_INT);
+                mir_emit(tag_inst);
+                let vi_r = mir_new_reg();
+                let vi_inst = mir_mk(MIR_CONST_INT);
+                vi_inst.dst = vi_r;
+                vi_inst.longval = variant_idx;
+                vi_inst.ty = mk_type(TYPE_INT);
+                mir_emit(vi_inst);
+                let cmp_r = mir_new_reg();
+                let cmp = mir_mk(MIR_BINOP);
+                cmp.dst = cmp_r;
+                cmp.arg1 = tag_r;
+                cmp.arg2 = vi_r;
+                cmp.longval = BIN_EQ;
+                cmp.ty = bool_ty;
+                mir_emit(cmp);
+                let body_label = mir_new_label();
+                let next_label = mir_new_label();
+                let condbr = mir_mk(MIR_CONDBR);
+                condbr.arg1 = cmp_r;
+                condbr.strval = body_label;
+                condbr.strval2 = next_label;
+                mir_set_term(condbr);
+                // 命中臂：提取每个 payload 写入绑定 slot
+                mir_seal_and_begin(body_label);
+                let bind_children = pat_h.children;
+                let bi = 0;
+                while (bi < len(bind_children)) {
+                    let bh = bind_children[bi];
+                    let payload_r = mir_new_reg();
+                    let pl_inst = mir_mk(MIR_ENUM_GET_PAYLOAD);
+                    pl_inst.dst = payload_r;
+                    pl_inst.arg1 = scrut;
+                    pl_inst.longval = bh.intval;  // 负载索引
+                    pl_inst.arg2 = len(bind_children);  // 负载总数
+                    pl_inst.ty = bh.inferred_type;
+                    if ((pl_inst.ty as any) == 0) { pl_inst.ty = mk_type(TYPE_ANY); }
+                    mir_emit(pl_inst);
+                    let stb2 = mir_mk(MIR_STORE_VAR);
+                    stb2.arg1 = payload_r;
+                    stb2.arg2 = bh.slot;
+                    stb2.ty = pl_inst.ty;
+                    mir_emit(stb2);
+                    bi = bi + 1;
+                }
+                let bv = mir_lower_expr(body_h);
+                let stb = mir_mk(MIR_STORE_VAR);
+                stb.arg1 = bv;
+                stb.arg2 = tmp_slot;
+                stb.ty = h.inferred_type;
+                mir_emit(stb);
+                mir_emit_br(merge_label);
+                mir_seal_and_begin(next_label);
+            } else {
+                // 无负载变体名（None）或字面量模式
+                let pat_ty = pat_h.inferred_type;
+                let is_no_payload_variant = 0;
+                let variant_idx_np = 0;
+                if ((pat_ty as any) != 0) {
+                    if (pat_ty.kind == TYPE_ENUM_PAYLOAD && pat_h.slot < 0) {
+                        is_no_payload_variant = 1;
+                        variant_idx_np = pat_h.intval as int;
+                    }
+                }
+                if (is_no_payload_variant == 1) {
+                    let tag_r = mir_new_reg();
+                    let tag_inst = mir_mk(MIR_ENUM_GET_TAG);
+                    tag_inst.dst = tag_r;
+                    tag_inst.arg1 = scrut;
+                    tag_inst.ty = mk_type(TYPE_INT);
+                    mir_emit(tag_inst);
+                    let vi_r = mir_new_reg();
+                    let vi_inst = mir_mk(MIR_CONST_INT);
+                    vi_inst.dst = vi_r;
+                    vi_inst.longval = variant_idx_np;
+                    vi_inst.ty = mk_type(TYPE_INT);
+                    mir_emit(vi_inst);
+                    let cmp_r = mir_new_reg();
+                    let cmp = mir_mk(MIR_BINOP);
+                    cmp.dst = cmp_r;
+                    cmp.arg1 = tag_r;
+                    cmp.arg2 = vi_r;
+                    cmp.longval = BIN_EQ;
+                    cmp.ty = bool_ty;
+                    mir_emit(cmp);
+                    let body_label = mir_new_label();
+                    let next_label = mir_new_label();
+                    let condbr = mir_mk(MIR_CONDBR);
+                    condbr.arg1 = cmp_r;
+                    condbr.strval = body_label;
+                    condbr.strval2 = next_label;
+                    mir_set_term(condbr);
+                    mir_seal_and_begin(body_label);
+                    let bv = mir_lower_expr(body_h);
+                    let stb = mir_mk(MIR_STORE_VAR);
+                    stb.arg1 = bv;
+                    stb.arg2 = tmp_slot;
+                    stb.ty = h.inferred_type;
+                    mir_emit(stb);
+                    mir_emit_br(merge_label);
+                    mir_seal_and_begin(next_label);
+                } else {
+                    let pv = mir_lower_expr(pat_h);
+                    let cmp_r = mir_new_reg();
+                    let cmp = mir_mk(MIR_BINOP);
+                    cmp.dst = cmp_r;
+                    cmp.arg1 = scrut;
+                    cmp.arg2 = pv;
+                    cmp.longval = BIN_EQ;
+                    cmp.ty = bool_ty;
+                    mir_emit(cmp);
+                    let body_label = mir_new_label();
+                    let next_label = mir_new_label();
+                    let condbr = mir_mk(MIR_CONDBR);
+                    condbr.arg1 = cmp_r;
+                    condbr.strval = body_label;
+                    condbr.strval2 = next_label;
+                    mir_set_term(condbr);
+                    mir_seal_and_begin(body_label);
+                    let bv = mir_lower_expr(body_h);
+                    let stb = mir_mk(MIR_STORE_VAR);
+                    stb.arg1 = bv;
+                    stb.arg2 = tmp_slot;
+                    stb.ty = h.inferred_type;
+                    mir_emit(stb);
+                    mir_emit_br(merge_label);
+                    mir_seal_and_begin(next_label);
+                }
+            }
+            i = i + 2;
+        }
+        // 全不匹配兜底：写 0（当前块已终止则自动丢弃）
+        let z = mir_mk(MIR_CONST_INT);
+        let zr = mir_new_reg();
+        z.dst = zr;
+        z.longval = 0;
+        z.ty = h.inferred_type;
+        mir_emit(z);
+        let stz = mir_mk(MIR_STORE_VAR);
+        stz.arg1 = zr;
+        stz.arg2 = tmp_slot;
+        stz.ty = h.inferred_type;
+        mir_emit(stz);
+        mir_emit_br(merge_label);
+        mir_seal_and_begin(merge_label);
+        let mr = mir_new_reg();
+        let mld = mir_mk(MIR_LOAD_VAR);
+        mld.dst = mr;
+        mld.arg1 = tmp_slot;
+        mld.ty = h.inferred_type;
+        mir_emit(mld);
+        return mr;
+    }
+
+    // `?` 错误传播：unwrap-or-throw
+    //   h.children[0] = inner；h.inferred_type = 解包类型 A（TC 推导）
+    //   h.op = 错误变体索引（1）；h.str1 = 枚举名（"Result"/"Option"）
+    if (k == EXPR_QUESTION) {
+        let inner_r = mir_lower_expr(h.children[0]);
+        // 立即备份 inner_r：GET_PAYLOAD 在 mir_seal_and_begin(ok_label) 之后才用。
+        // 0.4 编译器自身编译 mir.shadow 时，局部 int 跨多次函数调用（mir_mk/mir_emit/
+        // mir_seal_and_begin）存在 slot 被覆盖的风险（实测 GET_PAYLOAD.arg1 从正确值
+        // 变成后续寄存器号 1 → cg_get_reg 未设置 → IR `<null operand!>` → llc 崩溃）。
+        let inner_r_keep = inner_r;
+        if (file_exists("build/.qdbg") == 1) {
+            let k0 = -999;
+            if ((h.children[0] as any) != 0) { k0 = h.children[0].kind; }
+            println("DBG question inner_r=" + int_to_str(inner_r) + " nchild=" + int_to_str(len(h.children)) + " kind0=" + int_to_str(k0));
+        }
+        let a_ty = h.inferred_type;
+        if ((a_ty as any) == 0) { a_ty = mk_type(TYPE_ANY); }
+        let bool_ty = mk_type(TYPE_BOOL);
+        let tag_r = mir_new_reg();
+        let tag_inst = mir_mk(MIR_ENUM_GET_TAG);
+        tag_inst.dst = tag_r;
+        tag_inst.arg1 = inner_r_keep;
+        tag_inst.ty = mk_type(TYPE_INT);
+        mir_emit(tag_inst);
+        let vi_r = mir_new_reg();
+        let vi_inst = mir_mk(MIR_CONST_INT);
+        vi_inst.dst = vi_r;
+        vi_inst.longval = h.op;
+        vi_inst.ty = mk_type(TYPE_INT);
+        mir_emit(vi_inst);
+        let cmp_r = mir_new_reg();
+        let cmp = mir_mk(MIR_BINOP);
+        cmp.dst = cmp_r;
+        cmp.arg1 = tag_r;
+        cmp.arg2 = vi_r;
+        cmp.longval = BIN_EQ;
+        cmp.ty = bool_ty;
+        mir_emit(cmp);
+        let ok_label = mir_new_label();
+        let err_label = mir_new_label();
+        let merge_label = mir_new_label();
+        let condbr = mir_mk(MIR_CONDBR);
+        condbr.arg1 = cmp_r;
+        condbr.strval = err_label;
+        condbr.strval2 = ok_label;
+        mir_set_term(condbr);
+        // 错误臂：rt_throw_str(msg) + ret
+        mir_seal_and_begin(err_label);
+        let msg_r = mir_new_reg();
+        let msg_inst = mir_mk(MIR_CONST_STR);
+        msg_inst.dst = msg_r;
+        if (str_eq(h.str1, "Option") == 1) {
+            msg_inst.strval = "error: '?' used on None value";
+        } else {
+            msg_inst.strval = "error: '?' used on Err value";
+        }
+        msg_inst.ty = mk_type(TYPE_STRING);
+        mir_emit(msg_inst);
+        let thr = mir_mk(MIR_CALL);
+        thr.strval = "rt_throw_str";
+        thr.args = array_push([], msg_r);
+        thr.ty = mk_type(TYPE_VOID);
+        mir_emit(thr);
+        let ret_inst = mir_mk(MIR_RET);
+        ret_inst.arg1 = -1;
+        mir_set_term(ret_inst);
+        // OK 臂：提取 payload(A)
+        mir_seal_and_begin(ok_label);
+        let pv_r = mir_new_reg();
+        let pl = mir_mk(MIR_ENUM_GET_PAYLOAD);
+        pl.dst = pv_r;
+        pl.arg1 = inner_r_keep;
+        pl.longval = 0;
+        pl.ty = a_ty;
+        mir_emit(pl);
+        mir_emit_br(merge_label);
+        mir_seal_and_begin(merge_label);
+        return pv_r;
+    }
+
+    // 未知表达式种类
+    return -1;
+}
+
+
+// --- 语句 lowering ---
+pub kimo mir_lower_stmt(h: HirStmt) -> void {
+    let k = h.kind;
+
+    if (k == STMT_LET) {
+        if ((h.child as any) != 0) {
+            let rhs_reg = mir_lower_expr(h.child);
+            let inst = mir_mk(MIR_STORE_VAR);
+            inst.arg1 = rhs_reg;
+            inst.arg2 = h.slot;
+            inst.ty = h.inferred_type;
+            mir_emit(inst);
+        }
+        return;
+    }
+
+    if (k == STMT_EXPR) {
+        if ((h.child as any) != 0) {
+            mir_lower_expr(h.child);
+        }
+        return;
+    }
+
+    if (k == STMT_RETURN) {
+        if ((h.child as any) != 0) {
+            let r = mir_lower_expr(h.child);
+            let inst = mir_mk(MIR_RET);
+            inst.arg1 = r;
+            mir_set_term(inst);
+        } else {
+            let inst = mir_mk(MIR_RET);
+            inst.arg1 = -1;
+            mir_set_term(inst);
+        }
+        return;
+    }
+
+    if (k == STMT_IF) {
+        let cond_reg = mir_lower_expr(h.child);
+        let then_label = mir_new_label();
+        let else_label = mir_new_label();
+        let merge_label = mir_new_label();
+
+        let condbr = mir_mk(MIR_CONDBR);
+        condbr.arg1 = cond_reg;
+        condbr.strval = then_label;
+        condbr.strval2 = else_label;
+        mir_set_term(condbr);
+
+        mir_seal_and_begin(then_label);
+        let then_body = h.body;
+        let i = 0;
+        while (i < len(then_body)) {
+            mir_lower_stmt(then_body[i]);
+            i = i + 1;
+        }
+        mir_emit_br(merge_label);
+
+        mir_seal_and_begin(else_label);
+        let else_body = h.else_body;
+        let j = 0;
+        while (j < len(else_body)) {
+            mir_lower_stmt(else_body[j]);
+            j = j + 1;
+        }
+        mir_emit_br(merge_label);
+
+        mir_seal_and_begin(merge_label);
+        return;
+    }
+
+    // 语句级 match（含 enum 解构臂）：镜像 EXPR_MATCH 控制流，臂体是语句块
+    if (k == STMT_MATCH) {
+        let scrut = mir_lower_expr(h.child);
+        let merge_label = mir_new_label();
+        let pats = h.pats;
+        let blocks = h.arm_blocks;
+        let bool_ty = mk_type(TYPE_BOOL);
+        let n = len(pats);
+        let i = 0;
+        while (i < n) {
+            let pat_h = pats[i];
+            let blk = blocks[i];
+            let is_wild = 0;
+            if (pat_h.kind == EXPR_VAR && str_eq(pat_h.str1, "_") == 1) { is_wild = 1; }
+            if (is_wild == 1) {
+                let wj = 0;
+                while (wj < len(blk.stmts)) {
+                    mir_lower_stmt(blk.stmts[wj]);
+                    wj = wj + 1;
+                }
+                mir_emit_br(merge_label);
+                i = n;
+            } else if (pat_h.kind == EXPR_ENUM_VARIANT) {
+                let variant_idx = pat_h.intval as int;
+                let tag_r = mir_new_reg();
+                let tag_inst = mir_mk(MIR_ENUM_GET_TAG);
+                tag_inst.dst = tag_r;
+                tag_inst.arg1 = scrut;
+                tag_inst.ty = mk_type(TYPE_INT);
+                mir_emit(tag_inst);
+                let vi_r = mir_new_reg();
+                let vi_inst = mir_mk(MIR_CONST_INT);
+                vi_inst.dst = vi_r;
+                vi_inst.longval = variant_idx;
+                vi_inst.ty = mk_type(TYPE_INT);
+                mir_emit(vi_inst);
+                let cmp_r = mir_new_reg();
+                let cmp = mir_mk(MIR_BINOP);
+                cmp.dst = cmp_r;
+                cmp.arg1 = tag_r;
+                cmp.arg2 = vi_r;
+                cmp.longval = BIN_EQ;
+                cmp.ty = bool_ty;
+                mir_emit(cmp);
+                let body_label = mir_new_label();
+                let next_label = mir_new_label();
+                let condbr = mir_mk(MIR_CONDBR);
+                condbr.arg1 = cmp_r;
+                condbr.strval = body_label;
+                condbr.strval2 = next_label;
+                mir_set_term(condbr);
+                // 命中臂：提取 payload 写入绑定 slot，再执行臂块
+                mir_seal_and_begin(body_label);
+                let bind_children = pat_h.children;
+                let bi = 0;
+                while (bi < len(bind_children)) {
+                    let bh = bind_children[bi];
+                    let payload_r = mir_new_reg();
+                    let pl_inst = mir_mk(MIR_ENUM_GET_PAYLOAD);
+                    pl_inst.dst = payload_r;
+                    pl_inst.arg1 = scrut;
+                    pl_inst.longval = bh.intval;
+                    pl_inst.arg2 = len(bind_children);
+                    pl_inst.ty = bh.inferred_type;
+                    if ((pl_inst.ty as any) == 0) { pl_inst.ty = mk_type(TYPE_ANY); }
+                    mir_emit(pl_inst);
+                    let stb2 = mir_mk(MIR_STORE_VAR);
+                    stb2.arg1 = payload_r;
+                    stb2.arg2 = bh.slot;
+                    stb2.ty = pl_inst.ty;
+                    mir_emit(stb2);
+                    bi = bi + 1;
+                }
+                let bj = 0;
+                while (bj < len(blk.stmts)) {
+                    mir_lower_stmt(blk.stmts[bj]);
+                    bj = bj + 1;
+                }
+                mir_emit_br(merge_label);
+                mir_seal_and_begin(next_label);
+            } else {
+                // 无负载变体名（None）或字面量模式
+                let pat_ty = pat_h.inferred_type;
+                let is_no_payload_variant = 0;
+                let variant_idx_np = 0;
+                if ((pat_ty as any) != 0) {
+                    if (pat_ty.kind == TYPE_ENUM_PAYLOAD && pat_h.slot < 0) {
+                        is_no_payload_variant = 1;
+                        variant_idx_np = pat_h.intval as int;
+                    }
+                }
+                let cmp_r = mir_new_reg();
+                if (is_no_payload_variant == 1) {
+                    let tag_r = mir_new_reg();
+                    let tag_inst = mir_mk(MIR_ENUM_GET_TAG);
+                    tag_inst.dst = tag_r;
+                    tag_inst.arg1 = scrut;
+                    tag_inst.ty = mk_type(TYPE_INT);
+                    mir_emit(tag_inst);
+                    let vi_r = mir_new_reg();
+                    let vi_inst = mir_mk(MIR_CONST_INT);
+                    vi_inst.dst = vi_r;
+                    vi_inst.longval = variant_idx_np;
+                    vi_inst.ty = mk_type(TYPE_INT);
+                    mir_emit(vi_inst);
+                    let cmp = mir_mk(MIR_BINOP);
+                    cmp.dst = cmp_r;
+                    cmp.arg1 = tag_r;
+                    cmp.arg2 = vi_r;
+                    cmp.longval = BIN_EQ;
+                    cmp.ty = bool_ty;
+                    mir_emit(cmp);
+                } else {
+                    let pv = mir_lower_expr(pat_h);
+                    let cmp = mir_mk(MIR_BINOP);
+                    cmp.dst = cmp_r;
+                    cmp.arg1 = scrut;
+                    cmp.arg2 = pv;
+                    cmp.longval = BIN_EQ;
+                    cmp.ty = bool_ty;
+                    mir_emit(cmp);
+                }
+                let body_label = mir_new_label();
+                let next_label = mir_new_label();
+                let condbr = mir_mk(MIR_CONDBR);
+                condbr.arg1 = cmp_r;
+                condbr.strval = body_label;
+                condbr.strval2 = next_label;
+                mir_set_term(condbr);
+                mir_seal_and_begin(body_label);
+                let bj = 0;
+                while (bj < len(blk.stmts)) {
+                    mir_lower_stmt(blk.stmts[bj]);
+                    bj = bj + 1;
+                }
+                mir_emit_br(merge_label);
+                mir_seal_and_begin(next_label);
+            }
+            i = i + 1;
+        }
+        // 全不匹配：落入 merge
+        mir_emit_br(merge_label);
+        mir_seal_and_begin(merge_label);
+        return;
+    }
+
+    if (k == STMT_WHILE) {
+        let cond_label = mir_new_label();
+        let body_label = mir_new_label();
+        let exit_label = mir_new_label();
+
+        mir_emit_br(cond_label);
+
+        mir_seal_and_begin(cond_label);
+        let cond_reg = mir_lower_expr(h.child);
+        let condbr = mir_mk(MIR_CONDBR);
+        condbr.arg1 = cond_reg;
+        condbr.strval = body_label;
+        condbr.strval2 = exit_label;
+        mir_set_term(condbr);
+
+        mir_seal_and_begin(body_label);
+        mir_push_loop(exit_label, cond_label);
+        let body = h.body;
+        let i = 0;
+        while (i < len(body)) {
+            mir_lower_stmt(body[i]);
+            i = i + 1;
+        }
+        mir_pop_loop();
+        mir_emit_br(cond_label);
+
+        mir_seal_and_begin(exit_label);
+        return;
+    }
+
+    if (k == STMT_BREAK) {
+        let n = len(mir_loop_break_labels);
+        if (n > 0) {
+            let target = mir_loop_break_labels[n - 1] as string;
+            mir_emit_br(target);
+        }
+        return;
+    }
+
+    if (k == STMT_CONTINUE) {
+        let n = len(mir_loop_continue_labels);
+        if (n > 0) {
+            let target = mir_loop_continue_labels[n - 1] as string;
+            mir_emit_br(target);
+        }
+        return;
+    }
+
+    if (k == STMT_ASSIGN) {
+        let lhs = h.child;
+        let rhs_h = h.rhs;
+
+        if (lhs.kind == EXPR_VAR) {
+            let rhs_reg = -1;
+            if ((rhs_h as any) != 0) { rhs_reg = mir_lower_expr(rhs_h); }
+            let inst = mir_mk(MIR_STORE_VAR);
+            inst.arg1 = rhs_reg;
+            inst.arg2 = lhs.slot;
+            inst.ty = lhs.inferred_type;  // slot 类型（如 double）：codegen 据此做 float→double fpext
+            inst.strval = lhs.str1;  // 全局赋值（slot=-1）按名查找
+            mir_emit(inst);
+            return;
+        }
+
+        if (lhs.kind == EXPR_INDEX) {
+            let lhs_children = lhs.children;
+            let arr_reg = mir_lower_expr(lhs_children[0]);
+            let idx_reg = mir_lower_expr(lhs_children[1]);
+            let rhs_reg = -1;
+            if ((rhs_h as any) != 0) { rhs_reg = mir_lower_expr(rhs_h); }
+            let inst = mir_mk(MIR_STORE_INDEX);
+            inst.arg1 = arr_reg;
+            inst.arg2 = idx_reg;
+            inst.args = array_push([], rhs_reg);
+            mir_emit(inst);
+            return;
+        }
+
+        if (lhs.kind == EXPR_MEMBER) {
+            let lhs_children = lhs.children;
+            let obj_reg = mir_lower_expr(lhs_children[0]);
+            let rhs_reg = -1;
+            if ((rhs_h as any) != 0) { rhs_reg = mir_lower_expr(rhs_h); }
+            let inst = mir_mk(MIR_STORE_MEMBER);
+            inst.arg1 = obj_reg;
+            inst.strval = lhs.str1;
+            inst.longval = lhs.intval;  // 字段索引
+            inst.args = array_push([], rhs_reg);
+            mir_emit(inst);
+            return;
+        }
+        return;
+    }
+
+    if (k == STMT_BLOCK) {
+        let body = h.body;
+        let i = 0;
+        while (i < len(body)) {
+            mir_lower_stmt(body[i]);
+            i = i + 1;
+        }
+        return;
+    }
+
+    if (k == STMT_FOR) {
+        // for (vars in iter) { body } 去糖为带索引的 while：
+        //   单变量 for (x in arr): x = arr[idx]
+        //   双变量 for (i, x in arr): i = idx, x = arr[idx]
+        //   range for (i in a..b): idx = a; while (idx < b) { i = idx; body; idx++ }
+        //   多变量解包 for (a, b in arr): a = arr[idx].0, b = arr[idx].1
+        let var_names = tc_split_commas(h.str1);
+        let n_vars = len(var_names);
+        let first_slot = h.slot;
+        let idx_slot = h.int1;
+        let extra_slots = h.extra_slots;
+        let iter_h = h.child;
+
+        let int_ty = mk_type(TYPE_INT);
+        let bool_ty = mk_type(TYPE_BOOL);
+
+        // EXPR_RANGE: for (i in a..b)
+        let is_range = 0;
+        if (iter_h.kind == EXPR_RANGE) { is_range = 1; }
+
+        if (is_range == 1) {
+            let children = iter_h.children;
+            let start_h = children[0];
+            let end_h = children[1];
+            let start_reg = mir_lower_expr(start_h);
+            let end_reg = mir_lower_expr(end_h);
+
+            let st_start = mir_mk(MIR_STORE_VAR);
+            st_start.arg1 = start_reg;
+            st_start.arg2 = idx_slot;
+            st_start.ty = int_ty;
+            mir_emit(st_start);
+
+            let cond_label = mir_new_label();
+            let body_label = mir_new_label();
+            let inc_label = mir_new_label();
+            let exit_label = mir_new_label();
+            mir_emit_br(cond_label);
+
+            mir_seal_and_begin(cond_label);
+            let idx_r = mir_new_reg();
+            let ldi = mir_mk(MIR_LOAD_VAR);
+            ldi.dst = idx_r;
+            ldi.arg1 = idx_slot;
+            ldi.ty = int_ty;
+            mir_emit(ldi);
+            let cmp_r = mir_new_reg();
+            let cmp = mir_mk(MIR_BINOP);
+            cmp.dst = cmp_r;
+            cmp.arg1 = idx_r;
+            cmp.arg2 = end_reg;
+            cmp.longval = BIN_LT;
+            cmp.ty = bool_ty;
+            mir_emit(cmp);
+            let condbr = mir_mk(MIR_CONDBR);
+            condbr.arg1 = cmp_r;
+            condbr.strval = body_label;
+            condbr.strval2 = exit_label;
+            mir_set_term(condbr);
+
+            mir_seal_and_begin(body_label);
+            mir_push_loop(exit_label, inc_label);
+            let idx_r2 = mir_new_reg();
+            let ldi2 = mir_mk(MIR_LOAD_VAR);
+            ldi2.dst = idx_r2;
+            ldi2.arg1 = idx_slot;
+            ldi2.ty = int_ty;
+            mir_emit(ldi2);
+            let stx = mir_mk(MIR_STORE_VAR);
+            stx.arg1 = idx_r2;
+            stx.arg2 = first_slot;
+            stx.ty = int_ty;
+            mir_emit(stx);
+            let body = h.body;
+            let bi = 0;
+            while (bi < len(body)) {
+                mir_lower_stmt(body[bi]);
+                bi = bi + 1;
+            }
+            mir_pop_loop();
+            mir_emit_br(inc_label);
+
+            mir_seal_and_begin(inc_label);
+            let idx_r3 = mir_new_reg();
+            let ldi3 = mir_mk(MIR_LOAD_VAR);
+            ldi3.dst = idx_r3;
+            ldi3.arg1 = idx_slot;
+            ldi3.ty = int_ty;
+            mir_emit(ldi3);
+            let one_reg = mir_new_reg();
+            let onec = mir_mk(MIR_CONST_INT);
+            onec.dst = one_reg;
+            onec.longval = 1;
+            onec.ty = int_ty;
+            mir_emit(onec);
+            let inc_r = mir_new_reg();
+            let inc = mir_mk(MIR_BINOP);
+            inc.dst = inc_r;
+            inc.arg1 = idx_r3;
+            inc.arg2 = one_reg;
+            inc.longval = BIN_ADD;
+            inc.ty = int_ty;
+            mir_emit(inc);
+            let sti = mir_mk(MIR_STORE_VAR);
+            sti.arg1 = inc_r;
+            sti.arg2 = idx_slot;
+            sti.ty = int_ty;
+            mir_emit(sti);
+            mir_emit_br(cond_label);
+
+            mir_seal_and_begin(exit_label);
+            return;
+        }
+
+        // 数组/字符串/dict/set 迭代模式
+        let elem_ty = int_ty;
+        let is_string_iter = 0;
+        let is_dict_iter = 0;
+        let dict_val_ty = 0 as Type;
+        let is_set_iter = 0;
+        let iter_ty = iter_h.inferred_type;
+        if ((iter_ty as any) != 0) {
+            let att = iter_ty;
+            if (att.kind == TYPE_STRING) {
+                is_string_iter = 1;
+                elem_ty = mk_type(TYPE_CHAR);
+            } else if (att.kind == TYPE_DICT) {
+                is_dict_iter = 1;
+                elem_ty = mk_type(TYPE_STRING);
+                dict_val_ty = att.val_type;
+                if ((dict_val_ty as any) == 0) { dict_val_ty = mk_type(TYPE_STRING); }
+            } else if (att.kind == TYPE_SET) {
+                is_set_iter = 1;
+                elem_ty = att.elem_type;
+                if ((elem_ty as any) == 0) { elem_ty = mk_type(TYPE_STRING); }
+            } else if ((att.elem_type as any) != 0) {
+                elem_ty = att.elem_type;
+            }
+        }
+
+        // 求值迭代对象（仅一次）
+        let arr_reg = mir_lower_expr(iter_h);
+        let orig_dict_reg = arr_reg;
+
+        // len = is_dict ? shadow_dict_size : (is_set ? shadow_set_size : (is_string ? shadow_string_len : shadow_array_len))
+        let len_reg = mir_new_reg();
+        let lenc = mir_mk(MIR_CALL);
+        lenc.dst = len_reg;
+        if (is_dict_iter == 1) {
+            lenc.strval = "shadow_dict_size";
+        } else if (is_set_iter == 1) {
+            lenc.strval = "shadow_set_size";
+        } else if (is_string_iter == 1) {
+            lenc.strval = "shadow_string_len";
+        } else {
+            lenc.strval = "shadow_array_len";
+        }
+        lenc.args = array_push([], arr_reg);
+        lenc.ty = int_ty;
+        mir_emit(lenc);
+
+        // idx = 0
+        let zero_reg = mir_new_reg();
+        let zc = mir_mk(MIR_CONST_INT);
+        zc.dst = zero_reg;
+        zc.longval = 0;
+        zc.ty = int_ty;
+        mir_emit(zc);
+        let st0 = mir_mk(MIR_STORE_VAR);
+        st0.arg1 = zero_reg;
+        st0.arg2 = idx_slot;
+        st0.ty = int_ty;
+        mir_emit(st0);
+
+        let cond_label = mir_new_label();
+        let body_label = mir_new_label();
+        let inc_label = mir_new_label();
+        let exit_label = mir_new_label();
+
+        mir_emit_br(cond_label);
+
+        mir_seal_and_begin(cond_label);
+        let idx_r = mir_new_reg();
+        let ldi = mir_mk(MIR_LOAD_VAR);
+        ldi.dst = idx_r;
+        ldi.arg1 = idx_slot;
+        ldi.ty = int_ty;
+        mir_emit(ldi);
+        let cmp_r = mir_new_reg();
+        let cmp = mir_mk(MIR_BINOP);
+        cmp.dst = cmp_r;
+        cmp.arg1 = idx_r;
+        cmp.arg2 = len_reg;
+        cmp.longval = BIN_LT;
+        cmp.ty = bool_ty;
+        mir_emit(cmp);
+        let condbr = mir_mk(MIR_CONDBR);
+        condbr.arg1 = cmp_r;
+        condbr.strval = body_label;
+        condbr.strval2 = exit_label;
+        mir_set_term(condbr);
+
+        // body: 绑定循环变量 + <body>
+        mir_seal_and_begin(body_label);
+        mir_push_loop(exit_label, inc_label);
+
+        let idx_r2 = mir_new_reg();
+        let ldi2 = mir_mk(MIR_LOAD_VAR);
+        ldi2.dst = idx_r2;
+        ldi2.arg1 = idx_slot;
+        ldi2.ty = int_ty;
+        mir_emit(ldi2);
+
+        if (n_vars == 1) {
+            if (is_dict_iter == 1) {
+                // dict 单变量 for (k in dict): k = shadow_dict_key_at(dict, idx)
+                let elem_r = mir_new_reg();
+                let kc = mir_mk(MIR_CALL);
+                kc.dst = elem_r;
+                kc.strval = "shadow_dict_key_at";
+                kc.args = array_push(array_push([], orig_dict_reg), idx_r2);
+                kc.ty = elem_ty;
+                mir_emit(kc);
+                let stx = mir_mk(MIR_STORE_VAR);
+                stx.arg1 = elem_r;
+                stx.arg2 = first_slot;
+                stx.ty = elem_ty;
+                mir_emit(stx);
+            } else if (is_set_iter == 1) {
+                // set 单变量：shadow_set_at_{string|int}
+                let set_fn = "shadow_set_at_string";
+                let ret_ty = elem_ty;
+                let ek = TYPE_STRING;
+                if ((elem_ty as any) != 0) { ek = elem_ty.kind; }
+                if (ek == TYPE_INT || ek == TYPE_LONG || ek == TYPE_DATE
+                    || ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP
+                    || ek == TYPE_BOOL) {
+                    set_fn = "shadow_set_at_int";
+                    ret_ty = mk_type(TYPE_LONG);
+                }
+                let elem_r = mir_new_reg();
+                let kc = mir_mk(MIR_CALL);
+                kc.dst = elem_r;
+                kc.strval = set_fn;
+                kc.args = array_push(array_push([], arr_reg), idx_r2);
+                kc.ty = ret_ty;
+                mir_emit(kc);
+                let stx = mir_mk(MIR_STORE_VAR);
+                stx.arg1 = elem_r;
+                stx.arg2 = first_slot;
+                stx.ty = elem_ty;
+                mir_emit(stx);
+            } else {
+                // 单变量 for (x in arr): x = arr[idx]
+                let elem_r = mir_new_reg();
+                let idxinst = mir_mk(MIR_INDEX);
+                idxinst.dst = elem_r;
+                idxinst.arg1 = arr_reg;
+                idxinst.arg2 = idx_r2;
+                idxinst.ty = elem_ty;
+                mir_emit(idxinst);
+                let stx = mir_mk(MIR_STORE_VAR);
+                stx.arg1 = elem_r;
+                stx.arg2 = first_slot;
+                stx.ty = elem_ty;
+                mir_emit(stx);
+            }
+        } else if (n_vars == 2 && is_dict_iter == 1) {
+            // dict 双变量 for (k, v in dict): k = key_at, v = dict[k]
+            let key_r = mir_new_reg();
+            let kc = mir_mk(MIR_CALL);
+            kc.dst = key_r;
+            kc.strval = "shadow_dict_key_at";
+            kc.args = array_push(array_push([], orig_dict_reg), idx_r2);
+            kc.ty = elem_ty;
+            mir_emit(kc);
+            let stk = mir_mk(MIR_STORE_VAR);
+            stk.arg1 = key_r;
+            stk.arg2 = first_slot;
+            stk.ty = elem_ty;
+            mir_emit(stk);
+            let dict_get_fn = "shadow_dict_get_string";
+            let dict_val_ret_ty = dict_val_ty;
+            let dvk = TYPE_STRING;
+            if ((dict_val_ty as any) != 0) { dvk = dict_val_ty.kind; }
+            if (dvk == TYPE_INT || dvk == TYPE_LONG || dvk == TYPE_DATE
+                || dvk == TYPE_TIMESTAMP || dvk == TYPE_NANOTIMESTAMP
+                || dvk == TYPE_BOOL) {
+                dict_get_fn = "shadow_dict_get_int";
+                dict_val_ret_ty = mk_type(TYPE_LONG);
+            }
+            let val_r = mir_new_reg();
+            let valc = mir_mk(MIR_CALL);
+            valc.dst = val_r;
+            valc.strval = dict_get_fn;
+            valc.args = array_push(array_push([], orig_dict_reg), key_r);
+            valc.ty = dict_val_ret_ty;
+            mir_emit(valc);
+            let stv = mir_mk(MIR_STORE_VAR);
+            stv.arg1 = val_r;
+            stv.arg2 = extra_slots[0] as int;
+            stv.ty = dict_val_ty;
+            mir_emit(stv);
+        } else if (n_vars == 2) {
+            // 双变量 for (i, x in arr): i = idx, x = arr[idx]
+            let st_i = mir_mk(MIR_STORE_VAR);
+            st_i.arg1 = idx_r2;
+            st_i.arg2 = first_slot;
+            st_i.ty = int_ty;
+            mir_emit(st_i);
+            let elem_r = mir_new_reg();
+            let idxinst = mir_mk(MIR_INDEX);
+            idxinst.dst = elem_r;
+            idxinst.arg1 = arr_reg;
+            idxinst.arg2 = idx_r2;
+            idxinst.ty = elem_ty;
+            mir_emit(idxinst);
+            let stx = mir_mk(MIR_STORE_VAR);
+            stx.arg1 = elem_r;
+            stx.arg2 = extra_slots[0] as int;
+            stx.ty = elem_ty;
+            mir_emit(stx);
+        } else {
+            // 多变量解包 for (a, b, c in arr): a = arr[idx].0, ...
+            let elem_r = mir_new_reg();
+            let idxinst = mir_mk(MIR_INDEX);
+            idxinst.dst = elem_r;
+            idxinst.arg1 = arr_reg;
+            idxinst.arg2 = idx_r2;
+            idxinst.ty = elem_ty;
+            mir_emit(idxinst);
+
+            // 元组字段类型（元素类型应为 TYPE_TUPLE）
+            let tuple_param_types = 0 as Type;  // 仅用于判空；实际逐字段取 elem_ty 的 param_types
+            let tp_types: array<Type> = [];
+            if ((elem_ty as any) != 0 && elem_ty.kind == TYPE_TUPLE) {
+                let pi = 0;
+                while (pi < len(elem_ty.param_types)) {
+                    tp_types = array_push(tp_types, elem_ty.param_types[pi]);
+                    pi = pi + 1;
+                }
+            }
+
+            let all_slots: array<int> = [];
+            all_slots = array_push(all_slots, first_slot);
+            let vi = 0;
+            while (vi < len(extra_slots)) {
+                all_slots = array_push(all_slots, extra_slots[vi]);
+                vi = vi + 1;
+            }
+            let fi = 0;
+            while (fi < len(all_slots)) {
+                let field_ty = mk_type(TYPE_ANY);
+                if (fi < len(tp_types)) { field_ty = tp_types[fi]; }
+                let field_r = mir_new_reg();
+                let memacc = mir_mk(MIR_MEMBER);
+                memacc.dst = field_r;
+                memacc.arg1 = elem_r;
+                memacc.longval = fi;
+                memacc.ty = field_ty;
+                mir_emit(memacc);
+                let stf = mir_mk(MIR_STORE_VAR);
+                stf.arg1 = field_r;
+                stf.arg2 = all_slots[fi] as int;
+                stf.ty = field_ty;
+                mir_emit(stf);
+                fi = fi + 1;
+            }
+        }
+
+        let body = h.body;
+        let bi = 0;
+        while (bi < len(body)) {
+            mir_lower_stmt(body[bi]);
+            bi = bi + 1;
+        }
+        mir_pop_loop();
+        mir_emit_br(inc_label);
+
+        // inc: idx = idx + 1
+        mir_seal_and_begin(inc_label);
+        let idx_r3 = mir_new_reg();
+        let ldi3 = mir_mk(MIR_LOAD_VAR);
+        ldi3.dst = idx_r3;
+        ldi3.arg1 = idx_slot;
+        ldi3.ty = int_ty;
+        mir_emit(ldi3);
+        let one_reg = mir_new_reg();
+        let onec = mir_mk(MIR_CONST_INT);
+        onec.dst = one_reg;
+        onec.longval = 1;
+        onec.ty = int_ty;
+        mir_emit(onec);
+        let inc_r = mir_new_reg();
+        let inc = mir_mk(MIR_BINOP);
+        inc.dst = inc_r;
+        inc.arg1 = idx_r3;
+        inc.arg2 = one_reg;
+        inc.longval = BIN_ADD;
+        inc.ty = int_ty;
+        mir_emit(inc);
+        let sti = mir_mk(MIR_STORE_VAR);
+        sti.arg1 = inc_r;
+        sti.arg2 = idx_slot;
+        sti.ty = int_ty;
+        mir_emit(sti);
+        mir_emit_br(cond_label);
+
+        mir_seal_and_begin(exit_label);
+        return;
+    }
+}
+
+// --- 函数 lowering ---
+pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
+    mir_blocks = [];
+    mir_cur_label = "entry";
+    mir_cur_insts = [];
+    mir_cur_terminator = 0 as MirInst;
+    mir_n_regs = 0;
+    mir_label_counter = 0;
+    mir_loop_break_labels = [];
+    mir_loop_continue_labels = [];
+    mir_n_slots = hf.n_slots;
+
+    let body = hf.body;
+    let i = 0;
+    while (i < len(body)) {
+        let stmt = body[i];
+        mir_lower_stmt(stmt);
+        i = i + 1;
+    }
+
+    if (mir_has_terminator() == 0) {
+        let ret = mir_mk(MIR_RET);
+        ret.arg1 = -1;
+        mir_set_term(ret);
+    }
+
+    mir_seal_last();
+
+    let params_mir: array<MirParam> = [];
+    let params = hf.params;
+    let j = 0;
+    while (j < len(params)) {
+        let p = params[j];
+        params_mir = array_push(params_mir, MirParam { slot: p.slot, type_kind: p.ty.kind });
+        j = j + 1;
+    }
+
+    let mf = MirFunc {
+        name: hf.name,
+        params: params_mir,
+        return_type_kind: hf.return_type.kind,
+        blocks: mir_blocks,
+        n_regs: mir_n_regs,
+        n_slots: hf.n_slots,
+        extern_name: hf.extern_name
+    };
+    return mf;
+}
+
+// --- 程序 lowering：返回 array<MirFunc>（跳过 extern 函数）---
+pub kimo mir_lower_program(hfuncs: array<HirFunc>) -> array<MirFunc> {
+    let mfuncs: array<MirFunc> = [];
+    let i = 0;
+    while (i < len(hfuncs)) {
+        let hf = hfuncs[i];
+        if (len(hf.extern_name) == 0) {
+            mfuncs = array_push(mfuncs, mir_lower_func(hf));
+        }
+        i = i + 1;
+    }
+    return mfuncs;
+}

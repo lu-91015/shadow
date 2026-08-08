@@ -1,0 +1,10 @@
+//@desc: time type arithmetic with incompatible types is rejected (date + float)
+//@expect-stderr: error
+dsb tc_fail_time_arith_invalid;
+kimo main() -> int {
+    let d: date = date"2023.01.01";
+    let f: float = 1.5;
+    // date + float should be rejected (float is not int)
+    let r: date = d + f;
+    return 0;
+}

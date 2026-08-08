@@ -1,0 +1,19 @@
+//@desc: global negative initialization runtime check (0.2 crash regression)
+//@expect: neg_one=-1
+//@expect: neg_two=-2
+//@expect: neg_big=-1000
+//@expect: neg_long=-1000000000000
+//@expect: result=42
+dsb cg_global_neg_init;
+mut neg_one: int = -1;
+let neg_two: int = -2;
+let neg_big: int = -1000;
+let neg_long: long = -1000000000000L;
+kimo main() -> int {
+    println("neg_one=" + to_string(neg_one));
+    println("neg_two=" + to_string(neg_two));
+    println("neg_big=" + to_string(neg_big));
+    println("neg_long=" + to_string(neg_long));
+    println("result=" + to_string(neg_one + 43));
+    return 0;
+}

@@ -1,0 +1,11 @@
+//@desc: GC alloc + root management for struct on GC heap
+//@expect-ir: shadow_gc_alloc
+//@expect-ir: shadow_gc_frame_enter
+//@expect-ir: shadow_gc_frame_leave
+//@expect-ir: shadow_gc_root_
+dsb codegen_gc_alloc;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 10, y: 20 };
+    return p.x;
+}

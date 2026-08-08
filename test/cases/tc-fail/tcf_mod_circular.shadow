@@ -1,0 +1,6 @@
+//@mode: tc-fail
+//@desc: Phase 11 模块机制：包级循环依赖报错（§3.8.3 循环检测）
+//@expect-stderr: circular import detected
+dsb tcf_mod_circular;
+import circ_a.af;
+kimo main() -> int { return circ_fa(); }

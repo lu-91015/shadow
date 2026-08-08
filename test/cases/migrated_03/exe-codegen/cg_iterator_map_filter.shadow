@@ -1,0 +1,45 @@
+//@desc: L3 Iterator pattern — map/filter/collect with closures
+//@expect: 24
+dsb cg_iterator_map_filter;
+// Apply doubler to [1,2,3,4,5] → [2,4,6,8,10], filter >4 → [6,8,10], sum=24
+kimo array_map(f: any, arr: any) -> any {
+    let result: any = [];
+    let i = 0;
+    while (i < len(arr)) {
+        result = array_push(result, f(arr[i] as int));
+        i = i + 1;
+    }
+    return result;
+}
+
+kimo array_filter(f: any, arr: any) -> any {
+    let result: any = [];
+    let i = 0;
+    while (i < len(arr)) {
+        let v = arr[i] as int;
+        let keep = f(v) as int;
+        if (keep == 1) {
+            result = array_push(result, v);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+kimo main() -> int {
+    let arr: any = [1, 2, 3, 4, 5];
+    let doubler = kimo(x: int) -> int { return x * 2; };
+    let gt4 = kimo(x: int) -> int { if (x > 4) { return 1; } return 0; };
+
+    let doubled = array_map(doubler, arr);
+    let filtered = array_filter(gt4, doubled);
+
+    let sum = 0;
+    let i = 0;
+    while (i < len(filtered)) {
+        sum = sum + (filtered[i] as int);
+        i = i + 1;
+    }
+    println(sum);
+    return 0;
+}

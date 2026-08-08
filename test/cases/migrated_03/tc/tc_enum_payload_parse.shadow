@@ -1,0 +1,19 @@
+//@desc: L2 enum payload + generics parse smoke
+//@expect-ir: define
+dsb tc_enum_payload_parse;
+
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+enum Color { Red, Green, Blue }
+
+kimo main() -> int {
+    return 0;
+}

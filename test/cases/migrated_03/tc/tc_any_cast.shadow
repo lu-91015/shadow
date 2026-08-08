@@ -1,0 +1,8 @@
+//@desc: int boxed into `any` and unboxed back type-checks
+dsb tc_any_cast;
+kimo main() -> int {
+    let n = 7;
+    let a = n as any;
+    let b = a as int;
+    return b;
+}

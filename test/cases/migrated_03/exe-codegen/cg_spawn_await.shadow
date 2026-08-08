@@ -1,0 +1,11 @@
+//@desc: spawn/await coroutine concurrency (fiber scheduler)
+//@expect: 42
+dsb cg_spawn_await;
+// 协程体必须返回 any（运行时以 void* 承载 Future 值）
+kimo task() -> any { return 42 as any; }
+kimo main() -> int {
+    let f = spawn task;
+    let v = await f;
+    println(v as int);
+    return 0;
+}

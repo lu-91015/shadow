@@ -1,0 +1,10 @@
+//@ mode: tc-fail
+//@ desc: array index with non-integer type should fail
+//@ expect-stderr: array index must be integer
+dsb tc_fail_array_index;
+
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let idx: string = "0";
+    return arr[idx];
+}

@@ -1,0 +1,10 @@
+//@desc: struct field access codegen (GEP)
+//@expect: 1
+dsb codegen_struct_field;
+struct Point { x: int, y: int }
+kimo f() -> int {
+    let p = Point { x: 1, y: 2 };
+    let v = p.x;
+    return v;
+}
+kimo main() -> int { println(f()); return 0; }

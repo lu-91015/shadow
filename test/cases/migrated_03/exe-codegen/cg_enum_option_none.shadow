@@ -1,0 +1,18 @@
+//@expect: none
+//@desc: L2 enum payload — Option<T> None variant (no payload) matched correctly
+dsb cg_enum_option_none;
+
+enum Option<T> {
+    Some(T),
+    None,
+}
+
+kimo main() -> int {
+    let x = None;
+    let r = match x {
+        Some(v) => "some",
+        None => "none",
+    };
+    println(r);
+    return 0;
+}

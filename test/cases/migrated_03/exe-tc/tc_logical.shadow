@@ -1,0 +1,10 @@
+//@desc: logical && || ! type-check with bool operands
+//@expect: 0
+dsb tc_logical;
+kimo f(a: int, b: int) -> int {
+    let r = (a > 0) && (b > 0);
+    let s = (a > 0) || (b > 0);
+    if (r && s) { return 1; }
+    return 0;
+}
+kimo main() -> int { println(f(1, 0)); return 0; }

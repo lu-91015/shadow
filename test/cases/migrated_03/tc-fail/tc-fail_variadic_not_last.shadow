@@ -1,0 +1,12 @@
+//@desc: variadic param must be the last parameter
+//@expect: variadic parameter
+dsb tc_fail_variadic_not_last;
+
+// ...args 不能出现在非末位
+kimo bad(...a: int, b: int) -> int {
+    return b;
+}
+
+kimo main() -> int {
+    return bad(1, 2);
+}

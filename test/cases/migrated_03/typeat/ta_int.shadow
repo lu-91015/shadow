@@ -1,0 +1,15 @@
+//@mode: typeat
+//@desc: LSP-4 position-indexed type query — hover on an int variable
+//@pos: 8 13
+//@expect: type-at: int
+dsb ta_int;
+
+kimo add(a: int, b: int) -> int {
+    let s = a + b;
+    return s;
+}
+
+kimo main() -> int {
+    let x = add(1, 2);
+    return x;
+}

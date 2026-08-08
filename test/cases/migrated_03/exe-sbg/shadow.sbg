@@ -1,0 +1,8 @@
+# shadow.sbg — 阶段6 测试用例
+# 验证 shadow-0.3 的 .sbg 包描述文件解析与 import 集成
+[package]
+name = "sbg_test_pkg"
+version = "0.3.0"
+
+[deps]
+mylib = "."

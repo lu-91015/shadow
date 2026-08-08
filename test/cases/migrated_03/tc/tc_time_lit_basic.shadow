@@ -1,0 +1,16 @@
+//@desc: time type literals (date/timestamp/nanotimestamp) parse and typecheck
+//@expect: typecheck: 1
+dsb tc_time_lit_basic;
+kimo f1() -> date {
+    let d: date = date"2023.01.01";
+    return d;
+}
+kimo f2() -> timestamp {
+    let t: timestamp = timestamp"2023.01.01 10:00:00.000";
+    return t;
+}
+kimo f3() -> nanotimestamp {
+    let n: nanotimestamp = nanotimestamp"2023.01.01 00:00:00.000000000";
+    return n;
+}
+kimo main() -> int { return 0; }

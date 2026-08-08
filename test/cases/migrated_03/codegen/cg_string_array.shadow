@@ -1,0 +1,7 @@
+//@desc: string array literal lowers to shadow_array_create_ptrs (pointer buffer)
+//@expect-ir: __rt_shadow_malloc
+dsb cg_string_array;
+kimo main() -> int {
+    let a = ["x", "y", "z"];
+    return 0;
+}

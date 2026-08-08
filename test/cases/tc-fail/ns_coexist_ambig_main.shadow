@@ -1,0 +1,11 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：同时 import 两个都导出 c() 的模块 → 使用处 ambiguous（Java 通配符语义）
+//@expect-stderr: ambiguous function 'c'
+//@args: --strict
+dsb ns_coexist_ambig_main;
+import ns_coexist_ambig._a;
+import ns_coexist_ambig._b;
+kimo main() -> int {
+    let x = c();
+    return 0;
+}

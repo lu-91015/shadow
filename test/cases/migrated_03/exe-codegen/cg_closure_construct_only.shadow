@@ -1,0 +1,11 @@
+//@desc: L3 closure — construct capture closure without calling (isolate MAKE_CLOSURE)
+//@expect: 42
+dsb cg_closure_construct_only;
+kimo main() -> int {
+    let x = 40;
+    let f = kimo() -> int {
+        return x + 2;
+    };
+    println(42);
+    return 0;
+}

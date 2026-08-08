@@ -1,0 +1,21 @@
+//@desc: parse_int failure is caught by try/catch and propagates across functions
+//@expect: CAUGHT_ABC
+//@expect: AFTER_TRY
+dsb parse_fail_caught;
+
+// parse_int("abc") 失败时通过 shadow_throw_str 抛出异常，依赖 try/catch 向上传播。
+// 验证：异常被捕获，且 try 后续代码继续执行。
+kimo try_parse(s: string) -> int {
+    return parse_int(s);
+}
+
+kimo main() -> int {
+    try {
+        let r: int = try_parse("abc");
+        println("R=" + int_to_str(r));
+    } catch (e) {
+        println("CAUGHT_ABC");
+    }
+    println("AFTER_TRY");
+    return 0;
+}

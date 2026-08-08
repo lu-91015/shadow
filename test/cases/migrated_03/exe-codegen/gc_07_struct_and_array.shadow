@@ -1,0 +1,13 @@
+//@desc: GC struct and array mixed in same function
+//@expect: 16
+dsb gc_07_struct_and_array;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let p = P { x: 10, y: 20 };
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + x;
+    }
+    println(sum + p.x); return 0;
+}

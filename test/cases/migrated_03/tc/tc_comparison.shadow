@@ -1,0 +1,12 @@
+//@desc: comparison operators type-check and produce bool
+//@expect: typecheck: 1
+dsb tc_comparison;
+kimo f(a: int, b: int) -> int {
+    let r = a < b;
+    let r2 = a == b;
+    let r3 = a >= b;
+    let r4 = a != b;
+    if (r && r2 && r3 && r4) { return 1; }
+    return 0;
+}
+kimo main() -> int { return f(1, 2); }

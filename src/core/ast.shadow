@@ -1,0 +1,364 @@
+// Shadow 0.4 — 核心数据结构（AST 节点）
+// ============================================================
+// 语法完全复刻 shadow-0.3。位置区间采用 LSP-3 模型：
+// (line, col) 起点 1-based 含；end_line/end_col 终点 1-based 不含（半开区间）。
+//
+// 架构原则（用户明确要求）：**不使用 any 盒子**，全部用具体类型：
+//   - 递归类型 array<T> / Option<T> 已被宿主验证可用
+//   - 空子节点用 `0 as T`（空指针，宿主已验证）
+//   - 可选语义用宿主 Prelude 内置泛型 enum Option<T>（Some/None）
+//   - 闭包持有 FuncDef 经 Option<FuncDef> 打破值循环（已实测）
+//   - "未推断"用 TYPE_INFER 哨兵 Type
+//   - 跨模块可见性依赖 P0.4-1（0.3 宿主全局 pub 回退修复）
+dsb core_ast;
+
+// Token：携带完整区间 [line:col, end_line:end_col)
+pub struct Token { kind: int; text: string; line: int; col: int; end_line: int; end_col: int }
+
+// 位置区间
+pub struct Location { file: string; line: int; col: int; end_line: int; end_col: int }
+
+// 类型节点：完整支持所有类型种类。空引用用 `0 as Type`。
+pub struct Type {
+    kind: int;          // TYPE_*
+    name: string;       // 结构体/枚举/别名名
+    elem_type: Type;    // 数组元素类型
+    key_type: Type;     // 字典 key 类型
+    val_type: Type;     // 字典 value 类型
+    ret_type: Type;     // 函数返回类型
+    param_types: array<Type>; // 函数参数类型 / 元组元素类型 / 泛型实参
+    captured_count: int;      // 闭包捕获变量数量（仅 TYPE_FUNCTION）
+}
+
+// 表达式。空子节点用 `0 as Expr`。
+pub struct Expr {
+    id: int;            // NodeId：全局唯一，parser 分配
+    kind: int;          // EXPR_*
+    loc: Location;
+    str1: string;       // 变量名/函数名/变体名/成员名
+    str2: string;       // 辅助字符串
+    intval: long;       // 整数字面量/操作符 kind/元组字段索引
+    floatval: double;   // 浮点字面量
+    child1: Expr;       // 左子表达式 / 主体
+    child2: Expr;       // 右子表达式 / 条件 / range 终点
+    child3: Expr;       // 第三子表达式（if 的 else 分支等）
+    items: array<Expr>;      // 参数/元素/字段值/匹配模式
+    items2: array<Expr>;     // 第二表达式数组（EXPR_MATCH 的臂体等）
+    str_items: array<string>; // 名称列表（命名参数/字段名/解构绑定名）
+    stmt_items: array<Stmt>; // 语句数组（闭包宏体等）
+    type_args: array<Type>;  // 泛型实参（EXPR_NEW / EXPR_STRUCT_LIT）
+    closure_def: Option<FuncDef>; // 闭包定义（EXPR_CLOSURE）
+    bind_types: array<Type>; // 模式绑定类型（EXPR_ENUM_VARIANT 模式，与 str_items 并行；TC 回填）
+    inferred_type: Type; // 类型检查后回填 / CAST 目标类型（未推断 = TYPE_INFER 哨兵）
+}
+
+// 语句。空子节点用 `0 as Stmt`。
+pub struct Stmt {
+    kind: int;          // STMT_*
+    loc: Location;
+    str1: string;       // 变量名/for 变量列表/标签
+    str2: string;       // 辅助字符串
+    intval: long;       // 标记（return 是否有值、match 变体标记等）
+    floatval: double;
+    child1: Stmt;       // 子语句
+    child2: Stmt;       // 第二子语句
+    child3: Stmt;       // 第三子语句
+    items: array<Stmt>;      // 语句块 / 主分支
+    items2: array<Stmt>;     // else 分支 / 次要语句块
+    exprs: array<Expr>;      // 表达式列表（STMT_MATCH 的模式等）
+    str_items: array<string>; // 名称列表
+    type1: Type;        // 类型注解（STMT_LET 等；无 = TYPE_INFER 哨兵）
+    expr1: Expr;        // 关联表达式（let 初始化器、return 值、if 条件）
+    expr2: Expr;        // 第二关联表达式（赋值 RHS 等）
+    inferred_type: Type; // 类型检查后回填
+}
+
+// 函数参数
+pub struct Param {
+    name: string;
+    type_ref: Type;
+    loc: Location;
+    is_mut: int;
+    is_variadic: int;   // ...args 可变参数
+    default_value: Expr; // 默认参数（0 as Expr = 无）
+}
+
+// 泛型参数
+pub struct TypeParam {
+    name: string;
+    constraints: array<string>; // 联合约束（0.3: T: int|long 形式存类型名）
+}
+
+// 函数定义
+pub struct FuncDef {
+    name: string;
+    params: array<Param>;
+    return_type: Type;
+    body: Stmt;         // 块（0 as Stmt = 仅签名）
+    loc: Location;
+    is_pub: int;
+    is_extern: int;
+    extern_name: string;
+    type_params: array<TypeParam>;
+    is_async: int;
+    is_macro: int;
+}
+
+// 结构体字段
+pub struct StructField {
+    name: string;
+    type_ref: Type;
+    loc: Location;
+    is_pub: int;
+}
+
+// 结构体定义
+pub struct StructDef {
+    name: string;
+    fields: array<StructField>;
+    loc: Location;
+    is_pub: int;
+    type_params: array<TypeParam>;
+}
+
+// 枚举变体（可携带多负载）
+pub struct EnumVariant {
+    name: string;
+    payloads: array<Type>;
+    loc: Location;
+}
+
+// 枚举定义
+pub struct EnumDef {
+    name: string;
+    variants: array<EnumVariant>;
+    loc: Location;
+    is_pub: int;
+    type_params: array<TypeParam>;
+}
+
+// trait 定义
+pub struct TraitDef {
+    name: string;
+    methods: array<FuncDef>; // 仅签名
+    loc: Location;
+    is_pub: int;
+    type_params: array<TypeParam>;
+}
+
+// impl 块
+pub struct ImplDef {
+    type_name: string;
+    trait_name: string;  // 空 = inherent impl
+    methods: array<FuncDef>;
+    loc: Location;
+}
+
+// 全局变量
+pub struct GlobalVar {
+    name: string;
+    type_ref: Type;
+    init: Expr;          // 0 as Expr = 无初始化器
+    loc: Location;
+    is_pub: int;
+    is_mut: int;
+}
+
+// 类型别名
+pub struct TypeAlias {
+    name: string;
+    target: Type;
+    loc: Location;
+    is_pub: int;
+}
+
+// 宏定义（新语法：macro name(p: expr|ident|tt) { body_expr }）
+pub struct MacroDef {
+    name: string;
+    params: array<MacroParam>;
+    body: Expr;
+    loc: Location;
+    is_pub: int;
+}
+
+pub struct MacroParam {
+    name: string;
+    kind: string;        // expr | ident | tt
+}
+
+// 程序根
+pub struct Program {
+    funcs: array<FuncDef>;
+    structs: array<StructDef>;
+    enums: array<EnumDef>;
+    traits: array<TraitDef>;
+    impls: array<ImplDef>;
+    globals: array<GlobalVar>;
+    imports: array<string>;     // import 路径（点分转斜杠）
+    module_name: string;        // 来自 dsb 声明
+    type_aliases: array<TypeAlias>;
+    macros: array<MacroDef>;
+}
+
+// ============ 类型检查（TC）数据结构 ============
+// 模块节点：每模块独立符号表（pub 用原名注册，私有 mangled 为 __mod_<mod>__<name>）
+pub struct ModuleNode {
+    module_name: string;
+    struct_names: array<string>;
+    struct_defs: array<StructDef>;
+    enum_names: array<string>;
+    enum_defs: array<EnumDef>;
+    alias_names: array<string>;
+    alias_defs: array<TypeAlias>;
+    func_names: array<string>;
+    func_defs: array<FuncDef>;
+    trait_names: array<string>;
+    trait_defs: array<TraitDef>;
+    impl_keys: array<string>;   // "trait@@type"
+    impl_defs: array<ImplDef>;
+    global_names: array<string>;
+    global_types: array<Type>;
+    global_pubs: array<int>;
+    imports: array<string>;
+}
+
+// 模块图：已注册模块数据库（并行数组存名字→索引）
+pub struct ModuleGraph {
+    nodes: array<ModuleNode>;
+    name_keys: array<string>;
+    name_vals: array<int>;
+}
+
+// 编译上下文：每次编译的独立状态容器（支持并发/重入编译）
+pub struct CompileContext {
+    cur_node: ModuleNode;       // 当前正在构建的模块节点（0 as ModuleNode = 无）
+    graph: ModuleGraph;
+    current_module: string;
+    strict: int;                // 1=严格态（Phase 15 命名空间隔离）；0=兼容态（物理拼接语义）
+    errors: array<string>;
+    closure_funcs: array<FuncDef>;   // 闭包注册表
+    closure_counter: int;
+    free_vars_names: array<string>;  // 闭包捕获分析临时收集器
+    // 泛型真单态化状态
+    mono_cache: array<string>;       // 已实例化特化函数名
+    mono_funcs: array<FuncDef>;      // 待检查特化 worklist
+    mono_func_mods: array<string>;
+    mono_tmpl_names: array<string>;  // 泛型模板注册名
+    mono_tmpl_defs: array<FuncDef>;  // pristine 模板（深拷贝）
+    mono_tmpl_mods: array<string>;
+    struct_mono_cache: array<string>;
+    struct_mono_tmpl_names: array<string>;
+    struct_mono_tmpl_defs: array<StructDef>;
+    struct_mono_tmpl_mods: array<string>;
+    bind_names: array<string>;   // 泛型调用推断的绑定（临时；ctx 引用传递可回写）
+    bind_types: array<Type>;
+    // §3.8 兼容态命名空间树（FQN 解析用，不影响 codegen）
+    mod_ns: array<string>;       // 各加载模块的命名空间（路径派生）
+    mod_starts: array<int>;      // 各模块在 combined 源中的起始行（1-based）
+    ns_keys: array<string>;      // "ns::Symbol" 键
+    ns_kinds: array<int>;        // 1=struct 2=enum 3=func 4=alias 5=trait 6=global
+    ns_idx: array<int>;          // 在对应 kind 分数组中的下标
+    ns_structs: array<StructDef>;
+    ns_enums: array<EnumDef>;
+    ns_funcs: array<FuncDef>;
+    ns_aliases: array<TypeAlias>;
+    ns_traits: array<TraitDef>;
+    ns_globals: array<GlobalVar>;
+}
+
+// 类型环境（词法作用域：变量名 → Type）
+pub struct TEnv {
+    names: array<string>;
+    types: array<Type>;
+}
+
+// 结构化诊断（LSP-6；TC 错误与 ps 诊断同构）
+pub struct Diagnostic {
+    code: string;
+    message: string;
+    loc: Location;
+    severity: int;   // DIAG_ERROR 等
+    source: int;     // DIAG_SRC_TC 等
+}
+
+// ============ HIR（AST 去糖 + 名字解析） ============
+// 变量名 → slot 索引（每函数独立 slot 空间）。空子节点用 `0 as HirExpr`。
+// 类型直接存 Type（0 as Type = 无），不再使用 0.3 的 typemap。
+
+// HIR 名字环境：name → slot（函数级 slot 空间）
+pub struct HirEnv {
+    names: array<string>;
+    slots: array<int>;
+    counter: int;   // 下一个 slot
+}
+
+pub struct HirExpr {
+    id: int;            // NodeId：从对应 Expr.id 继承
+    kind: int;          // 复用 EXPR_*（部分已去糖）
+    op: int;            // 操作符 kind（EXPR_CALL 间接调用 op=-1）
+    str1: string;
+    intval: long;
+    floatval: double;
+    slot: int;          // 变量 slot（-1 = 非变量）
+    children: array<HirExpr>;
+    inferred_type: Type; // 结果类型（0 as Type = 无）
+    fn_ty: Type;         // spawn 专用：目标函数类型（TYPE_FUNCTION）；0 as Type = 无
+}
+
+pub struct HirStmt {
+    id: int;            // NodeId：从对应 Stmt.id 继承
+    kind: int;          // 复用 STMT_*
+    str1: string;
+    int1: int;          // for 隐藏索引变量 slot
+    slot: int;          // 目标变量 slot
+    child: HirExpr;     // 关联表达式（0 as HirExpr = 无）
+    body: array<HirStmt>;       // 语句块
+    else_body: array<HirStmt>;  // else 分支语句块
+    rhs: HirExpr;       // STMT_ASSIGN 的 RHS（0 as HirExpr = 无）
+    extra_slots: array<int>;    // for 多变量额外 slot 列表
+    pats: array<HirExpr>;       // STMT_MATCH 模式（HIR）
+    arm_blocks: array<HirBlock>; // STMT_MATCH 臂块
+    inferred_type: Type;        // 0 as Type = 无
+}
+
+pub struct HirBlock { stmts: array<HirStmt> }
+
+pub struct HirParam { name: string; slot: int; ty: Type }
+
+pub struct HirFunc {
+    name: string;
+    params: array<HirParam>;
+    return_type: Type;
+    body: array<HirStmt>;
+    n_slots: int;
+    extern_name: string;
+}
+
+// ============ MIR（线性指令 + 显式基本块） ============
+// 空引用：ty/terminator 用 `0 as Type` / `0 as MirInst`。
+pub struct MirInst {
+    op: int;            // MIR_OP_*
+    ty: Type;           // 结果类型（0 as Type = 无/void）
+    dst: int;           // 目标寄存器编号（-1 = 无）
+    arg1: int;          // 源寄存器/slot
+    arg2: int;
+    longval: long;      // 立即数
+    floatval: double;
+    strval: string;     // 立即数字符串/函数名/目标 label
+    strval2: string;    // 辅助字符串
+    args: array<int>;   // 变长操作数（call 参数、数组字面量元素等）
+}
+
+pub struct MirBlock { label: string; insts: array<MirInst>; terminator: MirInst }  // 0 as MirInst = 无
+
+pub struct MirParam { slot: int; type_kind: int }
+
+pub struct MirFunc {
+    name: string;
+    params: array<MirParam>;
+    return_type_kind: int;
+    blocks: array<MirBlock>;
+    n_regs: int;
+    n_slots: int;
+    extern_name: string;
+}

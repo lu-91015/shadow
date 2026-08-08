@@ -1,0 +1,8 @@
+//@desc: string subscript with a non-integer index is rejected by the type checker
+//@expect-stderr: array index must be integer
+dsb tcf_string_index_nonint;
+kimo main() -> int {
+    let s = "hello";
+    let ch = s["x"];
+    return 0;
+}

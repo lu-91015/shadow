@@ -1,0 +1,20 @@
+//@desc: for (i, x in arr) indexed iteration (i=index, x=element)
+//@expect: 0:10
+//@expect: 1:20
+//@expect: 2:30
+//@expect: idxsum=3
+//@expect: valsum=60
+dsb exe_for_indexed;
+kimo main() -> int {
+    let a = [10, 20, 30];
+    let idxsum = 0;
+    let valsum = 0;
+    for (i, x in a) {
+        println(i + ":" + x);
+        idxsum = idxsum + i;
+        valsum = valsum + x;
+    }
+    println("idxsum=" + idxsum);
+    println("valsum=" + valsum);
+    return 0;
+}

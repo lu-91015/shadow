@@ -1,0 +1,8 @@
+//@desc: nested folder import (utils.string.helper -> utils/string/helper.shadow)
+//@expect: 3
+dsb tc_import_nested;
+import utils.string.helper
+kimo main() -> int {
+    let s = repeat_str("x", 3);
+    println(str_len_approx(s)); return 0;
+}

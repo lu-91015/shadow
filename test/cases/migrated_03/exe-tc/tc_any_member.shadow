@@ -1,0 +1,10 @@
+//@desc: struct boxed into `any`, field accessed via reflection then unboxed
+//@expect: 5
+dsb tc_any_member;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 5, y: 6 };
+    let a = p as any;
+    let v = a.x as int;
+    println(v); return 0;
+}

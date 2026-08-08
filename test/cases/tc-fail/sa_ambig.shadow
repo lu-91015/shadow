@@ -1,0 +1,11 @@
+//@mode: tc-fail
+//@desc: Phase 15 严格态：import 两个都导出 dup() 的模块 → 使用处 ambiguous（Java 通配符语义）
+//@expect-stderr: ambiguous function 'dup'
+//@args: --strict
+dsb sa_ambig;
+import _sa_a;
+import _sa_b;
+kimo main() -> int {
+    let x = dup();
+    return 0;
+}

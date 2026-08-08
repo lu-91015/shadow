@@ -1,0 +1,11 @@
+//@desc: exe-extra generated case (exa_struct_184)
+//@expect: 7
+//@expect: 12
+dsb exa_struct_184;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 3, y: 4 };
+    println(p.x + p.y);
+    println(p.x * p.y);
+    return 0;
+}

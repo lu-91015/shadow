@@ -1,0 +1,9 @@
+//@desc: P2 semver — build metadata does not affect comparison (0.3.0+build.5 satisfies =0.3.0)
+//@expect: 42
+dsb main;
+import ver_pkg.helper
+
+kimo main() -> int {
+    println(get_value());
+    return 0;
+}

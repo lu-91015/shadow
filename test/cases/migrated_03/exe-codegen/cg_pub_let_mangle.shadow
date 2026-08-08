@@ -1,0 +1,16 @@
+//@expect: 100
+//@expect: 200
+//@expect: 100
+//@expect: 200
+//@ desc: cross-module same-name pub let mangled to module__name; in-module refs still resolve
+dsb cg_pub_let_mangle;
+import _mangle_a;
+import _mangle_b;
+
+kimo main() -> int {
+    println(mangle_a.VALUE);
+    println(mangle_b.VALUE);
+    println(mangle_a.get_value());
+    println(mangle_b.get_value());
+    return 0;
+}

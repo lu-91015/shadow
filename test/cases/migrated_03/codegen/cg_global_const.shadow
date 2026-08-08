@@ -1,0 +1,7 @@
+//@ mode: codegen
+//@ desc: top-level constant declaration
+dsb cg_global_const;
+let MAX_SIZE: int = 100;
+kimo main() -> int {
+    return MAX_SIZE;
+}

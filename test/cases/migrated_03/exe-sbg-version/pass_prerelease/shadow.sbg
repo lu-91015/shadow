@@ -1,0 +1,9 @@
+# shadow.sbg — P2 pre-release 测试
+# 约束 >=1.0.0-rc.1，包内 version=1.0.0-rc.1（精确匹配）
+# 验证 P2：pre-release 版本号解析与比较
+[package]
+name = "ver_test_prerelease"
+version = "0.3.0"
+
+[deps]
+ver_pkg = "ver_pkg.spk@>=1.0.0-rc.1"

@@ -1,0 +1,14 @@
+//@desc: LSP-3：跨行语句的区间必须跨行（end_line > line），折叠/高亮依赖于此
+//@expect: ranges: funcs=1
+//@expect: func: spread 8:1-14:2
+//@expect:   stmt: 9:5-12:6
+//@expect:   stmt: 13:5-13:14
+dsb rng_multiline;
+
+kimo spread() -> int {
+    if (1 == 1) {
+        let x = 2;
+        return x;
+    }
+    return 0;
+}

@@ -1,0 +1,9 @@
+//@mode: tc
+//@desc: Phase 15 严格态：import 后 pub 符号跨模块可见且可调用
+//@args: --strict
+dsb sa_pub_ok;
+import _sa_lib2;
+kimo main() -> int {
+    let a = shared();
+    return a;
+}

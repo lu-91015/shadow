@@ -1,0 +1,8 @@
+//@mode: tc
+//@desc: Phase 11 模块机制：shadow.sbg [deps] 目录依赖（§3.8.3 路径②）
+dsb tc_mod_deps;
+import mathlib.add;
+kimo main() -> int {
+    let v = mod_add3(1, 2, 39);
+    return v == 42 ? 0 : 1;
+}

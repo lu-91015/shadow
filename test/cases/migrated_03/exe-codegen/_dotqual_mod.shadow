@@ -1,0 +1,8 @@
+dsb dotqual_mod;
+
+pub let ANSWER: int = 7;
+pub let GREETING: string = "hi";
+
+pub kimo helper() -> int {
+    return 42;
+}

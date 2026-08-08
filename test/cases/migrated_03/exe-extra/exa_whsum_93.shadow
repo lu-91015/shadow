@@ -1,0 +1,10 @@
+//@desc: exe-extra generated case (exa_whsum_93)
+//@expect: 28
+dsb exa_whsum_93;
+kimo main() -> int {
+    let i = 0;
+    let s = 0;
+    while (i < 8) { s = s + i; i = i + 1; }
+    println(s);
+    return 0;
+}

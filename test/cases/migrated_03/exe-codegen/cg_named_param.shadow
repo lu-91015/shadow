@@ -1,0 +1,31 @@
+//@desc: named parameters f(x: 1, y: 2) reorders args by name
+//@expect: 7\n30\nhello alice\n100
+dsb cg_named_param;
+
+kimo greet(name: string, greeting: string) -> string {
+    return greeting + " " + name;
+}
+
+kimo add(x: int, y: int, z: int) -> int {
+    return x + y + z;
+}
+
+kimo main() -> int {
+    // 命名参数（乱序）
+    let a = add(z: 1, x: 5, y: 1);
+    println(int_to_str(a));
+
+    // 位置参数 + 命名参数混合
+    let b = add(10, z: 0, y: 20);
+    println(int_to_str(b));
+
+    // 字符串命名参数
+    let s = greet(name: "alice", greeting: "hello");
+    println(s);
+
+    // 全部位置参数（兼容性）
+    let c = add(50, 40, 10);
+    println(int_to_str(c));
+
+    return 0;
+}

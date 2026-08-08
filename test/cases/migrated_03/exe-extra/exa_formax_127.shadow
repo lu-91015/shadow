@@ -1,0 +1,10 @@
+//@desc: exe-extra generated case (exa_formax_127)
+//@expect: 1
+dsb exa_formax_127;
+kimo main() -> int {
+    let a = [1, 1, 1];
+    let m = a[0];
+    for (v in a) { if (v > m) { m = v; } }
+    println(m);
+    return 0;
+}

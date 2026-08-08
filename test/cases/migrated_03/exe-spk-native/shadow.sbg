@@ -1,0 +1,8 @@
+# shadow.sbg — 主包，依赖 native_lib.spk（带 native C++ 文件）
+# 验证 P0-2：库自带 native 文件，编译器自动收集并传给链接器
+[package]
+name = "spk_native_test"
+version = "0.3.0"
+
+[deps]
+native_lib = "native_lib.spk"

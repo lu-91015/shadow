@@ -1,0 +1,15 @@
+//@mode: exe
+//@desc: stress concat 100k（str_join 预计算总长一次分配，内存近线性）
+//@expect: len=100000
+dsb ex_str_stress;
+kimo main() -> int {
+    let parts = [];
+    let i = 0;
+    while (i < 100000) {
+        parts = array_push(parts, "x");
+        i = i + 1;
+    }
+    let s = str_join(parts, "");
+    println("len=" + int_to_str(len(s)));
+    return 0;
+}

@@ -1,0 +1,20 @@
+//@desc: relax `as` operator — string as int / long / float / bool dispatches to parse_*
+//@expect: AS_INT=42
+//@expect: AS_LONG=123
+//@expect: AS_BOOL=true
+dsb as_string_to_int;
+
+kimo main() -> int {
+    // string as int 等价于 parse_int(s)
+    let i: int = "42" as int;
+    println("AS_INT=" + int_to_str(i));
+
+    let l: long = "123" as long;
+    println("AS_LONG=" + long_to_str(l));
+
+    let b: bool = "true" as bool;
+    if (b) { println("AS_BOOL=true"); }
+    else { println("AS_BOOL=false"); }
+
+    return 0;
+}

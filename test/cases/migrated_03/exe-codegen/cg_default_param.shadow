@@ -1,0 +1,36 @@
+//@desc: default parameters fn f(x: int = 0, y: int = 1)
+//@xfail: default param not implemented in 0.4
+//@expect: 2\n7\n30\nhello world\nhello default
+dsb cg_default_param;
+
+kimo greet(name: string = "world") -> string {
+    return "hello " + name;
+}
+
+kimo add(x: int, y: int = 0, z: int = 1) -> int {
+    return x + y + z;
+}
+
+kimo main() -> int {
+    // add(1): x=1, y=0(default), z=1(default) -> 2
+    let a = add(1);
+    println(int_to_str(a));
+
+    // add(1,5): x=1, y=5, z=1(default) -> 7
+    let b = add(1, 5);
+    println(int_to_str(b));
+
+    // add(10,20,0): all provided -> 30
+    let c = add(10, 20, 0);
+    println(int_to_str(c));
+
+    // greet(): name="world"(default) -> "hello world"
+    let s1 = greet();
+    println(s1);
+
+    // greet("default"): name="default" -> "hello default"
+    let s2 = greet("default");
+    println(s2);
+
+    return 0;
+}

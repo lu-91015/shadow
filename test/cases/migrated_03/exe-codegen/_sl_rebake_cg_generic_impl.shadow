@@ -1,0 +1,13 @@
+dsb _sl_rebake_cg_generic_impl;
+
+struct Container<T> { item: T }
+impl Container {
+    kimo get(c: Container) -> any { return c.item; }
+    kimo set_v(c: Container, v: any) -> void { c.item = v; }
+}
+kimo main() -> int {
+    let c = Container { item: 100 };
+    let v = c.get();
+    c.set_v(200);
+    println(v); return 0;
+}

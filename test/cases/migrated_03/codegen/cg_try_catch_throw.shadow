@@ -1,0 +1,15 @@
+//@ mode: codegen
+//@ desc: try/catch with direct throw in try body generates exception flag checks
+//@expect-ir: shadow_exception_occurred
+dsb cg_try_catch_throw;
+
+kimo main() -> int {
+    let result = 0;
+    try {
+        throw "error";
+        result = 1;
+    } catch {
+        result = 99;
+    }
+    return result;
+}

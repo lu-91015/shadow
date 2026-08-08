@@ -1,0 +1,5 @@
+//@desc: recursive function type-checks
+//@expect: typecheck: 1
+dsb tc_recursion;
+kimo fact(n: int) -> int { if (n <= 1) { return 1; } return n * fact(n - 1); }
+kimo main() -> int { return fact(5); }

@@ -1,0 +1,10 @@
+dsb lib;
+// 模块 a：struct Pt(x,y)、enum Color{Red,Blue}、泛型 Pair<T>、inherent impl 方法 tag()、全局 g、函数 c
+pub let g: int = 10;
+pub struct Pt { x: int, y: int }
+pub enum Color { Red, Blue }
+pub struct Pair<T> { f1: T, f2: T }
+impl Pt {
+    pub kimo tag(self: Pt) -> int { return 7; }
+}
+pub kimo c() -> int { return 1; }

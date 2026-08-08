@@ -1,0 +1,22 @@
+//@desc: LSP-2 库化 API：无错文件走 api_check，报告到达 check 阶段且 ok=1
+//@expect: check: stage=check
+//@expect: funcs=2
+//@expect: structs=1
+//@expect: module=chk_clean
+//@expect: check: errors=0 sdiags=0 ok=1
+dsb chk_clean;
+
+struct Point {
+    x: int;
+    y: int;
+}
+
+kimo dist2(p: Point) -> int {
+    return p.x * p.x + p.y * p.y;
+}
+
+kimo main() -> int {
+    let p = Point { x: 3, y: 4 };
+    println(dist2(p));
+    return 0;
+}

@@ -1,0 +1,17 @@
+//@desc: GC frame leave on multiple return paths
+//@expect-ir: shadow_gc_frame_leave
+dsb gc_16_multi_return;
+struct P { x: int, y: int }
+kimo classify(n: int) -> int {
+    let p = P { x: n, y: n };
+    if (n > 10) {
+        return p.x;
+    }
+    if (n < 0) {
+        return p.y;
+    }
+    return 0;
+}
+kimo main() -> int {
+    return classify(5);
+}

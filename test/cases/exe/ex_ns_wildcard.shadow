@@ -1,0 +1,16 @@
+//@mode: exe
+//@desc: Phase 11 §3.8 通配符导入 import a.*（等价「目录=包」展开）+ FQN 调用
+//@expect: wildcard ok 7
+dsb ex_ns_wildcard;
+import nswild.*;
+
+kimo main() -> int {
+    // import nswild.* 展开目录下全部 .shadow（alpha + beta）
+    let s = alpha_val() + beta_val();
+    if (s != 7) { println("ERR sum " + int_to_str(s)); return 1; }
+    // 通配符导入的成员同样可用 FQN 限定（nswild\alpha.shadow → nswild.alpha）
+    let t = nswild.alpha.alpha_val() + nswild.beta.beta_val();
+    if (t != 7) { println("ERR fqn " + int_to_str(t)); return 1; }
+    println("wildcard ok " + int_to_str(s));
+    return 0;
+}

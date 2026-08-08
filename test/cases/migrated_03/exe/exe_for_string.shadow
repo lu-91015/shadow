@@ -1,0 +1,12 @@
+//@desc: for (c in s) string iteration (char count only)
+//@expect: 3
+dsb exe_for_string;
+kimo main() -> int {
+    let s = "abc";
+    let count = 0;
+    for (c in s) {
+        count = count + 1;
+    }
+    println(count);
+    return 0;
+}

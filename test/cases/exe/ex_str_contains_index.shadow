@@ -1,0 +1,16 @@
+//@mode: exe
+//@desc: str_contains / str_index_of
+//@expect: contains=1
+//@expect: idx=6
+//@expect: missing=-1
+dsb ex_str_contains_index;
+kimo main() -> int {
+    let s = "hello world";
+    let c = str_contains(s, "world");
+    let i = str_index_of(s, "world");
+    let m = str_index_of(s, "xyz");
+    println("contains=" + int_to_str(c));
+    println("idx=" + int_to_str(i as int));
+    println("missing=" + int_to_str(m as int));
+    return 0;
+}

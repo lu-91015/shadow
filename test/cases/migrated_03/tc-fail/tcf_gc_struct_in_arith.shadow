@@ -1,0 +1,8 @@
+//@desc: use struct itself (not a field) in arithmetic should fail
+//@expect-stderr: Type check failed
+dsb tcf_gc_struct_in_arith;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let p = P { x: 1, y: 2 };
+    return p + 1;
+}

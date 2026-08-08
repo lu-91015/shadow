@@ -1,0 +1,12 @@
+//@ mode: codegen
+//@ desc: generic monomorphization — first returns the generic T value
+//@expect-ir: first__T_int
+dsb cg_mono_return;
+
+kimo first<T>(a: T, b: T) -> T {
+    return a;
+}
+kimo main() -> int {
+    let v = first(7, 99);
+    return v;
+}

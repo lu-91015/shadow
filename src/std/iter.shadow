@@ -1,0 +1,149 @@
+// std/iter.shadow — Eager functional iterator API
+// ============================================================
+dsb iter;
+// import std.iter 后可用：
+//   array_map(arr, f)        — 对每个元素应用 f，返回新数组
+//   array_filter(arr, pred)  — 保留 pred(x) == 1 的元素
+//   array_take(arr, n)       — 取前 n 个
+//   array_skip(arr, n)       — 跳过前 n 个
+//   array_fold(arr, init, f) — 折叠 f(acc, x) -> new_acc
+//   array_reduce(arr, f)     — 无初始值折叠（空数组返回 0）
+//   array_zip(arr1, arr2)    — 打包为 [[a1,b1], [a2,b2], ...]
+//   array_enumerate(arr)     — 打包为 [[0,v0], [1,v1], ...]
+//   array_any(arr, pred)     — 任一满足返回 1
+//   array_all(arr, pred)     — 全部满足返回 1
+//   array_find(arr, pred)    — 第一个满足的元素（未找到返回 0）
+//   array_collect(arr)       — identity，链式终点（为未来 lazy iterator 预留）
+//
+// 注意：元素和闭包均用 any 传递（shadow 当前无单态化）。
+// 闭包通过 any 传递时 captured_count 按 0 处理，仅支持无捕获闭包
+// 或捕获变量已在闭包值中（通过 env_ptr）的有捕获闭包。
+
+pub kimo array_map(arr: any, f: any) -> any {
+    let result: any = [];
+    let i = 0;
+    while (i < len(arr)) {
+        result = array_push(result, f(arr[i]));
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_filter(arr: any, pred: any) -> any {
+    let result: any = [];
+    let i = 0;
+    while (i < len(arr)) {
+        let v = arr[i];
+        let keep = pred(v) as int;
+        if (keep == 1) {
+            result = array_push(result, v);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_take(arr: any, n: int) -> any {
+    let result: any = [];
+    let limit = n;
+    if (limit > len(arr)) { limit = len(arr); }
+    if (limit < 0) { limit = 0; }
+    let i = 0;
+    while (i < limit) {
+        result = array_push(result, arr[i]);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_skip(arr: any, n: int) -> any {
+    let result: any = [];
+    let start = n;
+    if (start < 0) { start = 0; }
+    let i = start;
+    while (i < len(arr)) {
+        result = array_push(result, arr[i]);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_fold(arr: any, init: any, f: any) -> any {
+    let acc = init;
+    let i = 0;
+    while (i < len(arr)) {
+        acc = f(acc, arr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+pub kimo array_reduce(arr: any, f: any) -> any {
+    if (len(arr) == 0) { return 0; }
+    let acc = arr[0];
+    let i = 1;
+    while (i < len(arr)) {
+        acc = f(acc, arr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+pub kimo array_zip(arr1: any, arr2: any) -> any {
+    let result: any = [];
+    let n = len(arr1);
+    if (len(arr2) < n) { n = len(arr2); }
+    let i = 0;
+    while (i < n) {
+        let pair: any = [arr1[i], arr2[i]];
+        result = array_push(result, pair);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_enumerate(arr: any) -> any {
+    let result: any = [];
+    let i = 0;
+    while (i < len(arr)) {
+        let pair: any = [i, arr[i]];
+        result = array_push(result, pair);
+        i = i + 1;
+    }
+    return result;
+}
+
+pub kimo array_any(arr: any, pred: any) -> int {
+    let i = 0;
+    while (i < len(arr)) {
+        let hit = pred(arr[i]) as int;
+        if (hit == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo array_all(arr: any, pred: any) -> int {
+    let i = 0;
+    while (i < len(arr)) {
+        let ok = pred(arr[i]) as int;
+        if (ok == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+pub kimo array_find(arr: any, pred: any) -> any {
+    let i = 0;
+    while (i < len(arr)) {
+        let v = arr[i];
+        let hit = pred(v) as int;
+        if (hit == 1) { return v; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo array_collect(arr: any) -> any {
+    return arr;
+}

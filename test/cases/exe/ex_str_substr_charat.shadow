@@ -1,0 +1,14 @@
+//@mode: exe
+//@desc: substr2 / str_char_at / 字符串下标
+//@expect: wor
+//@expect: h
+//@expect: abc
+dsb ex_str_substr_charat;
+kimo main() -> int {
+    println(substr2("hello world", 6, 9));
+    println(str_char_at("hello", 0));
+    let s = "abc";
+    let combo = s[0] + s[1] + s[2];
+    println(combo);
+    return 0;
+}

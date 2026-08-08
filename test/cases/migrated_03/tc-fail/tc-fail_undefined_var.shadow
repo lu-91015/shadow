@@ -1,0 +1,4 @@
+//@desc: reference to undefined variable is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_undefined_var;
+kimo main() -> int { return undefined_thing; }

@@ -1,0 +1,11 @@
+//@desc: float comparison yields bool usable in if/else
+//@expect: 1
+dsb tc_float_compare;
+kimo main() -> int {
+    let a = 1.5;
+    let b = 2.5;
+    if (a < b) { println(1); return 0; }
+    if (a != b) { println(2); return 0; }
+    if (a <= b) { println(3); return 0; }
+    println(0); return 0;
+}

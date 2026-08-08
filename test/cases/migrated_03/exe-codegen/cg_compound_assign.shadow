@@ -1,0 +1,12 @@
+//@expect: 19
+//@ desc: compound assignment on simple variable desugars to x = x op rhs
+dsb cg_compound_assign;
+
+kimo main() -> int {
+    let x = 10;
+    x += 5;
+    x -= 2;
+    x *= 3;
+    x /= 2;
+    println(x); return 0;
+}

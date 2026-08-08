@@ -1,0 +1,9 @@
+//@desc: struct field used in arithmetic expression
+dsb tc_gc_struct_field_arith;
+struct V { a: int, b: int, c: int }
+kimo main() -> int {
+    let v = V { a: 10, b: 20, c: 30 };
+    let sum = v.a + v.b + v.c;
+    let prod = v.a * v.b;
+    return sum - prod;
+}

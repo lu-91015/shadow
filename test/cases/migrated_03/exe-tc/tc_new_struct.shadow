@@ -1,0 +1,10 @@
+//@expect: 7
+//@ desc: new keyword creates a heap-allocated struct
+dsb tc_new_struct;
+struct Point { x: int; y: int }
+kimo main() -> int {
+    let p = new Point;
+    p.x = 3;
+    p.y = 4;
+    println(p.x + p.y); return 0;
+}

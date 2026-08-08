@@ -1,0 +1,8 @@
+//@desc: GC frame leave on function with no GC objects
+//@expect-ir: shadow_gc_frame_enter
+//@expect-ir: shadow_gc_frame_leave
+dsb gc_10_plain_fn_frame;
+kimo plain(x: int) -> int { return x + 1; }
+kimo main() -> int {
+    return plain(42);
+}

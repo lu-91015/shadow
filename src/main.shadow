@@ -1,0 +1,1751 @@
+// Shadow 0.4 — 编译器主入口
+// ============================================================
+// 完整管线：读文件 → tokenize → parse → TC → HIR → MIR → Codegen → .ll
+//   shadow <file.shadow> -o <out.ll>    只生成 .ll
+//   shadow <file.shadow> --run          编译 + llc + 链接 + 运行
+//   shadow --version                    打印版本
+//
+// 语法完全复刻 shadow-0.3（dsb 模块声明 + kimo 函数）。
+// 由 bootstrap/s03.exe（冻结的 0.3 宿主）编译，链接 runtime_for_selfhost.o。
+dsb main;
+
+// 扁平模块组织（0.3 架构）：主文件集中 import 全部模块，模块间不互相 import。
+// runtime 模块由 s03.exe 编译时自动拼接，无需 import。
+import core.const;
+import core.ast;
+import core.utils;
+import lexer.lexer;
+import parser.parser;
+import type_checker.type_checker;
+import hir.hir;
+import mir.mir;
+import mir.mir_serialize;
+import codegen.codegen;
+import api.compile_api;
+import lsp.lsp;
+
+// ============ Phase 12：SPK zip 工具 extern 声明（s03 宿主 TC 需要） ============
+@extern("shadow_zip_pack") kimo zip_pack(dir: string, out: string) -> int { return 0; }
+@extern("shadow_zip_unpack") kimo zip_unpack(spk: string, out: string) -> int { return 0; }
+@extern("shadow_zip_list") kimo zip_list(spk: string) -> string { return ""; }
+@extern("shadow_content_hash") kimo content_hash(path: string) -> string { return ""; }
+// TIMING-DBG-TEMP
+@extern("clock") kimo c_clock() -> long { return 0; }
+
+// 打印到 stderr（错误消息）
+kimo main_eprint(s: string) -> void {
+    rt_puts(s);
+}
+
+// 拼接多个字符串（用 str_join 避免内存问题，原则 9）
+kimo main_join(parts: array<string>) -> string {
+    return str_join(parts, "");
+}
+
+// ============ import 递归加载 + runtime 注入（Phase 7c）============
+// 0.4 编译任何程序（含自身）时，把 runtime_lib.shadow + 全部 import 模块源码
+// 拼接成 combined source，再进编译管线。顺序：runtime 在前（提供 shadow_* 定义），
+// import 依赖其次（被依赖者先出现），主文件最后（保留其 dsb）。
+// 除主文件外每个文件的 dsb 声明行删除（0.3 parse 要求 dsb 是文件第一条语句，
+// 拼接后重复 dsb 会报 SH-PARSE007）。import 行保留（parse 收集但 TC 不重新加载）。
+let main_loaded: array<string> = [];
+let main_parts: array<string> = [];
+
+// 读文件，不存在返回 ""
+kimo main_read_or_empty(path: string) -> string {
+    if (file_exists(path) == 0) { return ""; }
+    return file_read(path);
+}
+
+// ============ Phase 11：§3.8 模块/包机制（import 解析） ============
+// §3.8.3 算法：import a.b.c → 首段 a = 模块名，剩余 b/c = 包路径。
+//   ① 主模块自身：a 匹配主目录下的一级目录/文件（自举前提 B：core/lexer/parser…）；
+//   ② shadow.sbg [deps]：a 匹配依赖名 → 依赖目录下解析（.spk 留 Phase 12）；
+//   ③ 失败 → 报错 + 候选提示（对标 Go "no required module provides package"）。
+// 包级 DAG 循环检测：main_path_stack（当前 DFS 路径，push/pop）+ main_compiled（只加不减）。
+//   菱形依赖：c 在 compiled 命中 → 跳过；不在 path_stack → 不构成环。
+// 目录=包：<pkg>.shadow 文件缺失时，<pkg>/ 目录存在 → 加载目录下全部 .shadow
+//   （插入排序保证确定性，避免 FindFirstFile 顺序影响 fixed-point）。
+let main_sbg_name: string = "";              // [package] name（无 sbg = ""）
+let main_sbg_deps_names: array<string> = []; // [deps] 依赖名（import 首段）
+let main_sbg_deps_paths: array<string> = []; // [deps] 路径（相对主目录；目录或 .spk）
+let main_sbg_deps_versions: array<string> = []; // [deps] 版本约束（""=任意，semver）
+// P0-2：库自带 native 文件 — 从 .spk 包内 shadow.sbg 的 [native] 节收集。
+// main_link_exe 把 sources 编译为 .o 并追加到 clang++ 链接命令。
+let main_native_sources: array<string> = [];    // .cpp/.c 绝对路径（解包缓存目录下）
+let main_native_links: array<string> = [];      // -l 库名
+let main_native_link_dirs: array<string> = [];  // -L 搜索路径（绝对）
+let main_compiled: array<string> = [];       // 已编译文件 key（相对主目录，只加不减）
+let main_path_stack: array<string> = [];     // 当前 DFS 路径（push/pop）
+let main_resolved: array<string> = [];       // 一次 import 解析出的文件 key 列表
+let main_resolved_roots: array<string> = []; // 与 main_resolved 平行：每个文件的 project_root
+let main_import_err: string = "";            // 解析错误消息（非空即失败）
+// L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
+// 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
+// 在任意非编译器项目里都解析不到，报 "no required module provides package"。
+// 由 main_load_combined 从 argv[0] 目录向上探测 src/std/iter.shadow 得到。
+let main_std_root: string = "";
+
+// §3.8 兼容态命名空间：每个被加载模块在 combined 源中的「起始行」（1-based）。
+// 由 main_load_combined 填充，供类型检查器归因每个定义为所属命名空间（FQN 解析用）。
+// 纯叠加层：不影响拼接出的源码内容，故不会改变编译器自举产物。
+let tc_mod_ns: array<string> = [];
+let tc_mod_starts: array<int> = [];
+// 兼容态 dsb 别名：dsb 名 → 路径派生名（0.3 用例 _dotqual_mod 文件以 dotqual_mod 访问）。
+// 与 tc_mod_ns 平行；严格态（路径模型）不记录。注入 tc_set_mod_dsbmap。
+let tc_mod_dsb_alias: array<string> = [];
+let tc_mod_dsb_path: array<string> = [];
+// Phase 11 函数级增量缓存（.lu）：每模块源码全文 + 源文件路径（与 tc_mod_ns 平行）。
+// 缓存命中模块 = 源码 djb2 hash 与 .lu 一致 → 函数体检查 + hir/mir 跳过（MIR 从缓存加载）。
+let main_mod_srcs: array<string> = [];
+let main_mod_paths: array<string> = [];
+// 缓存命中标志（与 tc_mod_ns 平行，1=本次编译该模块函数体/hir/mir 可跳过）
+let main_g_valid: array<int> = [];
+// 依赖指纹：每模块签名 hash（与 tc_mod_ns 平行）+ 全程序世界签名指纹（本次编译现算）
+let main_mod_sigs: array<string> = [];
+let main_wsig: string = "";
+// 严格态（Phase 15）：每模块的 import 列表（与 tc_mod_imp_ns 平行），值已是命名空间（. 分隔）
+let tc_mod_imp_ns: array<string> = [];
+let tc_mod_imp_list: array<array<string>> = [];
+let main_cur_ns: string = "";
+
+// 统一分隔符为 \
+kimo main_bslash(path: string) -> string {
+    return str_replace(path, "/", "\\");
+}
+
+// 路径拼接：任一侧为空时**不能**产生分隔符。
+// project_root 为空是常态——主文件以裸文件名给出（`shadow main.shadow`，CWD 即工程根）时
+// 主目录推导结果就是 ""；直接 root + "\\" + key 会拼成 "\main.shadow"（盘符根绝对路径），
+// 模块一律读不到。同理 dir_key 为空时会拼出尾随分隔符。
+kimo main_path_join(root: string, rel: string) -> string {
+    if (len(root) == 0) { return rel; }
+    if (len(rel) == 0) { return root; }
+    return root + "\\" + rel;
+}
+
+// key 是否在当前 DFS 路径上（循环检测）
+kimo main_in_path_stack(key: string) -> int {
+    let i = 0;
+    while (i < len(main_path_stack)) {
+        if (str_eq(main_path_stack[i] as string, key) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// key 是否已编译（去重）
+kimo main_in_compiled(key: string) -> int {
+    let i = 0;
+    while (i < len(main_compiled)) {
+        if (str_eq(main_compiled[i] as string, key) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 从 path_stack 弹出栈顶（0.3 无数组 pop，重建）
+kimo main_path_pop() -> void {
+    let n = len(main_path_stack);
+    if (n == 0) { return; }
+    let nw: array<string> = [];
+    let i = 0;
+    while (i < n - 1) {
+        nw = array_push(nw, main_path_stack[i] as string);
+        i = i + 1;
+    }
+    main_path_stack = nw;
+}
+
+// 文件路径 key → 命名空间（core\ast.shadow → core.ast；main.shadow → main）
+kimo main_key_to_ns(key: string) -> string {
+    let s = key;
+    let n = len(s);
+    if (n > 7) {
+        let ext = substr2(s, n - 7, n);
+        if (str_eq(ext, ".shadow") == 1) { s = substr2(s, 0, n - 7); }
+    }
+    s = str_replace(s, "\\", ".");
+    return s;
+}
+
+// 记录当前模块在 combined 源中的起始行（1-based），供命名空间树归因。
+// 在即将追加某模块内容之前调用（main_parts 的当前长度 + 1 即首行行号）。
+kimo main_record_mod(ns: string) -> void {
+    tc_mod_ns = array_push(tc_mod_ns, ns);
+    tc_mod_starts = array_push(tc_mod_starts, len(main_parts) + 1);
+    main_cur_ns = ns;
+    // 为新模块建空 import 列表
+    tc_mod_imp_ns = array_push(tc_mod_imp_ns, ns);
+    tc_mod_imp_list = array_push(tc_mod_imp_list, []);
+}
+
+// 记录模块 owner 对 target 的 import（target 已是命名空间 . 分隔）
+kimo tc_mod_imp_record(owner: string, target: string) -> void {
+    let i = 0;
+    while (i < len(tc_mod_imp_ns)) {
+        if (str_eq(tc_mod_imp_ns[i] as string, owner) == 1) {
+            let lst = tc_mod_imp_list[i] as array<string>;
+            // 去重
+            let j = 0;
+            let dup = 0;
+            while (j < len(lst)) {
+                if (str_eq(lst[j] as string, target) == 1) { dup = 1; }
+                j = j + 1;
+            }
+            if (dup == 0) { lst = array_push(lst, target); tc_mod_imp_list[i] = lst; }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// 解析 shadow.sbg（TOML 微子集）：[package] name/version/abi_version + [deps] name="path"
+// 结果写入全局 main_sbg_*；sbg_src 为空则重置为无清单状态。
+kimo main_parse_sbg(sbg_src: string) -> void {
+    main_sbg_name = "";
+    main_sbg_deps_names = [];
+    main_sbg_deps_paths = [];
+    main_sbg_deps_versions = [];
+    if (len(sbg_src) == 0) { return; }
+    let lines = str_split(sbg_src, "\n");
+    let section = "";
+    let i = 0;
+    while (i < len(lines)) {
+        let t = str_trim(lines[i] as string);
+        if (len(t) == 0) { i = i + 1; continue; }
+        if (str_eq(substr2(t, 0, 1), "#") == 1) { i = i + 1; continue; }
+        if (str_eq(substr2(t, 0, 1), "[") == 1) {
+            let close = str_index_of(t, "]");
+            if (close > 0) { section = str_trim(substr2(t, 1, close as int)); }
+            i = i + 1;
+            continue;
+        }
+        let eq = str_index_of(t, "=");
+        if (eq < 0) { i = i + 1; continue; }
+        let key = str_trim(substr2(t, 0, eq as int));
+        let val = str_trim(substr2(t, eq + 1, len(t)));
+        if (len(val) >= 2) {
+            if (str_eq(substr2(val, 0, 1), "\"") == 1) {
+                val = substr2(val, 1, len(val) - 1);   // 剥首尾引号
+            }
+        }
+        if (str_eq(section, "package") == 1) {
+            if (str_eq(key, "name") == 1) { main_sbg_name = val; }
+        } else if (str_eq(section, "deps") == 1) {
+            // deps: name = "path"（目录或 .spk 文件）
+            if (len(key) > 0 && len(val) > 0) {
+                main_sbg_deps_names = array_push(main_sbg_deps_names, key);
+                main_sbg_deps_paths = array_push(main_sbg_deps_paths, val);
+                main_sbg_deps_versions = array_push(main_sbg_deps_versions, "");
+            }
+        } else if (str_starts_with(section, "deps.") == 1) {
+            // [deps.<name>] 表：path / version（semver 约束）
+            let dep_name = substr2(section, 5, len(section));
+            let di = 0;
+            let didx = -1;
+            while (di < len(main_sbg_deps_names)) {
+                if (str_eq(main_sbg_deps_names[di] as string, dep_name) == 1) { didx = di; }
+                di = di + 1;
+            }
+            if (didx < 0) {
+                main_sbg_deps_names = array_push(main_sbg_deps_names, dep_name);
+                main_sbg_deps_paths = array_push(main_sbg_deps_paths, "");
+                main_sbg_deps_versions = array_push(main_sbg_deps_versions, "");
+                didx = len(main_sbg_deps_names) - 1;
+            }
+            if (str_eq(key, "path") == 1) { main_sbg_deps_paths[didx] = val; }
+            if (str_eq(key, "version") == 1) { main_sbg_deps_versions[didx] = val; }
+        }
+        i = i + 1;
+    }
+}
+
+// 从主文件目录读 shadow.sbg 并解析（无则重置）
+kimo main_load_sbg(project_root: string) -> void {
+    main_parse_sbg(main_read_or_empty(main_path_join(project_root, "shadow.sbg")));
+}
+
+// dep 路径查表：import 首段 → 命中依赖则返回 dep 路径（相对主目录），否则 ""
+kimo main_dep_path_of(module: string) -> string {
+    let i = 0;
+    while (i < len(main_sbg_deps_names)) {
+        let n = main_sbg_deps_names[i] as string;
+        if (str_eq(n, module) == 1) {
+            return main_sbg_deps_paths[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// dep 版本约束查表（""=任意）
+kimo main_dep_version_of(module: string) -> string {
+    let i = 0;
+    while (i < len(main_sbg_deps_names)) {
+        let n = main_sbg_deps_names[i] as string;
+        if (str_eq(n, module) == 1) {
+            return main_sbg_deps_versions[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 读 shadow.sbg 的 [package] version（SPK 缓存解包后调用）
+kimo main_sbg_version_of(sbg_src: string) -> string {
+    let lines = str_split(sbg_src, "\n");
+    let section = "";
+    let ver = "";
+    let i = 0;
+    while (i < len(lines)) {
+        let t = str_trim(lines[i] as string);
+        if (len(t) == 0) { i = i + 1; continue; }
+        if (str_eq(substr2(t, 0, 1), "[") == 1) {
+            let close = str_index_of(t, "]");
+            if (close > 0) { section = str_trim(substr2(t, 1, close as int)); }
+            i = i + 1;
+            continue;
+        }
+        let eq = str_index_of(t, "=");
+        if (eq < 0) { i = i + 1; continue; }
+        let key = str_trim(substr2(t, 0, eq as int));
+        let val = str_trim(substr2(t, eq + 1, len(t)));
+        if (len(val) >= 2) {
+            if (str_eq(substr2(val, 0, 1), "\"") == 1) {
+                val = substr2(val, 1, len(val) - 1);
+            }
+        }
+        if (str_eq(section, "package") == 1) {
+            if (str_eq(key, "version") == 1) { ver = val; }
+        }
+        i = i + 1;
+    }
+    return ver;
+}
+
+// 字符串是否已在数组中（native 收集去重用）
+kimo main_str_in(arr: array<string>, s: string) -> int {
+    let i = 0;
+    while (i < len(arr)) {
+        if (str_eq(arr[i] as string, s) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// P0-2：从 shadow.sbg 源码收集 [native] 节：
+//   [native]
+//   sources   = ["native/calc_bind.cpp"]   # 相对包根，编译为 .o 进链接
+//   links     = ["mylib"]                  # -l 库名
+//   link_dirs = ["lib"]                    # 相对包根，-L 搜索路径
+// 幂等去重：main_spk_ensure 会被多条路径重复调用（依赖清单加载一次、import 解析再一次），
+// 若无条件追加，同一个 .cpp 会被编成 _native_0.o 与 _native_1.o 一起进链接器 →
+// lld-link "duplicate symbol"。按完整路径/库名去重。
+kimo main_collect_native_from_sbg(sbg_src: string, base_dir: string) -> void {
+    if (len(sbg_src) == 0) { return; }
+    let lines = str_split(sbg_src, "\n");
+    let section = "";
+    let i = 0;
+    while (i < len(lines)) {
+        let t = str_trim(lines[i] as string);
+        if (len(t) == 0) { i = i + 1; continue; }
+        if (str_eq(substr2(t, 0, 1), "#") == 1) { i = i + 1; continue; }
+        if (str_eq(substr2(t, 0, 1), "[") == 1) {
+            let close = str_index_of(t, "]");
+            if (close > 0) { section = str_trim(substr2(t, 1, close as int)); }
+            i = i + 1;
+            continue;
+        }
+        if (str_eq(section, "native") == 0) { i = i + 1; continue; }
+        let eq = str_index_of(t, "=");
+        if (eq < 0) { i = i + 1; continue; }
+        let key = str_trim(substr2(t, 0, eq as int));
+        let val = str_trim(substr2(t, eq + 1, len(t)));
+        // 数组值 ["a", "b"]：剥方括号后按逗号切；标量值也按单元素处理
+        if (len(val) >= 2) {
+            if (str_eq(substr2(val, 0, 1), "[") == 1) {
+                val = substr2(val, 1, len(val) - 1);
+            }
+        }
+        let items = str_split(val, ",");
+        let k = 0;
+        while (k < len(items)) {
+            let it = str_trim(items[k] as string);
+            if (len(it) >= 2) {
+                if (str_eq(substr2(it, 0, 1), "\"") == 1) {
+                    it = substr2(it, 1, len(it) - 1);   // 剥首尾引号
+                }
+            }
+            it = str_trim(it);
+            if (len(it) > 0) {
+                if (str_eq(key, "sources") == 1) {
+                    let full = main_bslash(it);
+                    if (len(base_dir) > 0) { full = base_dir + "\\" + full; }
+                    if (main_str_in(main_native_sources, full) == 0) {
+                        main_native_sources = array_push(main_native_sources, full);
+                    }
+                } else if (str_eq(key, "links") == 1) {
+                    if (main_str_in(main_native_links, it) == 0) {
+                        main_native_links = array_push(main_native_links, it);
+                    }
+                } else if (str_eq(key, "link_dirs") == 1) {
+                    let fd = main_bslash(it);
+                    if (len(base_dir) > 0) { fd = base_dir + "\\" + fd; }
+                    if (main_str_in(main_native_link_dirs, fd) == 0) {
+                        main_native_link_dirs = array_push(main_native_link_dirs, fd);
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// 版本约束是否满足（""/* 任意；否则与 version 精确相等；^/>= 等 semver 约束
+// 随 Phase 12 完整 semver 集成，先支持精确与通配）
+kimo main_ver_match(constraint: string, version: string) -> int {
+    let c = str_trim(constraint);
+    if (len(c) == 0) { return 1; }
+    if (str_eq(c, "*") == 1) { return 1; }
+    if (str_eq(c, version) == 1) { return 1; }
+    return 0;
+}
+
+// SPK 依赖解包到全局版本化缓存（对标 GOMODCACHE）：
+//   $SHADOW_HOME/pkg/mod/<module>@<version>/
+// 幂等：最终缓存目录存在（含 shadow.sbg）→ 复用；否则解包 + 校验 + 落位。
+// 返回缓存目录绝对路径；失败返回 ""。
+kimo main_spk_ensure(project_root: string, module: string, dep_path: string, ver_constraint: string) -> string {
+    let home = env_get("SHADOW_HOME");
+    if (len(home) == 0) {
+        home = env_get("USERPROFILE");
+        if (len(home) == 0) { return ""; }
+        home = home + "\\" + ".shadow";
+    }
+    home = main_bslash(home);
+    let cache_root = home + "\\pkg\\mod";
+    dir_create(cache_root);
+    // dep_path 相对 project_root；转绝对
+    let spk_full = main_path_join(project_root, main_bslash(dep_path));
+    if (file_exists(spk_full) == 0) { return ""; }
+    // 临时解包目录
+    let tmp_dir = cache_root + "\\" + module + "@_tmp";
+    zip_unpack(spk_full, tmp_dir);
+    // 读 version
+    let sbg_src = main_read_or_empty(tmp_dir + "\\shadow.sbg");
+    let version = main_sbg_version_of(sbg_src);
+    if (len(version) == 0) { version = "0.0.0"; }
+    if (main_ver_match(ver_constraint, version) == 0) {
+        main_eprint("module error: " + module + "@" + version + " does not satisfy constraint \"" + ver_constraint + "\"\n");
+        return "";
+    }
+    let final_dir = cache_root + "\\" + module + "@" + version;
+    // 内容戳：仅靠「目录已存在」判定会导致**同版本号重打包永不刷新**
+    // （发布方改了代码但没升 version → 消费方永远编译旧源码）。
+    // 用 spk 文件内容 hash 做戳，不一致则重新解包覆盖。
+    let stamp = final_dir + "\\.spk_hash";
+    let h = content_hash(spk_full);
+    if (file_exists(final_dir + "\\shadow.sbg") == 1) {
+        if (str_eq(str_trim(main_read_or_empty(stamp)), h) == 1) {
+            // P0-2：native 收集是编译期状态、不随缓存持久化，缓存命中也必须重新收集
+            main_collect_native_from_sbg(sbg_src, final_dir);
+            return final_dir;   // 已缓存且内容一致（幂等命中）
+        }
+    }
+    // 落位：解包到 final（幂等覆盖），并写入内容戳
+    let ok = zip_unpack(spk_full, final_dir);
+    if (ok != 0) { return ""; }
+    file_write(stamp, h);
+    main_collect_native_from_sbg(sbg_src, final_dir);
+    return final_dir;
+}
+
+// shadow.lock：记录解析出的依赖 (module@version=path)
+kimo main_lock_write(project_root: string) -> void {
+    let lines: array<string> = [];
+    let i = 0;
+    while (i < len(main_sbg_deps_names)) {
+        let n = main_sbg_deps_names[i] as string;
+        let p = main_sbg_deps_paths[i] as string;
+        lines = array_push(lines, n + "@" + p);
+        i = i + 1;
+    }
+    let content = str_join(lines, "\n");
+    file_write(main_path_join(project_root, "shadow.lock"), content);
+}
+
+// 目录=包：dir_key（相对主目录）下全部 .shadow 追加到 main_resolved（插入排序，确定性）
+kimo main_collect_dir(dir_key: string, project_root: string) -> int {
+    let full = main_path_join(project_root, dir_key);
+    let entries = file_list_dir(full);
+    if (len(entries) == 0) { return 0; }
+    let names = str_split(entries, ";");
+    let i = 0;
+    while (i < len(names)) {
+        let nm = names[i] as string;
+        let nl = len(nm);
+        if (nl > 7) {
+            let ext = substr2(nm, nl - 7, nl);
+            if (str_eq(ext, ".shadow") == 1) {
+                // dir_key 为空表示 project_root 自身就是包目录（SPK 解包根）：
+                // 不能拼成 "\\nm"，否则 full 出现双反斜杠、命名空间带前导点
+                let mkey = nm;
+                if (len(dir_key) > 0) { mkey = dir_key + "\\" + nm; }
+                main_resolved = array_push(main_resolved, mkey);
+                main_resolved_roots = array_push(main_resolved_roots, project_root);
+            }
+        }
+        i = i + 1;
+    }
+    if (len(main_resolved) == 0) { return 0; }
+    // 插入排序（str 升序，保证 fixed-point 确定性）
+    let j = 1;
+    while (j < len(main_resolved)) {
+        let k2 = j;
+        while (k2 > 0) {
+            let a = main_resolved[k2 - 1] as string;
+            let b = main_resolved[k2] as string;
+            if (rt_str_cmp(a, b) > 0) {
+                let ra = main_resolved_roots[k2 - 1] as string;
+                let rb = main_resolved_roots[k2] as string;
+                main_resolved[k2 - 1] = b;
+                main_resolved[k2] = a;
+                main_resolved_roots[k2 - 1] = rb;
+                main_resolved_roots[k2] = ra;
+                k2 = k2 - 1;
+            } else {
+                k2 = 0;
+            }
+        }
+        j = j + 1;
+    }
+    return 1;
+}
+
+// §3.8.3 Java 路径模型：import a.b.c 的 b.c 是**嵌套目录**（点号=目录分隔符），
+// 必须按 "." 拆成 b\c，而非当单个文件名 b.c.shadow。故 rest 先经 main_rest_to_rel 转换。
+//   文件级：base\<rel>.shadow；目录=包：base\<rel>\ 下全部 .shadow
+//   key_prefix = base 相对主目录的 key 前缀（""=主目录本身）
+// 命中追加到 main_resolved；返回命中数。
+kimo main_rest_to_rel(rest: string) -> string {
+    let parts = str_split(rest, ".");
+    let out = "";
+    let i = 0;
+    while (i < len(parts)) {
+        if (i > 0) { out = out + "\\"; }
+        out = out + (parts[i] as string);
+        i = i + 1;
+    }
+    return out;
+}
+kimo main_resolve_in_base(base: string, key_prefix: string, rest: string, project_root: string) -> int {
+    let hit = 0;
+    if (len(rest) > 0) {
+        let rel = main_rest_to_rel(rest);
+        let fkey = "";
+        if (len(key_prefix) > 0) { fkey = key_prefix + "\\"; }
+        fkey = fkey + rel + ".shadow";
+        let full = main_path_join(base, rel + ".shadow");
+        if (file_exists(full) == 1) {
+            main_resolved = array_push(main_resolved, fkey);
+            main_resolved_roots = array_push(main_resolved_roots, project_root);
+            return 1;
+        }
+        let dkey = "";
+        if (len(key_prefix) > 0) { dkey = key_prefix + "\\"; }
+        dkey = dkey + rel;
+        hit = main_collect_dir(dkey, project_root);
+        return hit;
+    }
+    // rest 空：base 自身作为包目录（目录=包）
+    hit = main_collect_dir(key_prefix, project_root);
+    return hit;
+}
+
+// §3.8.3 完整解析：import_path（点分）→ 填充 main_resolved（相对主目录的 key）
+kimo main_resolve_import(import_path: string, project_root: string) -> int {
+    main_resolved = [];
+    main_resolved_roots = [];
+    let parts = str_split(import_path, ".");
+    let n = len(parts);
+    if (n == 0) { return 0; }
+    let module = parts[0] as string;
+    let rest = "";
+    let i = 1;
+    while (i < n) {
+        if (i > 1) { rest = rest + "."; }
+        rest = rest + parts[i] as string;
+        i = i + 1;
+    }
+    let hit = 0;
+    // ① 主模块自身：首段匹配主目录下的一级目录/文件
+    let base = main_path_join(project_root, module);
+    if (len(rest) == 0) {
+        // 单段 import a：先试 a.shadow 文件，再试 a/ 目录（目录=包）
+        let mfile = main_path_join(project_root, module + ".shadow");
+        if (file_exists(mfile) == 1) {
+            main_resolved = array_push(main_resolved, module + ".shadow");
+            main_resolved_roots = array_push(main_resolved_roots, project_root);
+            hit = 1;
+        } else {
+            hit = main_collect_dir(module, project_root);
+        }
+    } else {
+        hit = main_resolve_in_base(base, module, rest, project_root);
+    }
+    // ② deps（主模块未命中）
+    if (hit == 0) {
+        let dep = main_dep_path_of(module);
+        if (len(dep) > 0) {
+            let is_spk = 0;
+            let dln = len(dep);
+            if (dln > 4) {
+                let dext = substr2(dep, dln - 4, dln);
+                if (str_eq(dext, ".spk") == 1) { is_spk = 1; }
+            }
+            if (is_spk == 1) {
+                // SPK 依赖（§3.8.4）：解包到全局版本化缓存，从缓存目录解析
+                let ver_constraint = main_dep_version_of(module);
+                let cache_dir = main_spk_ensure(project_root, module, dep, ver_constraint);
+                if (len(cache_dir) > 0) {
+                    if (len(rest) == 0) {
+                        // cache_dir 既是 project_root 也是包目录本身 → dir_key 必须为空，
+                        // 否则 full = cache_dir + "\" + cache_dir（路径双拼接，必然读不到）
+                        hit = main_collect_dir("", cache_dir);
+                    } else {
+                        hit = main_resolve_in_base(cache_dir, "", rest, cache_dir);
+                    }
+                } else {
+                    main_import_err = "SPK dependency unavailable: \"" + module + "\" (path " + dep + ")";
+                }
+            } else {
+                let dep_key = main_bslash(dep);
+                let base2 = main_path_join(project_root, dep_key);
+                if (len(rest) == 0) {
+                    hit = main_collect_dir(dep_key, project_root);
+                } else {
+                    hit = main_resolve_in_base(base2, dep_key, rest, project_root);
+                }
+            }
+        }
+    }
+    // ②.5 内置标准库回退（0.3 main_std_dir 的等价物）：
+    //     `import std.iter` 这类编译器自带模块不属于用户项目，也不在 [deps] 里，
+    //     必须从编译器自身的 src/ 目录解析，否则任何用户项目都用不了 std.*。
+    if (hit == 0) {
+        if (len(main_std_root) > 0) {
+            let sbase = main_path_join(main_std_root, module);
+            if (len(rest) == 0) {
+                hit = main_collect_dir(module, main_std_root);
+            } else {
+                hit = main_resolve_in_base(sbase, module, rest, main_std_root);
+            }
+        }
+    }
+    // ③ 失败：报错 + 候选提示
+    if (hit == 0) {
+        let e1 = "no required module provides package \"";
+        let e2 = e1 + import_path;
+        let e3 = e2 + "\" (module \"";
+        let e4 = e3 + module;
+        main_import_err = e4 + "\" not found in project or shadow.sbg [deps])";
+    }
+    return hit;
+}
+
+// 解析一行（已 trim）是否为 import 语句；是则返回模块路径（如 "core.const"），否则 ""
+kimo main_import_target(line: string) -> string {
+    if (len(line) < 7) { return ""; }
+    let head = substr2(line, 0, 7);
+    if (str_eq(head, "import ") == 0) { return ""; }
+    // 分号可选（与 parser 一致：`if (ps_at(TOK_SEMICOLON)==1) ps_adv();`）。
+    // 0.3 起 `import foo` 与 `import foo;` 均合法；此处若强制要求 ';'，
+    // 无分号的 import 会被静默忽略 → 模块不加载 → 报一堆 undefined function/unknown struct。
+    let semi = str_index_of(line, ";");
+    let endp = len(line);
+    if (semi >= 0) { endp = semi as int; }
+    let t = str_trim(substr2(line, 7, endp));
+    // 行尾注释剥离：`import foo   // 说明`
+    let ci = str_index_of(t, "//");
+    if (ci >= 0) { t = str_trim(substr2(t, 0, ci as int)); }
+    if (len(t) == 0) { return ""; }
+    // §3.8 通配符导入：import a.b.* 等价于 import a.b，
+    // 由「目录=包」逻辑（main_collect_dir）展开目录下全部 .shadow。
+    // 注意模块加载走的是本文本扫描，不经过 parser 的 imports 数组，故必须在此剥离。
+    let n = len(t);
+    if (n >= 2) {
+        if (str_eq(substr2(t, n - 2, n), ".*") == 1) { t = substr2(t, 0, n - 2); }
+    }
+    return t;
+}
+
+// 去 dsb 行：整行 trim 后以 "dsb " 开头
+kimo main_is_dsb_line(line: string) -> int {
+    let t = str_trim(line);
+    if (len(t) >= 4) {
+        let d4 = substr2(t, 0, 4);
+        if (str_eq(d4, "dsb ") == 1) { return 1; }
+    }
+    return 0;
+}
+
+// 取文件 basename（不含目录与 .shadow 扩展名）：a\b\c.shadow -> c
+kimo main_basename_of(key: string) -> string {
+    let s = key;
+    let n = len(s);
+    if (n > 7) {
+        let ext = substr2(s, n - 7, n);
+        if (str_eq(ext, ".shadow") == 1) { s = substr2(s, 0, n - 7); }
+    }
+    let last = -1;
+    let i = 0;
+    while (i < len(s)) {
+        if (str_eq(s[i], "\\") == 1 || str_eq(s[i], "/") == 1) { last = i; }
+        i = i + 1;
+    }
+    if (last >= 0) { s = substr2(s, last + 1, len(s)); }
+    return s;
+}
+// 提取源码首个 dsb 声明名：dsb xxx; -> xxx（无则返回 ""）
+kimo main_dsb_of(src: string) -> string {
+    let lines = str_split(src, "\n");
+    let i = 0;
+    while (i < len(lines)) {
+        let t = str_trim(lines[i] as string);
+        if (str_starts_with(t, "dsb ") == 1) {
+            let rest = str_trim(substr2(t, 4, len(t)));
+            let n = len(rest);
+            if (n > 0 && str_eq(substr2(rest, n - 1, n), ";") == 1) { rest = substr2(rest, 0, n - 1); }
+            return str_trim(rest);
+        }
+        i = i + 1;
+    }
+    return "";
+}
+// 模块化收集：key 为相对 project_root 的文件路径。
+// 顺序：先拼接本文件内容（keep_dsb=1 保留 dsb，仅主文件），再 DFS 递归 import
+// （依赖内容跟在调用者之后；0.3 声明收集无顺序问题，TC Pass1 先收集再检查）。
+// 循环检测：path_stack 命中 → 报 circular；compiled 命中 → 跳过（菱形依赖合法）。
+kimo main_collect_module(project_root: string, key: string, keep_dsb: int) -> int {
+    if (main_in_path_stack(key) == 1) {
+        // §3.9 Java 规则：循环 import 允许（a↔b 互相引用合法；禁的是循环*继承*）。
+        // 自举/兼容态保留 circular import detected 以暴露设计问题。
+        if (tc_is_strict() == 1) { return 1; }
+        main_import_err = "circular import detected: " + key;
+        return 0;
+    }
+    if (main_in_compiled(key) == 1) { return 1; }
+    main_path_stack = array_push(main_path_stack, key);
+    // §3.8 记录本文件所属命名空间及其起始行。
+    // 模块名一律用路径派生名（key_to_ns：nsdemo/geom.shadow → nsdemo.geom；严格态 Java
+    // 路径模型 pa/lib.shadow 与 pb/lib.shadow 各自独立命名空间）。
+    // 兼容态另记录 dsb 名 → 路径名映射（0.3 用例 import 名可带下划线前缀 _dotqual_mod，
+    // 访问用 dsb 名 dotqual_mod.X；tc_ns_slot 按别名替换前缀）。
+    let full = main_path_join(project_root, key);
+    let src = main_read_or_empty(full);
+    if (len(src) == 0) {
+        main_import_err = "cannot read module: " + full;
+        return 0;
+    }
+    let my_ns = main_key_to_ns(key);
+    if (tc_is_strict() == 0) {
+        let my_dsb = main_dsb_of(src);
+        if (len(my_dsb) > 0 && str_eq(my_dsb, my_ns) == 0) {
+            tc_mod_dsb_alias = array_push(tc_mod_dsb_alias, my_dsb);
+            tc_mod_dsb_path = array_push(tc_mod_dsb_path, my_ns);
+        }
+    }
+    main_record_mod(my_ns);
+    // §3.9 Java 规则：dsb 必须 == 文件 basename（不含 .shadow），仅严格态强制。
+    // 对应 Java「class 名 == 文件名」，包（命名空间）由目录路径自动派生。
+    if (tc_is_strict() == 1) {
+        let d = main_dsb_of(src);
+        if (len(d) > 0) {
+            let bnm = main_basename_of(key);
+            if (str_eq(d, bnm) == 0) {
+                main_import_err = "dsb '" + d + "' does not match file name '" + bnm + "' (expected 'dsb " + bnm + ";' for " + full + ")";
+                return 0;
+            }
+        }
+    }
+    // Phase 11：记录模块源码全文与路径（.lu 缓存 hash 用；与 tc_mod_ns 平行）
+    main_mod_srcs = array_push(main_mod_srcs, src);
+    main_mod_paths = array_push(main_mod_paths, full);
+    // 本文件内容（keep_dsb=0 去 dsb 行）
+    let lines = str_split(src, "\n");
+    let pi = 0;
+    while (pi < len(lines)) {
+        let l2 = lines[pi] as string;
+        if (keep_dsb == 0) {
+            if (main_is_dsb_line(l2) == 1) {
+                pi = pi + 1;
+                continue;
+            }
+        }
+        main_parts = array_push(main_parts, l2);
+        pi = pi + 1;
+    }
+    // 递归 import（DFS 后序）
+    let li = 0;
+    while (li < len(lines)) {
+        let t = str_trim(lines[li] as string);
+        let imp = main_import_target(t);
+        if (len(imp) > 0) {
+            tc_mod_imp_record(my_ns, imp);
+            main_resolve_import(imp, project_root);
+            if (len(main_import_err) > 0) { return 0; }
+            let ri = 0;
+            while (ri < len(main_resolved)) {
+                let rk = main_resolved[ri] as string;
+                let rr = main_resolved_roots[ri] as string;
+                if (main_collect_module(rr, rk, 0) == 0) { return 0; }
+                ri = ri + 1;
+            }
+        }
+        li = li + 1;
+    }
+    // DFS 完成：出栈 + 标记已编译
+    main_path_pop();
+    main_compiled = array_push(main_compiled, key);
+    return 1;
+}
+
+// 取 argv[0] 所在目录（无分隔符返回 ""）
+kimo main_exe_dir(arg0: string) -> string {
+    let n = len(arg0);
+    let i = n - 1;
+    while (i >= 0) {
+        let c = arg0[i];
+        if (str_eq(c, "\\") == 1 || str_eq(c, "/") == 1) {
+            return substr2(arg0, 0, i);
+        }
+        i = i - 1;
+    }
+    return "";
+}
+
+// 加载主文件 + runtime + 全部 import，返回 combined source
+// main_path：主文件路径（可含目录）；arg0：argv[0]（编译器自身路径）
+kimo main_load_combined(main_path: string, arg0: string) -> string {
+    main_loaded = [];
+    main_parts = [];
+    main_import_err = "";
+    main_compiled = [];
+    main_path_stack = [];
+    // §3.8 兼容态命名空间：重置模块行范围
+    tc_mod_ns = [];
+    tc_mod_starts = [];
+    tc_mod_dsb_alias = [];
+    tc_mod_dsb_path = [];
+    // Phase 11：重置每模块缓存收集（源码/路径/命中标志）
+    main_mod_srcs = [];
+    main_mod_paths = [];
+    main_g_valid = [];
+    // 严格态：重置每模块 import 表
+    tc_mod_imp_ns = [];
+    tc_mod_imp_list = [];
+    main_cur_ns = "";
+    // 主文件目录 = 主模块根（project_root）
+    let dir = "";
+    let n = len(main_path);
+    let i = n - 1;
+    while (i >= 0) {
+        let c = main_path[i];
+        if (str_eq(c, "\\") == 1 || str_eq(c, "/") == 1) {
+            dir = substr2(main_path, 0, i);
+            break;
+        }
+        i = i - 1;
+    }
+    let file_rel = "";
+    if (len(dir) > 0) { file_rel = substr2(main_path, len(dir) + 1, n); }
+    else { file_rel = main_path; }
+    // 内置标准库根（0.3 main_std_dir 的等价物）：定位编译器自带的 src/，
+    // 供 `import std.iter` 等解析。候选顺序与 runtime_lib 定位保持一致：
+    //   ① exe_dir\..\src（开发布局 build\shadow.exe）② exe_dir\src（发布布局）
+    //   ③ CWD 下 src（自举时 cwd 即项目根）④ exe_dir 向上最多 4 级
+    // 注意 main_exe_dir("build") == ""（相对路径无分隔符），故不能只靠向上走。
+    main_std_root = "";
+    let sxd = main_exe_dir(arg0);
+    if (len(sxd) > 0) {
+        let c1 = sxd + "\\..\\src";
+        if (file_exists(c1 + "\\std\\iter.shadow") == 1) { main_std_root = c1; }
+        if (len(main_std_root) == 0) {
+            let c2 = main_path_join(sxd, "src");
+            if (file_exists(c2 + "\\std\\iter.shadow") == 1) { main_std_root = c2; }
+        }
+    }
+    if (len(main_std_root) == 0) {
+        if (file_exists("src\\std\\iter.shadow") == 1) { main_std_root = "src"; }
+    }
+    if (len(main_std_root) == 0) {
+        let sd = sxd;
+        let stry = 0;
+        while (stry < 4) {
+            let parent = main_exe_dir(sd);
+            if (len(parent) == 0) { break; }
+            if (str_eq(parent, sd) == 1) { break; }
+            sd = parent;
+            let c3 = main_path_join(sd, "src");
+            if (file_exists(c3 + "\\std\\iter.shadow") == 1) {
+                main_std_root = c3;
+                break;
+            }
+            stry = stry + 1;
+        }
+    }
+    // 1. shadow.sbg（主模块清单 + [deps]）
+    main_load_sbg(dir);
+    // 2. 主文件（保留 dsb，递归 import 用 §3.8.3 模块解析）
+    main_collect_module(dir, main_bslash(file_rel), 1);
+    if (len(main_import_err) > 0) {
+        main_eprint("module error: " + main_import_err + "\n");
+        return "";
+    }
+    // 3. runtime_lib.shadow 定位：①exe 上级的 src/runtime（build\shadow.exe → ../src/runtime）
+    //    ②主文件同目录 runtime/ ③CWD 相对 src/runtime
+    let rt_path = "src\\runtime\\runtime_lib.shadow";
+    let exe_dir = main_exe_dir(arg0);
+    if (len(exe_dir) > 0) {
+        let cand = exe_dir + "\\..\\src\\runtime\\runtime_lib.shadow";
+        if (file_exists(cand) == 1) { rt_path = cand; }
+    }
+    if (file_exists(rt_path) == 0) {
+        let cand2 = main_path_join(dir, "runtime\\runtime_lib.shadow");
+        if (file_exists(cand2) == 1) { rt_path = cand2; }
+    }
+    let rt_src = main_read_or_empty(rt_path);
+    // 4. runtime_lib.shadow 内容（去 dsb）—— 放最后；0.3 声明收集无顺序问题
+    if (len(rt_src) > 0) {
+        // §3.8 兼容态：runtime 作为独立命名空间 shadow.runtime
+        main_record_mod("shadow.runtime");
+        // Phase 11：runtime 模块源码/路径收集（.lu 缓存用）
+        main_mod_srcs = array_push(main_mod_srcs, rt_src);
+        main_mod_paths = array_push(main_mod_paths, rt_path);
+        let rt_lines = str_split(rt_src, "\n");
+        let ri = 0;
+        while (ri < len(rt_lines)) {
+            let l3 = rt_lines[ri] as string;
+            if (main_is_dsb_line(l3) == 0) {
+                main_parts = array_push(main_parts, l3);
+            }
+            ri = ri + 1;
+        }
+    }
+    // 5. shadow.lock（记录解析出的依赖；仅当有 deps 时写入）
+    if (len(main_sbg_deps_names) > 0) { main_lock_write(dir); }
+    // 5.5 §3.8 兼容态：把模块行映射注入 TC 模块（CLI 与 LSP/API 共用同一份状态）
+    tc_set_mod_map(tc_mod_ns, tc_mod_starts);
+    tc_set_mod_dsbmap(tc_mod_dsb_alias, tc_mod_dsb_path);
+    // 严格态（Phase 15）：由 `--strict` CLI 标志触发（tc_set_strict 在参数解析阶段设置）；
+    // dsb 声明保持纯 `dsb <name>;` 语义（0.3/0.4/0.5 一致），不再承载 strict 关键字。
+    tc_set_mod_imports(tc_mod_imp_ns, tc_mod_imp_list);
+    // 6. 拼接
+    return str_join(main_parts, "\n");
+}
+
+// ============ Phase 11：函数级增量缓存（.lu） ============
+// 每模块（源文件）独立 .lu 缓存（mir_serialize v9）：
+//   - 缓存键 = 模块源码 djb2 hash（64 位，与 .lu 头部 source_hash 比较）
+//   - 命中 → 该模块全部函数的「函数体检查（TC bodies）+ hir/mir lower」跳过，MIR 从 .lu 加载
+//   - codegen 发射完全走 mfuncs（prog.funcs 仅用于 extern 声明）→ 跳过函数不影响 codegen
+//   - 启用范围：兼容态 + 源文件在 src/ 下（严格态 / LSP / API / 用户代码 → 全量，正确性优先）
+// 正确性依据：函数体检查只依赖「被调用符号的签名」，签名变化 ⟹ 源码变化 ⟹ hash 不匹配 ⟹ 缓存失效。
+
+// djb2 64 位 hash（与 0.3 sig_hash_source 同款），返回十进制字符串（与 .lu 存储一致）
+// ⚠️ 必须用 rt_get_byte 取字节：`s[i] as int` 在 0.3/0.4 编译器间的字符串语义不同，
+//    会导致 s03 编译的 stage1 与 0.4 编译的 stage2 算出不同键（缓存互相读不到）。
+//    rt_get_byte 是 C 层函数（固定宿主 runtime_for_selfhost.o），两代编译器语义一致。
+kimo main_hash_src(s: string) -> string {
+    let h: long = 5381;
+    let i = 0;
+    while (i < len(s)) {
+        let code = rt_get_byte(s, i);
+        h = h * 33 + (code as long);
+        i = i + 1;
+    }
+    return long_to_str(h);
+}
+
+// 泛型检测：源码中是否存在泛型声明（<T> / <T, U> / <K: 约束 / <A B 等）。
+// 用「<」后紧跟大写字母（A-Z）判定：任何泛型参数名首字符必然大写（语言约定）。
+// ⚠️ 宁可误伤（注释/字符串里的 "<X" 触发 → 放弃缓存 → 只损失性能），不可漏判：
+//    泛型模块命中 .lu 缓存 → TC bodies 跳过 → 单态化（mono worklist）不执行 →
+//    特化函数（first__T_int_string）不生成 → 调用点 declare-only → link undefined。
+//    旧实现只匹配 "<T:" "<T>" "<T "，漏掉 "<T," "<K," "<A," 等（cg_generic_fn_multi 回归）。
+kimo main_has_generic(src: string) -> int {
+    let n = len(src);
+    let i = 0;
+    while (i + 1 < n) {
+        if (rt_get_byte(src, i) == 60) {   // '<'
+            let c = rt_get_byte(src, i + 1);
+            if (c >= 65 && c <= 90) { return 1; }   // A-Z
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---- 依赖指纹（WSIG）：根治「签名变化不传播到依赖模块」 ----
+// 兼容态是「源码物理拼接 + 全局可见」，任何模块都可能引用任何其他模块的任意 pub 符号，
+// 因此无法做精确的模块级依赖图。改用**世界签名指纹**：
+//   sig_i = 模块 i 的全部声明签名文本（跳过函数体）
+//   WSIG  = djb2(sig_0 | sig_1 | ... | sig_n)
+// 缓存命中 ⟺ 自身源码 hash 匹配 AND WSIG 匹配。
+//   · 改函数体   → 所有 sig_i 不变 → WSIG 不变 → 只有被改模块失效（增量，常见场景）
+//   · 改任何签名 → WSIG 变         → 全部失效（全量，保守但绝对正确）
+// ⚠️ 签名提取必须「宁滥勿缺」：漏掉一类签名 → 依赖方读到过期 MIR → llc 类型错误或静默错码。
+
+// 该行是否函数头（impl / trait 内的方法同样以 kimo 开头）
+kimo main_is_func_head(t: string) -> int {
+    if (str_starts_with(t, "kimo ") == 1) { return 1; }
+    if (str_starts_with(t, "pub kimo ") == 1) { return 1; }
+    return 0;
+}
+
+// 提取模块「声明签名」文本：保留顶层声明头、struct 字段、enum 变体、impl/trait 方法头，
+// 丢弃全部函数体。逐行扫描并维护大括号深度；字符串/字符字面量与 // 、/* */ 注释内的
+// 括号不计数（否则 `let s = "{";` 会让深度永久失步 → 后续签名被整段跳过 → 危险的漏检）。
+kimo main_sig_of_src(src: string) -> string {
+    let out: array<string> = [];
+    let lines = str_split(src, "\n");
+    let depth = 0;
+    let skip_depth = -1;     // >=0：正在跳过函数体，值为该函数体的外层深度
+    let pending_func = 0;    // 多行函数签名续行中（`)` 与 `{` 不在函数头那一行）
+    let in_block = 0;        // 跨行块注释 /* */
+    let li = 0;
+    while (li < len(lines)) {
+        let raw = lines[li] as string;
+        let d = 0;           // 本行净括号增量
+        let has_code = 0;    // 本行是否含有效代码（排除空行/纯注释行）
+        let n = len(raw);
+        let in_str = 0;
+        let in_chr = 0;
+        let ci = 0;
+        while (ci < n) {
+            let c = rt_get_byte(raw, ci);
+            if (in_block == 1) {
+                if (c == 42) {
+                    if (ci + 1 < n) {
+                        if (rt_get_byte(raw, ci + 1) == 47) { in_block = 0; ci = ci + 2; continue; }
+                    }
+                }
+                ci = ci + 1;
+                continue;
+            }
+            if (in_str == 1) {
+                if (c == 92) { ci = ci + 2; continue; }
+                if (c == 34) { in_str = 0; }
+                ci = ci + 1;
+                continue;
+            }
+            if (in_chr == 1) {
+                if (c == 92) { ci = ci + 2; continue; }
+                if (c == 39) { in_chr = 0; }
+                ci = ci + 1;
+                continue;
+            }
+            if (c == 47) {
+                if (ci + 1 < n) {
+                    let c2 = rt_get_byte(raw, ci + 1);
+                    if (c2 == 47) { ci = n; continue; }                    // 行注释
+                    if (c2 == 42) { in_block = 1; ci = ci + 2; continue; } // 块注释开始
+                }
+            }
+            if (c == 34) { in_str = 1; has_code = 1; ci = ci + 1; continue; }
+            if (c == 39) { in_chr = 1; has_code = 1; ci = ci + 1; continue; }
+            if (c == 123) { d = d + 1; }
+            if (c == 125) { d = d - 1; }
+            if (c > 32) { has_code = 1; }
+            ci = ci + 1;
+        }
+        if (skip_depth >= 0) {
+            depth = depth + d;
+            if (depth <= skip_depth) { skip_depth = -1; }
+            li = li + 1;
+            continue;
+        }
+        if (has_code == 0) { depth = depth + d; li = li + 1; continue; }
+        let t = str_trim(raw);
+        out = array_push(out, t);
+        let d0 = depth;
+        depth = depth + d;
+        if (depth > d0) {
+            // 本行开启了一个块：若是函数（含多行签名的收尾行）→ 跳过其函数体
+            if (main_is_func_head(t) == 1) { skip_depth = d0; }
+            else if (pending_func == 1) { skip_depth = d0; }
+            pending_func = 0;
+        } else {
+            let tn = len(t);
+            let last = 0;
+            if (tn > 0) { last = rt_get_byte(t, tn - 1); }
+            if (str_index_of(t, "}") >= 0) { pending_func = 0; }
+            else if (last == 59) { pending_func = 0; }          // ';' 结尾：无体声明
+            else if (main_is_func_head(t) == 1) { pending_func = 1; }
+        }
+        li = li + 1;
+    }
+    return str_join(out, "\n");
+}
+
+// 行 → 模块索引（全局版 tc_module_of_line；tc_mod_starts 已由 main_load_combined 填充）
+kimo main_mod_idx_of_line(line: int) -> int {
+    let best = -1;
+    let best_start = -1;
+    let i = 0;
+    while (i < len(tc_mod_starts)) {
+        let st = tc_mod_starts[i] as int;
+        if (st <= line) {
+            if (st > best_start) { best = i; best_start = st; }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+// 模块源文件是否启用 .lu 缓存。
+// 曾按路径白名单限定（src/ 与 pkg/mod/），但那个闸门对**正确性毫无贡献**：
+// 命中判定是「自身源码 hash 匹配 AND 世界签名 WSIG 匹配」，路径只用来生成缓存键。
+// 白名单反而让真实项目失效——平铺布局（main.shadow 与库并列、无 src/ 目录）永远命不中，
+// 裸文件名调用（project_root="" → 路径 "main.shadow"）同样命不中。
+// 现改为：只要路径非空即可缓存。路径变化只会造成一次 miss，不会造成错误命中。
+// 用户代码与编译器自身源码同等对待（函数级缓存对用户代码同样生效——大项目编译加速）。
+// 正确性由 main_cache_sem（缓存语义版本）保证：TC/codegen 检查逻辑变化 → sem 变 →
+// 旧键（lu_cache/<sem>_<hash>.lu）整体失效 → 全量 TC（不漏报类型错误）。
+kimo main_mod_in_src(idx: int) -> int {
+    if (idx < 0 || idx >= len(main_mod_paths)) { return 0; }
+    let p = main_mod_paths[idx] as string;
+    if (len(p) == 0) { return 0; }
+    return 1;
+}
+
+// .lu 缓存键：独立目录 build/lu_cache/（0.4 专用，与 s03 的源码旁 .lu(v8) 互不干扰）
+// 键 = <缓存语义版本>_<源文件路径 djb2>（路径变 → 新键 → 首次 miss 全量一次）
+// ⚠️ main_cache_sem 是正确性关键：任何改变 TC/codegen 语义的修改（新增检查、改类型推断、
+// 修 bug 改变接受/拒绝集合）都必须 bump 它，否则旧缓存命中会跳过函数体检查 → 漏报类型错误。
+// 当前值 = "v9_s6"（s4 = 2026-08-07：string 下标检查、命名参数名、trait 签名、timestamp 算术、
+// 裸 array、泛型字段、默认参数拒绝等 TC 缺口修复后）。
+kimo main_lu_key(path: string) -> string {
+    return "build\\lu_cache\\v9_s6_" + main_hash_src(path);
+}
+
+// 编译开始：检查每模块 .lu 缓存有效性。
+// 返回 queues：array<any>，元素 = 命中模块的 MirFunc[]（按模块序，供消费）
+// 副作用：main_g_valid[i]=1（命中）、tc_set_valid_ns(命中 ns 列表)（TC bodies 跳过）
+kimo main_cache_setup() -> any {
+    main_g_valid = [];
+    main_mod_sigs = [];
+    main_wsig = "";
+    let queues: array<any> = [];
+    let qi = 0;
+    while (qi < len(tc_mod_ns)) {
+        main_g_valid = array_push(main_g_valid, 0);
+        main_mod_sigs = array_push(main_mod_sigs, "");
+        queues = array_push(queues, []);
+        qi = qi + 1;
+    }
+    tc_set_valid_ns([]);
+    if (tc_is_strict() == 1) { return queues; }   // 严格态：缓存禁用（mangle 改写不可跳过）
+    // dir_create → CreateDirectoryA 只建**单层**，父目录缺失会静默失败。
+    // 0.4 自身仓库恰好已有 build/，掩盖了这点；用户新工程首次编译会拿不到缓存目录。
+    dir_create("build");
+    dir_create("build\\lu_cache");   // 幂等；已存在时失败静默
+
+    // ---- Pass 1：算每模块自身 hash 与签名 hash，顺带把 .lu 载入备用 ----
+    // 优化：源码未变的模块直接复用 .lu 里存的 sig（避免每次全量重扫签名）；
+    //       只有源码变了的模块才现算 —— 「改一行」场景下现算量 = 1 个文件。
+    let mods: array<any> = [];
+    let ownh: array<string> = [];
+    let i = 0;
+    while (i < len(tc_mod_ns)) {
+        let src = main_mod_srcs[i] as string;
+        let oh = main_hash_src(src);
+        ownh = array_push(ownh, oh);
+        let sig = "";
+        let mod = 0 as any;
+        if (main_mod_in_src(i) == 1) {
+            mod = mir_cache_load(main_lu_key(main_mod_paths[i] as string));
+            if ((mod as any) != 0) {
+                // hash 字段编码为三段： "<own>|<sig>|<wsig>"（不改序列化格式与版本号）
+                let parts = str_split(mir_cache_mod_hash(mod), "|");
+                if (len(parts) == 3) {
+                    if (str_eq(parts[0] as string, oh) == 1) {
+                        sig = parts[1] as string;
+                    }
+                }
+            }
+        }
+        if (len(sig) == 0) { sig = main_hash_src(main_sig_of_src(src)); }
+        mods = array_push(mods, mod);
+        main_mod_sigs[i] = sig;
+        i = i + 1;
+    }
+
+    // ---- 折叠世界签名指纹（含命名空间与顺序，模块增删/换位同样失效）----
+    let acc: array<string> = [];
+    let ai = 0;
+    while (ai < len(tc_mod_ns)) {
+        acc = array_push(acc, (tc_mod_ns[ai] as string) + "=" + (main_mod_sigs[ai] as string));
+        ai = ai + 1;
+    }
+    main_wsig = main_hash_src(str_join(acc, ";"));
+
+    // ---- Pass 2：命中判定（自身源码未变 AND 世界签名未变）----
+    let valid: array<string> = [];
+    let k = 0;
+    while (k < len(tc_mod_ns)) {
+        let mod = mods[k];
+        if ((mod as any) != 0) {
+            let parts2 = str_split(mir_cache_mod_hash(mod), "|");
+            if (len(parts2) == 3) {
+                let hit = 0;
+                if (str_eq(parts2[0] as string, ownh[k] as string) == 1) {
+                    if (str_eq(parts2[2] as string, main_wsig) == 1) { hit = 1; }
+                }
+                if (hit == 1) {
+                    // 泛型特化模块不进缓存命中集合：缓存命中跳过函数体检查 → 特化不生成，
+                    // 且 TC 跳过（inferred_type 未填）与 lower 全量错配会产生 i0/sext ptr 非法 IR。
+                    // 判断用精确模式（<T: 约束 / <T> 无约束 / <T 空格）；不能含 "__T_"（注释误伤）。
+                    let src_g = main_mod_srcs[k] as string;
+                    let has_gen_g = 0;
+                    if (str_index_of(src_g, "<T:") >= 0) { has_gen_g = 1; }
+                    if (str_index_of(src_g, "<T>") >= 0) { has_gen_g = 1; }
+                    if (str_index_of(src_g, "<T ") >= 0) { has_gen_g = 1; }
+                    if (has_gen_g == 0) {
+                        valid = array_push(valid, tc_mod_ns[k] as string);
+                        main_g_valid[k] = 1;
+                        queues[k] = mir_cache_mod_funcs(mod);
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    tc_set_valid_ns(valid);
+    return queues;
+}
+
+// 从模块缓存队列取下一条 MirFunc（按上次存储顺序消费）
+kimo main_take_cached_mir(idx: int, queues: any, cpos: array<int>) -> MirFunc {
+    let q = queues[idx] as array<MirFunc>;
+    let pos = cpos[idx] as int;
+    let mf = q[pos] as MirFunc;
+    cpos[idx] = pos + 1;
+    return mf;
+}
+
+// 编译结束：对 src/ 下缓存未命中的模块写 .lu（下一次编译命中）
+kimo main_lu_store(new_mirs: any, new_globs: any) -> void {
+    if (tc_is_strict() == 1) { return; }
+    let si = 0;
+    while (si < len(tc_mod_ns)) {
+        let need = 0;
+        if (si < len(main_g_valid) && main_g_valid[si] == 0 && main_mod_in_src(si) == 1) { need = 1; }
+        if (need == 1) {
+            let ml = new_mirs[si] as array<MirFunc>;
+            let gl = new_globs[si] as array<GlobalVar>;
+            let p = main_lu_key(main_mod_paths[si] as string);
+            let src = main_mod_srcs[si] as string;
+            // hash 字段三段编码："<自身源码 hash>|<自身签名 hash>|<世界签名指纹>"
+            let sig = "";
+            if (si < len(main_mod_sigs)) { sig = main_mod_sigs[si] as string; }
+            let hfield = main_hash_src(src) + "|" + sig + "|" + main_wsig;
+            mir_cache_store(p, tc_mod_ns[si] as string, hfield, ml, gl);
+        }
+        si = si + 1;
+    }
+}
+
+// 编译源文件为 LLVM IR 文本；成功返回 IR，失败返回 ""
+// 输入：完整源码（含 runtime 拼接后的 combined）、文件名
+kimo main_compile_source(source: string, file: string) -> string {
+    // TIMING-DBG-TEMP
+    let t0 = c_clock();
+    // Phase 11：缓存 setup（命中模块的 MIR 队列 + valid 注入）
+    let queues = main_cache_setup();
+    let cpos: array<int> = [];
+    let ci = 0;
+    while (ci < len(tc_mod_ns)) { cpos = array_push(cpos, 0); ci = ci + 1; }
+    let toks = tokenize(source, file);
+    let t1 = c_clock();
+    let prog = parse(toks, file);
+    let t2 = c_clock();
+    // TC 前函数数：TC 会追加泛型特化（add_num__T_long）与闭包提升（__closure_n）。
+    // 这些追加函数没有 .lu 缓存 MIR，若按模块缓存命中走 use_cache 会取到队列里别的函数
+    // 的 MIR → 定义丢失（IR 只有 declare 无 define → link undefined / add ptr 等）。
+    let n_funcs_pre_tc = len(prog.funcs);
+    // Phase 15 严格态：由 `--strict` CLI 标志触发（tc_set_strict 在参数解析阶段设置）；否则兼容入口
+    let n_errs = 0;
+    if (tc_is_strict() == 1) {
+        n_errs = tc_check_program_strict(prog);
+    } else {
+        n_errs = tc_check_program(prog);
+    }
+    let t3 = c_clock();
+    if (n_errs > 0) {
+        return "";
+    }
+    // 闭包提升函数合并：__closure_<n> 由 TC 收集到 tc_g_closure_funcs（闭包字面量提升），
+    // 但 codegen 只发射 prog.funcs——不合并则 link 报 undefined symbol: __closure_0。
+    // 闭包 fd 已通过 tc_check_stmt 检查（body 合法），直接并入 prog.funcs 参与 lower+发射。
+    let cfi = 0;
+    let cfuncs = tc_closure_funcs_get();
+    while (cfi < len(cfuncs)) {
+        let cf = cfuncs[cfi] as FuncDef;
+        let already = 0;
+        let ai = 0;
+        while (ai < len(prog.funcs)) {
+            let af = prog.funcs[ai] as FuncDef;
+            if (str_eq(af.name, cf.name) == 1) { already = 1; break; }
+            ai = ai + 1;
+        }
+        if (already == 0) { prog.funcs = array_push(prog.funcs, cf); }
+        cfi = cfi + 1;
+    }
+    // Phase 11：hir/mir 按模块跳过（缓存命中 → 从 .lu 加载 MIR；否则 lower + 收集供 .lu 存储）
+    let hfuncs: array<HirFunc> = [];
+    let mfuncs: array<MirFunc> = [];
+    let new_mirs: array<any> = [];
+    let new_globs: array<any> = [];
+    let ni = 0;
+    while (ni < len(tc_mod_ns)) {
+        new_mirs = array_push(new_mirs, []);
+        new_globs = array_push(new_globs, []);
+        ni = ni + 1;
+    }
+    let N0 = n_funcs_pre_tc;   // TC 前原始函数数（编译器源码无泛型 → TC 不追加特化；追加段总是重编）
+    let t4 = c_clock();
+    let fi = 0;
+    while (fi < len(prog.funcs)) {
+        let fd = prog.funcs[fi] as FuncDef;
+        if (len(fd.extern_name) > 0) {
+            // extern：不 lower、不进 mfuncs（与 mir_lower_program 一致；codegen 从 prog.funcs 发射 extern 声明）
+            fi = fi + 1;
+            continue;
+        }
+        if (len(fd.type_params) > 0) {
+            // 泛型模板不发射（仅特化副本 add_num__T_long 发射）：模板 body 的 T 类型未绑定
+            //（inferred_type=TypeParam → codegen 视作 ptr）→ add ptr / sext ptr 非法 IR。
+            fi = fi + 1;
+            continue;
+        }
+        let idx = main_mod_idx_of_line(fd.loc.line);
+        let use_cache = 0;
+        if (fi < N0 && idx >= 0 && idx < len(main_g_valid) && main_g_valid[idx] == 1) {
+            // 泛型特化模块放弃缓存：缓存命中跳过函数体检查 → tc_mono_instantiate 不执行 →
+            // 特化（add_num__T_long）不生成 → 调用点 declare-only → link undefined / 类型错。
+            // 编译器自身源码（src/）无泛型定义（缓存收益大）；用户泛型代码全量 TC（正确性优先）。
+            let src_i = main_mod_srcs[idx] as string;
+            let has_gen = main_has_generic(src_i);
+            if (has_gen == 0) { use_cache = 1; }
+        }
+        if (use_cache == 1) {
+            let mf = main_take_cached_mir(idx, queues, cpos);
+            mfuncs = array_push(mfuncs, mf);
+        } else {
+            let hf = hir_lower_func(fd);
+            hfuncs = array_push(hfuncs, hf);
+            let mf = mir_lower_func(hf);
+            mfuncs = array_push(mfuncs, mf);
+            if (idx >= 0 && idx < len(new_mirs)) {
+                let ml = new_mirs[idx] as array<MirFunc>;
+                ml = array_push(ml, mf);
+                new_mirs[idx] = ml;
+            }
+        }
+        fi = fi + 1;
+    }
+    // 闭包 MIR 补取：缓存命中时 TC bodies 跳过 → lambda 不提升 → __closure_<n> fd 不在
+    // prog.funcs → 循环不消费其 MIR，闭包定义留在队列尾部 → link undefined symbol: __closure_0。
+    // 补取命中模块队列中所有未消费的 __closure_ 前缀 MirFunc 加入 mfuncs（cg_gen_program 发射）。
+    let cq = 0;
+    while (cq < len(tc_mod_ns)) {
+        if (cq < len(main_g_valid) && main_g_valid[cq] == 1) {
+            let qq = queues[cq] as array<MirFunc>;
+            let qpos = cpos[cq] as int;
+            while (qpos < len(qq)) {
+                let qf = qq[qpos] as MirFunc;
+                if (str_starts_with(qf.name, "__closure_") == 1) {
+                    mfuncs = array_push(mfuncs, qf);
+                }
+                qpos = qpos + 1;
+            }
+        }
+        cq = cq + 1;
+    }
+    // globals 按模块分（.lu 存储用）
+    let ggi = 0;
+    while (ggi < len(prog.globals)) {
+        let gv = prog.globals[ggi] as GlobalVar;
+        let gidx = main_mod_idx_of_line(gv.loc.line);
+        if (gidx >= 0 && gidx < len(new_globs)) {
+            let gl = new_globs[gidx] as array<GlobalVar>;
+            gl = array_push(gl, gv);
+            new_globs[gidx] = gl;
+        }
+        ggi = ggi + 1;
+    }
+    let t5 = c_clock();
+    let ir = cg_gen_program(prog, mfuncs);
+    let t6 = c_clock();
+    // Phase 11：写 .lu（未命中模块）
+    main_lu_store(new_mirs, new_globs);
+    // 阶段计时（默认静默：仅在 build/.timing 存在时输出；开发测速用）
+    if (file_exists("build\\.timing") == 1) {
+        println("TIMING: tok=" + long_to_str(t1 - t0) + " parse=" + long_to_str(t2 - t1) + " tc=" + long_to_str(t3 - t2) + " hir+mir=" + long_to_str(t5 - t4) + " cg=" + long_to_str(t6 - t5) + " total=" + long_to_str(t6 - t0));
+    }
+    return ir;
+}
+
+// ============ Phase 14：LSP / 查询类 CLI ============
+// flag_idx 为 flag 在 args 中的位置；文件与位置参数紧随其后：
+//   shadow <file> --check            → flag 在 args[2]，文件用 args[1]
+//   shadow --check <file>            → flag 在 args[1]，文件用 args[2]
+//   shadow --type-at <f> <l> <c>     → 位置参数 args[3]/args[4]
+//   shadow <f> --type-at <f> <l> <c> → 位置参数 args[4]/args[5]
+kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> int {
+    if (str_eq(qflag, "--lsp") == 1) {
+        lsp_run();
+        return 0;
+    }
+    // 文件参数：优先 flag 之后；否则 flag 之前（run_tests 格式：<file> --check）。
+    // 跳过 "--" 开头的 flag（查询模式可与 --strict 组合：<file> --strict --check）。
+    let f = "";
+    let i_f = flag_idx + 1;
+    while (i_f < n_args) {
+        let a_f = args[i_f] as string;
+        if (str_starts_with(a_f, "--") == 0) { f = a_f; break; }
+        i_f = i_f + 1;
+    }
+    if (len(f) == 0) {
+        let i_b = flag_idx - 1;
+        while (i_b >= 1) {
+            let a_b = args[i_b] as string;
+            if (str_starts_with(a_b, "--") == 0) { f = a_b; break; }
+            i_b = i_b - 1;
+        }
+    }
+    if (len(f) == 0) {
+        main_eprint("usage: shadow " + qflag + " <file>\n");
+        return 1;
+    }
+    // 查询模式也走 main_load_combined：import 递归加载 + dsb 检查 + strict 生效，
+    // 修复「跨模块符号在 --check/--diag-json/--at/--type-at 下全报 undefined」问题。
+    // 主文件在 combined 最前（行号不偏移），import 模块随后，runtime 最后。
+    let src = main_load_combined(f, args[0] as string);
+    if (len(src) == 0) {
+        if (len(main_import_err) > 0) {
+            main_eprint("module error: " + main_import_err + "\n");
+        } else {
+            main_eprint("cannot read file: " + f + "\n");
+        }
+        return 1;
+    }
+    // 库模式编译（收集诊断，不打印）
+    api_check(src, f);
+    // 查询计数只统计主文件模块（tc_mod_starts[0]=主文件起始 1，[1]=首个非主文件模块起始行）
+    if (len(tc_mod_starts) > 1) {
+        api_set_main_end((tc_mod_starts[1] as int) - 1);
+    }
+    // 位置参数（--at / --type-at）：flag 后 2/3 个参数
+    let pos_line = 0;
+    let pos_col = 0;
+    if (flag_idx + 2 < n_args) {
+        let pl = args[flag_idx + 2] as string;
+        pos_line = api_atoi(pl);
+    }
+    if (flag_idx + 3 < n_args) {
+        let pc = args[flag_idx + 3] as string;
+        pos_col = api_atoi(pc);
+    }
+    if (str_eq(qflag, "--check") == 1) {
+        let p1 = "check: stage=" + api_stage_name() + " tokens=" + int_to_str(api_token_count()) +
+                 " funcs=" + int_to_str(api_func_count()) + " structs=" + int_to_str(api_struct_count()) +
+                 " enum=" + int_to_str(api_enum_count()) + " globals=" + int_to_str(api_global_count()) +
+                 " module=" + api_module_name();
+        println(p1);
+        let i = 0;
+        while (i < api_sdiag_count()) {
+            println("sdiag: " + api_sdiag_line_at(i));
+            i = i + 1;
+        }
+        let p2 = "check: errors=" + int_to_str(api_err_count_total()) +
+                 " sdiags=" + int_to_str(api_sdiag_count()) + " ok=" + int_to_str(api_ok_flag());
+        println(p2);
+        return 0;
+    }
+    if (str_eq(qflag, "--diag-json") == 1) {
+        println(api_sdiag_json_array());
+        return 0;
+    }
+    if (str_eq(qflag, "--ranges") == 1) {
+        println(api_ranges());
+        return 0;
+    }
+    if (str_eq(qflag, "--at") == 1) {
+        if (pos_line <= 0) { main_eprint("usage: shadow --at <file> <line> <col>\n"); return 1; }
+        println(api_node_at_pos(pos_line, pos_col));
+        return 0;
+    }
+    if (str_eq(qflag, "--type-at") == 1) {
+        if (pos_line <= 0) { main_eprint("usage: shadow --type-at <file> <line> <col>\n"); return 1; }
+        println("type-at: " + api_type_at_pos(pos_line, pos_col));
+        return 0;
+    }
+    main_eprint("unknown query mode: " + qflag + "\n");
+    return 1;
+}
+
+// 从 .ll 生成 .o 并链接为 exe，返回 0 成功
+// LLVM_HOME 从环境变量读取（默认 D:\llvm\clang+llvm-22.1.0-x86_64-pc-windows-msvc）
+kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir: string) -> int {
+    let llvm_home = env_get("LLVM_HOME");
+    if (len(llvm_home) == 0) {
+        llvm_home = "D:\\llvm\\clang+llvm-22.1.0-x86_64-pc-windows-msvc";
+    } else {
+        // MSYS/Git Bash 可能把反斜杠路径转成正斜杠（D://llvm//...），
+        // 与下方 \\bin\\ 拼接混用会令 cmd 无法定位。统一转回反斜杠。
+        llvm_home = str_replace(llvm_home, "/", "\\");
+    }
+    let llc = llvm_home + "\\bin\\llc.exe";
+    let clang = llvm_home + "\\bin\\clang++.exe";
+    // 产物链接 0.4 自研 rt/ 系统调用层（纯 C，仅系统库），不再依赖 C++ runtime。
+    // 产物 .ll 已内嵌 Shadow runtime（main_load_combined 注入的 runtime_lib.shadow）。
+    let rt_dir = self_dir + "\\rt\\";
+    let rt_objs = "\"" + rt_dir + "rt_core.o\" \"" + rt_dir + "rt_fs.o\" \"" + rt_dir + "rt_proc.o\" \"" +
+                  rt_dir + "rt_time.o\" \"" + rt_dir + "rt_err.o\" \"" + rt_dir + "rt_extra.o\" \"" +
+                  rt_dir + "rt_gc.o\" \"" + rt_dir + "rt_thread.o\" \"" + rt_dir + "rt_io.o\"";
+    let miniz_obj = "bootstrap\\miniz.o";
+    // llc -O0 -filetype=obj <ir> -o <obj>
+    // cmd1：程序路径（llc）不带引号——LLVM_HOME 默认无空格；命令以引号开头会触发
+    // cmd /c 的引号剥除陷阱（_popen 走 cmd.exe）。文件路径加引号（用户路径可能含空格）。
+    let cmd1 = llc + " -O0 -filetype=obj \"" + ir_path + "\" -o \"" + obj_path + "\"";
+    let r1 = rt_sys_exec(cmd1);
+    if (file_exists(obj_path) == 0) {
+        main_eprint("DBG cmd1: " + cmd1 + "\n");
+        main_eprint("llc failed: " + r1 + "\n");
+        return 1;
+    }
+    // P0-2：先把 .spk 包 [native] sources 声明的 .cpp/.c 编译为 .o
+    // 输出到 <obj_path>_native_<n>.o（与 .obj 同目录，必定可写；避免依赖 cwd 下的 build/）
+    let native_objs: array<string> = [];
+    let ni = 0;
+    while (ni < len(main_native_sources)) {
+        let nsrc = main_native_sources[ni] as string;
+        let nobj = obj_path + "_native_" + int_to_str(ni) + ".o";
+        let ncmd = clang + " -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS 2>&1";
+        let nrc = rt_sys_exec(ncmd);
+        if (file_exists(nobj) == 0) {
+            main_eprint("link failed: native compile failed: " + nsrc + "\n");
+            if (len(nrc) > 0) { main_eprint(nrc + "\n"); }
+            let ci = 0;
+            while (ci < len(native_objs)) {
+                rt_delete_file(native_objs[ci] as string);
+                ci = ci + 1;
+            }
+            return 1;
+        }
+        native_objs = array_push(native_objs, nobj);
+        ni = ni + 1;
+    }
+    // cmd2：clang 不带引号（同 cmd1，避免 cmd /c 引号剥除陷阱）；文件/库路径加引号
+    let cmd2 = clang + " -std=c++17 \"" + obj_path + "\" " + rt_objs + " \"" + miniz_obj + "\"";
+    let oi = 0;
+    while (oi < len(native_objs)) {
+        cmd2 = cmd2 + " \"" + (native_objs[oi] as string) + "\"";
+        oi = oi + 1;
+    }
+    let ldi = 0;
+    while (ldi < len(main_native_link_dirs)) {
+        cmd2 = cmd2 + " -L\"" + (main_native_link_dirs[ldi] as string) + "\"";
+        ldi = ldi + 1;
+    }
+    let lki = 0;
+    while (lki < len(main_native_links)) {
+        cmd2 = cmd2 + " -l" + (main_native_links[lki] as string);
+        lki = lki + 1;
+    }
+    cmd2 = cmd2 + " -o \"" + exe_path + "\" -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\" 2>&1";
+    let r2 = rt_sys_exec(cmd2);
+    // native .o 是中间产物，链接结束即可清理（成功/失败都清）
+    let ci2 = 0;
+    while (ci2 < len(native_objs)) {
+        rt_delete_file(native_objs[ci2] as string);
+        ci2 = ci2 + 1;
+    }
+    if (file_exists(exe_path) == 0) {
+        main_eprint("link failed: " + r2 + "\n");
+        return 1;
+    }
+    return 0;
+}
+
+// 主入口
+kimo main() -> int {
+    let args = rt_sys_args();
+    let n_args = len(args);
+    if (n_args < 2) {
+        main_eprint("usage: shadow <file.shadow> [-o out.ll | --run] [--strict]\n");
+        main_eprint("       shadow pack <dir> <out.spk> | unpack <spk> <out_dir> | list <spk> | -init <dir>\n");
+        main_eprint("       shadow --lsp | --check <f> | --ranges <f> | --diag-json <f> | --at <f> <l> <c> | --type-at <f> <l> <c>\n");
+        return 1;
+    }
+    let arg1 = args[1] as string;
+    if (str_eq(arg1, "--version") == 1) {
+        println("shadow 0.4 (stage1)");
+        return 0;
+    }
+    // ---- 统一扫描：--strict 任意位置生效（严格态唯一触发方式；查询/编译路径共用）----
+    let i_st = 1;
+    while (i_st < n_args) {
+        if (str_eq(args[i_st] as string, "--strict") == 1) { tc_set_strict(1); }
+        i_st = i_st + 1;
+    }
+    // ---- Phase 14：LSP/查询类 CLI（flag 可在 args[1] 或文件之后）----
+    let i2 = 1;
+    while (i2 < n_args) {
+        let a2 = args[i2] as string;
+        if (str_eq(a2, "--lsp") == 1 || str_eq(a2, "--check") == 1 || str_eq(a2, "--ranges") == 1 ||
+            str_eq(a2, "--diag-json") == 1 || str_eq(a2, "--at") == 1 || str_eq(a2, "--type-at") == 1) {
+            return main_query_mode(a2, args, n_args, i2);
+        }
+        i2 = i2 + 1;
+    }
+    // ---- Phase 12：SPK 工具链 CLI ----
+    if (str_eq(arg1, "pack") == 1) {
+        if (n_args < 4) { main_eprint("usage: shadow pack <dir> <out.spk>\n"); return 1; }
+        let src_dir = args[2] as string;
+        let out_spk = args[3] as string;
+        let zrc = zip_pack(src_dir, out_spk);
+        if (zrc != 0) { main_eprint("pack failed: " + src_dir + "\n"); return 1; }
+        let h = content_hash(out_spk);
+        println("packed " + out_spk);
+        if (len(h) > 0) { println("content_hash=" + h); }
+        return 0;
+    }
+    if (str_eq(arg1, "unpack") == 1) {
+        if (n_args < 4) { main_eprint("usage: shadow unpack <spk> <out_dir>\n"); return 1; }
+        let spk = args[2] as string;
+        let out_dir = args[3] as string;
+        let zrc = zip_unpack(spk, out_dir);
+        if (zrc != 0) { main_eprint("unpack failed: " + spk + "\n"); return 1; }
+        println("unpacked to " + out_dir);
+        return 0;
+    }
+    if (str_eq(arg1, "list") == 1) {
+        if (n_args < 3) { main_eprint("usage: shadow list <spk>\n"); return 1; }
+        let spk = args[2] as string;
+        let lst = zip_list(spk);
+        if (len(lst) == 0) { main_eprint("list failed or empty: " + spk + "\n"); return 1; }
+        println(lst);
+        return 0;
+    }
+    if (str_eq(arg1, "-init") == 1) {
+        let dir = ".";
+        if (n_args >= 3) { dir = args[2] as string; }
+        let sbg_path = dir + "\\shadow.sbg";
+        if (file_exists(sbg_path) == 1) {
+            main_eprint("shadow.sbg already exists: " + sbg_path + "\n");
+            return 1;
+        }
+        let name = "myapp";
+        let i0 = len(dir) - 1;
+        while (i0 >= 0) {
+            let c = dir[i0];
+            if (str_eq(c, "\\") == 1 || str_eq(c, "/") == 1) {
+                name = substr2(dir, i0 + 1, len(dir));
+                break;
+            }
+            i0 = i0 - 1;
+        }
+        if (len(name) == 0) { name = "myapp"; }
+        let sbg = "[package]\nname = \"" + name + "\"\nversion = \"0.1.0\"\nabi_version = 1\n\n[deps]\n";
+        let wrc = file_write(sbg_path, sbg);
+        if (wrc == 0) { main_eprint("cannot write: " + sbg_path + "\n"); return 1; }
+        println("initialized " + sbg_path);
+        return 0;
+    }
+    // --strict：唯一严格态触发方式（Phase 15）；dsb 行恢复纯 `dsb <name>;` 语义，不再承载 strict 关键字
+    // （统一扫描已在查询分派前执行，此处保留向后兼容）
+    let i_s = 2;
+    while (i_s < n_args) {
+        if (str_eq(args[i_s] as string, "--strict") == 1) { tc_set_strict(1); }
+        i_s = i_s + 1;
+    }
+    // 文件参数：arg1 若为 flag（如 `shadow --strict foo.shadow`），取第一个非 flag 参数
+    let main_file = arg1;
+    if (str_starts_with(main_file, "--") == 1) {
+        let i_f2 = 2;
+        while (i_f2 < n_args) {
+            let a_f2 = args[i_f2] as string;
+            if (str_starts_with(a_f2, "--") == 0 && str_eq(a_f2, "-o") == 0) { main_file = a_f2; break; }
+            i_f2 = i_f2 + 1;
+        }
+    }
+    // 读源文件（含 runtime 注入 + import 递归加载，拼接为 combined）
+    let src = main_load_combined(main_file, args[0] as string);
+    if (len(src) == 0) {
+        if (len(main_import_err) > 0) {
+            main_eprint("module error: " + main_import_err + "\n");
+        } else {
+            main_eprint("cannot read file: " + main_file + "\n");
+        }
+        return 1;
+    }
+    // 解析参数：找 -o 或 --run
+    let out_path = "";
+    let do_run = 0;
+    let i = 2;
+    while (i < n_args) {
+        let a = args[i] as string;
+        if (str_eq(a, "-o") == 1 && i + 1 < n_args) {
+            out_path = args[i + 1] as string;
+            i = i + 1;
+        }
+        if (str_eq(a, "--run") == 1) { do_run = 1; }
+        i = i + 1;
+    }
+    // 编译
+    let ir = main_compile_source(src, main_file);
+    if (len(ir) == 0) {
+        main_eprint("compile failed\n");
+        return 1;
+    }
+    // 确定输出路径
+    let ir_path = out_path;
+    if (len(ir_path) == 0) { ir_path = main_file + ".ll"; }
+    let rc = file_write(ir_path, ir);
+    if (rc == 0) {
+        main_eprint("cannot write: " + ir_path + "\n");
+        return 1;
+    }
+    if (do_run == 0) {
+        println(ir_path);
+        return 0;
+    }
+    // --run：llc + 链接 + 运行
+    let base = main_file;
+    let exe_path = main_file + ".exe";
+    let obj_path = main_file + ".obj";
+    let self_dir = main_exe_dir(args[0] as string);
+    if (len(self_dir) == 0) { self_dir = "."; }
+    // 编译器自身所在目录（rt 层与其同目录）
+    let link_rc = main_link_exe(ir_path, obj_path, exe_path, self_dir);
+    if (link_rc != 0) {
+        return 1;
+    }
+    // 运行
+    let run_cmd = "\"" + exe_path + "\"";
+    let out = rt_sys_exec(run_cmd);
+    let ol = len(out);
+    if (ol > 0) {
+        // 一次性输出（rt_puts 会加换行；逐字符 rt_puts 会把每个字符单独换行）
+        rt_puts(out);
+    }
+    // 清理中间文件
+    rt_delete_file(obj_path);
+    rt_delete_file(ir_path);
+    return 0;
+}

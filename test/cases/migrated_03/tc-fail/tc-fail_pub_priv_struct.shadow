@@ -1,0 +1,8 @@
+//@ mode: tc-fail
+//@ desc: non-pub struct from imported module should not be accessible
+dsb tc_fail_pub_priv_struct;
+import _pub_helper
+kimo main() -> int {
+    let b = PrivBox { value: 99 };
+    return 0;
+}

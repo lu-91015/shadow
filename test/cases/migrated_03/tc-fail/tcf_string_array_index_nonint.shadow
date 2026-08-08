@@ -1,0 +1,7 @@
+//@desc: indexing a string array with a non-integer is rejected
+dsb tcf_string_array_index_nonint;
+kimo main() -> int {
+    let a = ["x", "y"];
+    let s = a["k"];
+    return 0;
+}

@@ -1,0 +1,11 @@
+//@expect: 6
+//@ desc: generic monomorphization — three different instantiations in one program
+dsb cg_mono_repeated_int;
+
+kimo id<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = id(1);
+    let b = id(2);
+    let c = id(3);
+    println(a + b + c); return 0;
+}

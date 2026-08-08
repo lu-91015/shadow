@@ -1,0 +1,8 @@
+//@desc: GC empty struct literal — capitalized name + {} parses as empty struct lit
+//@expect-ir: shadow_gc_alloc
+dsb edge_gc_empty_struct;
+struct Empty {}
+kimo main() -> int {
+    let e = Empty {};
+    return 0;
+}

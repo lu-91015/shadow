@@ -1,0 +1,11 @@
+//@expect: 3
+//@ desc: top-level mutable variable
+dsb cg_global_var;
+mut counter: int = 0;
+kimo inc() -> int {
+    counter = counter + 1;
+    return counter;
+}
+kimo main() -> int {
+    println(inc() + inc()); return 0;
+}

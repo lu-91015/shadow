@@ -1,0 +1,28 @@
+//@desc: array as function parameter and return value with modification
+//@expect: 6\n10\n3\n0
+dsb cg_array_fn;
+
+kimo sum_array(arr: array<int>) -> int {
+    let total = 0;
+    let i = 0;
+    while (i < len(arr)) {
+        total = total + arr[i];
+        i = i + 1;
+    }
+    return total;
+}
+
+kimo modify_array(arr: array<int>) -> array<int> {
+    arr[0] = 10;
+    return arr;
+}
+
+kimo main() -> int {
+    let data = [1, 2, 3];
+    let s = sum_array(data);
+    println(to_string(s));
+    let modified = modify_array(data);
+    println(to_string(modified[0]));
+    println(to_string(len(modified)));
+    println(0); return 0;
+}

@@ -1,0 +1,19 @@
+//@desc: L1 trait parse smoke — trait def + impl Trait for Type
+//@expect-ir: define
+dsb tc_trait_parse;
+
+trait ToString {
+    kimo to_string(self: any) -> string;
+}
+
+struct Foo { x: int; }
+
+impl ToString for Foo {
+    kimo to_string(self: any) -> string {
+        return "Foo";
+    }
+}
+
+kimo main() -> int {
+    return 0;
+}

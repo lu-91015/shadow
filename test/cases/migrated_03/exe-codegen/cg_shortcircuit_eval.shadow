@@ -1,0 +1,45 @@
+//@desc: && and || short-circuit: rhs must not evaluate when lhs decides (bug #59)
+//@expect: and_false 0
+//@expect: or_true 0
+//@expect: and_true 1
+//@expect: or_false 1
+//@expect: guard_ok
+dsb cg_shortcircuit_eval;
+
+// 用数组做计数器（堆引用，函数内可变）
+kimo probe(counter: any, v: bool) -> bool {
+    counter[0] = (counter[0] as int) + 1;
+    return v;
+}
+
+kimo main() -> int {
+    // lhs=false → && 不求值 rhs
+    let c1 = [0];
+    let a = false && probe(c1, true);
+    println("and_false " + int_to_str(c1[0] as int));
+
+    // lhs=true → || 不求值 rhs
+    let c2 = [0];
+    let b = true || probe(c2, false);
+    println("or_true " + int_to_str(c2[0] as int));
+
+    // lhs=true → && 必须求值 rhs
+    let c3 = [0];
+    let c = true && probe(c3, true);
+    println("and_true " + int_to_str(c3[0] as int));
+
+    // lhs=false → || 必须求值 rhs
+    let c4 = [0];
+    let d = false || probe(c4, true);
+    println("or_false " + int_to_str(c4[0] as int));
+
+    // 经典越界保护写法：i >= len 时右侧下标不能执行
+    let arr = [10, 20, 30];
+    let i = 3;
+    if (i < len(arr) && arr[i] > 0) {
+        println("guard_bad");
+    } else {
+        println("guard_ok");
+    }
+    return 0;
+}

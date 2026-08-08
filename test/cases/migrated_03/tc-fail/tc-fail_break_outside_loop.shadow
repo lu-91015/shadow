@@ -1,0 +1,4 @@
+//@desc: break outside a loop is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_break_outside_loop;
+kimo main() -> int { break; return 0; }

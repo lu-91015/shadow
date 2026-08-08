@@ -1,0 +1,17 @@
+//@desc: struct with typed fields (long, double, int) generates correct field types
+//@expect: 1\n100\n3.14\n0
+dsb cg_struct_typed_fields;
+
+struct Mixed {
+    a: int,
+    b: long,
+    c: double,
+}
+
+kimo main() -> int {
+    let p = Mixed { a: 1, b: 100L, c: 3.14 };
+    println(to_string(p.a));
+    println(to_string(p.b));
+    println(to_string(p.c));
+    println(0); return 0;
+}

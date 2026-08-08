@@ -1,0 +1,11 @@
+//@desc: minimal dict<K,V> test — declare, insert, access
+//@expect: world
+dsb cg_dict_minimal;
+
+kimo main() -> int {
+    let d: dict<string, string> = hashmap_new();
+    hashmap_insert(d, "hello", "world");
+    println(d["hello"]);
+    hashmap_free(d);
+    return 0;
+}

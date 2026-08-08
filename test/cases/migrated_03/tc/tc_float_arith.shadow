@@ -1,0 +1,11 @@
+//@desc: float/double arithmetic and mixed float*int, comparison in if
+dsb tc_float_arith;
+kimo main() -> int {
+    let a: float = 1.5;
+    let b: double = 2.5;
+    let s = a + b;
+    let p = a * 3.0;
+    if (s > 3.0) { return 1; }
+    if (p < 0.0) { return 2; }
+    return 0;
+}

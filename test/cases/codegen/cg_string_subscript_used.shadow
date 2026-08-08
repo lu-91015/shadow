@@ -1,0 +1,9 @@
+//@mode: codegen
+//@desc: string subscript result fed into string concat (no i32 truncation)
+//@expect-ir: shadow_subscript
+dsb cg_string_subscript_used;
+kimo main() -> int {
+    let s = "abc";
+    let combo = s[0] + "X";
+    return 0;
+}

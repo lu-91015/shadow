@@ -1,0 +1,4 @@
+//@desc: to_string(int) codegen — should emit shadow_int_to_string call
+//@expect-ir: __rt_shadow_int_to_cstr
+dsb cg_to_string_int;
+kimo main() -> int { let s = to_string(42); return 0; }

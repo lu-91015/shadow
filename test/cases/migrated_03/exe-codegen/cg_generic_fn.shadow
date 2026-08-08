@@ -1,0 +1,9 @@
+//@expect: 42
+//@ desc: generic function identity<T>(x: T) -> T, type-erased to any
+dsb cg_generic_fn;
+
+kimo identity<T>(x: T) -> T { return x; }
+kimo main() -> int {
+    let a = identity(42);
+    println(a); return 0;
+}

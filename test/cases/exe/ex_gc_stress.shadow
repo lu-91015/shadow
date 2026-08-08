@@ -1,0 +1,92 @@
+// ex_gc_stress.shadow — GC v1：高频率分配/丢弃，验证内存回收不爆
+// 期望：反复分配 1000 个 1KB 结构再丢弃，循环 500 轮；若 GC 失效内存会爆炸。
+dsb ex_gc_stress;
+
+struct Big {
+    a: int;
+    b: int;
+    c: int;
+    d: int;
+    e: int;
+    f: int;
+    g: int;
+    h: int;
+    i: int;
+    j: int;
+    k: int;
+    l: int;
+    m: int;
+    n: int;
+    o: int;
+    p: int;
+    q: int;
+    r: int;
+    s: int;
+    t: int;
+    u: int;
+    v: int;
+    w: int;
+    x: int;
+    y: int;
+    z: int;
+    aa: int;
+    bb: int;
+    cc: int;
+    dd: int;
+    ee: int;
+    ff: int;
+    gg: int;
+    hh: int;
+    ii: int;
+    jj: int;
+    kk: int;
+    ll: int;
+    mm: int;
+    nn: int;
+    oo: int;
+    pp: int;
+    qq: int;
+    rr: int;
+    ss: int;
+    tt: int;
+    uu: int;
+    vv: int;
+    ww: int;
+    xx: int;
+    yy: int;
+    zz: int;
+    arr: array<int>;
+}
+
+kimo main() -> int {
+    let round = 0;
+    while (round < 500) {
+        let keep: array<Big> = [];
+        let i = 0;
+        while (i < 200) {
+            let b: Big = Big { a: i, b: i * 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10,
+                k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20,
+                u: 21, v: 22, w: 23, x: 24, y: 25, z: 26, aa: 27, bb: 28, cc: 29, dd: 30,
+                ee: 31, ff: 32, gg: 33, hh: 34, ii: 35, jj: 36, kk: 37, ll: 38, mm: 39, nn: 40,
+                oo: 41, pp: 42, qq: 43, rr: 44, ss: 45, tt: 46, uu: 47, vv: 48, ww: 49, xx: 50,
+                yy: 51, zz: 52, arr: [1, 2, 3] };
+            keep = array_push(keep, b);
+            i = i + 1;
+        }
+        // 校验
+        let total = 0;
+        i = 0;
+        while (i < len(keep)) {
+            let b2: Big = keep[i];
+            total = total + b2.a + len(b2.arr);
+            i = i + 1;
+        }
+        if (total != 20500) {
+            println("ERR total=" + int_to_str(total));
+            return 1;
+        }
+        round = round + 1;
+    }
+    println("stress ok rounds=500");
+    return 0;
+}

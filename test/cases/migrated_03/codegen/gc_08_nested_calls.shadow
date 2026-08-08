@@ -1,0 +1,9 @@
+//@desc: GC with nested function calls passing struct fields
+//@expect-ir: shadow_gc_alloc
+dsb gc_08_nested_calls;
+struct P { x: int, y: int }
+kimo add(a: int, b: int) -> int { return a + b; }
+kimo main() -> int {
+    let p = P { x: 10, y: 20 };
+    return add(p.x, p.y);
+}

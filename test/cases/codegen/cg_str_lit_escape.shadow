@@ -1,0 +1,4 @@
+//@desc: string literal codegen — escape sequences (\n \t \\) should appear in IR
+//@expect-ir: c"line1\0A
+dsb cg_str_lit_escape;
+kimo main() -> int { let s = "line1\nline2"; return 0; }

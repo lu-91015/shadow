@@ -1,0 +1,29 @@
+//@desc: for (i in a..b) range iteration (half-open: [a, b))
+//@expect: 45
+//@expect: 0
+//@expect: 4
+dsb exe_for_range;
+kimo main() -> int {
+    // 0..10: i = 0,1,...,9, sum = 45
+    let sum = 0;
+    for (i in 0..10) {
+        sum = sum + i;
+    }
+    println(sum);
+
+    // a..a (empty range): no iteration
+    let count = 0;
+    for (i in 5..5) {
+        count = count + 1;
+    }
+    println(count);
+
+    // 1..5: i = 1,2,3,4, last = 4
+    let last = 0;
+    for (i in 1..5) {
+        last = i;
+    }
+    println(last);
+
+    return 0;
+}

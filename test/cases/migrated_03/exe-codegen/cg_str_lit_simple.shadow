@@ -1,0 +1,4 @@
+//@desc: string literal codegen — simple string should appear as LLVM global constant
+//@expect: 0
+dsb cg_str_lit_simple;
+kimo main() -> int { let s = "hello"; println(0); return 0; }

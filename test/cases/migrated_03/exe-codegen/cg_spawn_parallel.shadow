@@ -1,0 +1,18 @@
+//@desc: spawn several tasks on real OS threads (std::thread), await all, sum
+//@expect: 60
+dsb cg_spawn_parallel;
+
+kimo worker(base: int) -> int {
+    return base * 10;
+}
+
+kimo main() -> int {
+    let f1 = spawn worker(1);
+    let f2 = spawn worker(2);
+    let f3 = spawn worker(3);
+    let a = await f1;
+    let b = await f2;
+    let c = await f3;
+    println((a as int) + (b as int) + (c as int));
+    return 0;
+}

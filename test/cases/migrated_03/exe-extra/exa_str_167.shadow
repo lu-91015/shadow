@@ -1,0 +1,12 @@
+//@desc: exe-extra generated case (exa_str_167)
+//@expect: shadow
+//@expect: 6
+//@expect: s
+dsb exa_str_167;
+kimo main() -> int {
+    let s = "sha" + "dow";
+    println(s);
+    println(len(s));
+    println(s[0]);
+    return 0;
+}

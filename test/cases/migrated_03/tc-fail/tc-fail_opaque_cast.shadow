@@ -1,0 +1,10 @@
+//@desc: opaque type cannot be cast to int (avoids 64->32 bit truncation)
+//@expect-stderr: invalid cast from opaque
+dsb tc_fail_opaque_cast;
+@extern("my_opaque_open") kimo my_opaque_open() -> opaque { return null as opaque; }
+
+kimo main() -> int {
+    let p = my_opaque_open();
+    let bad: int = p as int;
+    return 0;
+}

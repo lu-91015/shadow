@@ -1,0 +1,10 @@
+//@desc: member access (obj.field) type-checks
+//@expect: typecheck: 1
+dsb tc_member;
+struct Point { x: int, y: int }
+kimo f() -> int {
+    let p = Point { x: 1, y: 2 };
+    if (p.x == p.y) { return 0; }
+    return 1;
+}
+kimo main() -> int { return f(); }

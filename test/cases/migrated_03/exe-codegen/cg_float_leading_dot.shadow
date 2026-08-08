@@ -1,0 +1,7 @@
+//@desc: leading-dot float constant (.5) tokenized as float
+//@expect: 0
+dsb cg_float_leading_dot;
+kimo main() -> int {
+    let x = .5;
+    println(0); return 0;
+}

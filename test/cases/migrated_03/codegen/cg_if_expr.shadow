@@ -1,0 +1,10 @@
+//@ mode: codegen
+//@ desc: if-expression evaluates to a value using alloca+store+load
+//@expect-ir: load
+dsb cg_if_expr;
+
+kimo main() -> int {
+    let flag = 1;
+    let x = if (flag) { 42 } else { 99 };
+    return x;
+}

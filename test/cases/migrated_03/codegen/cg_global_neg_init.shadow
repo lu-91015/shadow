@@ -1,0 +1,12 @@
+//@ mode: codegen
+//@ desc: global variable initialized to negative value (0.2 crash regression)
+dsb cg_global_neg_init;
+mut neg_one: int = -1;
+let neg_two: int = -2;
+let neg_big: int = -1000;
+let neg_long: long = -1000000000000L;
+let neg_float: double = -3.14;
+let neg_inferred = -42;
+kimo main() -> int {
+    return neg_one + neg_two + neg_big;
+}

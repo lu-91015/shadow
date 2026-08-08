@@ -1,0 +1,16 @@
+//@mode: codegen
+//@desc: Panic statement - generates shadow_panic call and unreachable
+//@expect-ir: shadow_panic
+//@expect-ir: shadow_panic
+dsb cg_panic;
+
+kimo main() -> int {
+    let x = 42;
+    if (x > 100) {
+        panic("x is too large");
+    }
+    if (x < 0) {
+        panic("x is negative");
+    }
+    return 0;
+}

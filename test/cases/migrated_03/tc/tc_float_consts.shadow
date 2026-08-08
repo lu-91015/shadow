@@ -1,0 +1,12 @@
+//@desc: float constant pool edge cases: decimal, negative, leading-dot, scientific
+dsb tc_float_consts;
+kimo main() -> int {
+    let a = 1.5;
+    let b = -2.25;
+    let c = .5;
+    let d = 1e3;
+    let e = 1.0e-4;
+    let f = 2E10;
+    let g = 0.0;
+    return 0;
+}

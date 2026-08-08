@@ -1,0 +1,53 @@
+//@desc: L6 `?` on Option<T> — unwraps Some(T); None throws (catchable via try/catch)
+//@expect: 5\nhello\ncaught none\nside: 0
+dsb cg_question_option;
+
+// Option<T> 由类型检查器 prelude 预注册（Some=0, None=1），无需本地定义。
+
+let g_side: int = 0;
+
+kimo pick(x: int) -> Option<int> {
+    if (x == 0) {
+        return None;
+    }
+    return Some(x);
+}
+
+kimo pick_str(ok: int) -> Option<string> {
+    if (ok == 0) {
+        return None;
+    }
+    return Some("hello");
+}
+
+kimo use_pick(x: int) -> int {
+    let v = pick(x)?;
+    return v;
+}
+
+// string 负载：验证 `?` 解包类型 T=string 正确
+kimo use_pick_str() -> string {
+    let s = pick_str(1)?;
+    return s;
+}
+
+kimo use_none() -> int {
+    let v = pick(0)?;
+    g_side = 1;  // None -> throw，不会执行
+    return v;
+}
+
+kimo main() -> int {
+    println(use_pick(5));    // Some(5) -> 5
+    println(use_pick_str()); // Some("hello") -> hello
+
+    g_side = 0;
+    try {
+        use_none();
+    } catch {
+        println("caught none");
+    }
+    print("side: ");
+    println(g_side);         // 0
+    return 0;
+}

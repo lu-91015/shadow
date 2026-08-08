@@ -1,0 +1,10 @@
+//@mode: codegen
+//@desc: match-expression returning a string, concatenated with another
+//@expect-ir: shadow_string_concat
+dsb edge_match_expr_string;
+kimo main() -> int {
+    let x = 2;
+    let s = match x { 1 => "one", 2 => "two", 3 => "three" };
+    let t = s + "!";
+    return 0;
+}

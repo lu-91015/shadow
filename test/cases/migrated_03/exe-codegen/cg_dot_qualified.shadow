@@ -1,0 +1,13 @@
+//@expect: 42
+//@expect: 7
+//@expect: hi
+//@ desc: module.func() and module.var with dot syntax (Go/Java style)
+dsb cg_dot_qualified;
+import _dotqual_mod;
+
+kimo main() -> int {
+    println(dotqual_mod.helper());
+    println(dotqual_mod.ANSWER);
+    println(dotqual_mod.GREETING);
+    return 0;
+}

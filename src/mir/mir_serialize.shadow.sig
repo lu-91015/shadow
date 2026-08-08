@@ -1,0 +1,27 @@
+# hash: 5492861068671229173
+module|mir_ser
+fn|mir_ser_put|1||3|0|void|buf:any,off:int,b:int|
+fn|mir_ser_put_bytes|1||3|0|int|s:string,buf:any,off:int|
+fn|mir_ser_store_long|1||3|0|void|buf:any,off:int,v:long|
+fn|mir_ser_store_float|1||3|0|void|buf:any,off:int,v:double|
+fn|leb_enc_uint|1||3|0|int|buf:any,off:int,val:int|
+fn|leb_dec_uint|1||2|0|void|buf:any,off:int|
+fn|leb_enc_int|1||3|0|int|buf:any,off:int,val:int|
+fn|leb_dec_int|1||2|0|void|buf:any,off:int|
+fn|leb_enc_long|1||3|0|int|buf:any,off:int,val:long|
+fn|leb_dec_long|1||2|0|void|buf:any,off:int|
+fn|mir_ser_write_str|1||3|0|int|buf:any,off:int,s:string|
+fn|mir_ser_read_str|1||2|0|string|buf:any,off:int|
+fn|mir_ser_write_type|1||3|0|int|buf:any,off:int,t:Type|
+fn|mir_ser_read_type|1||2|0|Type|buf:any,off:int|
+fn|mir_ser_write_inst|1||3|0|int|buf:any,off:int,inst:MirInst|
+fn|mir_ser_read_inst|1||2|0|MirInst|buf:any,off:int|
+fn|mir_ser_write_func|1||3|0|int|buf:any,off:int,mf:MirFunc|
+fn|mir_ser_read_func|1||2|0|MirFunc|buf:any,off:int|
+fn|mir_ser_emit_all|1||5|0|int|buf:any,module_name:string,source_hash_str:string,funcs:MirFunc[],globals:GlobalVar[]|
+fn|mir_cache_store|1||5|0|int|source_path:string,module_name:string,source_hash_str:string,funcs:MirFunc[],globals:GlobalVar[]|
+fn|mir_cache_load|1||1|0|any|source_path:string|
+fn|mir_cache_mod_name|1||1|0|string|mod:any|
+fn|mir_cache_mod_hash|1||1|0|string|mod:any|
+fn|mir_cache_mod_funcs|1||1|0|any|mod:any|
+fn|mir_cache_mod_globals|1||1|0|any|mod:any|

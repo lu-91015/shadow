@@ -1,0 +1,18 @@
+//@desc: function returning array uses implicit null return via llvmConstN
+//@expect-ir: ret ptr
+dsb cg_implicit_null_ret;
+
+kimo maybe_arr(flag: int) -> array {
+    if (flag == 0) {
+        return [1, 2, 3];
+    }
+    // implicit return null (ptr) here
+}
+
+kimo main() -> int {
+    let a = maybe_arr(1);
+    if (a == null) {
+        println("null");
+    }
+    return 0;
+}

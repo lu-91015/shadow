@@ -1,0 +1,11 @@
+//@desc: for-loop with array iteration type-checks correctly
+//@expect: 6
+dsb tc_for;
+kimo main() -> int {
+    let arr = [1, 2, 3];
+    let sum = 0;
+    for (x in arr) {
+        sum = sum + x;
+    }
+    println(sum); return 0;
+}

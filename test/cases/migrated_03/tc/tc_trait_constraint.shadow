@@ -1,0 +1,26 @@
+//@desc: L1 trait constraint — generic <T: Trait> requires impl Trait for Type
+//@expect-ir: define
+dsb tc_trait_constraint;
+
+trait Greet {
+    kimo greet(self: any) -> string;
+}
+
+struct Foo { x: int; }
+
+impl Greet for Foo {
+    kimo greet(self: any) -> string {
+        return "hello from Foo";
+    }
+}
+
+// 泛型函数：T 必须实现 Greet trait
+kimo call_greet<T: Greet>(x: T) -> int {
+    return 42;
+}
+
+kimo main() -> int {
+    let f = Foo { x: 1 };
+    let r = call_greet(f);
+    return r - 42;
+}

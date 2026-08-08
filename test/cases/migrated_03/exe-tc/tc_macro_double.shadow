@@ -1,0 +1,5 @@
+//@desc: macro applied to a computed expression
+//@expect: 21
+dsb tc_macro_double;
+macro inc { x => x + 1; }
+kimo main() -> int { let v = inc(10 + 10); println(v); return 0; }

@@ -1,0 +1,26 @@
+//@desc: set<T> type syntax — declare, add, contains, remove, size
+//@expect: 1\n1\n0\n2\n1\n0
+dsb cg_set_type_syntax;
+
+kimo main() -> int {
+    // set<string> 类型声明 + set_new 创建
+    let s: set<string> = set_new();
+    set_add(s, "hello");
+    set_add(s, "world");
+    set_add(s, "hello");  // 重复元素，不应增加 size
+
+    // set_contains 检查
+    println(set_contains(s, "hello"));   // 1
+    println(set_contains(s, "world"));   // 1
+    println(set_contains(s, "missing")); // 0
+
+    // set_size
+    println(set_size(s));  // 2（hello 去重）
+
+    // set_remove
+    println(set_remove(s, "hello"));    // 1
+    println(set_contains(s, "hello"));  // 0
+
+    set_free(s);
+    return 0;
+}

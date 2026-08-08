@@ -1,0 +1,8 @@
+//@desc: string array containing empty strings type-checks
+//@expect: 0
+dsb tc_string_array_empty;
+kimo main() -> int {
+    let a = ["", "x", ""];
+    let s = a[1];
+    println(0); return 0;
+}

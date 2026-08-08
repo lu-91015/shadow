@@ -1,0 +1,18 @@
+//@expect: 42
+//@desc: L2 enum payload — Result<int, string> with Ok and Err arms
+dsb cg_enum_result_int;
+
+enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+kimo main() -> int {
+    let x = Ok(42);
+    let r = match x {
+        Ok(v) => v,
+        Err(e) => 0,
+    };
+    println(r);
+    return 0;
+}

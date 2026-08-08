@@ -1,0 +1,12 @@
+//@expect: 20
+//@desc: match statement codegen (icmp + condbr)
+dsb cg_match_simple;
+kimo main() -> int {
+    let x = 2;
+    match x {
+        1 => { println(10); return 0; }
+        2 => { println(20); return 0; }
+        3 => { println(30); return 0; }
+    }
+    println(0); return 0;
+}

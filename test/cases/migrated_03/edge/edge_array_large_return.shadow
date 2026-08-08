@@ -1,0 +1,15 @@
+//@mode: codegen
+//@desc: large array (20 ints) returned and indexed at boundaries
+//@expect-ir: shadow_array_get
+dsb edge_array_large_return;
+kimo make() -> array<int> {
+    let a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    return a;
+}
+kimo main() -> int {
+    let a = make();
+    let v0 = a[0];
+    let v9 = a[9];
+    let v19 = a[19];
+    return v0 + v9 + v19;
+}

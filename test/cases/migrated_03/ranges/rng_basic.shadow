@@ -1,0 +1,17 @@
+//@desc: LSP-3：AST 节点携带真实源码区间（半开 [start, end)），而非退化点
+//@expect: ranges: funcs=2
+//@expect: func: add 10:1-12:2
+//@expect:   stmt: 11:5-11:18
+//@expect: func: main 14:1-17:2
+//@expect:   stmt: 15:5-15:24
+//@expect:   stmt: 16:5-16:14
+dsb rng_basic;
+
+kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    println(add(3, 4));
+    return 0;
+}

@@ -1,0 +1,7 @@
+//@desc: member access on a bare int is rejected (must box to `any` first)
+dsb tcf_any_member_on_int;
+kimo main() -> int {
+    let x = 5;
+    let y = x.field;
+    return 0;
+}

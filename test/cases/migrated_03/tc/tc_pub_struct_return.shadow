@@ -1,0 +1,8 @@
+//@ desc: pub struct used as function return type
+dsb tc_pub_struct_return;
+import _pub_helper;
+kimo make_pub_box(v: int) -> PubBox { return PubBox { value: v }; }
+kimo main() -> int {
+    let b = make_pub_box(99);
+    return get_pub_box_value(b);
+}

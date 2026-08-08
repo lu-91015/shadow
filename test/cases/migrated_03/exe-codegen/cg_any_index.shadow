@@ -1,0 +1,9 @@
+//@desc: `any` index access lowers to shadow_index_any
+//@expect: 0
+dsb cg_any_index;
+kimo main() -> int {
+    let m = [10, 20, 30];
+    let a = m as any;
+    let v = a[0] as int;
+    println(v); return 0;
+}

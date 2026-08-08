@@ -1,0 +1,8 @@
+//@desc: exe-extra generated case (exa_sumdn_66)
+//@expect: 465
+dsb exa_sumdn_66;
+kimo sd(n: int) -> int { if (n <= 0) { return 0; } return n + sd(n - 1); }
+kimo main() -> int {
+    println(sd(30));
+    return 0;
+}

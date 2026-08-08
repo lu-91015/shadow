@@ -1,0 +1,13 @@
+//@desc: L3 closure — capture multiple variables of different types
+//@expect: 100
+dsb cg_closure_capture_multi;
+kimo main() -> int {
+    let a = 30;
+    let b = 70;
+    let f = kimo() -> int {
+        return a + b;
+    };
+    let r = f();
+    println(r);
+    return 0;
+}

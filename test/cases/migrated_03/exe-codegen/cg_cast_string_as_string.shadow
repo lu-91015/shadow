@@ -1,0 +1,8 @@
+//@desc: `s as string`（string→string）应为恒等转换，不得被错误编译成 shadow_parse_int(s)
+//@expect: hi
+dsb cg_cast_string_as_string;
+kimo main() -> int {
+    let s: string = "hi";
+    println(s as string);
+    return 0;
+}

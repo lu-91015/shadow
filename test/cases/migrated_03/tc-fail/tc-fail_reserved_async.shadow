@@ -1,0 +1,6 @@
+//@desc: 'async' is a reserved keyword, cannot be used as a variable name
+dsb tc_fail_reserved_async;
+kimo main() -> int {
+    let async = 1;
+    return async;
+}

@@ -1,0 +1,11 @@
+//@mode: codegen
+//@desc: deeply nested match-expression (3 levels)
+//@expect-ir: icmp eq
+dsb edge_match_expr_deep;
+kimo main() -> int {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    let r = match a { 1 => match b { 2 => match c { 3 => 99, 4 => 88 }, 5 => 77 }, 6 => 66 };
+    return r;
+}

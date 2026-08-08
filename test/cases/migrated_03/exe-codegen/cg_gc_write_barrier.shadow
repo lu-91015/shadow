@@ -1,0 +1,26 @@
+//@desc: P1 GC write barrier — struct field holds young-gen ptr through minor GC
+//@expect: 42
+dsb cg_gc_write_barrier;
+
+// 嵌套 struct：outer.inner 指向另一 struct（GC 跟踪的指针类型字段）
+struct Inner { v: int; }
+struct Outer { inner: any; }
+
+kimo make_inner(v: int) -> any {
+    let i = Inner { v: v };
+    return i as any;
+}
+
+kimo main() -> int {
+    let o = Outer { inner: make_inner(42) };
+    // 大量分配触发 minor GC；写屏障应保证 o.inner 指向的 Inner 不被误回收
+    let i = 0;
+    while (i < 1000) {
+        let tmp = Inner { v: i };
+        i = i + 1;
+    }
+    // 读取 o.inner.v — 若写屏障未生效，minor GC 可能已回收该对象
+    let inner_val = o.inner as Inner;
+    println(inner_val.v);
+    return 0;
+}

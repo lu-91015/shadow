@@ -1,0 +1,11 @@
+//@ mode: codegen
+//@ desc: array index assignment generates shadow_array_set_int call
+//@expect-ir: shadow_array_set_int
+//@expect-ir: shadow_array_set_int
+dsb cg_array_set;
+
+kimo main() -> int {
+    let arr = [10, 20, 30];
+    arr[0] = 99;
+    return arr[0];
+}

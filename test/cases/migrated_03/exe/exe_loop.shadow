@@ -1,0 +1,13 @@
+//@desc: --exe: while-loop accumulation compiled to a native exe
+//@expect: 10
+dsb exe_loop;
+kimo main() -> int {
+    let i = 0;
+    let s = 0;
+    while (i < 5) {
+        s = s + i;
+        i = i + 1;
+    }
+    println(s);
+    return 0;
+}

@@ -1,0 +1,9 @@
+//@ mode: codegen
+//@ desc: generic with type constraint — int satisfies int|long
+//@expect-ir: add_num__T_int
+dsb cg_constraint_pass;
+kimo add_num<T: int|long>(a: T, b: T) -> T { return a + b; }
+kimo main() -> int {
+    let x = add_num(10, 20);
+    return x;
+}

@@ -1,0 +1,9 @@
+//@desc: boxing a struct into `any` lowers to shadow_any_box_ptr
+//@expect: 0
+dsb cg_any_box;
+struct Point { x: int, y: int }
+kimo main() -> int {
+    let p = Point { x: 1, y: 2 };
+    let a = p as any;
+    println(0); return 0;
+}

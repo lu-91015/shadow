@@ -1,0 +1,9 @@
+//@mode: codegen
+//@desc: match-expression result is materialized via alloca/store/load (mres slot)
+//@expect-ir: br label
+dsb cg_match_expr_value;
+kimo main() -> int {
+    let x = 1;
+    let r = match x { 1 => 100, 2 => 200 };
+    return r + 1;
+}

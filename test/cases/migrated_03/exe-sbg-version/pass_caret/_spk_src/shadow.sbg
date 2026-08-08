@@ -1,0 +1,5 @@
+# ver_pkg.spk 内嵌的 shadow.sbg
+# 版本 0.3.5 满足约束 ^0.3（>=0.3.0, <0.4.0）
+[package]
+name = "ver_pkg"
+version = "0.3.5"

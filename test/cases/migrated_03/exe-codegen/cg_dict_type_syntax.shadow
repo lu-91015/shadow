@@ -1,0 +1,26 @@
+//@desc: dict<K,V> type syntax — declare, insert via function API, access via d[key]
+//@expect: world\n1\n2\n1\nval
+dsb cg_dict_type_syntax;
+
+kimo main() -> int {
+    // dict<string, string> 类型声明 + 函数式 API 创建
+    let d: dict<string, string> = hashmap_new();
+    hashmap_insert(d, "hello", "world");
+    hashmap_insert(d, "foo", "bar");
+
+    // d[key] 访问语法（通过 shadow_dict_get_string）
+    println(d["hello"]);   // world
+    println(hashmap_contains(d, "hello")); // 1
+
+    println(hashmap_size(d));  // 2
+    println(hashmap_remove(d, "hello")); // 1
+
+    // map<K,V> 别名测试
+    let m: map<string, string> = hashmap_new();
+    hashmap_insert(m, "key", "val");
+    println(m["key"]);   // val
+
+    hashmap_free(d);
+    hashmap_free(m);
+    return 0;
+}

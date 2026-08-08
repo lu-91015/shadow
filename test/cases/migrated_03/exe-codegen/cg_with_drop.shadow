@@ -1,0 +1,62 @@
+//@desc: L8 with + Drop trait — 资源管理自动调用 drop() 释放（含提前 return/throw）
+//@expect: opened:test.log\nwrote:hello\nfile closed\ninside:a.log,b.log\nfile closed\nafter-inner\nfile closed\nearly-return\nfile closed\noutside
+dsb cg_with_drop;
+
+trait Drop {
+    kimo drop(self: Self) -> void;
+}
+
+struct File {
+    path: string;
+    closed: int;
+}
+
+impl Drop for File {
+    kimo drop(self: File) -> void {
+        println("file closed");
+        self.closed = 1;
+    }
+}
+
+kimo make_file(p: string) -> File {
+    return File { path: p, closed: 0 };
+}
+
+// L8 fix 验证：with body 内提前 return 时 drop() 仍执行
+kimo early_return(use_ret: int) -> int {
+    with f = make_file("ret.log") {
+        println("early-return");
+        if (use_ret == 1) {
+            return 1;  // 提前退出，drop() 应在此前执行
+        }
+        println("not-reached");
+    }
+    return 0;
+}
+
+kimo main() -> int {
+    // 1) with name = expr { body } —— body 结束自动调用 f.drop()
+    with f = make_file("test.log") {
+        println("opened:" + f.path);
+        println("wrote:hello");
+    }
+    // drop() 已在 with 块结束时调用，输出 "file closed"
+
+    // 2) 多个 with 嵌套 —— LIFO 顺序释放
+    with a = make_file("a.log") {
+        with b = make_file("b.log") {
+            println("inside:" + a.path + "," + b.path);
+        }
+        // b.drop() 已调用
+        println("after-inner");
+    }
+    // a.drop() 已调用
+
+    // 3) 提前 return —— drop() 应在 return 前执行
+    let r = early_return(1);
+    // early_return 输出: early-return, file closed
+
+    println("outside");
+    return 0;
+}
+

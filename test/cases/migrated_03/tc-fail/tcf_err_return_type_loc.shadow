@@ -1,0 +1,7 @@
+//@desc: returning a string from an int-returning function reports a located error
+//@expect-stderr: return type mismatch
+dsb tcf_err_return_type_loc;
+kimo f() -> int {
+    return "oops";
+}
+kimo main() -> int { return 0; }

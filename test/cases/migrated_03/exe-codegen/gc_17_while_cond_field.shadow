@@ -1,0 +1,12 @@
+//@desc: GC struct field access in while condition
+//@expect: 5
+dsb gc_17_while_cond_field;
+struct Counter { val: int }
+kimo main() -> int {
+    let c = Counter { val: 5 };
+    let i = 0;
+    while (i < c.val) {
+        i = i + 1;
+    }
+    println(i); return 0;
+}

@@ -1,0 +1,7 @@
+//@desc: match-expression subject referencing an undefined variable reports location
+//@expect-stderr: undefined variable
+dsb tcf_match_expr_undef_subject;
+kimo main() -> int {
+    let r = match nope { 1 => 2, 2 => 3 };
+    return r;
+}

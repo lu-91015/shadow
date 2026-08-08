@@ -1,0 +1,4 @@
+//@desc: assignment to an undefined variable is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_assign_undefined;
+kimo main() -> int { x = 1; return 0; }

@@ -1,0 +1,14 @@
+//@ mode: codegen
+//@ desc: generic monomorphization — same call site triggers two instantiations
+//@expect-ir: choose__T_int
+dsb cg_mono_two_calls;
+
+kimo choose<T>(cond: int, a: T, b: T) -> T {
+    if (cond == 1) { return a; }
+    return b;
+}
+kimo main() -> int {
+    let x = choose(1, 10, 20);
+    let y = choose(0, 30, 40);
+    return x + y;
+}

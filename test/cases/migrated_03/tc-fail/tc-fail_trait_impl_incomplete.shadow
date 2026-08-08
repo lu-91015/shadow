@@ -1,0 +1,21 @@
+//@ mode: tc-fail
+//@ desc: L1 impl completeness — Foo impl Greet but missing required method 'greet'
+dsb tc_fail_trait_impl_incomplete;
+
+trait Greet {
+    kimo greet(self: any) -> string;
+    kimo name(self: any) -> string;
+}
+
+struct Foo { x: int; }
+
+// 只实现了 greet，缺少 name — 应失败
+impl Greet for Foo {
+    kimo greet(self: any) -> string {
+        return "hello";
+    }
+}
+
+kimo main() -> int {
+    return 0;
+}

@@ -1,0 +1,23 @@
+//@desc: 16 string subscripts across a string (boundary indices)
+//@expect: 0
+dsb edge_string_big_index;
+kimo main() -> int {
+    let s = "abcdefghijklmnop";
+    let c0 = s[0];
+    let c1 = s[1];
+    let c2 = s[2];
+    let c3 = s[3];
+    let c4 = s[4];
+    let c5 = s[5];
+    let c6 = s[6];
+    let c7 = s[7];
+    let c8 = s[8];
+    let c9 = s[9];
+    let c10 = s[10];
+    let c11 = s[11];
+    let c12 = s[12];
+    let c13 = s[13];
+    let c14 = s[14];
+    let c15 = s[15];
+    println(0); return 0;
+}

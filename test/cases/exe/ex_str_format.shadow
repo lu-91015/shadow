@@ -1,0 +1,16 @@
+//@mode: exe
+//@desc: str_format {N} 占位 + {{ 转义 + 非法索引保留
+//@expect: hello bob!
+//@expect: {x}
+//@expect: 42
+dsb ex_str_format;
+kimo main() -> int {
+    let args = ["bob", "42"];
+    let s = str_format("hello {0}!", args);
+    println(s);
+    let s2 = str_format("{x}", args);
+    println(s2);
+    let s3 = str_format("{1}", args);
+    println(s3);
+    return 0;
+}

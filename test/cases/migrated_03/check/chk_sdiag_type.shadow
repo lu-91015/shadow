@@ -1,0 +1,10 @@
+//@desc: LSP-6：类型错误的结构化诊断直接携带表达式区间（非从文本反解），source=typecheck
+//@expect: sdiag: SH-TC001 error typecheck 8:18-8:41 undefined function 'no_such_function_here'
+//@expect: sdiag: SH-TC001 error typecheck 8:5-8:42 type mismatch in let binding
+//@expect: check: errors=2 sdiags=2 ok=0
+dsb chk_sdiag_type;
+
+kimo main() -> int {
+    let x: int = no_such_function_here();
+    return x;
+}

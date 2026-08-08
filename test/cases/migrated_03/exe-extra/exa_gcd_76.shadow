@@ -1,0 +1,11 @@
+//@desc: exe-extra generated case (exa_gcd_76)
+//@expect: 9
+dsb exa_gcd_76;
+kimo gcd(a: int, b: int) -> int {
+    while (a != b) { if (a > b) { a = a - b; } else { b = b - a; } }
+    return a;
+}
+kimo main() -> int {
+    println(gcd(27, 18));
+    return 0;
+}

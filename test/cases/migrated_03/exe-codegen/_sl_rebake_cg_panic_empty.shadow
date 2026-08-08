@@ -1,0 +1,5 @@
+dsb _sl_rebake_cg_panic_empty;
+kimo main() -> int {
+    panic;
+    println(0); return 0;
+}

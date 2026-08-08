@@ -1,0 +1,13 @@
+//@desc: GC alloc in else branch
+//@expect-ir: shadow_gc_alloc
+dsb gc_14_else_branch;
+struct P { x: int, y: int }
+kimo main() -> int {
+    let flag = 0;
+    if (flag > 0) {
+        return 0;
+    } else {
+        let p = P { x: 1, y: 2 };
+        return p.y;
+    }
+}

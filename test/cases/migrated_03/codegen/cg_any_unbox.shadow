@@ -1,0 +1,9 @@
+//@desc: unboxing `any` to int lowers to shadow_any_as_int
+//@expect-ir: shadow_any_
+dsb cg_any_unbox;
+kimo main() -> int {
+    let n = 42;
+    let a = n as any;
+    let b = a as int;
+    return b;
+}

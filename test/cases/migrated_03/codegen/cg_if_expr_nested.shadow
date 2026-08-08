@@ -1,0 +1,11 @@
+//@ mode: codegen
+//@ desc: nested if-expression in arithmetic context
+//@expect-ir: load
+dsb cg_if_expr_nested;
+
+kimo main() -> int {
+    let a = 1;
+    let b = 0;
+    let x = if (a) { if (b) { 10 } else { 20 } } else { 30 };
+    return x;
+}

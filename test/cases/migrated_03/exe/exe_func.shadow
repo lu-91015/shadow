@@ -1,0 +1,12 @@
+//@desc: --exe: user-defined function calls in a native executable
+//@expect: 7
+//@expect: 30
+dsb exe_func;
+kimo add(x: int, y: int) -> int {
+    return x + y;
+}
+kimo main() -> int {
+    println(add(3, 4));
+    println(add(10, 20));
+    return 0;
+}

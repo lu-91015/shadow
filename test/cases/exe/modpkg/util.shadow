@@ -1,0 +1,4 @@
+dsb modpkg_util;
+// pub 必需：主模块 ex_mod_pkg 在上级目录（不同包），按 §3.8.2「pub = 跨包可见；
+// 模块内默认私有」，只有 pub 符号才能被跨包 import 引用。
+pub kimo modpkg_double(x: int) -> int { return x * 2; }

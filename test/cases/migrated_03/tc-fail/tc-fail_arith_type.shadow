@@ -1,0 +1,4 @@
+//@desc: arithmetic on incompatible types (string - int) is rejected
+//@expect-stderr: Type check failed
+dsb tc_fail_arith_type;
+kimo main() -> int { let x = "a" - 1; return 0; }

@@ -1,0 +1,20 @@
+//@ mode: tc-fail
+//@ desc: B2 trait signature check — impl method return type mismatch (expected string, got int)
+dsb tc_fail_trait_sig_return_type;
+
+trait Greeter {
+    kimo greet(self: Self) -> string;
+}
+
+struct Foo { x: int; }
+
+// impl 方法 greet 返回 int，与 trait 声明的 string 不匹配 — 应失败
+impl Greeter for Foo {
+    kimo greet(self: Foo) -> int {
+        return self.x;
+    }
+}
+
+kimo main() -> int {
+    return 0;
+}

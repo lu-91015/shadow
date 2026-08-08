@@ -1,0 +1,3 @@
+// 严格态库：仅导出 pub shared()
+dsb _sa_lib2;
+pub kimo shared() -> int { return 99; }

@@ -1,0 +1,12 @@
+//@expect: 10
+//@expect: 20
+//@expect: 30
+dsb any_index;
+kimo main() -> int {
+    let m = [10, 20, 30];
+    let a = m as any;
+    println(a[0] as int);
+    println(a[1] as int);
+    println(a[2] as int);
+    return 0;
+}

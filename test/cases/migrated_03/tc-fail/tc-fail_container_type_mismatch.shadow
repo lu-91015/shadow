@@ -1,0 +1,11 @@
+//@ mode: tc-fail
+//@ desc: P0 container element type check — array<int> = array<string> should fail
+dsb tc_fail_container_type_mismatch;
+
+kimo main() -> int {
+    let ai: array<int> = [1, 2, 3];
+    let astr: array<string> = ["a", "b"];
+    // array<int> = array<string> — element type mismatch, should fail
+    ai = astr;
+    return 0;
+}

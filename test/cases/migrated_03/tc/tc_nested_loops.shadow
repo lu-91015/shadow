@@ -1,0 +1,15 @@
+//@desc: nested while loops type-check
+//@expect: typecheck: 1
+dsb tc_nested_loops;
+kimo f() -> int {
+    let i = 0;
+    while (i < 3) {
+        let j = 0;
+        while (j < 3) {
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return i;
+}
+kimo main() -> int { return f(); }

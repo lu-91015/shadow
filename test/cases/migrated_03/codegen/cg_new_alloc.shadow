@@ -1,0 +1,10 @@
+//@desc: new TypeName heap allocation codegen
+//@expect-ir: shadow_gc_alloc
+dsb cg_new_alloc;
+struct Point { x: int; y: int }
+kimo main() -> int {
+    let p = new Point;
+    p.x = 10;
+    p.y = 20;
+    return p.x + p.y;
+}

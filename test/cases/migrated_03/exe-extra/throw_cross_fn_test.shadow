@@ -1,0 +1,39 @@
+//@desc: test cross-function throw propagation — throw must exit the function immediately
+//@expect: CAUGHT
+//@expect: COUNT_0
+dsb throw_cross_fn_test;
+
+// 全局计数器：b 的 throw 后语句若执行则递增。修复后应为 0。
+let g_count: int = 0;
+
+// b 内部 throw；若 throw 后没有立即 return，则后续 println + 自增 + return 99 都会执行。
+kimo b(inner: int) -> int {
+    if (inner == 0) {
+        throw "b failed";
+    }
+    // 这行在 throw 后，b 函数体不在 try 块内 —— 修复后不应执行
+    println("B_AFTER_THROW_RAN");
+    g_count = g_count + 1;
+    return 99;
+}
+
+kimo a(x: int) -> int {
+    try {
+        let r = b(x);
+        println(r);
+    } catch (e) {
+        println("CAUGHT");
+    }
+    return 0;
+}
+
+kimo main() -> int {
+    a(0);
+    // 用 println 直接输出标志位，不依赖 int_to_str（该函数不在隐式 prelude 中）
+    if (g_count == 0) {
+        println("COUNT_0");
+    } else {
+        println("COUNT_NONZERO");
+    }
+    return 0;
+}

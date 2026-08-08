@@ -1,0 +1,1777 @@
+// Shadow 0.4 — LSP 服务器（Phase 14）
+// ============================================================
+// JSON-RPC 2.0 over stdio，对齐 0.3 lsp.shadow 的行为语义，
+// 但基于 0.4 compile_api（src/api/compile_api.shadow）。
+//
+// 结构：
+//   FFI（stdin/stdout/JSON）→ 工具 → 文档存储 → 编译（compile_api）
+//   → 帧读写 → 生命周期/分发 → handlers → 主循环
+//
+// 0.3 宿主（s03.exe）编译约束：无嵌套数组索引、数组传参修改用全局、
+// struct 判空用 as any == 0、字符串拼接避免裸 + 长链（原则 9 str_join）。
+dsb lsp;
+
+// ============ FFI：stdio/JSON（0.3 runtime_for_selfhost.o 提供符号） ============
+@extern("shadow_stdin_read_line") kimo lsp_rt_read_line() -> string { return ""; }
+@extern("shadow_stdin_read_n") kimo lsp_rt_read_n(n: int) -> string { return ""; }
+@extern("shadow_stdout_write_raw") kimo lsp_rt_write_raw(s: string) -> void {}
+@extern("shadow_json_get_raw") kimo lsp_rt_json_raw(json: string, key: string) -> string { return ""; }
+@extern("shadow_json_array_get") kimo lsp_rt_arr_get(json: string, idx: int) -> string { return ""; }
+@extern("shadow_dbg_mark") kimo lsp_rt_dbg(s: string) -> void {}
+
+// stderr 调试日志
+pub kimo lsp_log(msg: string) -> void {
+    lsp_rt_dbg("[LSP] " + msg);
+}
+
+// ============ 小工具 ============
+
+// 手写 atoi（数字字符码 48-57）
+pub kimo lsp_atoi(s: string) -> int {
+    let n = len(s);
+    let val = 0;
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "0") == 1) { val = val * 10 + 0; }
+        else if (str_eq(c, "1") == 1) { val = val * 10 + 1; }
+        else if (str_eq(c, "2") == 1) { val = val * 10 + 2; }
+        else if (str_eq(c, "3") == 1) { val = val * 10 + 3; }
+        else if (str_eq(c, "4") == 1) { val = val * 10 + 4; }
+        else if (str_eq(c, "5") == 1) { val = val * 10 + 5; }
+        else if (str_eq(c, "6") == 1) { val = val * 10 + 6; }
+        else if (str_eq(c, "7") == 1) { val = val * 10 + 7; }
+        else if (str_eq(c, "8") == 1) { val = val * 10 + 8; }
+        else if (str_eq(c, "9") == 1) { val = val * 10 + 9; }
+        else { break; }
+        i = i + 1;
+    }
+    return val;
+}
+
+pub kimo lsp_parse_bool(s: string) -> int {
+    if (str_eq(s, "true") == 1) { return 1; }
+    if (str_eq(s, "false") == 1) { return 0; }
+    return lsp_atoi(s);
+}
+
+// JSON 取嵌套值原始片段；链式：lsp_json_get(x,"a") 再 get(..,"b")
+pub kimo lsp_json_get(json: string, key: string) -> string {
+    return lsp_rt_json_raw(json, key);
+}
+
+// JSON 字符串叶子值（剥引号后 unescape）
+pub kimo lsp_json_str(json: string, key: string) -> string {
+    let raw = lsp_rt_json_raw(json, key);
+    if (len(raw) == 0) { return ""; }
+    return lsp_unescape(raw);
+}
+
+pub kimo lsp_unescape(s: string) -> string {
+    let parts: array<string> = [];
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "\\") == 1 && i + 1 < n) {
+            let nx = s[i + 1];
+            if (str_eq(nx, "n") == 1) { parts = array_push(parts, "\n"); }
+            else if (str_eq(nx, "t") == 1) { parts = array_push(parts, "\t"); }
+            else if (str_eq(nx, "r") == 1) { parts = array_push(parts, "\r"); }
+            else if (str_eq(nx, "\\") == 1) { parts = array_push(parts, "\\"); }
+            else if (str_eq(nx, "\"") == 1) { parts = array_push(parts, "\""); }
+            else if (str_eq(nx, "/") == 1) { parts = array_push(parts, "/"); }
+            else { parts = array_push(parts, nx); }
+            i = i + 2;
+            continue;
+        }
+        parts = array_push(parts, c);
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+// id 可能是数字或字符串
+pub kimo lsp_is_int_str(s: string) -> int {
+    if (len(s) == 0) { return 0; }
+    let i = 0;
+    while (i < len(s)) {
+        let c = s[i];
+        if (c >= "0" && c <= "9") {
+            i = i + 1;
+            continue;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+pub kimo lsp_json_id(idraw: string) -> string {
+    if (lsp_is_int_str(idraw) == 1) { return idraw; }
+    return "\"" + idraw + "\"";
+}
+
+pub kimo lsp_response(idraw: string, result_json: string) -> string {
+    let p1 = "{\"jsonrpc\":\"2.0\",\"id\":" + lsp_json_id(idraw) + ",\"result\":";
+    let p2 = p1 + result_json;
+    return p2 + "}";
+}
+
+pub kimo lsp_error(idraw: string, msg: string) -> string {
+    let e = "{\"code\":-32600,\"message\":\"" + api_json_escape(msg) + "\"}";
+    let p1 = "{\"jsonrpc\":\"2.0\",\"id\":" + lsp_json_id(idraw) + ",\"error\":";
+    let p2 = p1 + e;
+    return p2 + "}";
+}
+
+// uri → 本地路径（file:/// 前缀 + percent-decode）
+pub kimo lsp_uri_to_path(uri: string) -> string {
+    let path = uri;
+    if (str_starts_with(path, "file:///") == 1) { path = substr2(path, 8, len(path)); }
+    else if (str_starts_with(path, "file://") == 1) { path = substr2(path, 7, len(path)); }
+    return lsp_percent_decode(path);
+}
+
+pub kimo lsp_percent_decode(s: string) -> string {
+    let parts: array<string> = [];
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let ch = s[i];
+        if (str_eq(ch, "%") == 1 && i + 2 < n) {
+            let hi = s[i + 1];
+            let lo = s[i + 2];
+            let val = lsp_hex(hi) * 16 + lsp_hex(lo);
+            let dec = lsp_pct_char(val);
+            if (len(dec) > 0) {
+                parts = array_push(parts, dec);
+                i = i + 3;
+                continue;
+            }
+        }
+        parts = array_push(parts, ch);
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+pub kimo lsp_hex(c: string) -> int {
+    if (c >= "0" && c <= "9") { return lsp_atoi(c); }
+    if (c == "a") { return 10; } if (c == "A") { return 10; }
+    if (c == "b") { return 11; } if (c == "B") { return 11; }
+    if (c == "c") { return 12; } if (c == "C") { return 12; }
+    if (c == "d") { return 13; } if (c == "D") { return 13; }
+    if (c == "e") { return 14; } if (c == "E") { return 14; }
+    if (c == "f") { return 15; } if (c == "F") { return 15; }
+    return 0;
+}
+
+pub kimo lsp_pct_char(val: int) -> string {
+    if (val == 58) { return ":"; }
+    if (val == 32) { return " "; }
+    if (val == 47) { return "/"; }
+    if (val == 92) { return "\\"; }
+    if (val == 46) { return "."; }
+    if (val == 37) { return "%"; }
+    if (val == 45) { return "-"; }
+    if (val == 95) { return "_"; }
+    if (val == 126) { return "~"; }
+    return "";
+}
+
+// ============ 文档存储 ============
+let lsp_uris: array<string> = [];
+let lsp_srcs: array<string> = [];
+let lsp_versions: array<int> = [];
+
+pub kimo lsp_doc_put(uri: string, src: string, version: int) -> void {
+    let i = 0;
+    while (i < len(lsp_uris)) {
+        if (str_eq(lsp_uris[i] as string, uri) == 1) {
+            lsp_srcs[i] = src;
+            if (version >= 0) { lsp_versions[i] = version; }
+            return;
+        }
+        i = i + 1;
+    }
+    lsp_uris = array_push(lsp_uris, uri);
+    lsp_srcs = array_push(lsp_srcs, src);
+    lsp_versions = array_push(lsp_versions, version);
+}
+
+pub kimo lsp_doc_get(uri: string) -> string {
+    let i = 0;
+    while (i < len(lsp_uris)) {
+        if (str_eq(lsp_uris[i] as string, uri) == 1) {
+            return lsp_srcs[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub kimo lsp_doc_get_version(uri: string) -> int {
+    let i = 0;
+    while (i < len(lsp_uris)) {
+        if (str_eq(lsp_uris[i] as string, uri) == 1) {
+            return lsp_versions[i] as int;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+pub kimo lsp_doc_remove(uri: string) -> void {
+    let nw_uris: array<string> = [];
+    let nw_srcs: array<string> = [];
+    let nw_vers: array<int> = [];
+    let i = 0;
+    while (i < len(lsp_uris)) {
+        if (str_eq(lsp_uris[i] as string, uri) == 0) {
+            nw_uris = array_push(nw_uris, lsp_uris[i] as string);
+            nw_srcs = array_push(nw_srcs, lsp_srcs[i] as string);
+            nw_vers = array_push(nw_vers, lsp_versions[i] as int);
+        }
+        i = i + 1;
+    }
+    lsp_uris = nw_uris;
+    lsp_srcs = nw_srcs;
+    lsp_versions = nw_vers;
+}
+
+// 应用 LSP 增量补丁（didChange contentChanges: range/text）
+pub kimo lsp_apply_change(uri: string, range_json: string, new_text: string) -> void {
+    let src = lsp_doc_get(uri);
+    // range_json: {"start":{"line":L,"character":C},"end":{...}}（0-based）
+    let start_json = lsp_json_get(range_json, "start");
+    let end_json = lsp_json_get(range_json, "end");
+    let sl = lsp_atoi(lsp_json_get(start_json, "line"));
+    let sc = lsp_atoi(lsp_json_get(start_json, "character"));
+    let el = lsp_atoi(lsp_json_get(end_json, "line"));
+    let ec = lsp_atoi(lsp_json_get(end_json, "character"));
+    let lines = str_split(src, "\n");
+    let n_lines = len(lines);
+    // 行号 0-based → 数组下标
+    let start_off = lsp_linecol_to_offset(lines, sl, sc);
+    let end_off = lsp_linecol_to_offset(lines, el, ec);
+    let p1 = substr2(src, 0, start_off);
+    let p2 = substr2(src, end_off, len(src));
+    let p3 = p1 + new_text;
+    let p4 = p3 + p2;
+    lsp_doc_put(uri, p4, -1);
+}
+
+// (line0, col0) → 全局字节偏移
+pub kimo lsp_linecol_to_offset(lines: array<string>, line0: int, col0: int) -> int {
+    let off = 0;
+    let i = 0;
+    while (i < line0) {
+        if (i < len(lines)) {
+            off = off + len(lines[i] as string) + 1;  // +1 换行符
+        }
+        i = i + 1;
+    }
+    return off + col0;
+}
+
+// ============ 编译（委托 compile_api，单槽缓存） ============
+let lsp_last_uri: string = "";
+
+// 对文档 uri 编译（didChange/didOpen 后调用；查询前确保调用）
+pub kimo lsp_compile(uri: string) -> void {
+    let src = lsp_doc_get(uri);
+    let path = lsp_uri_to_path(uri);
+    api_set_source(src);
+    api_check(src, path);
+    lsp_last_uri = uri;
+}
+
+// 推送诊断通知（didChange 后）
+pub kimo lsp_publish_diagnostics(uri: string, version: int) -> void {
+    lsp_compile(uri);
+    let diags = api_sdiag_json_array();
+    let p1 = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"";
+    let p2 = p1 + uri;
+    let p3 = p2 + "\",\"version\":" + int_to_str(version) + ",\"diagnostics\":";
+    let p4 = p3 + diags;
+    // p1 已打开两层对象：外层 {jsonrpc,method,params} 与 params {uri,...}。
+    // diags 拼接后需先闭合 params，再闭合外层对象，故用 "}}"。
+    lsp_write_message(p4 + "}}");
+}
+
+// ============ 帧读写（JSON-RPC over stdio） ============
+
+pub kimo lsp_read_message() -> string {
+    let content_len = -1;
+    let got_any = 0;
+    while (1 == 1) {
+        let line = lsp_rt_read_line();
+        if (len(line) == 0) {
+            if (got_any == 0) { return ""; }   // EOF（首个 header 前）
+            break;                              // 空行 = header 结束
+        }
+        got_any = 1;
+        if (str_starts_with(line, "Content-Length:") == 1) {
+            let ci = str_index_of(line, ":");
+            if (ci >= 0) {
+                let v = str_trim(substr2(line, ci + 1, len(line)));
+                content_len = lsp_atoi(v);
+            }
+        }
+    }
+    if (content_len < 0) { return ""; }
+    return lsp_rt_read_n(content_len);
+}
+
+pub kimo lsp_write_message(body: string) -> void {
+    let header = "Content-Length: " + int_to_str(len(body)) + "\r\n\r\n";
+    lsp_rt_write_raw(header);
+    lsp_rt_write_raw(body);
+}
+
+// ============ 生命周期状态 ============
+let lsp_exit_flag: int = 0;
+let lsp_initialized: int = 0;
+let lsp_cancelled: array<string> = [];   // 被取消的请求 id
+let lsp_server_seq: int = 100000;        // 服务端→客户端请求 id 计数
+let lsp_workspace_folders: array<string> = [];  // uri 列表
+
+pub kimo lsp_is_cancelled(idraw: string) -> int {
+    let i = 0;
+    while (i < len(lsp_cancelled)) {
+        if (str_eq(lsp_cancelled[i] as string, idraw) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ============ 通用 JSON 拼装 ============
+
+// 位置（1-based）→ LSP Location JSON（0-based）
+pub kimo lsp_location_json(path: string, line: int, col: int, end_line: int, end_col: int) -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"uri\":\"file:///");
+    parts = array_push(parts, path);
+    parts = array_push(parts, "\",\"range\":{\"start\":{\"line\":");
+    parts = array_push(parts, int_to_str(line - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(col - 1));
+    parts = array_push(parts, "},\"end\":{\"line\":");
+    parts = array_push(parts, int_to_str(end_line - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(end_col - 1));
+    parts = array_push(parts, "}}}");
+    return str_join(parts, "");
+}
+
+// 路径 → uri（file:/// 前缀；反斜杠转正斜杠）
+pub kimo lsp_path_to_uri(path: string) -> string {
+    let p = str_replace(path, "\\", "/");
+    let p2 = "file:///" + p;
+    return p2;
+}
+
+// 当前编译结果的符号表 → DocumentSymbol JSON 数组
+pub kimo lsp_document_symbols_json() -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let first = 1;
+    // funcs（fmeta: name|L|C|EL|EC|rettype|sig）
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 5) {
+            let fl = api_atoi(fm[1] as string);
+            let fc = api_atoi(fm[2] as string);
+            let fel = api_atoi(fm[3] as string);
+            let fec = api_atoi(fm[4] as string);
+            let nm = fm[0] as string;
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"name\":\"" + nm + "\",\"kind\":12,\"detail\":\"function\"," +
+                       "\"range\":{\"start\":{\"line\":" + int_to_str(fl - 1) +
+                       ",\"character\":" + int_to_str(fc - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(fel - 1) +
+                       ",\"character\":" + int_to_str(fec - 1) + "}}," +
+                       "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(fl - 1) +
+                       ",\"character\":" + int_to_str(fc - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(fl - 1) +
+                       ",\"character\":" + int_to_str(fc + len(nm) - 1) + "}}}";
+            parts = array_push(parts, item);
+        }
+        i = i + 1;
+    }
+    // structs（smeta）
+    i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 5) {
+            let sl2 = api_atoi(sm[1] as string);
+            let sc2 = api_atoi(sm[2] as string);
+            let sel2 = api_atoi(sm[3] as string);
+            let sec2 = api_atoi(sm[4] as string);
+            let nm2 = sm[0] as string;
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"name\":\"" + nm2 + "\",\"kind\":5,\"detail\":\"struct\"," +
+                       "\"range\":{\"start\":{\"line\":" + int_to_str(sl2 - 1) +
+                       ",\"character\":" + int_to_str(sc2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(sel2 - 1) +
+                       ",\"character\":" + int_to_str(sec2 - 1) + "}}," +
+                       "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(sl2 - 1) +
+                       ",\"character\":" + int_to_str(sc2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(sl2 - 1) +
+                       ",\"character\":" + int_to_str(sc2 + len(nm2) - 1) + "}}}";
+            parts = array_push(parts, item);
+        }
+        i = i + 1;
+    }
+    // enums（emeta）
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 5) {
+            let el2 = api_atoi(em[1] as string);
+            let ec2 = api_atoi(em[2] as string);
+            let eel2 = api_atoi(em[3] as string);
+            let eec2 = api_atoi(em[4] as string);
+            let nm3 = em[0] as string;
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"name\":\"" + nm3 + "\",\"kind\":10,\"detail\":\"enum\"," +
+                       "\"range\":{\"start\":{\"line\":" + int_to_str(el2 - 1) +
+                       ",\"character\":" + int_to_str(ec2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(eel2 - 1) +
+                       ",\"character\":" + int_to_str(eec2 - 1) + "}}," +
+                       "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(el2 - 1) +
+                       ",\"character\":" + int_to_str(ec2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(el2 - 1) +
+                       ",\"character\":" + int_to_str(ec2 + len(nm3) - 1) + "}}}";
+            parts = array_push(parts, item);
+        }
+        i = i + 1;
+    }
+    // globals（gmeta）
+    i = 0;
+    while (i < len(api_gmeta)) {
+        let gm = str_split(api_gmeta[i] as string, "|");
+        if (len(gm) >= 5) {
+            let gl2 = api_atoi(gm[1] as string);
+            let gc2 = api_atoi(gm[2] as string);
+            let gel2 = api_atoi(gm[3] as string);
+            let gec2 = api_atoi(gm[4] as string);
+            let nm4 = gm[0] as string;
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"name\":\"" + nm4 + "\",\"kind\":13,\"detail\":\"variable\"," +
+                       "\"range\":{\"start\":{\"line\":" + int_to_str(gl2 - 1) +
+                       ",\"character\":" + int_to_str(gc2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(gel2 - 1) +
+                       ",\"character\":" + int_to_str(gec2 - 1) + "}}," +
+                       "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(gl2 - 1) +
+                       ",\"character\":" + int_to_str(gc2 - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(gl2 - 1) +
+                       ",\"character\":" + int_to_str(gc2 + len(nm4) - 1) + "}}}";
+            parts = array_push(parts, item);
+        }
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+pub kimo lsp_semantic_tokens_json() -> string {
+    let toks = api_tokens;
+    let data: array<int> = [];
+    let prev_line = 0;
+    let prev_char = 0;
+    let i = 0;
+    let n = len(toks);
+    while (i < n) {
+        let t = toks[i] as Token;
+        let tok_type = -1;
+        let k = t.kind;
+        if (k == TOK_INT_LIT || k == TOK_LONG_LIT || k == TOK_FLOAT_LIT) { tok_type = 7; }
+        else if (k == TOK_STRING_LIT || k == TOK_CHAR_LIT) { tok_type = 8; }
+        else if (k == TOK_IDENT) {
+            // 区分函数/类型/变量：前一个 token 为 kimo → function；为 struct/enum 名 → type
+            let prev_kind = -1;
+            if (i > 0) {
+                let pt = toks[i - 1] as Token;
+                prev_kind = pt.kind;
+            }
+            if (prev_kind == TOK_KIMO) { tok_type = 1; }          // function
+            else if (lsp_is_type_name(t.text) == 1) { tok_type = 5; }  // type
+            else { tok_type = 0; }                                 // variable
+        }
+        else if (k >= TOK_KIMO && k <= TOK_DSB) { tok_type = 4; }  // keyword
+        else if (k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL) { tok_type = 4; }
+        if (tok_type >= 0) {
+            // delta 编码：行增量 / 列增量（与上一个 token 相对）
+            let dl = t.line - 1 - prev_line;
+            if (dl == 0) {
+                let dc = t.col - 1 - prev_char;
+                let tl = len(t.text);
+                data = array_push(data, dl);
+                data = array_push(data, dc);
+                data = array_push(data, tl);
+                data = array_push(data, tok_type);
+                data = array_push(data, 0);
+            } else {
+                let dc2 = t.col - 1;
+                let tl2 = len(t.text);
+                data = array_push(data, dl);
+                data = array_push(data, dc2);
+                data = array_push(data, tl2);
+                data = array_push(data, tok_type);
+                data = array_push(data, 0);
+            }
+            prev_line = t.line - 1;
+            prev_char = t.col - 1 + len(t.text);
+        }
+        i = i + 1;
+    }
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"data\":[");
+    let j = 0;
+    while (j < len(data)) {
+        if (j > 0) { parts = array_push(parts, ","); }
+        parts = array_push(parts, int_to_str(data[j] as int));
+        j = j + 1;
+    }
+    parts = array_push(parts, "]}");
+    return str_join(parts, "");
+}
+
+// 判断标识符是否为当前程序中的类型名（struct/enum）
+pub kimo lsp_is_type_name(name: string) -> int {
+    let i = 0;
+    while (i < len(api_smeta)) {
+        let sm = str_split(api_smeta[i] as string, "|");
+        if (len(sm) >= 1 && str_eq(sm[0] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(api_emeta)) {
+        let em = str_split(api_emeta[i] as string, "|");
+        if (len(em) >= 1 && str_eq(em[0] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo lsp_format_text(src: string) -> string {
+    let lines = str_split(src, "\n");
+    let out: array<string> = [];
+    let indent = 0;
+    let i = 0;
+    let n = len(lines);
+    while (i < n) {
+        let ln = str_trim(lines[i] as string);
+        // 行首 } → 先减缩进
+        if (str_starts_with(ln, "}") == 1) {
+            if (indent > 0) { indent = indent - 1; }
+        }
+        let pad = lsp_indent_str(indent);
+        // 块开括号计数（简化：{ 增、} 减）
+        let j = 0;
+        while (j < len(ln)) {
+            let c = ln[j];
+            if (str_eq(c, "{") == 1) { indent = indent + 1; }
+            if (str_eq(c, "}") == 1) {
+                if (indent > 0) { indent = indent - 1; }
+            }
+            j = j + 1;
+        }
+        let line_out = pad + ln;
+        out = array_push(out, line_out);
+        i = i + 1;
+    }
+    return str_join(out, "\n");
+}
+
+pub kimo lsp_indent_str(n: int) -> string {
+    let parts: array<string> = [];
+    let i = 0;
+    while (i < n) {
+        parts = array_push(parts, "    ");
+        i = i + 1;
+    }
+    return str_join(parts, "");
+}
+
+// 全文替换 TextEdit（新文本）
+pub kimo lsp_full_edit_json(uri: string, new_text: string) -> string {
+    // 计算文档行数
+    let src = lsp_doc_get(uri);
+    let lines = str_split(src, "\n");
+    let n_lines = len(lines);
+    let last_col = 0;
+    if (n_lines > 0) { last_col = len(lines[n_lines - 1] as string); }
+    let p1 = "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":";
+    let p2 = p1 + int_to_str(n_lines - 1);
+    let p3 = p2 + ",\"character\":" + int_to_str(last_col) + "}},\"newText\":\"";
+    let p4 = p3 + api_json_escape(new_text);
+    return p4 + "\"}]";
+}
+
+// ============ completion ============
+// 收集补全项 → LSP CompletionItem JSON
+pub kimo lsp_completion_json(prefix: string) -> string {
+    let syms = api_collect_symbols();
+    let items = str_split(syms, ";");
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"isIncomplete\":false,\"items\":[");
+    let first = 1;
+    let i = 0;
+    while (i < len(items)) {
+        let it = items[i] as string;
+        if (len(it) == 0) { i = i + 1; continue; }
+        let f = str_split(it, "|");
+        if (len(f) < 4) { i = i + 1; continue; }
+        let name = f[0] as string;
+        let kind = f[1] as string;
+        let detail = f[2] as string;
+        // 前缀过滤
+        if (len(prefix) > 0) {
+            if (str_starts_with(name, prefix) == 0) { i = i + 1; continue; }
+        }
+        if (first == 0) { parts = array_push(parts, ","); }
+        first = 0;
+        let item = "{\"label\":\"" + name + "\",\"kind\":" + kind +
+                   ",\"detail\":\"" + api_json_escape(detail) + "\"}";
+        parts = array_push(parts, item);
+        i = i + 1;
+    }
+    parts = array_push(parts, "]}");
+    return str_join(parts, "");
+}
+
+// ============ 补全触发前缀（光标前标识符） ============
+pub kimo lsp_completion_prefix(src: string, line0: int, char0: int) -> string {
+    let lines = str_split(src, "\n");
+    if (line0 < 0 || line0 >= len(lines)) { return ""; }
+    let ln = lines[line0] as string;
+    let start = char0;
+    let i = char0 - 1;
+    while (i >= 0) {
+        let c = substr2(ln, i, i + 1);
+        if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq(c, "_") == 1) {
+            start = i;
+            i = i - 1;
+            continue;
+        }
+        break;
+    }
+    return substr2(ln, start, char0);
+}
+
+// ============ 辅助：字符串/文档扫描 ============
+pub kimo lsp_rindex(s: string, ch: string) -> int {
+    let i = len(s) - 1;
+    while (i >= 0) {
+        let c = substr2(s, i, i + 1);
+        if (str_eq(c, ch) == 1) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+pub kimo lsp_parent_dir(p: string) -> string {
+    let si = lsp_rindex(p, "/");
+    let bi = lsp_rindex(p, "\\");
+    let cut = si;
+    if (bi > cut) { cut = bi; }
+    if (cut < 0) { return p; }
+    return substr2(p, 0, cut);
+}
+
+pub kimo lsp_dots_to_slashes(p: string) -> string {
+    let out = "";
+    let i = 0;
+    while (i < len(p)) {
+        let c = substr2(p, i, i + 1);
+        if (str_eq(c, ".") == 1) { out = out + "/"; }
+        else { out = out + c; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// import 行 → DocumentLink（目标 = 主目录/<点分路径>.shadow）
+pub kimo lsp_document_link_json(src: string, doc_uri: string) -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let lines = str_split(src, "\n");
+    let first = 1;
+    let li = 0;
+    while (li < len(lines)) {
+        let ln = lines[li] as string;
+        let ki = str_index_of(ln, "import ");
+        if (ki >= 0) {
+            let semi = str_index_of(ln, ";");
+            if (semi >= ki) {
+                let path = str_trim(substr2(ln, ki + 7, semi));
+                if (len(path) > 0) {
+                    let pd = lsp_parent_dir(lsp_uri_to_path(doc_uri));
+                    let target_path = pd + "/" + lsp_dots_to_slashes(path) + ".shadow";
+                    let target_uri = "file:///" + target_path;
+                    if (first == 0) { parts = array_push(parts, ","); }
+                    first = 0;
+                    let link = "{\"range\":{\"start\":{\"line\":" + int_to_str(li) +
+                               ",\"character\":" + int_to_str(ki + 7) +
+                               "},\"end\":{\"line\":" + int_to_str(li) +
+                               ",\"character\":" + int_to_str(semi) + "}}," +
+                               "\"target\":\"" + api_json_escape(target_uri) + "\"}";
+                    parts = array_push(parts, link);
+                }
+            }
+        }
+        li = li + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// 扫描文档中的函数定义：返回 "name|line|col"（1-based）
+pub kimo lsp_scan_func_defs(src: string) -> array<string> {
+    let out: array<string> = [];
+    let lines = str_split(src, "\n");
+    let li = 0;
+    while (li < len(lines)) {
+        let ln = lines[li] as string;
+        let ki = str_index_of(ln, "kimo ");
+        if (ki >= 0) {
+            let rest = substr2(ln, ki + 5, len(ln));
+            let name = "";
+            let j = 0;
+            while (j < len(rest)) {
+                let c = substr2(rest, j, j + 1);
+                if (str_eq(c, "(") == 1 || str_eq(c, " ") == 1 || str_eq(c, "\t") == 1) { break; }
+                name = name + c;
+                j = j + 1;
+            }
+            if (len(name) > 0) {
+                out = array_push(out, name + "|" + int_to_str(li + 1) + "|" + int_to_str(ki + 6));
+            }
+        }
+        li = li + 1;
+    }
+    return out;
+}
+
+// 扫描文档中所有 "word(" 调用点：返回 "line|col"（1-based）
+pub kimo lsp_scan_calls(src: string, word: string) -> array<string> {
+    let out: array<string> = [];
+    let lines = str_split(src, "\n");
+    let wl = len(word);
+    let li = 0;
+    while (li < len(lines)) {
+        let ln = lines[li] as string;
+        let ci = 0;
+        while (ci + wl <= len(ln)) {
+            let seg = substr2(ln, ci, ci + wl);
+            if (str_eq(seg, word) == 1) {
+                let prev_ok = 1;
+                if (ci > 0) {
+                    let pc = substr2(ln, ci - 1, ci);
+                    if ((pc >= "a" && pc <= "z") || (pc >= "A" && pc <= "Z") ||
+                        (pc >= "0" && pc <= "9") || str_eq(pc, "_") == 1) { prev_ok = 0; }
+                }
+                let after = substr2(ln, ci + wl, ci + wl + 1);
+                let next_ok = 0;
+                if (str_eq(after, "(") == 1) { next_ok = 1; }
+                if (prev_ok == 1 && next_ok == 1) {
+                    out = array_push(out, int_to_str(li + 1) + "|" + int_to_str(ci + 1));
+                }
+                ci = ci + wl;
+            } else {
+                ci = ci + 1;
+            }
+        }
+        li = li + 1;
+    }
+    return out;
+}
+
+// ============ GC tick（长驻进程内存控制） ============
+let lsp_rounds: int = 0;
+
+pub kimo lsp_gc_tick() -> void {
+    lsp_rounds = lsp_rounds + 1;
+    // 0.4 GC v2 自动触发（GOGC 模型）；此处仅记录轮次。
+    // 若需主动收集可调 rt_gc_collect（0.4 rt_gc 提供）。
+    return;
+}
+
+// ============ 分发 ============
+pub kimo lsp_dispatch(body: string) -> void {
+    let method = lsp_json_str(body, "method");
+    let idraw = lsp_json_get(body, "id");
+    // 通知（无 id）：不响应
+    let is_request = 0;
+    if (len(idraw) > 0) { is_request = 1; }
+    if (len(method) == 0) {
+        // 纯响应（服务端→客户端请求的应答）——直接忽略
+        return;
+    }
+    let params = lsp_json_get(body, "params");
+    // 取消请求
+    if (str_eq(method, "$/cancelRequest") == 1) {
+        let cancel_id = lsp_json_str(params, "id");
+        if (len(cancel_id) > 0) {
+            lsp_cancelled = array_push(lsp_cancelled, cancel_id);
+        }
+        return;
+    }
+    // 生命周期
+    if (str_eq(method, "initialize") == 1) {
+        lsp_initialized = 1;
+        if (is_request == 1) {
+            lsp_write_message(lsp_response(idraw, lsp_initialize_result()));
+        }
+        return;
+    }
+    if (str_eq(method, "initialized") == 1) { return; }
+    if (str_eq(method, "shutdown") == 1) {
+        if (is_request == 1) { lsp_write_message(lsp_response(idraw, "null")); }
+        return;
+    }
+    if (str_eq(method, "exit") == 1) {
+        lsp_exit_flag = 1;
+        return;
+    }
+    if (str_eq(method, "$/setTrace") == 1) { return; }
+    // 文本同步
+    if (str_eq(method, "textDocument/didOpen") == 1) {
+        let td = lsp_json_get(params, "textDocument");
+        let uri = lsp_json_str(td, "uri");
+        let text = lsp_json_str(td, "text");
+        let ver = lsp_atoi(lsp_json_get(td, "version"));
+        lsp_doc_put(uri, text, ver);
+        lsp_publish_diagnostics(uri, ver);
+        return;
+    }
+    if (str_eq(method, "textDocument/didChange") == 1) {
+        let td = lsp_json_get(params, "textDocument");
+        let uri = lsp_json_str(td, "uri");
+        let ver = lsp_atoi(lsp_json_get(td, "version"));
+        let changes = lsp_json_get(params, "contentChanges");
+        // 处理全部 contentChanges（0.4 支持增量与全文替换）
+        let ci = 0;
+        while (1 == 1) {
+            let ch = lsp_rt_arr_get(changes, ci);
+            if (len(ch) == 0) { break; }
+            let rng = lsp_json_get(ch, "range");
+            if (len(rng) > 0) {
+                let new_text = lsp_json_str(ch, "text");
+                lsp_apply_change(uri, rng, new_text);
+            } else {
+                // 全文替换
+                let new_text2 = lsp_json_str(ch, "text");
+                lsp_doc_put(uri, new_text2, ver);
+            }
+            ci = ci + 1;
+        }
+        lsp_doc_put(uri, lsp_doc_get(uri), ver);
+        lsp_publish_diagnostics(uri, ver);
+        return;
+    }
+    if (str_eq(method, "textDocument/didClose") == 1) {
+        let td = lsp_json_get(params, "textDocument");
+        let uri = lsp_json_str(td, "uri");
+        lsp_doc_remove(uri);
+        return;
+    }
+    if (str_eq(method, "textDocument/didSave") == 1) {
+        let td = lsp_json_get(params, "textDocument");
+        let uri = lsp_json_str(td, "uri");
+        let ver = lsp_doc_get_version(uri);
+        if (ver < 0) { ver = 0; }
+        lsp_publish_diagnostics(uri, ver);
+        return;
+    }
+    // 工作区
+    if (str_eq(method, "workspace/didChangeConfiguration") == 1) { return; }
+    if (str_eq(method, "workspace/didChangeWorkspaceFolders") == 1) {
+        let added = lsp_json_get(params, "event");
+        let wf = lsp_json_get(added, "added");
+        return;
+    }
+    // 查询类请求
+    if (is_request == 1) {
+        let result = lsp_handle_query(method, params, idraw);
+        if (str_eq(result, "__NO_RESPONSE__") == 1) { return; }
+        if (str_eq(result, "__ERROR__") == 1) {
+            lsp_write_message(lsp_error(idraw, "method not found: " + method));
+            return;
+        }
+        lsp_write_message(lsp_response(idraw, result));
+        return;
+    }
+}
+
+// initialize 结果（capabilities）
+pub kimo lsp_initialize_result() -> string {
+    let cap = "{\"textDocumentSync\":2," +
+        "\"hoverProvider\":true," +
+        "\"definitionProvider\":true," +
+        "\"declarationProvider\":true," +
+        "\"typeDefinitionProvider\":true," +
+        "\"implementationProvider\":true," +
+        "\"referencesProvider\":true," +
+        "\"renameProvider\":{\"prepareProvider\":true}," +
+        "\"documentSymbolProvider\":true," +
+        "\"workspaceSymbolProvider\":true," +
+        "\"documentHighlightProvider\":true," +
+        "\"foldingRangeProvider\":true," +
+        "\"selectionRangeProvider\":true," +
+        "\"documentLinkProvider\":{\"resolveProvider\":false}," +
+        "\"documentColorProvider\":true," +
+        "\"colorProvider\":true," +
+        "\"codeActionProvider\":{\"resolveProvider\":true}," +
+        "\"codeLensProvider\":{\"resolveProvider\":true}," +
+        "\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}," +
+        "\"documentFormattingProvider\":true," +
+        "\"documentRangeFormattingProvider\":true," +
+        "\"documentOnTypeFormattingProvider\":{\"firstTriggerCharacter\":\"}\",\"moreTriggerCharacter\":[\"}\"]}," +
+        "\"inlayHintProvider\":true," +
+        "\"inlineValueProvider\":true," +
+        "\"inlineCompletionProvider\":true," +
+        "\"linkedEditingRangeProvider\":true," +
+        "\"monikerProvider\":true," +
+        "\"callHierarchyProvider\":true," +
+        "\"typeHierarchyProvider\":true," +
+        "\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"variable\",\"function\",\"parameter\",\"property\",\"keyword\",\"type\",\"comment\",\"number\",\"string\"],\"tokenModifiers\":[]},\"full\":{\"delta\":true},\"range\":true}," +
+        "\"completionProvider\":{\"resolveProvider\":true,\"triggerCharacters\":[\".\",\" \"]}," +
+        "\"diagnosticProvider\":{\"interFileDependencies\":false,\"workspaceDiagnostics\":true}," +
+        "\"executeCommandProvider\":{\"commands\":[\"shadow.showReferences\",\"shadow.formatDocument\",\"shadow.applyEdit\"]}," +
+        "\"workspace\":{\"workspaceFolders\":{\"supported\":true,\"changeNotifications\":true}}," +
+        "\"window\":{\"showDocument\":{\"support\":true}}}";
+    return "{\"capabilities\":" + cap + "}";
+}
+
+// 查询类请求分派（返回 result JSON；__NO_RESPONSE__ / __ERROR__ 特殊值）
+pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> string {
+    // 文本位置参数提取
+    let td = lsp_json_get(params, "textDocument");
+    let uri = lsp_json_str(td, "uri");
+    let pos = lsp_json_get(params, "position");
+    let pline = 0;
+    let pchar = 0;
+    if (len(pos) > 0) {
+        pline = lsp_atoi(lsp_json_get(pos, "line")) + 1;   // 0-based → 1-based
+        pchar = lsp_atoi(lsp_json_get(pos, "character")) + 1;
+    }
+    let has_pos = (len(pos) > 0);
+
+    // hover
+    if (str_eq(method, "textDocument/hover") == 1) {
+        if (len(uri) == 0) { return "{\"contents\":{\"kind\":\"markdown\",\"value\":\"\"}}"; }
+        lsp_compile(uri);
+        let info = api_hover_info(pline, pchar);
+        let p1 = "{\"contents\":{\"kind\":\"markdown\",\"value\":\"```shadow\\n";
+        let p2 = p1 + api_json_escape(info);
+        let p3 = p2 + "\\n```\"}}";
+        return p3;
+    }
+    // definition
+    if (str_eq(method, "textDocument/definition") == 1 ||
+        str_eq(method, "textDocument/declaration") == 1 ||
+        str_eq(method, "textDocument/typeDefinition") == 1 ||
+        str_eq(method, "textDocument/implementation") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        let def = api_find_definition(word);
+        if (len(def) == 0) { return "null"; }
+        let dp = str_split(def, "|");
+        if (len(dp) < 6) { return "null"; }
+        let path = lsp_uri_to_path(uri);
+        let loc = lsp_location_json(path, api_atoi(dp[0] as string), api_atoi(dp[1] as string),
+                                    api_atoi(dp[2] as string), api_atoi(dp[3] as string));
+        return loc;
+    }
+    // references
+    if (str_eq(method, "textDocument/references") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        let refs = api_find_references(word);
+        let parts: array<string> = [];
+        parts = array_push(parts, "[");
+        let first = 1;
+        let hits = str_split(refs, ";");
+        let i = 0;
+        while (i < len(hits)) {
+            let h = hits[i] as string;
+            if (len(h) == 0) { i = i + 1; continue; }
+            let hp = str_split(h, "|");
+            if (len(hp) < 2) { i = i + 1; continue; }
+            let hl = api_atoi(hp[0] as string);
+            let hc = api_atoi(hp[1] as string);
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            parts = array_push(parts, lsp_location_json(lsp_uri_to_path(uri), hl, hc, hl, hc + 1));
+            i = i + 1;
+        }
+        parts = array_push(parts, "]");
+        return str_join(parts, "");
+    }
+    // documentHighlight
+    if (str_eq(method, "textDocument/documentHighlight") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        let refs = api_find_references(word);
+        let parts: array<string> = [];
+        parts = array_push(parts, "[");
+        let first = 1;
+        let hits = str_split(refs, ";");
+        let i = 0;
+        while (i < len(hits)) {
+            let h = hits[i] as string;
+            if (len(h) == 0) { i = i + 1; continue; }
+            let hp = str_split(h, "|");
+            if (len(hp) < 2) { i = i + 1; continue; }
+            let hl = api_atoi(hp[0] as string);
+            let hc = api_atoi(hp[1] as string);
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(hl - 1) +
+                       ",\"character\":" + int_to_str(hc - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(hl - 1) +
+                       ",\"character\":" + int_to_str(hc) + "}}}";
+            parts = array_push(parts, item);
+            i = i + 1;
+        }
+        parts = array_push(parts, "]");
+        return str_join(parts, "");
+    }
+    // documentSymbol
+    if (str_eq(method, "textDocument/documentSymbol") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        return lsp_document_symbols_json();
+    }
+    // semanticTokens/full
+    if (str_eq(method, "textDocument/semanticTokens/full") == 1) {
+        if (len(uri) == 0) { return "{\"data\":[]}"; }
+        lsp_compile(uri);
+        return lsp_semantic_tokens_json();
+    }
+    // semanticTokens/range（简化：返回 full）
+    if (str_eq(method, "textDocument/semanticTokens/range") == 1) {
+        if (len(uri) == 0) { return "{\"data\":[]}"; }
+        lsp_compile(uri);
+        return lsp_semantic_tokens_json();
+    }
+    // semanticTokens/full/delta（简化：返回 full 数据）
+    if (str_eq(method, "textDocument/semanticTokens/full/delta") == 1) {
+        if (len(uri) == 0) { return "{\"data\":[]}"; }
+        lsp_compile(uri);
+        return lsp_semantic_tokens_json();
+    }
+    // completion
+    if (str_eq(method, "textDocument/completion") == 1) {
+        if (len(uri) == 0) { return "{\"isIncomplete\":false,\"items\":[]}"; }
+        lsp_compile(uri);
+        let src = lsp_doc_get(uri);
+        let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
+        return lsp_completion_json(prefix);
+    }
+    // signatureHelp
+    if (str_eq(method, "textDocument/signatureHelp") == 1) {
+        if (len(uri) == 0) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
+        lsp_compile(uri);
+        return lsp_signature_help_json(pline, pchar);
+    }
+    // foldingRange
+    if (str_eq(method, "textDocument/foldingRange") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        return lsp_folding_range_json();
+    }
+    // selectionRange
+    if (str_eq(method, "textDocument/selectionRange") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        // 简化：返回包含位置的最深 Expr 区间（info = L|C|EL|EC|kind|str1|type）
+        let info = api_deepest_expr_info(pline, pchar);
+        if (len(info) == 0) { return "null"; }
+        let ip = str_split(info, "|");
+        if (len(ip) < 4) { return "null"; }
+        let rng = "{\"range\":{\"start\":{\"line\":" + int_to_str(api_atoi(ip[0] as string) - 1) +
+                  ",\"character\":" + int_to_str(api_atoi(ip[1] as string) - 1) +
+                  "},\"end\":{\"line\":" + int_to_str(api_atoi(ip[2] as string) - 1) +
+                  ",\"character\":" + int_to_str(api_atoi(ip[3] as string) - 1) + "}}}";
+        return rng;
+    }
+    // inlayHint
+    if (str_eq(method, "textDocument/inlayHint") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        return lsp_inlay_hint_json();
+    }
+    // documentColor
+    if (str_eq(method, "textDocument/documentColor") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        let src = lsp_doc_get(uri);
+        return lsp_document_color_json(src);
+    }
+    // colorPresentation
+    if (str_eq(method, "textDocument/colorPresentation") == 1) {
+        let color = lsp_json_get(params, "color");
+        let r = lsp_atoi(lsp_json_get(color, "red"));
+        let g = lsp_atoi(lsp_json_get(color, "green"));
+        let b = lsp_atoi(lsp_json_get(color, "blue"));
+        let hex = lsp_rgb_to_hex(r, g, b);
+        let item = "[{\"label\":\"#" + hex + "\"}]";
+        return item;
+    }
+    // linkedEditingRange（光标处标识符的所有引用区间，编辑其一即联动其余）
+    if (str_eq(method, "textDocument/linkedEditingRange") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        if (len(word) == 0) { return "null"; }
+        let refs = api_find_references(word);
+        let parts: array<string> = [];
+        parts = array_push(parts, "[");
+        let first = 1;
+        let hits = str_split(refs, ";");
+        let i = 0;
+        while (i < len(hits)) {
+            let h = hits[i] as string;
+            if (len(h) == 0) { i = i + 1; continue; }
+            let hp = str_split(h, "|");
+            if (len(hp) < 2) { i = i + 1; continue; }
+            let hl = api_atoi(hp[0] as string);
+            let hc = api_atoi(hp[1] as string);
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(hl - 1) +
+                       ",\"character\":" + int_to_str(hc - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(hl - 1) +
+                       ",\"character\":" + int_to_str(hc) + "}}}";
+            parts = array_push(parts, item);
+            i = i + 1;
+        }
+        parts = array_push(parts, "]");
+        return str_join(parts, "");
+    }
+    // moniker
+    if (str_eq(method, "textDocument/moniker") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        if (len(word) == 0) { return "[]"; }
+        let idn = lsp_uri_to_path(uri) + "#" + word;
+        let item = "[{\"kind\":\"export\",\"scheme\":\"shadow\",\"identifier\":\"" +
+                   api_json_escape(word) + "\",\"unique\":\"shadow:" +
+                   api_json_escape(idn) + "\"}]";
+        return item;
+    }
+    // formatting / rangeFormatting / onTypeFormatting
+    if (str_eq(method, "textDocument/formatting") == 1 ||
+        str_eq(method, "textDocument/rangeFormatting") == 1 ||
+        str_eq(method, "textDocument/onTypeFormatting") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        let src = lsp_doc_get(uri);
+        let fmt = lsp_format_text(src);
+        return lsp_full_edit_json(uri, fmt);
+    }
+    // prepareRename
+    if (str_eq(method, "textDocument/prepareRename") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        if (len(word) == 0) { return "null"; }
+        let rng = "{\"range\":{\"start\":{\"line\":" + int_to_str(pline - 1) +
+                  ",\"character\":" + int_to_str(pchar - 1) +
+                  "},\"end\":{\"line\":" + int_to_str(pline - 1) +
+                  ",\"character\":" + int_to_str(pchar - 1 + len(word)) + "}},\"placeholder\":\"" + word + "\"}";
+        return rng;
+    }
+    // rename
+    if (str_eq(method, "textDocument/rename") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let new_name = lsp_json_str(params, "newName");
+        let word = api_ident_at(pline, pchar);
+        let refs = api_find_references(word);
+        let edits: array<string> = [];
+        edits = array_push(edits, "{\"changes\":{\"" + uri + "\":[");
+        let first = 1;
+        let hits = str_split(refs, ";");
+        let i = 0;
+        while (i < len(hits)) {
+            let h = hits[i] as string;
+            if (len(h) == 0) { i = i + 1; continue; }
+            let hp = str_split(h, "|");
+            if (len(hp) < 2) { i = i + 1; continue; }
+            let hl = api_atoi(hp[0] as string);
+            let hc = api_atoi(hp[1] as string);
+            if (first == 0) { edits = array_push(edits, ","); }
+            first = 0;
+            let ed = "{\"range\":{\"start\":{\"line\":" + int_to_str(hl - 1) +
+                     ",\"character\":" + int_to_str(hc - 1) +
+                     "},\"end\":{\"line\":" + int_to_str(hl - 1) +
+                     ",\"character\":" + int_to_str(hc + len(word) - 1) +
+                     "}},\"newText\":\"" + new_name + "\"}";
+            edits = array_push(edits, ed);
+            i = i + 1;
+        }
+        edits = array_push(edits, "]}}");
+        return str_join(edits, "");
+    }
+    // codeAction
+    if (str_eq(method, "textDocument/codeAction") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        return lsp_code_action_json(uri);
+    }
+    // codeLens（每个顶层函数显示引用计数，点击跳转到引用）
+    if (str_eq(method, "textDocument/codeLens") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        lsp_compile(uri);
+        let src = lsp_doc_get(uri);
+        let defs = lsp_scan_func_defs(src);
+        let parts: array<string> = [];
+        parts = array_push(parts, "[");
+        let first = 1;
+        let i = 0;
+        while (i < len(defs)) {
+            let d = str_split(defs[i] as string, "|");
+            if (len(d) < 3) { i = i + 1; continue; }
+            let name = d[0] as string;
+            let dl = api_atoi(d[1] as string);
+            let dc = api_atoi(d[2] as string);
+            let refs = api_find_references(name);
+            let nref = 0;
+            let rh = str_split(refs, ";");
+            let j = 0;
+            while (j < len(rh)) { if (len(rh[j] as string) > 0) { nref = nref + 1; } j = j + 1; }
+            if (first == 0) { parts = array_push(parts, ","); }
+            first = 0;
+            let lens = "{\"range\":{\"start\":{\"line\":" + int_to_str(dl - 1) +
+                       ",\"character\":" + int_to_str(dc - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(dl - 1) +
+                       ",\"character\":" + int_to_str(dc - 1 + len(name)) +
+                       "}},\"command\":{\"title\":\"" + int_to_str(nref) + " references\"," +
+                       "\"command\":\"shadow.showReferences\",\"arguments\":[{\"uri\":\"" + uri +
+                       "\",\"range\":{\"start\":{\"line\":" + int_to_str(dl - 1) +
+                       ",\"character\":" + int_to_str(dc - 1) + "},\"end\":{\"line\":" +
+                       int_to_str(dl - 1) + ",\"character\":" + int_to_str(dc - 1 + len(name)) + "}}}]}}";
+            parts = array_push(parts, lens);
+            i = i + 1;
+        }
+        parts = array_push(parts, "]");
+        return str_join(parts, "");
+    }
+    // inlineValue（需要调试器运行时值，0.4 暂无，返回空）
+    if (str_eq(method, "textDocument/inlineValue") == 1) {
+        return "[]";
+    }
+    // inlineCompletion（复用补全结果生成行内补全）
+    if (str_eq(method, "textDocument/inlineCompletion") == 1) {
+        if (len(uri) == 0) { return "{\"items\":[]}"; }
+        lsp_compile(uri);
+        let src = lsp_doc_get(uri);
+        let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
+        let cj = lsp_completion_json(prefix);
+        let ib = str_index_of(cj, "[");
+        let ie = lsp_rindex(cj, "]");
+        if (ib < 0 || ie < 0) { return "{\"items\":[]}"; }
+        let items = substr2(cj, ib, ie + 1);
+        return "{\"items\":" + items + "}";
+    }
+    // diagnostic（LSP 3.17 pull）
+    if (str_eq(method, "textDocument/diagnostic") == 1) {
+        if (len(uri) == 0) { return "{\"kind\":\"full\",\"items\":[]}"; }
+        lsp_compile(uri);
+        let diags = api_sdiag_json_array();
+        let p1 = "{\"kind\":\"full\",\"items\":";
+        return p1 + diags + "}";
+    }
+    // workspace/diagnostic（扫描所有已打开文档）
+    if (str_eq(method, "workspace/diagnostic") == 1) {
+        let parts: array<string> = [];
+        parts = array_push(parts, "{\"items\":[");
+        let first = 1;
+        let i = 0;
+        while (i < len(lsp_uris)) {
+            let u = lsp_uris[i] as string;
+            lsp_compile(u);
+            let diags = api_sdiag_json_array();
+            if (len(diags) > 2) {
+                if (first == 0) { parts = array_push(parts, ","); }
+                first = 0;
+                let entry = "{\"uri\":\"" + u + "\",\"version\":" +
+                            int_to_str(lsp_doc_get_version(u)) + ",\"diagnostics\":" + diags + "}";
+                parts = array_push(parts, entry);
+            }
+            i = i + 1;
+        }
+        parts = array_push(parts, "]}");
+        return str_join(parts, "");
+    }
+    // callHierarchy
+    if (str_eq(method, "textDocument/prepareCallHierarchy") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        let def = api_find_definition(word);
+        if (len(def) == 0) { return "null"; }
+        let dp = str_split(def, "|");
+        if (len(dp) < 6) { return "null"; }
+        let item = "{\"name\":\"" + word + "\",\"kind\":12,\"uri\":\"" + uri + "\"," +
+                   "\"range\":{\"start\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1) +
+                   "},\"end\":{\"line\":" + int_to_str(api_atoi(dp[2] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[3] as string) - 1) + "}}," +
+                   "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1) +
+                   "},\"end\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1 + len(word)) + "}}}";
+        return "[" + item + "]";
+    }
+    // callHierarchy/incomingCalls（谁调用了当前符号）
+    if (str_eq(method, "callHierarchy/incomingCalls") == 1) {
+        let item = lsp_json_get(params, "item");
+        let word = lsp_json_str(item, "name");
+        if (len(word) == 0) { return "[]"; }
+        let out: array<string> = [];
+        let i = 0;
+        while (i < len(lsp_uris)) {
+            let u = lsp_uris[i] as string;
+            let src = lsp_doc_get(u);
+            let calls = lsp_scan_calls(src, word);
+            let j = 0;
+            while (j < len(calls)) {
+                let cp = str_split(calls[j] as string, "|");
+                if (len(cp) < 2) { j = j + 1; continue; }
+                let cl = api_atoi(cp[0] as string);
+                let cc = api_atoi(cp[1] as string);
+                out = array_push(out, "{\"fromRanges\":[{\"start\":{\"line\":" + int_to_str(cl - 1) +
+                          ",\"character\":" + int_to_str(cc - 1) + "},\"end\":{\"line\":" +
+                          int_to_str(cl - 1) + ",\"character\":" + int_to_str(cc) + "}}]," +
+                          "\"from\":\"file://" + api_json_escape(lsp_uri_to_path(u)) + "\"}");
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return "[" + str_join(out, ",") + "]";
+    }
+    // callHierarchy/outgoingCalls（当前函数体内调用了谁）
+    if (str_eq(method, "callHierarchy/outgoingCalls") == 1) {
+        let item = lsp_json_get(params, "item");
+        let word = lsp_json_str(item, "name");
+        if (len(word) == 0) { return "[]"; }
+        let u = lsp_last_uri;
+        let src = lsp_doc_get(u);
+        let calls = lsp_scan_calls(src, word);
+        let defs = lsp_scan_func_defs(src);
+        let def_line = -1;
+        let di = 0;
+        while (di < len(defs)) {
+            let dp = str_split(defs[di] as string, "|");
+            if (len(dp) >= 3 && str_eq(dp[0] as string, word) == 1) { def_line = api_atoi(dp[1] as string); }
+            di = di + 1;
+        }
+        let seen: array<string> = [];
+        let out: array<string> = [];
+        let ci = 0;
+        while (ci < len(calls)) {
+            let cp = str_split(calls[ci] as string, "|");
+            if (len(cp) < 2) { ci = ci + 1; continue; }
+            let cl = api_atoi(cp[0] as string);
+            let cc = api_atoi(cp[1] as string);
+            if (cl == def_line) { ci = ci + 1; continue; }
+            let callee = api_ident_at(cl, cc);
+            if (len(callee) == 0) { ci = ci + 1; continue; }
+            let dup = 0;
+            let si = 0;
+            while (si < len(seen)) { if (str_eq(seen[si] as string, callee) == 1) { dup = 1; } si = si + 1; }
+            if (dup == 1) { ci = ci + 1; continue; }
+            seen = array_push(seen, callee);
+            let rng = "{\"start\":{\"line\":" + int_to_str(cl - 1) + ",\"character\":" + int_to_str(cc - 1) +
+                      "},\"end\":{\"line\":" + int_to_str(cl - 1) + ",\"character\":" + int_to_str(cc + len(callee) - 1) + "}}";
+            out = array_push(out, "{\"to\":{\"name\":\"" + api_json_escape(callee) + "\",\"kind\":12,\"uri\":\"" + u +
+                          "\",\"range\":" + rng + ",\"selectionRange\":" + rng + "},\"fromRanges\":[" + rng + "]}");
+            ci = ci + 1;
+        }
+        return "[" + str_join(out, ",") + "]";
+    }
+    // typeHierarchy
+    if (str_eq(method, "textDocument/prepareTypeHierarchy") == 1) {
+        if (len(uri) == 0) { return "null"; }
+        lsp_compile(uri);
+        let word = api_ident_at(pline, pchar);
+        let def = api_find_definition(word);
+        if (len(def) == 0) { return "null"; }
+        let dp = str_split(def, "|");
+        if (len(dp) < 6) { return "null"; }
+        let item = "{\"name\":\"" + word + "\",\"kind\":5,\"uri\":\"" + uri + "\"," +
+                   "\"range\":{\"start\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1) +
+                   "},\"end\":{\"line\":" + int_to_str(api_atoi(dp[2] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[3] as string) - 1) + "}}," +
+                   "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1) +
+                   "},\"end\":{\"line\":" + int_to_str(api_atoi(dp[0] as string) - 1) +
+                   ",\"character\":" + int_to_str(api_atoi(dp[1] as string) - 1 + len(word)) + "}}}";
+        return "[" + item + "]";
+    }
+    if (str_eq(method, "typeHierarchy/supertypes") == 1 ||
+        str_eq(method, "typeHierarchy/subtypes") == 1) {
+        return "[]";
+    }
+    // workspace/symbol
+    if (str_eq(method, "workspace/symbol") == 1) {
+        lsp_compile(lsp_last_uri);
+        return lsp_document_symbols_json();
+    }
+    // workspace/executeCommand
+    if (str_eq(method, "workspace/executeCommand") == 1) {
+        let cmd = lsp_json_str(params, "command");
+        if (str_eq(cmd, "shadow.formatDocument") == 1) {
+            let args = lsp_json_get(params, "arguments");
+            let a0 = lsp_rt_arr_get(args, 0);
+            let uri0 = lsp_json_str(a0, "uri");
+            let src0 = lsp_doc_get(uri0);
+            let fmt0 = lsp_format_text(src0);
+            let edits0 = lsp_full_edit_json(uri0, fmt0);
+            // 服务端→客户端 applyEdit（带请求 id，测试预置响应）
+            let req_id = int_to_str(lsp_server_seq);
+            lsp_server_seq = lsp_server_seq + 1;
+            let apply = "{\"jsonrpc\":\"2.0\",\"id\":" + req_id +
+                        ",\"method\":\"workspace/applyEdit\",\"params\":{\"edit\":{\"changes\":{\"" +
+                        uri0 + "\":" + edits0 + "}}}}";
+            lsp_write_message(apply);
+            return "{\"applied\":true}";
+        }
+        return "null";
+    }
+    // completionItem/resolve
+    if (str_eq(method, "completionItem/resolve") == 1) {
+        return params;
+    }
+    // codeAction/resolve / codeLens/resolve / inlayHint/resolve / workspaceSymbol/resolve
+    if (str_eq(method, "codeAction/resolve") == 1) { return params; }
+    if (str_eq(method, "codeLens/resolve") == 1) { return "null"; }
+    if (str_eq(method, "inlayHint/resolve") == 1) { return params; }
+    if (str_eq(method, "workspaceSymbol/resolve") == 1) { return params; }
+    // documentLink（import 语句 → 模块文件链接）
+    if (str_eq(method, "textDocument/documentLink") == 1) {
+        if (len(uri) == 0) { return "[]"; }
+        let src = lsp_doc_get(uri);
+        return lsp_document_link_json(src, uri);
+    }
+    // 文件生命周期（watch）等未知方法：返回空
+    return "__NO_RESPONSE__";
+}
+
+// ============ signatureHelp ============
+pub kimo lsp_signature_help_json(line: int, col: int) -> string {
+    // 找光标所在行的函数调用：行内 '(' 之前的标识符
+    let lines = str_split(api_source(), "\n");
+    if (line < 1 || line > len(lines)) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
+    let ln = lines[line - 1] as string;
+    // 从 col-1 往前找最近 '('
+    let i = col - 1;
+    if (i > len(ln)) { i = len(ln); }
+    while (i >= 0) {
+        let c = substr2(ln, i, i + 1);
+        if (str_eq(c, "(") == 1) {
+            // 找 '(' 前的标识符
+            let j = i - 1;
+            let start = j + 1;
+            while (j >= 0) {
+                let cj = substr2(ln, j, j + 1);
+                if ((cj >= "a" && cj <= "z") || (cj >= "A" && cj <= "Z") || (cj >= "0" && cj <= "9") || str_eq(cj, "_") == 1) {
+                    start = j;
+                    j = j - 1;
+                    continue;
+                }
+                break;
+            }
+            let fname = substr2(ln, start, i);
+            // 查函数签名（fmeta: name|L|C|EL|EC|rettype|sig）
+            let k = 0;
+            while (k < len(api_fmeta)) {
+                let fm = str_split(api_fmeta[k] as string, "|");
+                if (len(fm) >= 7 && str_eq(fm[0] as string, fname) == 1) {
+                    let sig = fm[6] as string;
+                    let p1 = "{\"signatures\":[{\"label\":\"" + api_json_escape(sig) +
+                             "\",\"documentation\":\"\",\"parameters\":[]}],\"activeSignature\":0,\"activeParameter\":0}";
+                    return p1;
+                }
+                k = k + 1;
+            }
+            break;
+        }
+        i = i - 1;
+    }
+    return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}";
+}
+
+// ============ foldingRange（基于 {} 配对） ============
+pub kimo lsp_folding_range_json() -> string {
+    let toks = api_tokens;
+    let stack_lines: array<int> = [];
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let first = 1;
+    let i = 0;
+    let n = len(toks);
+    while (i < n) {
+        let t = toks[i] as Token;
+        if (t.kind == TOK_LBRACE) {
+            stack_lines = array_push(stack_lines, t.line);
+        } else if (t.kind == TOK_RBRACE) {
+            let ns = len(stack_lines);
+            if (ns > 0) {
+                let open_line = stack_lines[ns - 1] as int;
+                // 弹出
+                let nw: array<int> = [];
+                let j = 0;
+                while (j < ns - 1) {
+                    nw = array_push(nw, stack_lines[j] as int);
+                    j = j + 1;
+                }
+                stack_lines = nw;
+                if (open_line != t.line && len(t.text) > 0) {
+                    if (first == 0) { parts = array_push(parts, ","); }
+                    first = 0;
+                    let item = "{\"startLine\":" + int_to_str(open_line - 1) +
+                               ",\"endLine\":" + int_to_str(t.line - 1) + "}";
+                    parts = array_push(parts, item);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// ============ inlayHint（let 变量类型标注） ============
+pub kimo lsp_inlay_hint_json() -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    // mode=2：收集 STMT_LET 的 "L|C|type"
+    api_scan_mode = 2;
+    api_acc_refs = [];
+    api_walk_program();
+    let first = 1;
+    let i = 0;
+    let ns = len(api_acc_refs);
+    while (i < ns) {
+        let lp = str_split(api_acc_refs[i] as string, "|");
+        if (len(lp) >= 3) {
+            let tyname = lp[2] as string;
+            if (len(tyname) > 0) {
+                if (first == 0) { parts = array_push(parts, ","); }
+                first = 0;
+                let item = "{\"position\":{\"line\":" + int_to_str(api_atoi(lp[0] as string) - 1) +
+                           ",\"character\":" + int_to_str(api_atoi(lp[1] as string) + 3) +
+                           "},\"label\":\": " + api_json_escape(tyname) + "\",\"kind\":1}";
+                parts = array_push(parts, item);
+            }
+        }
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// ============ documentColor（文本扫 #hex） ============
+pub kimo lsp_document_color_json(src: string) -> string {
+    let lines = str_split(src, "\n");
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let first = 1;
+    let i = 0;
+    let n = len(lines);
+    while (i < n) {
+        let ln = lines[i] as string;
+        let j = 0;
+        let nl = len(ln);
+        while (j <= nl - 4) {
+            let c = substr2(ln, j, j + 1);
+            if (str_eq(c, "#") == 1) {
+                // 提取 3/6/8 位 hex
+                let hex = lsp_try_hex(ln, j);
+                if (len(hex) > 0) {
+                    let rgb = lsp_hex_to_rgb(hex);
+                    if (first == 0) { parts = array_push(parts, ","); }
+                    first = 0;
+                    let item = "{\"color\":{" + rgb + "},\"range\":{\"start\":{\"line\":" +
+                               int_to_str(i) + ",\"character\":" + int_to_str(j) +
+                               "},\"end\":{\"line\":" + int_to_str(i) + ",\"character\":" +
+                               int_to_str(j + len(hex) + 1) + "}}}";
+                    parts = array_push(parts, item);
+                    j = j + len(hex) + 1;
+                    continue;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// 从 ln[j]（'#'）尝试提取 hex 颜色；返回 hex 数字串（不含 #），失败 ""
+pub kimo lsp_try_hex(ln: string, j: int) -> string {
+    let nl = len(ln);
+    let len_h = 6;
+    let hex = "";
+    if (j + 7 <= nl) {
+        let h6 = substr2(ln, j + 1, j + 7);
+        if (lsp_is_hex_str(h6) == 1) { hex = h6; }
+    }
+    if (len(hex) == 0 && j + 4 <= nl) {
+        let h3 = substr2(ln, j + 1, j + 4);
+        if (lsp_is_hex_str(h3) == 1) {
+            // 3 位扩展为 6 位
+            let c1 = substr2(h3, 0, 1);
+            let c2 = substr2(h3, 1, 2);
+            let c3 = substr2(h3, 2, 3);
+            let e1 = c1 + c1;
+            let e2 = c2 + c2;
+            let e3 = c3 + c3;
+            hex = e1 + e2 + e3;
+        }
+    }
+    return hex;
+}
+
+pub kimo lsp_is_hex_str(s: string) -> int {
+    let i = 0;
+    while (i < len(s)) {
+        let c = s[i];
+        if ((c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")) {
+            i = i + 1;
+            continue;
+        }
+        return 0;
+    }
+    if (len(s) == 6 || len(s) == 3) { return 1; }
+    return 0;
+}
+
+// hex → ""red":r,"green":g,"blue":b"（0-1 浮点）
+pub kimo lsp_hex_to_rgb(hex: string) -> string {
+    let r = lsp_hex_val(substr2(hex, 0, 2));
+    let g = lsp_hex_val(substr2(hex, 2, 4));
+    let b = lsp_hex_val(substr2(hex, 4, 6));
+    let p = "\"red\":" + int_to_str(r) + ".0,\"green\":" + int_to_str(g) + ".0,\"blue\":" + int_to_str(b) + ".0";
+    return p;
+}
+
+pub kimo lsp_hex_val(h2: string) -> int {
+    let hi = lsp_hex(substr2(h2, 0, 1));
+    let lo = lsp_hex(substr2(h2, 1, 2));
+    return hi * 16 + lo;
+}
+
+// 0-255 → 2 位 hex
+pub kimo lsp_rgb_to_hex(r: int, g: int, b: int) -> string {
+    let rh = lsp_byte_hex(r);
+    let gh = lsp_byte_hex(g);
+    let bh = lsp_byte_hex(b);
+    return rh + gh + bh;
+}
+
+pub kimo lsp_byte_hex(v: int) -> string {
+    let d = v;
+    if (d < 0) { d = 0; }
+    if (d > 255) { d = 255; }
+    let hi = d / 16;
+    let lo = d % 16;
+    return lsp_hex_digit(hi) + lsp_hex_digit(lo);
+}
+
+pub kimo lsp_hex_digit(v: int) -> string {
+    if (v < 10) {
+        if (v == 0) { return "0"; } if (v == 1) { return "1"; }
+        if (v == 2) { return "2"; } if (v == 3) { return "3"; }
+        if (v == 4) { return "4"; } if (v == 5) { return "5"; }
+        if (v == 6) { return "6"; } if (v == 7) { return "7"; }
+        if (v == 8) { return "8"; }
+        return "9";
+    }
+    if (v == 10) { return "a"; } if (v == 11) { return "b"; }
+    if (v == 12) { return "c"; } if (v == 13) { return "d"; }
+    if (v == 14) { return "e"; }
+    return "f";
+}
+
+// ============ codeAction（基于诊断关键词） ============
+pub kimo lsp_code_action_json(uri: string) -> string {
+    let parts: array<string> = [];
+    parts = array_push(parts, "[");
+    let first = 1;
+    let i = 0;
+    let n = api_sdiag_count();
+    while (i < n) {
+        let line = api_sdiag_line_at(i);
+        // 提取 message（最后一个空格后）与位置
+        let sp = str_split(line, " ");
+        if (len(sp) < 5) { i = i + 1; continue; }
+        let rng = sp[3] as string;
+        let msg = "";
+        let mi = 4;
+        while (mi < len(sp)) {
+            if (mi > 4) { msg = msg + " "; }
+            msg = msg + sp[mi] as string;
+            mi = mi + 1;
+        }
+        // 解析 rng 起始
+        let dash = str_index_of(rng, "-");
+        let start_s = rng;
+        if (dash >= 0) { start_s = substr2(rng, 0, dash); }
+        let sc2 = str_index_of(start_s, ":");
+        let sl2 = 1;
+        let sch2 = 0;
+        if (sc2 >= 0) {
+            sl2 = lsp_atoi(substr2(start_s, 0, sc2));
+            sch2 = lsp_atoi(substr2(start_s, sc2 + 1, len(start_s)));
+        }
+        // 生成 title：根据 message 关键词
+        let title = "Fix: " + msg;
+        if (str_contains(msg, "undefined function") == 1) {
+            title = "Insert placeholder function";
+        } else if (str_contains(msg, "type mismatch") == 1) {
+            title = "Add explicit cast";
+        }
+        if (first == 0) { parts = array_push(parts, ","); }
+        first = 0;
+        let item = "{\"title\":\"" + api_json_escape(title) + "\",\"kind\":\"quickfix\"," +
+                   "\"diagnostics\":[{\"range\":{\"start\":{\"line\":" + int_to_str(sl2 - 1) +
+                   ",\"character\":" + int_to_str(sch2 - 1) +
+                   "},\"end\":{\"line\":" + int_to_str(sl2 - 1) +
+                   ",\"character\":" + int_to_str(sch2) + "}},\"message\":\"" +
+                   api_json_escape(msg) + "\",\"severity\":1}],\"isPreferred\":true}";
+        parts = array_push(parts, item);
+        i = i + 1;
+    }
+    parts = array_push(parts, "]");
+    return str_join(parts, "");
+}
+
+// ============ 主循环 ============
+pub kimo lsp_run() -> void {
+    lsp_exit_flag = 0;
+    lsp_log("shadow LSP server (0.4) started");
+    while (lsp_exit_flag == 0) {
+        let body = lsp_read_message();
+        if (len(body) == 0) { break; }
+        lsp_dispatch(body);
+        lsp_gc_tick();
+    }
+    lsp_log("shadow LSP server exited");
+}

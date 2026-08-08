@@ -1,0 +1,5 @@
+dsb _sl_rebake_cg_panic_string;
+kimo main() -> int {
+    panic "something went wrong";
+    println(0); return 0;
+}

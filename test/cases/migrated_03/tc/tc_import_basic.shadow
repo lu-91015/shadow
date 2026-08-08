@@ -1,0 +1,5 @@
+//@desc: import module with helper functions
+//@expect: typecheck: 1
+dsb tc_import_basic;
+import _math_helper;
+kimo main() -> int { return max(1, 2); }

@@ -1,0 +1,16 @@
+//@ mode: codegen
+//@ desc: generic struct with impl block methods, combining generics + method calls
+//@expect-ir: call
+dsb cg_generic_impl;
+
+struct Container<T> { item: T }
+impl Container {
+    kimo get(c: Container) -> any { return c.item; }
+    kimo put(c: Container, v: any) -> void { c.item = v; }
+}
+kimo main() -> int {
+    let c = Container { item: 100 };
+    let v = c.get();
+    c.put(200);
+    return v as int;
+}

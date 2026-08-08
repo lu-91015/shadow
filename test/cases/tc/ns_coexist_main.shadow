@@ -1,0 +1,14 @@
+//@mode: exe
+//@desc: Phase 15 严格态：同名 struct/enum 跨模块共存 + inherent impl 方法分发
+//@expect: strict ns coexist ok 29/27
+//@args: --strict
+dsb ns_coexist_main;
+import ns_coexist.d;
+import ns_coexist.e;
+kimo main() -> int {
+    let x = ns_coexist.d.run();
+    let y = ns_coexist.e.run();
+    if (x != 29 || y != 27) { println("ERR x=" + int_to_str(x) + " y=" + int_to_str(y)); return 1; }
+    println("strict ns coexist ok " + int_to_str(x) + "/" + int_to_str(y));
+    return 0;
+}

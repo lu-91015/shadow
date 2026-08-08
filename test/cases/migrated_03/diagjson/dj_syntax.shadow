@@ -1,0 +1,13 @@
+//@desc: LSP-6：诊断以 LSP publishDiagnostics JSON 输出，行列由 1-based 平移为 0-based
+//@expect: "range":{"start":{"line":10,"character":12},"end":{"line":10,"character":13}}
+//@expect: "severity":1
+//@expect: "code":"SH-PARSE006"
+//@expect: "source":"shadow-parse"
+dsb dj_syntax;
+
+// 断言锁的是**坐标系转换**：源码里 `;` 位于第 11 行第 13 列（1-based），
+// LSP 侧必须是 line=10 / character=12。协议层不得再做第二次平移。
+kimo broken() -> int {
+    let a = ;
+    return a;
+}

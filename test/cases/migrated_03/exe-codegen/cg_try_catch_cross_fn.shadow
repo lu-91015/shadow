@@ -1,0 +1,19 @@
+//@expect: 42
+//@ desc: try/catch with cross-function throw (called function throws, caller catches)
+dsb cg_try_catch_cross_fn;
+
+kimo fail() -> int {
+    throw "boom";
+    return 0;
+}
+
+kimo main() -> int {
+    let result = 0;
+    try {
+        result = fail();
+        result = result + 1;
+    } catch {
+        result = 42;
+    }
+    println(result); return 0;
+}

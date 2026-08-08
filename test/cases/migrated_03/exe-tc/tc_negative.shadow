@@ -1,0 +1,11 @@
+//@desc: negative integer literals type-check
+//@expect: -2147483648
+dsb tc_negative;
+kimo f(x: int) -> int {
+    let n = -x;
+    let m = -5;
+    let k = -2147483648;
+    if (n < m) { return 1; }
+    return k;
+}
+kimo main() -> int { println(f(3)); return 0; }

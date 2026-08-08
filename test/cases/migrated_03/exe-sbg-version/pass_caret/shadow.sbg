@@ -1,0 +1,8 @@
+# shadow.sbg — 主包，依赖 ver_pkg.spk，约束 ^0.3（允许 0.3.x）
+# 验证 P1：版本约束检查通过，包内 version=0.3.5 满足 ^0.3
+[package]
+name = "ver_test_pass"
+version = "0.3.0"
+
+[deps]
+ver_pkg = "ver_pkg.spk@^0.3"

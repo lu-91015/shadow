@@ -1,0 +1,8 @@
+//@mode: codegen
+//@desc: leading-dot float constant (.5) tokenized as float
+//@expect-ir: e-01
+dsb cg_float_leading_dot;
+kimo main() -> int {
+    let x = .5;
+    return 0;
+}

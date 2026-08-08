@@ -1,0 +1,4 @@
+//@desc: println int codegen — should emit shadow_println_int call
+//@expect: 42\n0
+dsb cg_println_int;
+kimo main() -> int { println(42); println(0); return 0; }

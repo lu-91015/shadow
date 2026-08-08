@@ -1,0 +1,5 @@
+# ver_pkg.spk 内嵌的 shadow.sbg
+# 版本 1.0.0-rc.1（pre-release）
+[package]
+name = "ver_pkg"
+version = "1.0.0-rc.1"
