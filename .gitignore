@@ -8,6 +8,9 @@ build/
 *.ilk
 *.lib
 *.exp
+# 函数级增量缓存（.lu）：源码旁旧位置已废弃，缓存统一在 build/lu_cache/（build/ 已覆盖）。
+# 防止历史 .lu 文件（旧缓存位置遗留）再次被 git 跟踪。
+*.lu
 
 # 测试产物
 test/cases/**/*.exe
