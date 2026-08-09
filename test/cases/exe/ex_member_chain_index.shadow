@@ -1,0 +1,34 @@
+//@mode: exe
+//@desc: §12 F2 —— 数组索引后直接连写成员链 arr[i].field / arr[i].m() / a[i].f[j].g（此前必须过中间变量）
+//@expect: F2 x=1 y=4 mag=304 nest=7 chain=42
+// 债务复现（修复前）：`let x = arr[0].x;` 报 SH-PARSE002 "expected ; but got '.'"
+// —— primary 解析完 `name[idx]` 后直接 return，没有接回 parse_member_chain。
+dsb ex_member_chain_index;
+
+struct P { x: int; y: int; }
+struct Row { cells: array<P>; }
+
+kimo mag(p: P) -> int { return p.x * 100 + p.y; }
+
+kimo main() -> int {
+    let arr: array<P> = [];
+    arr = array_push(arr, P { x: 1, y: 2 });
+    arr = array_push(arr, P { x: 3, y: 4 });
+    let rows: array<Row> = [];
+    rows = array_push(rows, Row { cells: arr });
+
+    // ① 索引后取字段
+    let x = arr[0].x;
+    let y = arr[1].y;
+    // ② 索引后方法调用（desugar 成 mag(arr[1])）
+    let m = arr[1].mag();
+    // ③ 索引 → 字段 → 索引 → 字段（多级交替）
+    let nest = rows[0].cells[1].x + rows[0].cells[0].y * 2;   // 3 + 2*2 = 7
+    // ④ 索引后字段参与算术
+    let chain = arr[0].x * 40 + arr[0].y;                     // 40 + 2 = 42
+
+    println("F2 x=" + int_to_str(x) + " y=" + int_to_str(y)
+            + " mag=" + int_to_str(m) + " nest=" + int_to_str(nest)
+            + " chain=" + int_to_str(chain));
+    return 0;
+}

@@ -1,0 +1,33 @@
+//@mode: exe
+//@desc: §12 F3 —— 括号表达式（尤其 cast）后直接连写成员链 (expr as T).field / (f(x)).field / (e)[i]
+//@expect: F3 x=5 y=6 mag=506 sum=11 idx=9
+// 债务复现（修复前）：`let px = (a as P).x;` 报 SH-PARSE002 "expected ; but got '.'"
+// —— primary 解析完 `( expr )` 后直接 return first，没有接回 parse_member_chain。
+dsb ex_member_chain_paren;
+
+struct P { x: int; y: int; }
+
+kimo mag(p: P) -> int { return p.x * 100 + p.y; }
+kimo mk(x: int, y: int) -> P { return P { x: x, y: y }; }
+
+kimo main() -> int {
+    let p = P { x: 5, y: 6 };
+    let a = p as any;
+
+    // ① cast 回具体类型后直接取字段
+    let px = (a as P).x;
+    let py = (a as P).y;
+    // ② cast 后方法调用（desugar 成 mag((a as P))）
+    let pm = (a as P).mag();
+    // ③ 括号内是函数调用，后接字段
+    let sum = (mk(4, 7)).x + (mk(4, 7)).y;   // 4 + 7 = 11
+    // ④ 括号后接索引
+    let nums: array<int> = [];
+    nums = array_push(nums, 9);
+    let idx = (nums)[0];
+
+    println("F3 x=" + int_to_str(px) + " y=" + int_to_str(py)
+            + " mag=" + int_to_str(pm) + " sum=" + int_to_str(sum)
+            + " idx=" + int_to_str(idx));
+    return 0;
+}

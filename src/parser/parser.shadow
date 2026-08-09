@@ -960,7 +960,9 @@ pub kimo parse_primary_inner() -> Expr {
             base.str1 = name;
             e.child1 = base;
             e.child2 = idx;
-            return e;
+            // §12 F2：索引后允许继续接成员链（arr[i].field、m[k].f()、g[i][j].x）。
+            // parse_member_chain 在下一个 token 非 `.`/`[` 时原样返回，是安全的 no-op。
+            return parse_member_chain(e, loc);
         }
         // 成员访问
         if (ps_at(TOK_DOT) == 1) {
@@ -991,7 +993,9 @@ pub kimo parse_primary_inner() -> Expr {
             return e;
         }
         ps_expect(TOK_RPAREN, ")");
-        return first;
+        // §12 F3：括号表达式后允许继续接成员链，(expr as T).field / (a + b).f() /
+        // (arr).0 均可连写。同上，非 `.`/`[` 时 parse_member_chain 是 no-op。
+        return parse_member_chain(first, loc);
     }
 
     if (k == TOK_LBRACKET) {
