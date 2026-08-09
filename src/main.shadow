@@ -82,9 +82,18 @@ let main_resolved_roots: array<string> = []; // 与 main_resolved 平行：每�
 let main_resolved_ns: array<string> = [];    // 与 main_resolved 平行：命名空间覆盖（dep/SPK 场景，空=由 key 派生）
 let main_import_err: string = "";            // 解析错误消息（非空即失败）
 // §3.7 债务①：兼容/严格双轨已删除，0.5 恒严格态，不再有 main_g_strict 开关。
-// Phase 11 .lu 函数级增量缓存在严格态下必须禁用（私有符号 mangle 改写不可跳过），
-// 用独立门控保留缓存代码路径（这是性能开关，不是语义双轨）；缓存支持 mangle 后置 1 复活。
-let main_g_lu_cache: int = 0;
+// Phase 11 .lu 函数级增量缓存开关（性能开关，不是语义双轨）。
+//
+// 曾以「私有符号 mangle 改写不可跳过」为由置 0。复核后该理由不成立：
+// 缓存命中只跳过 tc_check_bodies 里的 **函数体检查**（type_checker.shadow:tc_ns_is_valid），
+// 而 mangle 发生在 Pass 1 声明注册（tc_reg_name_for + fd.name 回写），命中与否都照常执行。
+// 真正的阻塞点是另外两条，均已在本次修复：
+//   ① 闭包用全局顺序计数器命名（__closure_<n>），编号随「跳过了哪些模块」漂移
+//      → 改为按模块独立编号 __closure_<mod>_<n>（type_checker.shadow tc_closure_seq_next）。
+//   ② 泛型判定按模块文本扫描，看不见使用方模块的实例化点
+//      → 改为 AST 全程序判定 main_prog_has_generic + main_cache_revoke。
+// 另配套把缓存键世代从 v9_s6 提到 v10_s1，物理隔离 0.4 兼容态写下的旧缓存。
+let main_g_lu_cache: int = 1;
 
 // L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
 // 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
@@ -991,17 +1000,74 @@ kimo main_hash_src(s: string) -> string {
 //    泛型模块命中 .lu 缓存 → TC bodies 跳过 → 单态化（mono worklist）不执行 →
 //    特化函数（first__T_int_string）不生成 → 调用点 declare-only → link undefined。
 //    旧实现只匹配 "<T:" "<T>" "<T "，漏掉 "<T," "<K," "<A," 等（cg_generic_fn_multi 回归）。
-kimo main_has_generic(src: string) -> int {
-    let n = len(src);
+// §3.7 债务④：泛型 × 增量缓存的判定，从「按模块文本扫描」升级为「按 AST 全程序判定」。
+//
+// 旧实现 main_has_generic(src) 扫本模块源码里 `<` 后跟 A-Z，两头都不准：
+//   · 漏（致命）：**实例化点**在使用方模块，而 `Box<int>` / `array<string>` / `id(5)`
+//     （小写类型实参或全靠推断）都扫不出 `<A-Z` → 使用方模块被判定"无泛型"→ 命中缓存
+//     → 函数体检查跳过 → tc_mono_instantiate 不执行 → 特化函数不生成，
+//     而缓存 MIR 里的调用点仍指向 `id__T_int` → **link undefined**。
+//   · 溢（无害）：`a < B` 这类比较被误判，只损失一次缓存。
+//
+// 新判定：只要**整个程序**存在任何泛型定义（func / struct / enum / trait / impl 方法
+// 带 type_params），就对所有模块弃用缓存；一个泛型定义都没有 → 任何模块都不可能触发
+// 单态化 → 缓存安全。判据落在 AST 上，与源码写法（大小写、空格、注释）完全无关。
+// 编译器自身源码无泛型定义 → 自举场景仍全量命中，缓存收益不受影响。
+kimo main_prog_has_generic(prog: Program) -> int {
     let i = 0;
-    while (i + 1 < n) {
-        if (rt_get_byte(src, i) == 60) {   // '<'
-            let c = rt_get_byte(src, i + 1);
-            if (c >= 65 && c <= 90) { return 1; }   // A-Z
+    while (i < len(prog.funcs)) {
+        let fd = prog.funcs[i] as FuncDef;
+        if (len(fd.type_params) > 0) { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(prog.structs)) {
+        let sd = prog.structs[i] as StructDef;
+        if (len(sd.type_params) > 0) { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(prog.enums)) {
+        let ed = prog.enums[i] as EnumDef;
+        if (len(ed.type_params) > 0) { return 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(prog.traits)) {
+        let td = prog.traits[i] as TraitDef;
+        if (len(td.type_params) > 0) { return 1; }
+        let mi = 0;
+        while (mi < len(td.methods)) {
+            let tm = td.methods[mi] as FuncDef;
+            if (len(tm.type_params) > 0) { return 1; }
+            mi = mi + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < len(prog.impls)) {
+        let id = prog.impls[i] as ImplDef;
+        let mj = 0;
+        while (mj < len(id.methods)) {
+            let im = id.methods[mj] as FuncDef;
+            if (len(im.type_params) > 0) { return 1; }
+            mj = mj + 1;
         }
         i = i + 1;
     }
     return 0;
+}
+
+// 撤销本轮全部缓存命中（AST 级判定发现泛型定义时调用）。
+// main_cache_setup 在 parse 之前运行（拿不到 AST），因此采用「先乐观命中、
+// 拿到 AST 后再撤销」的两段式；撤销必须同时清 main_g_valid 与 TC 的 valid_ns。
+kimo main_cache_revoke() -> void {
+    let i = 0;
+    while (i < len(main_g_valid)) {
+        main_g_valid[i] = 0;
+        i = i + 1;
+    }
+    tc_set_valid_ns([]);
 }
 
 // ---- 依赖指纹（WSIG）：根治「签名变化不传播到依赖模块」 ----
@@ -1141,10 +1207,14 @@ kimo main_mod_in_src(idx: int) -> int {
 // 键 = <缓存语义版本>_<源文件路径 djb2>（路径变 → 新键 → 首次 miss 全量一次）
 // ⚠️ main_cache_sem 是正确性关键：任何改变 TC/codegen 语义的修改（新增检查、改类型推断、
 // 修 bug 改变接受/拒绝集合）都必须 bump 它，否则旧缓存命中会跳过函数体检查 → 漏报类型错误。
-// 当前值 = "v9_s6"（s4 = 2026-08-07：string 下标检查、命名参数名、trait 签名、timestamp 算术、
-// 裸 array、泛型字段、默认参数拒绝等 TC 缺口修复后）。
+// 当前值 = "v10_s1"。
+// ⚠️ 为什么从 v9_s6 跳到 v10_s1（必须跳，不是美观问题）：
+//   磁盘上遗留的 v9_s6_*.lu 是 **0.4 兼容态**写的——那时私有符号不按模块 mangle，
+//   MIR 里的函数名/调用名与 0.5 严格态（__mod_<ns>__<name>）完全不同族。
+//   0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
+//   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
 kimo main_lu_key(path: string) -> string {
-    return "build\\lu_cache\\v9_s6_" + main_hash_src(path);
+    return "build\\lu_cache\\v10_s1_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
@@ -1163,7 +1233,7 @@ kimo main_cache_setup() -> any {
         qi = qi + 1;
     }
     tc_set_valid_ns([]);
-    if (main_g_lu_cache == 0) { return queues; }   // 严格态：.lu 缓存禁用（mangle 改写不可跳过）
+    if (main_g_lu_cache == 0) { return queues; }   // 缓存总开关关闭：全部模块视为未命中
     // dir_create → CreateDirectoryA 只建**单层**，父目录缺失会静默失败。
     // 0.4 自身仓库恰好已有 build/，掩盖了这点；用户新工程首次编译会拿不到缓存目录。
     dir_create("build");
@@ -1221,19 +1291,12 @@ kimo main_cache_setup() -> any {
                     if (str_eq(parts2[2] as string, main_wsig) == 1) { hit = 1; }
                 }
                 if (hit == 1) {
-                    // 泛型特化模块不进缓存命中集合：缓存命中跳过函数体检查 → 特化不生成，
-                    // 且 TC 跳过（inferred_type 未填）与 lower 全量错配会产生 i0/sext ptr 非法 IR。
-                    // 判断用精确模式（<T: 约束 / <T> 无约束 / <T 空格）；不能含 "__T_"（注释误伤）。
-                    let src_g = main_mod_srcs[k] as string;
-                    let has_gen_g = 0;
-                    if (str_index_of(src_g, "<T:") >= 0) { has_gen_g = 1; }
-                    if (str_index_of(src_g, "<T>") >= 0) { has_gen_g = 1; }
-                    if (str_index_of(src_g, "<T ") >= 0) { has_gen_g = 1; }
-                    if (has_gen_g == 0) {
-                        valid = array_push(valid, tc_mod_ns[k] as string);
-                        main_g_valid[k] = 1;
-                        queues[k] = mir_cache_mod_funcs(mod);
-                    }
+                    // 泛型闸门已上移：此处不再做文本扫描（旧写法只认 `<T:`/`<T>`/`<T `，
+                    // 既漏 `<U>`/`<K, V>` 这类命名，也完全看不见使用方模块的实例化点）。
+                    // 统一由 main_prog_has_generic(prog) 在 parse 后按 AST 判定并撤销命中。
+                    valid = array_push(valid, tc_mod_ns[k] as string);
+                    main_g_valid[k] = 1;
+                    queues[k] = mir_cache_mod_funcs(mod);
                 }
             }
         }
@@ -1287,6 +1350,9 @@ kimo main_compile_source(source: string, file: string) -> string {
     let toks = tokenize(source, file);
     let t1 = c_clock();
     let prog = parse(toks, file);
+    // §3.7 债务④：AST 到手后做泛型判定，发现任何泛型定义即撤销全部缓存命中。
+    // （main_cache_setup 跑在 parse 之前，只能先乐观命中、此处再撤销。）
+    if (main_prog_has_generic(prog) == 1) { main_cache_revoke(); }
     let t2 = c_clock();
     // TC 前函数数：TC 会追加泛型特化（add_num__T_long）与闭包提升（__closure_n）。
     // 这些追加函数没有 .lu 缓存 MIR，若按模块缓存命中走 use_cache 会取到队列里别的函数
@@ -1345,12 +1411,10 @@ kimo main_compile_source(source: string, file: string) -> string {
         let idx = main_mod_idx_of_line(fd.loc.line);
         let use_cache = 0;
         if (fi < N0 && idx >= 0 && idx < len(main_g_valid) && main_g_valid[idx] == 1) {
-            // 泛型特化模块放弃缓存：缓存命中跳过函数体检查 → tc_mono_instantiate 不执行 →
-            // 特化（add_num__T_long）不生成 → 调用点 declare-only → link undefined / 类型错。
-            // 编译器自身源码（src/）无泛型定义（缓存收益大）；用户泛型代码全量 TC（正确性优先）。
-            let src_i = main_mod_srcs[idx] as string;
-            let has_gen = main_has_generic(src_i);
-            if (has_gen == 0) { use_cache = 1; }
+            // 泛型闸门统一在 parse 后由 main_prog_has_generic + main_cache_revoke 处理：
+            // 程序里只要有泛型定义，main_g_valid 已被整体清零，走不到这里。
+            // 故此处只保留「TC 追加函数（fi >= N0）不用缓存」这一条（N0 判据在上行）。
+            use_cache = 1;
         }
         if (use_cache == 1) {
             let mf = main_take_cached_mir(idx, queues, cpos);

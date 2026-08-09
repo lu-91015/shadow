@@ -1034,6 +1034,38 @@ pub kimo tc_closure_funcs_get() -> array<FuncDef> {
     return tc_g_closure_funcs;
 }
 
+// ---- 闭包编号：按模块独立（Phase 11 增量缓存的正确性前置）----
+// 原实现用单一全局计数器 ctx.closure_counter，编号取决于「本次编译检查了哪些函数体」。
+// 缓存命中的模块会跳过函数体检查 → 计数器不推进 → 未命中模块新生成的闭包会拿到
+// 缓存 MIR 里已占用的编号（__closure_0）→ 重复定义 / 调用指向错误函数。
+// 改为「模块名 + 模块内序号」：__closure_<mod>_<n>。同一模块源码不变 → 编号稳定，
+// 与「哪些别的模块命中缓存」完全无关。仍以 __closure_ 开头，main_compile_source
+// 的补取判据（str_starts_with "__closure_"）不受影响。
+let tc_g_cl_mods: array<string> = [];
+let tc_g_cl_seqs: array<int> = [];
+
+kimo tc_closure_seq_next(mod_name: string) -> int {
+    let i = 0;
+    while (i < len(tc_g_cl_mods)) {
+        if (str_eq(tc_g_cl_mods[i] as string, mod_name) == 1) {
+            let v = tc_g_cl_seqs[i] as int;
+            tc_g_cl_seqs[i] = v + 1;
+            return v;
+        }
+        i = i + 1;
+    }
+    tc_g_cl_mods = array_push(tc_g_cl_mods, mod_name);
+    tc_g_cl_seqs = array_push(tc_g_cl_seqs, 1);
+    return 0;
+}
+
+// 模块名 → 符号名片段。空模块名（LSP/API 单 Program 场景）用 "g" 占位，
+// 避免产生 "__closure__0" 这种双下划线歧义名。
+kimo tc_closure_mod_tag(mod_name: string) -> string {
+    if (len(mod_name) == 0) { return "g"; }
+    return mod_name;
+}
+
 // 注入模块行映射。未调用时两数组为空 → tc_is_known_ns 恒假 → FQN 解析自动降级关闭。
 pub kimo tc_set_mod_map(ns: array<string>, starts: array<int>) -> void {
     tc_g_mod_ns = ns;
@@ -1070,9 +1102,20 @@ pub kimo tc_is_strict() -> int { return 1; }
 let tc_g_valid_ns: array<string> = [];
 pub kimo tc_set_valid_ns(list: array<string>) -> void { tc_g_valid_ns = list; }
 
-// 函数所在行所属模块是否在缓存命中集合内（兼容态才启用；严格态缓存禁用恒 false）
+// 函数所在行所属模块是否在缓存命中集合内。
+//
+// ⚠️ 此处曾有一行无条件 `return 0;`（配合 main_g_lu_cache=0 的第二道硬闸），
+// 使下方查表全部成为不可达死代码。后果极具迷惑性：main_g_valid / MIR 队列复用照常生效，
+// 缓存文件也确实命中、不再重写，**唯独占编译大头的函数体检查从未跳过** →
+// 表现为「缓存明明命中却几乎不提速」（实测冷 318s vs 热 310s）。删闸门必须两道一起删。
+//
+// 跳过函数体检查的正确性依据：命中条件是「本模块源码 hash 未变 AND 世界签名 WSIG 未变」，
+// 即本模块代码与**所有**模块的签名都没变；而符号 mangle 发生在 Pass 1 声明注册
+// （tc_reg_name_for + fd.name 回写），与命中与否无关，照常执行。
+// 被跳过模块的 MIR 整体来自 .lu，故其 AST 后处理（spawn 的 e.str1 回写、内置遮蔽改写、
+// inferred_type 填充）都无下游消费者；闭包提升的缺失由 main.shadow 的「闭包 MIR 补取」兜底；
+// 泛型单态化的缺失由 main_prog_has_generic 整体撤销命中来排除。
 pub kimo tc_ns_is_valid(ctx: CompileContext, line: int) -> int {
-    return 0;
     let ns = tc_module_of_line(ctx, line);
     if (len(ns) == 0) { return 0; }
     let i = 0;
@@ -4361,10 +4404,11 @@ pub kimo tc_check_closure(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         e.inferred_type = fty;
         return fty;
     }
-    // 闭包字面量：提升 __closure_<n>
-    let n = ctx.closure_counter;
-    ctx.closure_counter = ctx.closure_counter + 1;
-    let cname = "__closure_" + int_to_str(n);
+    // 闭包字面量：提升 __closure_<mod>_<n>（按模块独立编号，见 tc_closure_seq_next 注释）
+    let cl_mod = tc_closure_mod_tag(ctx.current_module);
+    let n = tc_closure_seq_next(cl_mod);
+    ctx.closure_counter = ctx.closure_counter + 1;   // 保留：其它诊断/统计仍读该字段
+    let cname = "__closure_" + cl_mod + "_" + int_to_str(n);
     fd.name = cname;
     // 捕获分析：扫描 body 自由变量，排除参数/本地绑定
     ctx.free_vars_names = [];
@@ -5137,6 +5181,8 @@ pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
 pub kimo tc_check_program(prog: Program) -> int {
     // 初始化 ctx
     tc_g_closure_funcs = [];
+    tc_g_cl_mods = [];
+    tc_g_cl_seqs = [];
     let ctx = CompileContext {
         cur_node: 0 as ModuleNode,
         graph: tc_mg_new(),
