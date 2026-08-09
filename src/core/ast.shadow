@@ -10,7 +10,7 @@
 //   - 闭包持有 FuncDef 经 Option<FuncDef> 打破值循环（已实测）
 //   - "未推断"用 TYPE_INFER 哨兵 Type
 //   - 跨模块可见性依赖 P0.4-1（0.3 宿主全局 pub 回退修复）
-dsb core_ast;
+dsb ast;
 
 // Token：携带完整区间 [line:col, end_line:end_col)
 pub struct Token { kind: int; text: string; line: int; col: int; end_line: int; end_col: int }

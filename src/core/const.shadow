@@ -3,7 +3,7 @@
 // 语法完全复刻 shadow-0.3：dsb 模块声明 + pub let 全局常量。
 // 常量跨模块可见（P0.4-1 全局 pub 回退），模块内直接引用无需 import。
 // 字符串拼接遵循原则 9：禁止裸 + 链，统一 str_join。
-dsb core_const;
+dsb const;
 
 // ============ 类型种类 TYPE_* ============
 pub let TYPE_VOID: int = 0;

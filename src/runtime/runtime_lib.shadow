@@ -1,4 +1,4 @@
-dsb rt;
+dsb runtime_lib;
 
 // === Runtime @extern declarations ===
 // runtime 作为独立模块编译：所有非 @extern 的 kimo 标记为 pub，

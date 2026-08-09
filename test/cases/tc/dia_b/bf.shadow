@@ -1,3 +1,3 @@
-dsb dia_bf;
+dsb bf;
 import dia_d.df;
 pub kimo dia_fb() -> int { return dia_fd(); }

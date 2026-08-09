@@ -9,6 +9,9 @@
 //   - 跨模块引用 core 的 pub 符号（Token/TOK_*）依赖 P0.4-1 全局 pub 回退
 dsb lexer;
 
+import core.ast;
+import core.const;
+
 // 词法状态（模块级全局变量，tokenize 时初始化）
 let lx_src: string = "";
 let lx_len: int = 0;      // ⚡ 源码长度快照，见下方性能说明

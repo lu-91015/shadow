@@ -16,7 +16,11 @@
 // 尾部：n_globals, globals[name, type_kind, is_pub, is_ext, init_tag, init...]
 //
 // 编解码 LEB128 的全局状态：mir_ser_off / mir_ser_val
-dsb mir_ser;
+dsb mir_serialize;
+
+import core.ast;
+import core.const;
+import core.utils;
 
 let MIR_SER_MAGIC0: int = 76;   // 'L'
 let MIR_SER_MAGIC1: int = 85;   // 'U'

@@ -1,4 +1,4 @@
-dsb nsdemo_geom;
+dsb geom;
 
 pub struct Point { x: int; y: int; }
 

@@ -1,7 +1,7 @@
 //@ mode: tc-fail
 //@ desc: non-pub enum from imported module should not be accessible
 dsb tc_fail_pub_priv_enum;
-import _pub_helper
+import _privpkg._pub_helper
 kimo main() -> int {
     let c = PrivColor.A;
     return 0;

@@ -1,3 +1,3 @@
-dsb dia_cf;
+dsb cf;
 import dia_d.df;
 pub kimo dia_fc() -> int { return dia_fd() + 2; }

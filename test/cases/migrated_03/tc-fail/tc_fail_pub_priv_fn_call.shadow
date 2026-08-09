@@ -1,7 +1,7 @@
 //@ mode: tc-fail
 //@ desc: referencing a non-pub function from an imported module should fail
 dsb tc_fail_pub_priv_fn_call;
-import _pub_helper
+import _privpkg._pub_helper
 kimo main() -> int {
     return priv_color_val(PrivColor.A);
 }

@@ -11,6 +11,11 @@
 // struct 判空用 as any == 0、字符串拼接避免裸 + 长链（原则 9 str_join）。
 dsb lsp;
 
+import api.compile_api;
+import core.ast;
+import core.utils;
+import core.const;
+
 // ============ FFI：stdio/JSON（0.3 runtime_for_selfhost.o 提供符号） ============
 @extern("shadow_stdin_read_line") kimo lsp_rt_read_line() -> string { return ""; }
 @extern("shadow_stdin_read_n") kimo lsp_rt_read_n(n: int) -> string { return ""; }

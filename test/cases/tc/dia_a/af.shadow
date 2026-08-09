@@ -1,4 +1,4 @@
-dsb dia_af;
+dsb af;
 import dia_b.bf;
 import dia_c.cf;
 pub kimo dia_fa() -> int { return dia_fb() + dia_fc(); }

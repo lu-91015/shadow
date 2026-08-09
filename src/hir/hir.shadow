@@ -15,6 +15,11 @@
 //   - EXPR_ENUM_VARIANT 模式绑定类型来自 pe.bind_types（TC 已填充）
 dsb hir;
 
+import core.ast;
+import core.const;
+import core.utils;
+import type_checker.type_checker;
+
 // ============ HIR 名字环境：name → slot ============
 let hir_tmp_counter: int = 0;
 

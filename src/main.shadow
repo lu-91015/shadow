@@ -79,7 +79,10 @@ let main_compiled: array<string> = [];       // 已编译文件 key（相对主�
 let main_path_stack: array<string> = [];     // 当前 DFS 路径（push/pop）
 let main_resolved: array<string> = [];       // 一次 import 解析出的文件 key 列表
 let main_resolved_roots: array<string> = []; // 与 main_resolved 平行：每个文件的 project_root
+let main_resolved_ns: array<string> = [];    // 与 main_resolved 平行：命名空间覆盖（dep/SPK 场景，空=由 key 派生）
 let main_import_err: string = "";            // 解析错误消息（非空即失败）
+let main_g_strict: int = 1;                     // 0.5 恒严格态（本地开关；TC 注册前不能调 tc_is_strict）
+
 // L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
 // 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
 // 在任意非编译器项目里都解析不到，报 "no required module provides package"。
@@ -568,6 +571,7 @@ kimo main_resolve_in_base(base: string, key_prefix: string, rest: string, projec
 kimo main_resolve_import(import_path: string, project_root: string) -> int {
     main_resolved = [];
     main_resolved_roots = [];
+    main_resolved_ns = [];
     let parts = str_split(import_path, ".");
     let n = len(parts);
     if (n == 0) { return 0; }
@@ -615,7 +619,14 @@ kimo main_resolve_import(import_path: string, project_root: string) -> int {
                         // 否则 full = cache_dir + "\" + cache_dir（路径双拼接，必然读不到）
                         hit = main_collect_dir("", cache_dir);
                     } else {
+                        // 0.5 严格态：文件读取用相对 cache_dir 的 key，命名空间覆盖为 import 路径
+                        let pre_n = len(main_resolved);
                         hit = main_resolve_in_base(cache_dir, "", rest, cache_dir);
+                        let k = pre_n;
+                        while (k < len(main_resolved)) {
+                            main_resolved_ns = array_push(main_resolved_ns, module + "." + rest);
+                            k = k + 1;
+                        }
                     }
                 } else {
                     main_import_err = "SPK dependency unavailable: \"" + module + "\" (path " + dep + ")";
@@ -623,10 +634,18 @@ kimo main_resolve_import(import_path: string, project_root: string) -> int {
             } else {
                 let dep_key = main_bslash(dep);
                 let base2 = main_path_join(project_root, dep_key);
+                // 0.5 严格态 dep：文件读取用相对 dep 路径的 key（读文件正确），
+                // 命名空间覆盖为 import 路径（mylib._helper）→ 与 import 记录一致（可见性）。
                 if (len(rest) == 0) {
                     hit = main_collect_dir(dep_key, project_root);
                 } else {
-                    hit = main_resolve_in_base(base2, dep_key, rest, project_root);
+                    let pre_n = len(main_resolved);
+                    hit = main_resolve_in_base(base2, "", rest, base2);
+                    let k = pre_n;
+                    while (k < len(main_resolved)) {
+                        main_resolved_ns = array_push(main_resolved_ns, module + "." + rest);
+                        k = k + 1;
+                    }
                 }
             }
         }
@@ -728,11 +747,11 @@ kimo main_dsb_of(src: string) -> string {
 // 顺序：先拼接本文件内容（keep_dsb=1 保留 dsb，仅主文件），再 DFS 递归 import
 // （依赖内容跟在调用者之后；0.3 声明收集无顺序问题，TC Pass1 先收集再检查）。
 // 循环检测：path_stack 命中 → 报 circular；compiled 命中 → 跳过（菱形依赖合法）。
-kimo main_collect_module(project_root: string, key: string, keep_dsb: int) -> int {
+kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_override: string) -> int {
     if (main_in_path_stack(key) == 1) {
         // §3.9 Java 规则：循环 import 允许（a↔b 互相引用合法；禁的是循环*继承*）。
         // 自举/兼容态保留 circular import detected 以暴露设计问题。
-        if (tc_is_strict() == 1) { return 1; }
+        if (main_g_strict == 1) { return 1; }
         main_import_err = "circular import detected: " + key;
         return 0;
     }
@@ -750,7 +769,10 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int) -> in
         return 0;
     }
     let my_ns = main_key_to_ns(key);
-    if (tc_is_strict() == 0) {
+    // 0.5 严格态 dep/SPK：命名空间覆盖为 import 路径（mylib._helper），
+    // 文件读取仍用相对 project_root 的实际路径（key）——两者分离。
+    if (len(ns_override) > 0) { my_ns = ns_override; }
+    if (main_g_strict == 0) {
         let my_dsb = main_dsb_of(src);
         if (len(my_dsb) > 0 && str_eq(my_dsb, my_ns) == 0) {
             tc_mod_dsb_alias = array_push(tc_mod_dsb_alias, my_dsb);
@@ -760,7 +782,7 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int) -> in
     main_record_mod(my_ns);
     // §3.9 Java 规则：dsb 必须 == 文件 basename（不含 .shadow），仅严格态强制。
     // 对应 Java「class 名 == 文件名」，包（命名空间）由目录路径自动派生。
-    if (tc_is_strict() == 1) {
+    if (main_g_strict == 1) {
         let d = main_dsb_of(src);
         if (len(d) > 0) {
             let bnm = main_basename_of(key);
@@ -800,7 +822,9 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int) -> in
             while (ri < len(main_resolved)) {
                 let rk = main_resolved[ri] as string;
                 let rr = main_resolved_roots[ri] as string;
-                if (main_collect_module(rr, rk, 0) == 0) { return 0; }
+                let rns = "";
+                if (ri < len(main_resolved_ns)) { rns = main_resolved_ns[ri] as string; }
+                if (main_collect_module(rr, rk, 0, rns) == 0) { return 0; }
                 ri = ri + 1;
             }
         }
@@ -899,7 +923,7 @@ kimo main_load_combined(main_path: string, arg0: string) -> string {
     // 1. shadow.sbg（主模块清单 + [deps]）
     main_load_sbg(dir);
     // 2. 主文件（保留 dsb，递归 import 用 §3.8.3 模块解析）
-    main_collect_module(dir, main_bslash(file_rel), 1);
+    main_collect_module(dir, main_bslash(file_rel), 1, "");
     if (len(main_import_err) > 0) {
         main_eprint("module error: " + main_import_err + "\n");
         return "";
@@ -1147,7 +1171,7 @@ kimo main_cache_setup() -> any {
         qi = qi + 1;
     }
     tc_set_valid_ns([]);
-    if (tc_is_strict() == 1) { return queues; }   // 严格态：缓存禁用（mangle 改写不可跳过）
+    if (main_g_strict == 1) { return queues; }   // 严格态：缓存禁用（mangle 改写不可跳过）
     // dir_create → CreateDirectoryA 只建**单层**，父目录缺失会静默失败。
     // 0.4 自身仓库恰好已有 build/，掩盖了这点；用户新工程首次编译会拿不到缓存目录。
     dir_create("build");
@@ -1238,7 +1262,7 @@ kimo main_take_cached_mir(idx: int, queues: any, cpos: array<int>) -> MirFunc {
 
 // 编译结束：对 src/ 下缓存未命中的模块写 .lu（下一次编译命中）
 kimo main_lu_store(new_mirs: any, new_globs: any) -> void {
-    if (tc_is_strict() == 1) { return; }
+    if (main_g_strict == 1) { return; }
     let si = 0;
     while (si < len(tc_mod_ns)) {
         let need = 0;
@@ -1278,7 +1302,7 @@ kimo main_compile_source(source: string, file: string) -> string {
     let n_funcs_pre_tc = len(prog.funcs);
     // Phase 15 严格态：由 `--strict` CLI 标志触发（tc_set_strict 在参数解析阶段设置）；否则兼容入口
     let n_errs = 0;
-    if (tc_is_strict() == 1) {
+    if (main_g_strict == 1) {
         n_errs = tc_check_program_strict(prog);
     } else {
         n_errs = tc_check_program(prog);

@@ -16,7 +16,7 @@
 //      long 字段会得到垃圾值）。凡读 long 字段参与 int 比较/赋值，一律 `as int`
 //      （值在 int 范围时低 32 位截断无损）。操作符/索引/整数字面量皆适用；
 //      超 int 范围的 long 字面量跨模块传递会错，编译器源码应避免。
-dsb core_utils;
+dsb utils;
 
 // 构造退化点区间（起点=终点，长度 0）
 pub kimo mk_loc(file: string, line: int, col: int) -> Location {

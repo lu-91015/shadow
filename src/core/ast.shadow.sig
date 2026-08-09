@@ -1,5 +1,5 @@
-# hash: 7202128840569550775
-module|core_ast
+# hash: -2259924927553354997
+module|ast
 struct|Token|1|6|0|kind:int:0,text:string:0,line:int:0,col:int:0,end_line:int:0,end_col:int:0|
 struct|Location|1|5|0|file:string:0,line:int:0,col:int:0,end_line:int:0,end_col:int:0|
 struct|Type|1|8|0|kind:int:0,name:string:0,elem_type:Type:0,key_type:Type:0,val_type:Type:0,ret_type:Type:0,param_types:Type[]:0,captured_count:int:0|

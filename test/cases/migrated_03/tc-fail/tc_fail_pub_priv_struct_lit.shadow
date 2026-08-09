@@ -1,6 +1,6 @@
 //@ desc: using imported private struct is rejected
 dsb tc_fail_pub_priv_struct_lit;
-import _pub_helper
+import _privpkg._pub_helper
 kimo main() -> int {
     let b = PrivBox { value: 1 };
     return get_priv_box_value(b);

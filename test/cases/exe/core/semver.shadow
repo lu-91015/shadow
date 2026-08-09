@@ -9,7 +9,7 @@
 //     数字标识符 < 字母标识符；
 //   - build 元数据不参与优先级比较。
 // 宿主规避：无嵌套数组索引；结构体数组可正常使用。
-dsb core_semver;
+dsb semver;
 
 // 解析后的版本
 pub struct SemVer {

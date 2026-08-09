@@ -10,6 +10,11 @@
 //     仅处理 TYPE_ENUM_PAYLOAD 的无负载变体（None）→ MIR_ENUM_CONSTRUCT
 dsb mir;
 
+import core.ast;
+import core.const;
+import core.utils;
+import type_checker.type_checker;
+
 // MIR builder 全局状态（每次 mir_lower_func 重置）
 let mir_blocks: array<MirBlock> = [];
 let mir_cur_label: string = "";

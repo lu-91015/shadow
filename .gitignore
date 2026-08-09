@@ -31,3 +31,6 @@ _spk_extracted/
 # 测试/构建临时产物（exe tmp、SPK 锁）
 *.tmp*
 shadow.lock
+
+# 工作区记忆（不入库）
+.workbuddy/

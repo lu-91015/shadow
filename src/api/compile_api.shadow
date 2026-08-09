@@ -15,7 +15,14 @@
 //   - struct 判空用 `as any == 0`（勿直接 ==）；
 //   - 字符串拼接大量使用原则 9 str_join 替代裸 + 链（本文件逻辑简单，
 //     拼接量小，直接 + 亦可，但保持与 main.shadow 一致的风格）。
-dsb api;
+dsb compile_api;
+
+import core.ast;
+import core.utils;
+import core.const;
+import lexer.lexer;
+import parser.parser;
+import type_checker.type_checker;
 
 
 

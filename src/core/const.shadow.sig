@@ -1,5 +1,5 @@
-# hash: -5689205480165576579
-module|core_const
+# hash: 2171489343129849963
+module|const
 const|TYPE_VOID|int
 const|TYPE_INT|int
 const|TYPE_LONG|int
