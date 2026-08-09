@@ -23,6 +23,8 @@ import core.const;
 import lexer.lexer;
 import parser.parser;
 import type_checker.type_checker;
+// 形成 main ↔ compile_api 循环依赖；宿主（0.4 shadow.exe）严格态已验证可容忍模块级循环 import。
+import main;
 
 
 
@@ -486,6 +488,43 @@ pub kimo api_check(source: string, file: string) -> int {
     api_stage = 2;
     if (api_err_count == 0) { api_ok = 1; }
     return api_stage;
+}
+
+// ============ 严格态模块图加载（main_load_combined 的库封装） ============
+// CLI（main_query_mode）与 LSP（lsp_compile）共用同一份模块加载逻辑。
+// mem_src 非空时用内存缓冲区覆盖主模块（LSP didChange 后的最新内容），
+// 实现「用编辑器缓冲区编译」；主文件在模块图最前、行号不偏移。
+// 注意：本模块 `import main;`（单段 → src/main.shadow）形成 main ↔ compile_api
+// 循环依赖。按 §3.9 Java 规则循环 import 合法（main_collect_module 命中 DFS
+// 路径栈直接返回成功），禁止的是循环*继承*。
+pub kimo api_load_combined(main_path: string, arg0: string, mem_src: string) -> string {
+    let key = main_main_key(main_path);
+    main_set_mem_main(mem_src, key);
+    let combined = main_load_combined(main_path, arg0);
+    main_set_mem_main("", "");
+    return combined;
+}
+
+// 主文件模块行上界（查询计数/ranges 只统计主文件）
+pub kimo api_main_module_end() -> int {
+    return tc_main_module_end();
+}
+
+// 模块加载错误串（import 解析失败时诊断用）
+pub kimo api_import_err() -> string {
+    return main_import_err_str();
+}
+
+// LSP 跨模块定位：combined 行号 → "模块内行号|模块真实路径"。
+// 转发 main 的映射（lsp 模块不 import main，经 api 层中转）。
+pub kimo api_mod_loc_of_line(line: int) -> string {
+    return main_mod_loc_of_line(line);
+}
+
+// 追加一条结构化诊断行（格式 "CODE severity source L:C-L:C message"）。
+// 供 LSP 把模块图加载失败呈现为诊断——必须在 api_check 之后调用（后者会清空 api_sdiags）。
+pub kimo api_push_sdiag(line: string) -> void {
+    api_sdiags = array_push(api_sdiags, line);
 }
 
 // ---- 查询计数 ----

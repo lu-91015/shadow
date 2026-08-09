@@ -1,16 +1,12 @@
-// Shadow 0.4 — 编译器主入口
+// Shadow 0.5 — 编译器主入口
 // ============================================================
 // 完整管线：读文件 → tokenize → parse → TC → HIR → MIR → Codegen → .ll
 //   shadow <file.shadow> -o <out.ll>    只生成 .ll
 //   shadow <file.shadow> --run          编译 + llc + 链接 + 运行
 //   shadow --version                    打印版本
 //
-// 语法完全复刻 shadow-0.3（dsb 模块声明 + kimo 函数）。
-// 由 bootstrap/s03.exe（冻结的 0.3 宿主）编译，链接 runtime_for_selfhost.o。
 dsb main;
 
-// 扁平模块组织（0.3 架构）：主文件集中 import 全部模块，模块间不互相 import。
-// runtime 模块由 s03.exe 编译时自动拼接，无需 import。
 import core.const;
 import core.ast;
 import core.utils;
@@ -114,6 +110,10 @@ let tc_mod_dsb_path: array<string> = [];
 // 缓存命中模块 = 源码 djb2 hash 与 .lu 一致 → 函数体检查 + hir/mir 跳过（MIR 从缓存加载）。
 let main_mod_srcs: array<string> = [];
 let main_mod_paths: array<string> = [];
+// LSP 跨模块定位：每模块磁盘文件中的 dsb 行号（1-based；0=无 dsb 行）。
+// import 模块拼接进 combined 时 keep_dsb=0 会去掉该行，导致 combined 行号比磁盘少 1；
+// main_mod_loc_of_line 换算时按此补偿（主文件 keep_dsb=1 保留 dsb，记 0 不补偿）。
+let main_mod_dsb_line: array<int> = [];
 // 缓存命中标志（与 tc_mod_ns 平行，1=本次编译该模块函数体/hir/mir 可跳过）
 let main_g_valid: array<int> = [];
 // 依赖指纹：每模块签名 hash（与 tc_mod_ns 平行）+ 全程序世界签名指纹（本次编译现算）
@@ -123,6 +123,10 @@ let main_wsig: string = "";
 let tc_mod_imp_ns: array<string> = [];
 let tc_mod_imp_list: array<array<string>> = [];
 let main_cur_ns: string = "";
+// LSP 内存主模块注入：api_load_combined（compile_api）在编译前设置；
+// main_collect_module 读取后用内存缓冲区覆盖磁盘主文件内容（实现“用编辑器缓冲区编译”）。
+let main_mem_main_src: string = "";
+let main_mem_main_key: string = "";
 
 // 统一分隔符为 \
 kimo main_bslash(path: string) -> string {
@@ -772,6 +776,10 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_ov
     // 访问用 dsb 名 dotqual_mod.X；tc_ns_slot 按别名替换前缀）。
     let full = main_path_join(project_root, key);
     let src = main_read_or_empty(full);
+    // LSP：主模块用内存缓冲区覆盖磁盘内容（didChange 后的最新源码）
+    if (str_eq(key, main_mem_main_key) == 1 && len(main_mem_main_src) > 0) {
+        src = main_mem_main_src;
+    }
     if (len(src) == 0) {
         main_import_err = "cannot read module: " + full;
         return 0;
@@ -796,6 +804,18 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_ov
     // Phase 11：记录模块源码全文与路径（.lu 缓存 hash 用；与 tc_mod_ns 平行）
     main_mod_srcs = array_push(main_mod_srcs, src);
     main_mod_paths = array_push(main_mod_paths, full);
+    // LSP 跨模块定位：记录本模块磁盘文件中的 dsb 行号（keep_dsb=0 时拼接会去掉该行，
+    // combined 行号比磁盘少 1；主文件 keep_dsb=1 保留 dsb，记 0 不补偿）。
+    let dsb_ln = 0;
+    if (keep_dsb == 0) {
+        let dlines = str_split(src, "\n");
+        let di = 0;
+        while (di < len(dlines)) {
+            if (main_is_dsb_line(dlines[di] as string) == 1) { dsb_ln = di + 1; break; }
+            di = di + 1;
+        }
+    }
+    main_mod_dsb_line = array_push(main_mod_dsb_line, dsb_ln);
     // 本文件内容（keep_dsb=0 去 dsb 行）
     let lines = str_split(src, "\n");
     let pi = 0;
@@ -853,7 +873,31 @@ kimo main_exe_dir(arg0: string) -> string {
 
 // 加载主文件 + runtime + 全部 import，返回 combined source
 // main_path：主文件路径（可含目录）；arg0：argv[0]（编译器自身路径）
-kimo main_load_combined(main_path: string, arg0: string) -> string {
+// LSP 内存主模块注入接口（compile_api.api_load_combined 调用）
+pub kimo main_set_mem_main(src: string, key: string) -> void {
+    main_mem_main_src = src;
+    main_mem_main_key = key;
+}
+
+// 计算主文件在模块图中的 key（与 main_collect_module 顶层 key 一致），
+// 供 api_load_combined 注入内存主模块。注意与 main_load_combined 的 key 推导保持同步。
+pub kimo main_main_key(main_path: string) -> string {
+    let n = len(main_path);
+    let i = n - 1;
+    while (i >= 0) {
+        let c = main_path[i];
+        if (str_eq(c, "\\") == 1 || str_eq(c, "/") == 1) {
+            return main_bslash(substr2(main_path, i + 1, n));
+        }
+        i = i - 1;
+    }
+    return main_bslash(main_path);
+}
+
+// LSP/API 取模块加载错误串（import 解析失败时诊断用）
+pub kimo main_import_err_str() -> string { return main_import_err; }
+
+pub kimo main_load_combined(main_path: string, arg0: string) -> string {
     main_loaded = [];
     main_parts = [];
     main_import_err = "";
@@ -867,6 +911,7 @@ kimo main_load_combined(main_path: string, arg0: string) -> string {
     // Phase 11：重置每模块缓存收集（源码/路径/命中标志）
     main_mod_srcs = [];
     main_mod_paths = [];
+    main_mod_dsb_line = [];
     main_g_valid = [];
     // 严格态：重置每模块 import 表
     tc_mod_imp_ns = [];
@@ -949,6 +994,15 @@ kimo main_load_combined(main_path: string, arg0: string) -> string {
         // Phase 11：runtime 模块源码/路径收集（.lu 缓存用）
         main_mod_srcs = array_push(main_mod_srcs, rt_src);
         main_mod_paths = array_push(main_mod_paths, rt_path);
+        // LSP 跨模块定位：runtime 拼接同样去 dsb 行，记录其行号用于坐标补偿
+        let rt_dsb = 0;
+        let rt_dl = str_split(rt_src, "\n");
+        let rdi = 0;
+        while (rdi < len(rt_dl)) {
+            if (main_is_dsb_line(rt_dl[rdi] as string) == 1) { rt_dsb = rdi + 1; break; }
+            rdi = rdi + 1;
+        }
+        main_mod_dsb_line = array_push(main_mod_dsb_line, rt_dsb);
         let rt_lines = str_split(rt_src, "\n");
         let ri = 0;
         while (ri < len(rt_lines)) {
@@ -1185,6 +1239,24 @@ kimo main_mod_idx_of_line(line: int) -> int {
         i = i + 1;
     }
     return best;
+}
+
+// LSP 跨模块定位：combined 行号 → "模块内行号|模块真实路径"。
+// 主文件在 combined 最前（tc_mod_starts[0]=1，行号不偏移），import 模块随后、runtime 最后。
+// import 模块/runtime 拼接时去掉 dsb 行（keep_dsb=0）→ combined 行号比磁盘少 1；
+// 按 main_mod_dsb_line 补偿：combined 行号 ≥ dsb 行号时 +1（该行之后所有行都少 1）。
+// 返回 "" 表示越界（不应发生）；路径为 main_path_join 产物（可能混合 \ 与 /，消费方自行归一）。
+pub kimo main_mod_loc_of_line(line: int) -> string {
+    let idx = main_mod_idx_of_line(line);
+    if (idx < 0) { return ""; }
+    let st = tc_mod_starts[idx] as int;
+    let inner = line - st + 1;
+    if (idx < len(main_mod_dsb_line)) {
+        let dl = main_mod_dsb_line[idx] as int;
+        if (dl > 0 && inner >= dl) { inner = inner + 1; }
+    }
+    let p = main_mod_paths[idx] as string;
+    return int_to_str(inner) + "|" + p;
 }
 
 // 模块源文件是否启用 .lu 缓存。
@@ -1482,6 +1554,7 @@ kimo main_compile_source(source: string, file: string) -> string {
 //   shadow <f> --type-at <f> <l> <c> → 位置参数 args[4]/args[5]
 kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> int {
     if (str_eq(qflag, "--lsp") == 1) {
+        lsp_set_arg0(args[0] as string);
         lsp_run();
         return 0;
     }
@@ -1669,7 +1742,7 @@ kimo main() -> int {
     }
     let arg1 = args[1] as string;
     if (str_eq(arg1, "--version") == 1) {
-        println("shadow 0.4 (stage1)");
+        println("shadow 0.5");
         return 0;
     }
     // ---- 统一扫描：--strict 任意位置生效（严格态唯一触发方式；查询/编译路径共用）----

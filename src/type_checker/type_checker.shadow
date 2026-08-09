@@ -1097,6 +1097,14 @@ pub kimo tc_dsb_to_path(ctx: CompileContext, ns: string) -> string {
 pub kimo tc_set_strict(v: int) -> void { let ignored = v; }
 pub kimo tc_is_strict() -> int { return 1; }
 
+// LSP/API 用：返回主文件模块行上界（= 首个非主文件模块的起始行 - 1）。
+// 供 api_set_main_end 使查询计数与 diagnostics ranges 只统计主文件模块
+// （runtime/import 模块是符号来源，不计入主文件的查询计数）。
+pub kimo tc_main_module_end() -> int {
+    if (len(tc_g_mod_starts) > 1) { return (tc_g_mod_starts[1] as int) - 1; }
+    return 0;
+}
+
 // Phase 11 函数级增量缓存：缓存命中的模块（源码 hash 匹配 .lu）→ 跳过其函数体检查。
 // 由 loader（main.shadow）在编译前注入；每次编译开始重置（LSP/API 多文档安全）。
 let tc_g_valid_ns: array<string> = [];
@@ -5180,6 +5188,12 @@ pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
 // 双轨（兼容态物理拼接语义）已于 §3.7 债务①彻底删除，不再有 mode 形参。
 pub kimo tc_check_program(prog: Program) -> int {
     // 初始化 ctx
+    // LSP 长驻进程会多次调用本函数（每次重建全新 graph），一次性注册/累积名单必须重置，
+    // 否则二次编译跳过 prelude 注册（Option/Result/Some/None 假错误）或残留上一轮的
+    // 内置遮蔽/pub 冲突名单（污染本轮语义）。
+    tc_prelude_registered = 0;
+    tc_g_pub_conflicts = [];
+    tc_g_builtin_shadowed = [];
     tc_g_closure_funcs = [];
     tc_g_cl_mods = [];
     tc_g_cl_seqs = [];

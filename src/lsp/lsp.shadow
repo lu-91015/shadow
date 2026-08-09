@@ -281,13 +281,28 @@ pub kimo lsp_linecol_to_offset(lines: array<string>, line0: int, col0: int) -> i
 
 // ============ 编译（委托 compile_api，单槽缓存） ============
 let lsp_last_uri: string = "";
+let lsp_arg0: string = "";   // shadow.exe 路径（main 在 --lsp 入口注入，供模块图 std 根探测）
+
+// main 在 --lsp 入口注入 exe 路径（供 main_load_combined 探测 src/std 根）
+pub kimo lsp_set_arg0(p: string) -> void { lsp_arg0 = p; }
 
 // 对文档 uri 编译（didChange/didOpen 后调用；查询前确保调用）
 pub kimo lsp_compile(uri: string) -> void {
     let src = lsp_doc_get(uri);
     let path = lsp_uri_to_path(uri);
     api_set_source(src);
-    api_check(src, path);
+    // 严格态是唯一路径：加载 import 模块图（主模块用编辑器缓冲区覆盖磁盘内容），
+    // 启用跨模块符号解析、Java 可见性检查与命名空间隔离。
+    // 不存在单文件退化路径——模块图加载失败一律以诊断呈现，而非降级为单文件检查。
+    let combined = api_load_combined(path, lsp_arg0, src);
+    api_check(combined, path);
+    api_set_main_end(api_main_module_end());
+    // 模块图加载失败（dsb 与文件名不符 / import 无法解析）→ 落一条模块诊断。
+    // 必须在 api_check 之后，否则会被其清空。
+    let merr = api_import_err();
+    if (len(merr) > 0) {
+        api_push_sdiag("SH-MOD001 error shadow-module 1:1-1:1 " + merr);
+    }
     lsp_last_uri = uri;
 }
 
@@ -367,6 +382,47 @@ pub kimo lsp_location_json(path: string, line: int, col: int, end_line: int, end
     parts = array_push(parts, int_to_str(end_col - 1));
     parts = array_push(parts, "}}}");
     return str_join(parts, "");
+}
+
+// LSP 跨模块定位：combined 坐标（1-based）→ 所属模块的真实 Location JSON。
+// api_* 的 fmeta/smeta/emeta/references 行号都是 combined 坐标（主文件在 combined 最前、
+// import 模块随后、runtime 最后），直接按请求文档 path 构造会跨模块指错文件/行号。
+// 经 api_mod_loc_of_line 映射回「模块内行号|模块真实路径」，再拼 URI（反斜杠归一为正斜杠）。
+// 返回 "" 表示行号越界（不应发生）。
+pub kimo lsp_combined_loc_json(c_line: int, c_col: int, c_end_line: int, c_end_col: int) -> string {
+    let ml = api_mod_loc_of_line(c_line);
+    if (len(ml) == 0) { return ""; }
+    let mp = str_split(ml, "|");
+    if (len(mp) < 2) { return ""; }
+    let inner_line = api_atoi(mp[0] as string);
+    let mod_path = mp[1] as string;
+    let uri = lsp_path_to_uri(mod_path);
+    // 结束行在同一模块内：换算偏移（end_line - line 为 combined 增量，模块内同样成立）
+    let inner_end = inner_line + (c_end_line - c_line);
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"uri\":\"");
+    parts = array_push(parts, uri);
+    parts = array_push(parts, "\",\"range\":{\"start\":{\"line\":");
+    parts = array_push(parts, int_to_str(inner_line - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(c_col - 1));
+    parts = array_push(parts, "},\"end\":{\"line\":");
+    parts = array_push(parts, int_to_str(inner_end - 1));
+    parts = array_push(parts, ",\"character\":");
+    parts = array_push(parts, int_to_str(c_end_col - 1));
+    parts = array_push(parts, "}}}");
+    return str_join(parts, "");
+}
+
+// LSP 跨模块行号换算：combined 行号（1-based）→ 模块内行号（1-based）。
+// 供仅返回 range（无 uri）的 handler 用（documentHighlight / linkedEditingRange）。
+// 返回 0 表示越界。
+pub kimo lsp_combined_to_inner(c_line: int) -> int {
+    let ml = api_mod_loc_of_line(c_line);
+    if (len(ml) == 0) { return 0; }
+    let mp = str_split(ml, "|");
+    if (len(mp) < 2) { return 0; }
+    return api_atoi(mp[0] as string);
 }
 
 // 路径 → uri（file:/// 前缀；反斜杠转正斜杠）
@@ -992,9 +1048,9 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(def) == 0) { return "null"; }
         let dp = str_split(def, "|");
         if (len(dp) < 6) { return "null"; }
-        let path = lsp_uri_to_path(uri);
-        let loc = lsp_location_json(path, api_atoi(dp[0] as string), api_atoi(dp[1] as string),
-                                    api_atoi(dp[2] as string), api_atoi(dp[3] as string));
+        // 跨模块：def 行号是 combined 坐标 → 映射回定义所在模块的真实路径与模块内行号
+        let loc = lsp_combined_loc_json(api_atoi(dp[0] as string), api_atoi(dp[1] as string),
+                                        api_atoi(dp[2] as string), api_atoi(dp[3] as string));
         return loc;
     }
     // references
@@ -1017,7 +1073,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
             let hc = api_atoi(hp[1] as string);
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
-            parts = array_push(parts, lsp_location_json(lsp_uri_to_path(uri), hl, hc, hl, hc + 1));
+            // 跨模块：引用行号是 combined 坐标 → 映射回引用所在模块的真实路径与模块内行号
+            let hloc = lsp_combined_loc_json(hl, hc, hl, hc + 1);
+            if (len(hloc) > 0) {
+                parts = array_push(parts, hloc);
+            } else {
+                parts = array_push(parts, lsp_location_json(lsp_uri_to_path(uri), hl, hc, hl, hc + 1));
+            }
             i = i + 1;
         }
         parts = array_push(parts, "]");
@@ -1043,9 +1105,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
             let hc = api_atoi(hp[1] as string);
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
-            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(hl - 1) +
+            // 跨模块：引用行号是 combined 坐标 → 换算为所属模块内行号（0-based）
+            let il = lsp_combined_to_inner(hl);
+            let base = hl - 1;
+            if (il > 0) { base = il - 1; }
+            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(base) +
                        ",\"character\":" + int_to_str(hc - 1) +
-                       "},\"end\":{\"line\":" + int_to_str(hl - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(base) +
                        ",\"character\":" + int_to_str(hc) + "}}}";
             parts = array_push(parts, item);
             i = i + 1;
@@ -1155,9 +1221,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
             let hc = api_atoi(hp[1] as string);
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
-            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(hl - 1) +
+            // 跨模块：引用行号是 combined 坐标 → 换算为所属模块内行号（0-based）
+            let il = lsp_combined_to_inner(hl);
+            let base = hl - 1;
+            if (il > 0) { base = il - 1; }
+            let item = "{\"range\":{\"start\":{\"line\":" + int_to_str(base) +
                        ",\"character\":" + int_to_str(hc - 1) +
-                       "},\"end\":{\"line\":" + int_to_str(hl - 1) +
+                       "},\"end\":{\"line\":" + int_to_str(base) +
                        ",\"character\":" + int_to_str(hc) + "}}}";
             parts = array_push(parts, item);
             i = i + 1;
