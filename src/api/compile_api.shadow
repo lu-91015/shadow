@@ -372,9 +372,7 @@ pub kimo api_check(source: string, file: string) -> int {
     api_tc_raw = [];
     api_err_count = 0;
     api_ok = 0;
-    // 严格态由 `--strict` CLI 标志触发（Phase 15）；dsb 行恢复纯 `dsb <name>;` 语义，不承载 strict 关键字。
-    // LSP/API 单文件场景默认兼容态；如需严格态由调用方显式 tc_set_strict(1)。
-    tc_set_strict(0);
+    // 0.5 恒严格态：无兼容态可选，dsb 行为纯 `dsb <name>;` 语义（不承载 strict 关键字）。
     // lex + parse（收集模式）
     ps_set_fatal_mode(0);
     ps_reset_diags();
@@ -392,14 +390,9 @@ pub kimo api_check(source: string, file: string) -> int {
     }
     if (np > 0) { api_stage = 1; }
     // TC（收集模式）——即使 parse 有错也跑（0.3：语法错误下返回部分 AST，TC 容错）
-    // Phase 15 严格态：tc_is_strict() 由调用方显式设置（--strict 或 LSP 配置）；否则兼容入口
+    // 0.5：唯一入口 tc_check_program（恒严格态）
     tc_begin_collect();
-    let n_errs = 0;
-    if (tc_is_strict() == 1) {
-        n_errs = tc_check_program_strict(prog);
-    } else {
-        n_errs = tc_check_program(prog);
-    }
+    let n_errs = tc_check_program(prog);
     api_tc_raw = tc_end_collect();
     let tc_rngs = tc_collected_ranges();
     let nt = len(api_tc_raw);

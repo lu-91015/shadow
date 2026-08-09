@@ -81,7 +81,10 @@ let main_resolved: array<string> = [];       // 一次 import 解析出的文件
 let main_resolved_roots: array<string> = []; // 与 main_resolved 平行：每个文件的 project_root
 let main_resolved_ns: array<string> = [];    // 与 main_resolved 平行：命名空间覆盖（dep/SPK 场景，空=由 key 派生）
 let main_import_err: string = "";            // 解析错误消息（非空即失败）
-let main_g_strict: int = 1;                     // 0.5 恒严格态（本地开关；TC 注册前不能调 tc_is_strict）
+// §3.7 债务①：兼容/严格双轨已删除，0.5 恒严格态，不再有 main_g_strict 开关。
+// Phase 11 .lu 函数级增量缓存在严格态下必须禁用（私有符号 mangle 改写不可跳过），
+// 用独立门控保留缓存代码路径（这是性能开关，不是语义双轨）；缓存支持 mangle 后置 1 复活。
+let main_g_lu_cache: int = 0;
 
 // L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
 // 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
@@ -748,13 +751,9 @@ kimo main_dsb_of(src: string) -> string {
 // （依赖内容跟在调用者之后；0.3 声明收集无顺序问题，TC Pass1 先收集再检查）。
 // 循环检测：path_stack 命中 → 报 circular；compiled 命中 → 跳过（菱形依赖合法）。
 kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_override: string) -> int {
-    if (main_in_path_stack(key) == 1) {
-        // §3.9 Java 规则：循环 import 允许（a↔b 互相引用合法；禁的是循环*继承*）。
-        // 自举/兼容态保留 circular import detected 以暴露设计问题。
-        if (main_g_strict == 1) { return 1; }
-        main_import_err = "circular import detected: " + key;
-        return 0;
-    }
+    // §3.9 Java 规则：循环 import 允许（a↔b 互相引用合法；禁的是循环*继承*）。
+    // 0.5 恒严格态 → 命中 DFS 路径栈直接视为已处理返回成功，不再报 circular import。
+    if (main_in_path_stack(key) == 1) { return 1; }
     if (main_in_compiled(key) == 1) { return 1; }
     main_path_stack = array_push(main_path_stack, key);
     // §3.8 记录本文件所属命名空间及其起始行。
@@ -772,24 +771,17 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_ov
     // 0.5 严格态 dep/SPK：命名空间覆盖为 import 路径（mylib._helper），
     // 文件读取仍用相对 project_root 的实际路径（key）——两者分离。
     if (len(ns_override) > 0) { my_ns = ns_override; }
-    if (main_g_strict == 0) {
-        let my_dsb = main_dsb_of(src);
-        if (len(my_dsb) > 0 && str_eq(my_dsb, my_ns) == 0) {
-            tc_mod_dsb_alias = array_push(tc_mod_dsb_alias, my_dsb);
-            tc_mod_dsb_path = array_push(tc_mod_dsb_path, my_ns);
-        }
-    }
+    // 注：原兼容态在此记录「dsb 名 → 路径名」别名映射（tc_mod_dsb_alias/path），
+    // 严格态下 dsb 必须 == basename，别名恒为空 → 该分支已随双轨一并删除。
     main_record_mod(my_ns);
-    // §3.9 Java 规则：dsb 必须 == 文件 basename（不含 .shadow），仅严格态强制。
+    // §3.9 Java 规则：dsb 必须 == 文件 basename（不含 .shadow）。
     // 对应 Java「class 名 == 文件名」，包（命名空间）由目录路径自动派生。
-    if (main_g_strict == 1) {
-        let d = main_dsb_of(src);
-        if (len(d) > 0) {
-            let bnm = main_basename_of(key);
-            if (str_eq(d, bnm) == 0) {
-                main_import_err = "dsb '" + d + "' does not match file name '" + bnm + "' (expected 'dsb " + bnm + ";' for " + full + ")";
-                return 0;
-            }
+    let d = main_dsb_of(src);
+    if (len(d) > 0) {
+        let bnm = main_basename_of(key);
+        if (str_eq(d, bnm) == 0) {
+            main_import_err = "dsb '" + d + "' does not match file name '" + bnm + "' (expected 'dsb " + bnm + ";' for " + full + ")";
+            return 0;
         }
     }
     // Phase 11：记录模块源码全文与路径（.lu 缓存 hash 用；与 tc_mod_ns 平行）
@@ -1171,7 +1163,7 @@ kimo main_cache_setup() -> any {
         qi = qi + 1;
     }
     tc_set_valid_ns([]);
-    if (main_g_strict == 1) { return queues; }   // 严格态：缓存禁用（mangle 改写不可跳过）
+    if (main_g_lu_cache == 0) { return queues; }   // 严格态：.lu 缓存禁用（mangle 改写不可跳过）
     // dir_create → CreateDirectoryA 只建**单层**，父目录缺失会静默失败。
     // 0.4 自身仓库恰好已有 build/，掩盖了这点；用户新工程首次编译会拿不到缓存目录。
     dir_create("build");
@@ -1262,7 +1254,7 @@ kimo main_take_cached_mir(idx: int, queues: any, cpos: array<int>) -> MirFunc {
 
 // 编译结束：对 src/ 下缓存未命中的模块写 .lu（下一次编译命中）
 kimo main_lu_store(new_mirs: any, new_globs: any) -> void {
-    if (main_g_strict == 1) { return; }
+    if (main_g_lu_cache == 0) { return; }
     let si = 0;
     while (si < len(tc_mod_ns)) {
         let need = 0;
@@ -1300,13 +1292,8 @@ kimo main_compile_source(source: string, file: string) -> string {
     // 这些追加函数没有 .lu 缓存 MIR，若按模块缓存命中走 use_cache 会取到队列里别的函数
     // 的 MIR → 定义丢失（IR 只有 declare 无 define → link undefined / add ptr 等）。
     let n_funcs_pre_tc = len(prog.funcs);
-    // Phase 15 严格态：由 `--strict` CLI 标志触发（tc_set_strict 在参数解析阶段设置）；否则兼容入口
-    let n_errs = 0;
-    if (main_g_strict == 1) {
-        n_errs = tc_check_program_strict(prog);
-    } else {
-        n_errs = tc_check_program(prog);
-    }
+    // 0.5：唯一类型检查入口（恒严格态，无兼容分支）
+    let n_errs = tc_check_program(prog);
     let t3 = c_clock();
     if (n_errs > 0) {
         return "";

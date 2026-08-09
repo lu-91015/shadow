@@ -176,33 +176,16 @@ pub kimo tc_node_lookup_alias(node: ModuleNode, reg_name: string) -> TypeAlias {
     return z;
 }
 
+// 0.5 恒严格态：只做精确名匹配。原兼容态的 __mod_<mod>__<name> 回退轮已删除
+//（回退会让 A 模块的 private fn 被 B 模块裸名命中，跨模块可见性失守）。
 pub kimo tc_node_lookup_func(node: ModuleNode, reg_name: string) -> FuncDef {
-    let ci = 0;
-    while (ci < 2) {
-        let cname = reg_name;
-        if (ci == 1) {
-            // 兼容态回退：pub 函数跨模块同名冲突方注册为 __mod_<mod>__<name>，模块内裸名
-            // 引用经此命中。严格态严禁回退（私有符号跨模块不可见，回退会泄露 priv_fn）。
-            if (tc_is_strict() == 1) { break; }
-            if (len(node.module_name) == 0) { break; }
-            cname = tc_mangle_private(node.module_name, reg_name);
+    let i = 0;
+    while (i < len(node.func_names)) {
+        let n = node.func_names[i] as string;
+        if (str_eq(n, reg_name) == 1) {
+            return node.func_defs[i] as FuncDef;
         }
-        let i = 0;
-        while (i < len(node.func_names)) {
-            let n = node.func_names[i] as string;
-            if (str_eq(n, cname) == 1) {
-                let cand = node.func_defs[i] as FuncDef;
-                // 回退轮只认「因跨模块同名冲突被 mangle 的 pub 函数」。
-                // 兼容态注册阶段 current_module 恒为主模块，**所有**模块的私有函数
-                // 都注册成 __mod_<主模块>__<name>，与回退名撞形 → 若不加 is_pub 过滤，
-                // A 模块的 private fn 会被 B 模块裸名引用命中，跨模块可见性彻底失守
-                // （tc-fail_pub_priv_* 等负例全部变成 rc==0）。
-                if (ci == 1 && cand.is_pub == 0) { i = i + 1; continue; }
-                return cand;
-            }
-            i = i + 1;
-        }
-        ci = ci + 1;
+        i = i + 1;
     }
     let z = 0 as FuncDef;
     return z;
@@ -221,34 +204,19 @@ pub kimo tc_node_lookup_trait(node: ModuleNode, reg_name: string) -> TraitDef {
     return z;
 }
 
-// 全局变量查找：require_pub=1 时只匹配 pub。先精确名，再试模块 mangle 名
-//（pub let 跨模块同名冲突方注册为 __mod_<mod>__<name>；模块内裸名引用经此回退命中）。
+// 全局变量查找：require_pub=1 时只匹配 pub。0.5 恒严格态 → 只做精确名匹配，
+// 原兼容态的 __mod_<mod>__<name> 回退轮已删除（否则跨模块私有 let 会被裸名泄露）。
 pub kimo tc_node_lookup_global(node: ModuleNode, name: string, require_pub: int) -> GlobalVar {
-    let ci = 0;
-    while (ci < 2) {
-        let cname = name;
-        if (ci == 1) {
-            // 兼容态回退：pub let 跨模块同名冲突方注册为 __mod_<mod>__<name>，模块内裸名
-            // 引用经此命中。严格态严禁回退（私有全局跨模块不可见）。
-            if (tc_is_strict() == 1) { break; }
-            if (len(node.module_name) == 0) { break; }
-            cname = tc_mangle_private(node.module_name, name);
-        }
-        let i = 0;
-        while (i < len(node.global_names)) {
-            let n = node.global_names[i] as string;
-            if (str_eq(n, cname) == 1) {
-                // 回退轮同 tc_node_lookup_func：只认冲突 mangle 的 pub 全局，
-                // 否则跨模块私有 let 会被裸名引用泄露（tcf_pub_let_private_import）。
-                if (ci == 1 && node.global_pubs[i] == 0) { i = i + 1; continue; }
-                if (require_pub == 0 || node.global_pubs[i] == 1) {
-                    let g = GlobalVar { name: cname, type_ref: node.global_types[i], init: 0 as Expr, loc: mk_loc("", 0, 0), is_pub: node.global_pubs[i], is_mut: 0 };
-                    return g;
-                }
+    let i = 0;
+    while (i < len(node.global_names)) {
+        let n = node.global_names[i] as string;
+        if (str_eq(n, name) == 1) {
+            if (require_pub == 0 || node.global_pubs[i] == 1) {
+                let g = GlobalVar { name: name, type_ref: node.global_types[i], init: 0 as Expr, loc: mk_loc("", 0, 0), is_pub: node.global_pubs[i], is_mut: 0 };
+                return g;
             }
-            i = i + 1;
         }
-        ci = ci + 1;
+        i = i + 1;
     }
     let z = 0 as GlobalVar;
     return z;
@@ -317,33 +285,31 @@ pub kimo tc_mg_lookup_struct(ctx: CompileContext, name: string) -> StructDef {
         let r2 = tc_node_lookup_struct(cur, name);
         if (tc_struct_is_none(r2) == 0) { return r2; }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub struct（mangled 名查找）
-        let owners: array<string> = [];
-        let found = 0 as StructDef;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                let mname = tc_mangle_private(owner, name);
-                let gnode2 = tc_mg_node_for(ctx, owner);
-                let gres = 0 as StructDef;
-                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_struct(gnode2, mname); }
-                if (tc_struct_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
-                    if (tc_struct_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
-                }
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub struct（mangled 名查找）
+    let owners: array<string> = [];
+    let found = 0 as StructDef;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            let mname = tc_mangle_private(owner, name);
+            let gnode2 = tc_mg_node_for(ctx, owner);
+            let gres = 0 as StructDef;
+            if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_struct(gnode2, mname); }
+            if (tc_struct_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                if (tc_struct_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
             }
-            mi = mi + 1;
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as StructDef;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as StructDef;
+        return z;
+    }
+    return found;
     // 全局 pub 回退
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
@@ -388,40 +354,38 @@ pub kimo tc_mg_lookup_enum(ctx: CompileContext, name: string) -> EnumDef {
     }
     // 0.5 多 node：prelude（Option/Result 内置类型）注册为裸名、不在 tc_g_mod_ns，
     // 严格态循环遍历不到 → 单独查 prelude node（tc_visible_from 白名单已放行）。
-    if (ctx.strict == 1 && tc_visible_from(ctx.current_module, "prelude") == 1) {
+    if (tc_visible_from(ctx.current_module, "prelude") == 1) {
         let pnode = tc_mg_node_for(ctx, "prelude");
         if (tc_node_is_none(pnode) == 0) {
             let pr = tc_node_lookup_enum(pnode, name);
             if (tc_enum_is_none(pr) == 0) { return pr; }
         }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub enum（mangled 名查找）
-        let owners: array<string> = [];
-        let found = 0 as EnumDef;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                let mname = tc_mangle_private(owner, name);
-                let gnode2 = tc_mg_node_for(ctx, owner);
-                let gres = 0 as EnumDef;
-                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_enum(gnode2, mname); }
-                if (tc_enum_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
-                    if (tc_enum_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
-                }
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub enum（mangled 名查找）
+    let owners: array<string> = [];
+    let found = 0 as EnumDef;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            let mname = tc_mangle_private(owner, name);
+            let gnode2 = tc_mg_node_for(ctx, owner);
+            let gres = 0 as EnumDef;
+            if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_enum(gnode2, mname); }
+            if (tc_enum_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                if (tc_enum_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
             }
-            mi = mi + 1;
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as EnumDef;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as EnumDef;
+        return z;
+    }
+    return found;
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
         let gnode = ctx.graph.nodes[gi] as ModuleNode;
@@ -463,33 +427,31 @@ pub kimo tc_mg_lookup_alias(ctx: CompileContext, name: string) -> TypeAlias {
         let r2 = tc_node_lookup_alias(cur, name);
         if (tc_alias_is_none(r2) == 0) { return r2; }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub alias（mangled 名查找）
-        let owners: array<string> = [];
-        let found = 0 as TypeAlias;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                let mname = tc_mangle_private(owner, name);
-                let gnode2 = tc_mg_node_for(ctx, owner);
-                let gres = 0 as TypeAlias;
-                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_alias(gnode2, mname); }
-                if (tc_alias_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
-                    if (tc_alias_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
-                }
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub alias（mangled 名查找）
+    let owners: array<string> = [];
+    let found = 0 as TypeAlias;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            let mname = tc_mangle_private(owner, name);
+            let gnode2 = tc_mg_node_for(ctx, owner);
+            let gres = 0 as TypeAlias;
+            if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_alias(gnode2, mname); }
+            if (tc_alias_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                if (tc_alias_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
             }
-            mi = mi + 1;
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as TypeAlias;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as TypeAlias;
+        return z;
+    }
+    return found;
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
         let gnode = ctx.graph.nodes[gi] as ModuleNode;
@@ -533,68 +495,47 @@ pub kimo tc_mg_lookup_func(ctx: CompileContext, name: string) -> FuncDef {
             // 兼容态：裸名命中的是「先注册者」。若该名进过 pub 冲突名单，说明还有
             // 别的模块导出同名 pub（已被 mangle），此处必须报 ambiguous 而不是静默取第一个。
             // 名单通常为空 → tc_pub_conflict_has 立即返回 0，热路径无额外开销。
-            if (ctx.strict == 0 && tc_pub_conflict_has(name) == 1) {
-                let cowners: array<string> = [];
-                cowners = array_push(cowners, tc_module_of_line(ctx, r2.loc.line));
-                let cmj = 0;
-                while (cmj < len(ctx.mod_ns)) {
-                    let cown = ctx.mod_ns[cmj] as string;
-                    let ccand = tc_node_lookup_func(cur, tc_mangle_private(cown, name));
-                    if (tc_func_is_none(ccand) == 0 && ccand.is_pub == 1) {
-                        cowners = array_push(cowners, cown);
-                    }
-                    cmj = cmj + 1;
-                }
-                if (len(cowners) > 1) {
-                    tc_g_ambig_name = name;
-                    tc_g_ambig_mods = cowners;
-                    let zc = 0 as FuncDef;
-                    return zc;
-                }
-            }
             return r2;
         }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub 符号（mangled 名查找）。
-        // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous，绝不静默取第一个。
-        let owners: array<string> = [];
-        let found = 0 as FuncDef;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                // 豁免名（rt_/shadow_/extern/main/__impl__）注册保持原名 → 裸名查；
-                // 其余按模块 mangle 查。
-                let mname = name;
-                if (tc_is_exempt_name(name) == 0) { mname = tc_mangle_private(owner, name); }
-                let gnode2 = tc_mg_node_for(ctx, owner);
-                let gres = 0 as FuncDef;
-                if (tc_node_is_none(gnode2) == 0) {
-                    gres = tc_node_lookup_func(gnode2, mname);
-                    // extern 函数豁免 mangle（注册保持原名）但名字无 rt_/shadow_ 前缀，
-                    // tc_is_exempt_name 判不出 → mangle 查不到 → 裸名兜底一次
-                    // （env_get 等 @extern 声明）。
-                    if (tc_func_is_none(gres) == 1 && tc_is_exempt_name(name) == 0) {
-                        let gres2 = tc_node_lookup_func(gnode2, name);
-                        if (tc_func_is_none(gres2) == 0 && len(gres2.extern_name) > 0) { gres = gres2; }
-                    }
-                }
-                if (tc_func_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1 || tc_is_exempt_name(name) == 1 || len(gres.extern_name) > 0)) {
-                    if (tc_func_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub 符号（mangled 名查找）。
+    // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous，绝不静默取第一个。
+    let owners: array<string> = [];
+    let found = 0 as FuncDef;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            // 豁免名（rt_/shadow_/extern/main/__impl__）注册保持原名 → 裸名查；
+            // 其余按模块 mangle 查。
+            let mname = name;
+            if (tc_is_exempt_name(name) == 0) { mname = tc_mangle_private(owner, name); }
+            let gnode2 = tc_mg_node_for(ctx, owner);
+            let gres = 0 as FuncDef;
+            if (tc_node_is_none(gnode2) == 0) {
+                gres = tc_node_lookup_func(gnode2, mname);
+                // extern 函数豁免 mangle（注册保持原名）但名字无 rt_/shadow_ 前缀，
+                // tc_is_exempt_name 判不出 → mangle 查不到 → 裸名兜底一次
+                // （env_get 等 @extern 声明）。
+                if (tc_func_is_none(gres) == 1 && tc_is_exempt_name(name) == 0) {
+                    let gres2 = tc_node_lookup_func(gnode2, name);
+                    if (tc_func_is_none(gres2) == 0 && len(gres2.extern_name) > 0) { gres = gres2; }
                 }
             }
-            mi = mi + 1;
+            if (tc_func_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1 || tc_is_exempt_name(name) == 1 || len(gres.extern_name) > 0)) {
+                if (tc_func_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
+            }
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as FuncDef;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as FuncDef;
+        return z;
+    }
+    return found;
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
         let gnode = ctx.graph.nodes[gi] as ModuleNode;
@@ -636,33 +577,31 @@ pub kimo tc_mg_lookup_trait(ctx: CompileContext, name: string) -> TraitDef {
         let r2 = tc_node_lookup_trait(cur, name);
         if (tc_trait_is_none(r2) == 0) { return r2; }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub trait（mangled 名查找）
-        let owners: array<string> = [];
-        let found = 0 as TraitDef;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                let mname = tc_mangle_private(owner, name);
-                let gnode2 = tc_mg_node_for(ctx, owner);
-                let gres = 0 as TraitDef;
-                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_trait(gnode2, mname); }
-                if (tc_trait_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
-                    if (tc_trait_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
-                }
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub trait（mangled 名查找）
+    let owners: array<string> = [];
+    let found = 0 as TraitDef;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            let mname = tc_mangle_private(owner, name);
+            let gnode2 = tc_mg_node_for(ctx, owner);
+            let gres = 0 as TraitDef;
+            if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_trait(gnode2, mname); }
+            if (tc_trait_is_none(gres) == 0 && (gres.is_pub == 1 || tc_same_pkg(ctx.current_module, owner) == 1)) {
+                if (tc_trait_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
             }
-            mi = mi + 1;
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as TraitDef;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as TraitDef;
+        return z;
+    }
+    return found;
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
         let gnode = ctx.graph.nodes[gi] as ModuleNode;
@@ -723,41 +662,39 @@ pub kimo tc_mg_lookup_global(ctx: CompileContext, name: string) -> GlobalVar {
         let r2 = tc_node_lookup_global(cur, name, 0);
         if (tc_global_is_none(r2) == 0) { return r2; }
     }
-    if (ctx.strict == 1) {
-        // 严格态：只按「当前模块显式 import 的模块」解析 pub 全局（mangled 名查找）。
-        // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous。
-        let owners: array<string> = [];
-        let found = 0 as GlobalVar;
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let owner = tc_g_mod_ns[mi] as string;
-            if (tc_visible_from(ctx.current_module, owner) == 1) {
-                // 豁免名（rt_/shadow_ 全局）注册保持原名 → 裸名查且不过滤 pub；
-                // 其余按模块 mangle 查 pub。
-                let gres = 0 as GlobalVar;
-                if (tc_is_exempt_name(name) == 1) {
-                    let gnode2 = tc_mg_node_for(ctx, owner);
-                    if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_global(gnode2, name, 0); }
-                } else {
-                    let mname = tc_mangle_private(owner, name);
-                    let gnode2 = tc_mg_node_for(ctx, owner);
-                    if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_global(gnode2, mname, 1); }
-                }
-                if (tc_global_is_none(gres) == 0) {
-                    if (tc_global_is_none(found) == 1) { found = gres; }
-                    owners = array_push(owners, owner);
-                }
+    // 严格态：只按「当前模块显式 import 的模块」解析 pub 全局（mangled 名查找）。
+    // Java 通配符导入语义：2+ 候选 → 使用处 ambiguous。
+    let owners: array<string> = [];
+    let found = 0 as GlobalVar;
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let owner = tc_g_mod_ns[mi] as string;
+        if (tc_visible_from(ctx.current_module, owner) == 1) {
+            // 豁免名（rt_/shadow_ 全局）注册保持原名 → 裸名查且不过滤 pub；
+            // 其余按模块 mangle 查 pub。
+            let gres = 0 as GlobalVar;
+            if (tc_is_exempt_name(name) == 1) {
+                let gnode2 = tc_mg_node_for(ctx, owner);
+                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_global(gnode2, name, 0); }
+            } else {
+                let mname = tc_mangle_private(owner, name);
+                let gnode2 = tc_mg_node_for(ctx, owner);
+                if (tc_node_is_none(gnode2) == 0) { gres = tc_node_lookup_global(gnode2, mname, 1); }
             }
-            mi = mi + 1;
+            if (tc_global_is_none(gres) == 0) {
+                if (tc_global_is_none(found) == 1) { found = gres; }
+                owners = array_push(owners, owner);
+            }
         }
-        if (len(owners) > 1) {
-            tc_g_ambig_name = name;
-            tc_g_ambig_mods = owners;
-            let z = 0 as GlobalVar;
-            return z;
-        }
-        return found;
+        mi = mi + 1;
     }
+    if (len(owners) > 1) {
+        tc_g_ambig_name = name;
+        tc_g_ambig_mods = owners;
+        let z = 0 as GlobalVar;
+        return z;
+    }
+    return found;
     let gi = 0;
     while (gi < len(ctx.graph.nodes)) {
         let gnode = ctx.graph.nodes[gi] as ModuleNode;
@@ -1122,12 +1059,11 @@ pub kimo tc_dsb_to_path(ctx: CompileContext, ns: string) -> string {
 }
 
 // ============ 严格态（0.5 唯一路径）基础设施 ============
-// 0.5 删除兼容态：严格态是唯一模式，开关恒为 1。
-// tc_set_strict 保留接受参数（main.shadow 解析 --strict 时调用），但恒等 1 不受影响；
-// tc_is_strict() 恒返回 1，各调用点（main.shadow/compile_api.shadow）自动走严格态分支。
-let tc_g_strict: int = 1;
-pub kimo tc_set_strict(v: int) -> void { tc_g_strict = v; if (tc_g_strict == 0) { tc_g_strict = 1; } }
-pub kimo tc_is_strict() -> int { return tc_g_strict; }
+// §3.7 债务①已收口：兼容态双轨彻底删除，严格态是唯一模式，不存在运行期开关。
+// tc_set_strict 退化为 no-op，仅为向后兼容 `--strict` CLI 标志与测试 //@args 保留；
+// tc_is_strict() 恒返回 1（保留供外部/LSP 探测语义模式）。
+pub kimo tc_set_strict(v: int) -> void { let ignored = v; }
+pub kimo tc_is_strict() -> int { return 1; }
 
 // Phase 11 函数级增量缓存：缓存命中的模块（源码 hash 匹配 .lu）→ 跳过其函数体检查。
 // 由 loader（main.shadow）在编译前注入；每次编译开始重置（LSP/API 多文档安全）。
@@ -1136,7 +1072,7 @@ pub kimo tc_set_valid_ns(list: array<string>) -> void { tc_g_valid_ns = list; }
 
 // 函数所在行所属模块是否在缓存命中集合内（兼容态才启用；严格态缓存禁用恒 false）
 pub kimo tc_ns_is_valid(ctx: CompileContext, line: int) -> int {
-    if (ctx.strict == 1) { return 0; }
+    return 0;
     let ns = tc_module_of_line(ctx, line);
     if (len(ns) == 0) { return 0; }
     let i = 0;
@@ -1279,21 +1215,6 @@ pub kimo tc_visible_from(cur_ns: string, owner_ns: string) -> int {
 
 // 计算符号的注册名（含严格态模块前缀）。exempt=1 表示 extern/main/__impl__ 等不 mangle。
 pub kimo tc_reg_name_for(ctx: CompileContext, name: string, line: int, is_pub: int, exempt: int) -> string {
-    if (ctx.strict == 0) {
-        // 兼容态私有符号按【所属模块】（按行号定位）加前缀，而非 ctx.current_module（主模块）。
-        // 用主模块前缀会让所有模块的私有符号塌进同一命名空间：
-        //   ① 被 import 模块的私有函数/类型可被主模块裸名引用（tc-fail_pub_priv_* 全部失守）；
-        //   ② 主模块私有 add 与被 import 模块 pub add 争抢同一符号（tc_module_namespace_local）。
-        // 0.3 参照实现即按所属模块 mangle（__mod_<mod>__<name>）。
-        if (is_pub == 0 && exempt == 0) {
-            // mod_starts/mod_ns 为空（LSP/API 直传单 Program，未经 main 的模块收集）时
-            // tc_module_of_line 返回 ""，退回 current_module 保持旧行为，避免 __mod____name。
-            let owner = tc_module_of_line(ctx, line);
-            if (len(owner) == 0) { owner = ctx.current_module; }
-            return tc_mangle_private(owner, name);
-        }
-        return name;
-    }
     if (exempt == 1) { return name; }
     let mod = tc_module_of_line(ctx, line);
     return tc_mangle_private(mod, name);
@@ -1302,7 +1223,6 @@ pub kimo tc_reg_name_for(ctx: CompileContext, name: string, line: int, is_pub: i
 // 严格态类型名归一：裸类型名 → 注册名（mangled）。非 strict / FQN 原样返回。
 // 供 tc_resolve_type / tc_resolve_type_name 统一改写 Type.name（等价 Java FQN 符号表）。
 pub kimo tc_strict_resolve_name(ctx: CompileContext, name: string) -> string {
-    if (ctx.strict == 0) { return name; }
     if (tc_has_dot(name) == 1) { return name; }   // FQN 交给 FQN 分支
     let sd = tc_mg_lookup_struct(ctx, name);
     if (tc_struct_is_none(sd) == 0) { return sd.name; }
@@ -1315,7 +1235,6 @@ pub kimo tc_strict_resolve_name(ctx: CompileContext, name: string) -> string {
 
 // 全局 pub 回退的可见性判定（严格态按 import 作用域）。返回是否可作为候选。
 pub kimo tc_candidate_ok(ctx: CompileContext, gres_line: int, is_pub: int, cur_ns: string) -> int {
-    if (ctx.strict == 0) { return is_pub; }
     if (is_pub == 0) { return 0; }   // 私有跨包不可见
     let owner = tc_module_of_line(ctx, gres_line);
     return tc_visible_from(cur_ns, owner);
@@ -1464,7 +1383,7 @@ pub kimo tc_type_compat(ctx: CompileContext, declared: Type, actual: Type) -> in
     if (d_named == 1 && a_named == 1 && str_eq(declared.name, actual.name) == 1) { return 1; }
     // 0.5 严格态兜底：裸名 vs mangled 同名失配（mk_named_type(TYPE_STRUCT,"Type") 构造的
     // 裸名类型 vs tc_resolve_type 后的 __mod_<mod>__Type）。把裸名侧 resolve 后重比。
-    if (ctx.strict == 1 && d_named == 1 && a_named == 1 && str_eq(declared.name, actual.name) == 0) {
+    if (d_named == 1 && a_named == 1 && str_eq(declared.name, actual.name) == 0) {
         let dr = tc_strict_resolve_name(ctx, declared.name);
         if (str_eq(dr, actual.name) == 1) { return 1; }
         let ar = tc_strict_resolve_name(ctx, actual.name);
@@ -1688,14 +1607,14 @@ pub kimo tc_resolve_type_name(ctx: CompileContext, name: string) -> Type {
         // §3.8：FQN 写法 a.b.C 解析后回落为裸名，保持 codegen 侧符号不变
         // 严格态：直接用注册名（mangled），保证 Type.name 与定义一致
         let nm = name;
-        if (tc_has_dot(nm) == 1 || ctx.strict == 1) { nm = sd.name; }
+        nm = sd.name;
         let t = mk_named_type(TYPE_STRUCT, nm);
         return t;
     }
     let ed = tc_mg_lookup_enum(ctx, name);
     if (tc_enum_is_none(ed) == 0) {
         let en = name;
-        if (tc_has_dot(en) == 1 || ctx.strict == 1) { en = ed.name; }
+        en = ed.name;
         return tc_enum_type_for(ctx, en);
     }
     return type_none_inner();
@@ -1877,7 +1796,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, sd.loc.line));
         let reg_name = tc_reg_name_for(ctx, sd.name, sd.loc.line, sd.is_pub, 0);
-        if (ctx.strict == 1) { sd.name = reg_name; }
+        sd.name = reg_name;
         // 0.5：字段类型 resolve 移至注册后独立 pass（tc_resolve_all_field_types）——
         // 注册循环内 resolve 有顺序问题（Node 先于 Expr 注册时 Expr 尚不可查）。
         let sdup = tc_node_lookup_struct(node, reg_name);
@@ -1898,7 +1817,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, ed.loc.line));
         let reg_name = tc_reg_name_for(ctx, ed.name, ed.loc.line, ed.is_pub, 0);
-        if (ctx.strict == 1) { ed.name = reg_name; }
+        ed.name = reg_name;
         // 0.5：enum payload 类型 resolve 移至注册后独立 pass（同 struct）
         let edup = tc_node_lookup_enum(node, reg_name);
         if (tc_enum_is_none(edup) == 0) {
@@ -1918,7 +1837,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, ta.loc.line));
         let reg_name = tc_reg_name_for(ctx, ta.name, ta.loc.line, ta.is_pub, 0);
-        if (ctx.strict == 1) { ta.name = reg_name; }
+        ta.name = reg_name;
         let adup = tc_node_lookup_alias(node, reg_name);
         if (tc_alias_is_none(adup) == 0) {
             let msg = "redefinition of type alias '" + ta.name + "' in module '" + mod_name + "'";
@@ -1937,7 +1856,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, td.loc.line));
         let reg_name = tc_reg_name_for(ctx, td.name, td.loc.line, td.is_pub, 0);
-        if (ctx.strict == 1) { td.name = reg_name; }
+        td.name = reg_name;
         let tdup = tc_node_lookup_trait(node, reg_name);
         if (tc_trait_is_none(tdup) == 0) {
             let msg = "redefinition of trait '" + td.name + "' in module '" + mod_name + "'";
@@ -1982,23 +1901,21 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         fd.name = reg_name;
         // 严格态：预先归一函数签名类型（参数/返回，按函数所属模块作用域）。
         // 必须在注册时完成——调用点（如 recv.method() 分发）可能在函数体检查之前解析参数类型。
-        if (ctx.strict == 1) {
-            // 关键：register_decls 里所有 push 都在局部 node，末尾才回写 ctx.cur_node——
-            // 此处必须先接上，否则签名 resolve 的 lookup 看不到已注册的 structs/enums
-            ctx.cur_node = node;
-            let saved_mod = ctx.current_module;
-            ctx.current_module = tc_module_of_line(ctx, fd.loc.line);
-            let rpi = 0;
-            while (rpi < len(fd.params)) {
-                // Param 是值类型：必须直接写数组元素，局部变量修改不传播
-                let rp = fd.params[rpi] as Param;
-                let rpt = tc_resolve_type(ctx, rp.type_ref);
-                fd.params[rpi].type_ref = rpt;
-                rpi = rpi + 1;
-            }
-            fd.return_type = tc_resolve_type(ctx, fd.return_type);
-            ctx.current_module = saved_mod;
+        // 关键：register_decls 里所有 push 都在局部 node，末尾才回写 ctx.cur_node——
+        // 此处必须先接上，否则签名 resolve 的 lookup 看不到已注册的 structs/enums
+        ctx.cur_node = node;
+        let saved_mod = ctx.current_module;
+        ctx.current_module = tc_module_of_line(ctx, fd.loc.line);
+        let rpi = 0;
+        while (rpi < len(fd.params)) {
+            // Param 是值类型：必须直接写数组元素，局部变量修改不传播
+            let rp = fd.params[rpi] as Param;
+            let rpt = tc_resolve_type(ctx, rp.type_ref);
+            fd.params[rpi].type_ref = rpt;
+            rpi = rpi + 1;
         }
+        fd.return_type = tc_resolve_type(ctx, fd.return_type);
+        ctx.current_module = saved_mod;
         // 泛型函数：注册 pristine 模板
         if (len(fd.type_params) > 0) {
             ctx.mono_tmpl_names = array_push(ctx.mono_tmpl_names, reg_name);
@@ -2032,9 +1949,6 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
                         // 兼容态若冲突双方都是 pub：裸名被先注册者独占，后来者改名后
                         // 再无人能用裸名引用到它 → 静默取第一个，违反 0.3「ambiguous」语义。
                         // 记入冲突名单，由 tc_mg_lookup_func 在使用处报 ambiguous。
-                        if (ctx.strict == 0 && fd.is_pub == 1 && fdup.is_pub == 1) {
-                            tc_pub_conflict_add(orig_name);
-                        }
                         fd.name = mangled2;
                         node.func_names = array_push(node.func_names, mangled2);
                         node.func_defs = array_push(node.func_defs, fd);
@@ -2055,33 +1969,31 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, id.loc.line));
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
-        if (ctx.strict == 1) {
-            let old_type = id.type_name;
-            let old_trait = id.trait_name;
-            let sd2 = tc_mg_lookup_struct(ctx, id.type_name);
-            if (tc_struct_is_none(sd2) == 0) { id.type_name = sd2.name; }
-            if (len(id.trait_name) > 0) {
-                let td2 = tc_mg_lookup_trait(ctx, id.trait_name);
-                if (tc_trait_is_none(td2) == 0) { id.trait_name = td2.name; }
-            }
-            // 同步改写 trait impl 方法符号：__impl__<type>__<trait>__<method> 的两段
-            let mi2 = 0;
-            while (mi2 < len(id.methods)) {
-                let mf = id.methods[mi2] as FuncDef;
-                if (str_starts_with(mf.name, "__impl__") == 1) {
-                    let body = substr2(mf.name, 8, len(mf.name));   // 去掉 "__impl__"
-                    let d1 = str_index_of(body, "__");
-                    if (d1 >= 0) {
-                        let rest1 = substr2(body, d1 + 2, len(body));
-                        let d2 = str_index_of(rest1, "__");
-                        if (d2 >= 0) {
-                            let method_seg = substr2(rest1, d2 + 2, len(rest1));
-                            mf.name = "__impl__" + id.type_name + "__" + id.trait_name + "__" + method_seg;
-                        }
+        let old_type = id.type_name;
+        let old_trait = id.trait_name;
+        let sd2 = tc_mg_lookup_struct(ctx, id.type_name);
+        if (tc_struct_is_none(sd2) == 0) { id.type_name = sd2.name; }
+        if (len(id.trait_name) > 0) {
+            let td2 = tc_mg_lookup_trait(ctx, id.trait_name);
+            if (tc_trait_is_none(td2) == 0) { id.trait_name = td2.name; }
+        }
+        // 同步改写 trait impl 方法符号：__impl__<type>__<trait>__<method> 的两段
+        let mi2 = 0;
+        while (mi2 < len(id.methods)) {
+            let mf = id.methods[mi2] as FuncDef;
+            if (str_starts_with(mf.name, "__impl__") == 1) {
+                let body = substr2(mf.name, 8, len(mf.name));   // 去掉 "__impl__"
+                let d1 = str_index_of(body, "__");
+                if (d1 >= 0) {
+                    let rest1 = substr2(body, d1 + 2, len(body));
+                    let d2 = str_index_of(rest1, "__");
+                    if (d2 >= 0) {
+                        let method_seg = substr2(rest1, d2 + 2, len(rest1));
+                        mf.name = "__impl__" + id.type_name + "__" + id.trait_name + "__" + method_seg;
                     }
                 }
-                mi2 = mi2 + 1;
             }
+            mi2 = mi2 + 1;
         }
         let key = id.trait_name + "@@" + id.type_name;
         let idup = tc_node_lookup_impl(node, key);
@@ -2109,7 +2021,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         if (str_starts_with(gv.name, "rt_") == 1) { gexempt = 1; }
         if (str_starts_with(gv.name, "shadow_") == 1) { gexempt = 1; }
         let reg_name = gv.name;
-        if (ctx.strict == 1 && gexempt == 0) {
+        if (gexempt == 0) {
             let gmod = tc_module_of_line(ctx, gv.loc.line);
             reg_name = tc_mangle_private(gmod, gv.name);
             gv.name = reg_name;
@@ -5138,15 +5050,13 @@ pub kimo tc_check_function(ctx: CompileContext, fd: FuncDef) -> void {
     while (pi < len(fd.params)) {
         let p = fd.params[pi] as Param;
         let pt = p.type_ref;
-        if (ctx.strict == 1) { pt = tc_resolve_type(ctx, pt); fd.params[pi].type_ref = pt; }
-        else { pt = tc_normalize_enum_named(ctx, pt); }
+        pt = tc_resolve_type(ctx, pt);
+        fd.params[pi].type_ref = pt;
         tc_env_set(env, p.name, pt);
         pi = pi + 1;
     }
     // 严格态：返回类型归一为注册名
-    if (ctx.strict == 1) {
-        fd.return_type = tc_resolve_type(ctx, fd.return_type);
-    }
+    fd.return_type = tc_resolve_type(ctx, fd.return_type);
     // 逐语句检查
     let body = fd.body;
     let stmts = body.items;
@@ -5222,16 +5132,15 @@ pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
     return len(ctx.errors);
 }
 
-// 共享实现：strict=0 兼容态（物理拼接语义，历史行为），strict=1 严格态（命名空间隔离）。
-// 0.5 迭代时：删掉 tc_check_program 兼容入口，调用点全部改走 tc_check_program_strict。
-pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
+// 0.5 唯一类型检查入口：恒严格态（命名空间隔离、import 作用域、私有跨包不可见）。
+// 双轨（兼容态物理拼接语义）已于 §3.7 债务①彻底删除，不再有 mode 形参。
+pub kimo tc_check_program(prog: Program) -> int {
     // 初始化 ctx
     tc_g_closure_funcs = [];
     let ctx = CompileContext {
         cur_node: 0 as ModuleNode,
         graph: tc_mg_new(),
         current_module: prog.module_name,
-        strict: strict,
         errors: [],
         closure_funcs: [],
         closure_counter: 0,
@@ -5286,34 +5195,10 @@ pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
     // 符号注册（tc_register_decls）按符号所属模块（tc_module_of_line）分发到对应 node；
     // tc_mg_lookup_* 严格态路径经 tc_mg_node_for 精确命中 owner node（不再依赖 combined 回退）。
     // 兼容态（strict=0，0.4 过渡）保持单 combined node：tc_mg_node_for 回退 cur_node，行为不变。
-    if (ctx.strict == 1) {
-        let mi = 0;
-        while (mi < len(tc_g_mod_ns)) {
-            let mnode = ModuleNode {
-                module_name: tc_g_mod_ns[mi] as string,
-                struct_names: [],
-                struct_defs: [],
-                enum_names: [],
-                enum_defs: [],
-                alias_names: [],
-                alias_defs: [],
-                func_names: [],
-                func_defs: [],
-                trait_names: [],
-                trait_defs: [],
-                impl_keys: [],
-                impl_defs: [],
-                global_names: [],
-                global_types: [],
-                global_pubs: [],
-                imports: [],
-            };
-            ctx.graph = tc_mg_add(ctx.graph, mnode);
-            mi = mi + 1;
-        }
-        // prelude node：Option/Result 内置类型注册处（tc_register_prelude 按此名取 node）
-        let pnode = ModuleNode {
-            module_name: "prelude",
+    let mi = 0;
+    while (mi < len(tc_g_mod_ns)) {
+        let mnode = ModuleNode {
+            module_name: tc_g_mod_ns[mi] as string,
             struct_names: [],
             struct_defs: [],
             enum_names: [],
@@ -5331,12 +5216,34 @@ pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
             global_pubs: [],
             imports: [],
         };
-        ctx.graph = tc_mg_add(ctx.graph, pnode);
+        ctx.graph = tc_mg_add(ctx.graph, mnode);
+        mi = mi + 1;
     }
+    // prelude node：Option/Result 内置类型注册处（tc_register_prelude 按此名取 node）
+    let pnode = ModuleNode {
+        module_name: "prelude",
+        struct_names: [],
+        struct_defs: [],
+        enum_names: [],
+        enum_defs: [],
+        alias_names: [],
+        alias_defs: [],
+        func_names: [],
+        func_defs: [],
+        trait_names: [],
+        trait_defs: [],
+        impl_keys: [],
+        impl_defs: [],
+        global_names: [],
+        global_types: [],
+        global_pubs: [],
+        imports: [],
+    };
+    ctx.graph = tc_mg_add(ctx.graph, pnode);
     // Pass 1：声明收集
     tc_register_decls(ctx, prog);
     // 0.5：注册后统一 resolve 字段/payload 类型（严格态多 node 下按模块命名空间）
-    if (ctx.strict == 1) { tc_resolve_all_field_types(ctx); }
+    tc_resolve_all_field_types(ctx);
     // 注册泛型 struct 模板（必须在 register_decls 之后：严格态下 sd.name 已带模块前缀，
     // 否则 a.Pair/b.Pair 模板同裸名冲突，单态化会选错模板）
     let si = 0;
@@ -5346,7 +5253,7 @@ pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
             ctx.struct_mono_tmpl_names = array_push(ctx.struct_mono_tmpl_names, sd.name);
             ctx.struct_mono_tmpl_defs = array_push(ctx.struct_mono_tmpl_defs, sd);
             let tmod = prog.module_name;
-            if (ctx.strict == 1) { tmod = tc_module_of_line(ctx, sd.loc.line); }
+            tmod = tc_module_of_line(ctx, sd.loc.line);
             ctx.struct_mono_tmpl_mods = array_push(ctx.struct_mono_tmpl_mods, tmod);
         }
         si = si + 1;
@@ -5362,12 +5269,7 @@ pub kimo tc_check_program_mode(prog: Program, strict: int) -> int {
     return len(ctx.errors);
 }
 
-// 0.5：兼容态已删除。tc_check_program 保留为别名（调用点尚存），行为即严格态。
-pub kimo tc_check_program(prog: Program) -> int {
-    return tc_check_program_mode(prog, 1);
-}
-
-// 严格态入口：命名空间隔离（同名跨模块共存、import 作用域、私有跨包不可见）。0.5 唯一入口。
+// 兼容别名：历史调用点（LSP/API）沿用 tc_check_program_strict 名字；0.5 与 tc_check_program 等价。
 pub kimo tc_check_program_strict(prog: Program) -> int {
-    return tc_check_program_mode(prog, 1);
+    return tc_check_program(prog);
 }

@@ -234,7 +234,7 @@ pub struct CompileContext {
     cur_node: ModuleNode;       // 当前正在构建的模块节点（0 as ModuleNode = 无）
     graph: ModuleGraph;
     current_module: string;
-    strict: int;                // 1=严格态（Phase 15 命名空间隔离）；0=兼容态（物理拼接语义）
+    // 注：0.5 恒严格态，原 `strict: int` 双轨开关已删除（命名空间隔离是唯一语义）。
     errors: array<string>;
     closure_funcs: array<FuncDef>;   // 闭包注册表
     closure_counter: int;
