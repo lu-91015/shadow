@@ -1,0 +1,73 @@
+name: build-setup
+
+# 触发：源码/构建链改动 push 自动构建；也可手动触发（workflow_dispatch）
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'rt/**'
+      - 'bootstrap/**'
+      - 'build_shadow.sh'
+      - 'pkg/**'
+      - 'tools/**'
+      - '.github/workflows/build-setup.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pyinstaller
+        run: python -m pip install --quiet pyinstaller
+
+      # build_shadow.sh 内部用 python3 调 verify_fixed_point.py；Windows Git Bash 无 python3，
+      # 建一个包装脚本指向 python
+      - name: Ensure python3 alias
+        run: |
+          if ! command -v python3 >/dev/null 2>&1; then
+            mkdir -p "$HOME/bin"
+            printf '#!/bin/sh\nexec python "$@"\n' > "$HOME/bin/python3"
+            chmod +x "$HOME/bin/python3"
+            echo "$HOME/bin" >> "$GITHUB_PATH"
+          fi
+          python3 --version
+
+      - name: Download LLVM 22.1.0
+        run: |
+          LLVM_DIR="$PWD/clang+llvm-22.1.0-x86_64-pc-windows-msvc"
+          curl -L --fail -o llvm.tar.xz \
+            https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/clang+llvm-22.1.0-x86_64-pc-windows-msvc.tar.xz
+          python - <<'EOF'
+          import lzma, tarfile
+          with tarfile.open('llvm.tar.xz', 'r:xz') as t:
+              t.extractall()
+          EOF
+          echo "LLVM_HOME=$LLVM_DIR" >> "$GITHUB_ENV"
+          "$LLVM_DIR/bin/llc.exe" --version | head -1
+
+      # 自举链：HOST=build/shadow.exe（种子已入库）→ stage1 → stage2 → stage3 → fixed-point
+      - name: Bootstrap shadow.exe
+        run: bash build_shadow.sh
+
+      # 打包：刷新载荷 → pyinstaller --onefile --windowed
+      - name: Package setup exe
+        run: PYTHON=python bash pkg/make_setup.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-0.5.0-setup
+          path: pkg/dist/shadow-0.5.0-setup.exe
+          if-no-files-found: error

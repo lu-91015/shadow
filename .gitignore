@@ -1,5 +1,5 @@
-# 构建产物
-build/
+# 构建产物（build/* 而非 build/：需例外跟踪 build/shadow.exe 种子宿主，见下）
+build/*
 *.o
 *.obj
 *.exe
@@ -31,9 +31,18 @@ _spk_extracted/
 !bootstrap/runtime_for_selfhost.o
 !bootstrap/miniz.o
 
+# 例外：build/shadow.exe 种子宿主必须入库（CI 冷启动自举链 HOST，build_shadow.sh [1/7] 依赖）
+!build/shadow.exe
+
 # 测试/构建临时产物（exe tmp、SPK 锁）
 *.tmp*
 shadow.lock
 
 # 工作区记忆（不入库）
 .workbuddy/
+
+# 打包中间产物（make_setup.sh / CI 生成，setup exe 由 CI artifact 分发）
+pkg/build_tmp*/
+pkg/dist/
+pkg/*.spec
+pkg/*.exe.old

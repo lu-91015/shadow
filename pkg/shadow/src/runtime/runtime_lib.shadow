@@ -1,0 +1,845 @@
+dsb runtime_lib;
+
+// === Runtime @extern declarations ===
+// runtime 作为独立模块编译：所有非 @extern 的 kimo 标记为 pub，
+// 不参与 name mangling，保持原名供 codegen 直接调用。
+// @extern 声明的 extern_name 非空，本身就不 mangle，无需 pub。
+@extern("__rt_shadow_malloc") kimo rt_malloc(n: int) -> any { return 0 as any; }
+@extern("shadow_gc_alloc") kimo shadow_gc_alloc(size: int, type_id: int) -> any { return 0 as any; }
+pub kimo rt_free(p: any) -> void {}
+@extern("__rt_shadow_memcpy") kimo rt_memcpy(dst: any, src: any, n: int) -> void {}
+@extern("__rt_shadow_memcpy_at") kimo rt_memcpy_at(dst: any, dst_off: int, src: any, src_off: int, n: int) -> void {}
+@extern("__rt_shadow_memset") kimo rt_memset(dst: any, val: int, n: int) -> void {}
+@extern("__rt_shadow_strlen") kimo rt_strlen(s: any) -> int { return 0; }
+@extern("shadow_get_byte") kimo rt_get_byte(p: any, off: int) -> int { return 0; }
+@extern("__rt_shadow_set_byte") kimo rt_set_byte(p: any, off: int, val: int) -> void {}
+@extern("__rt_shadow_load_int") kimo rt_load_int(p: any, off: int) -> int { return 0; }
+@extern("__rt_shadow_store_int") kimo rt_store_int(p: any, off: int, val: int) -> void {}
+@extern("__rt_shadow_load_long") kimo rt_load_long(p: any, off: int) -> long { return 0; }
+@extern("__rt_shadow_store_long") kimo rt_store_long(p: any, off: int, val: long) -> void {}
+@extern("__rt_shadow_load_ptr") kimo rt_load_ptr(p: any, off: int) -> any { return 0 as any; }
+@extern("__rt_shadow_store_ptr") kimo rt_store_ptr(p: any, off: int, val: any) -> void {}
+@extern("__rt_shadow_load_float") kimo rt_load_float(p: any, off: int) -> double { return 0.0; }
+@extern("__rt_shadow_store_float") kimo rt_store_float(p: any, off: int, val: double) -> void {}
+// ---- .lu 序列化 / 文件 I/O 原语（0.4 mir_serialize 使用；C 侧符号见 shadow_runtime_minimal.cpp） ----
+@extern("rt_buf_alloc") kimo rt_buf_alloc(n: int) -> any { return 0 as any; }
+@extern("rt_buf_len") kimo rt_buf_len(p: any) -> int { return 0; }
+@extern("rt_write_bytes") kimo rt_write_bytes(path: any, p: any, n: int) -> int { return 0; }
+@extern("rt_read_bytes") kimo rt_read_bytes(path: any) -> any { return 0 as any; }
+@extern("rt_str_to_bytes") kimo rt_str_to_bytes(s: any, buf: any, off: int) -> int { return 0; }
+@extern("rt_bytes_to_str") kimo rt_bytes_to_str(buf: any, off: int, slen: int) -> string { return ""; }
+@extern("shadow_delete_file") kimo rt_delete_file(path: any) -> int { return 0; }
+@extern("shadow_rename_file") kimo rt_rename_file(old_path: any, new_path: any) -> int { return 0; }
+// ---- 进程/命令行（编译器 CLI 用；C 侧 shadow_runtime_minimal.cpp） ----
+@extern("shadow_sys_args") kimo rt_sys_args() -> any { return 0 as any; }
+@extern("shadow_sys_exec") kimo rt_sys_exec(cmd: string) -> string { return ""; }
+@extern("shadow_env_get") kimo env_get(name: string) -> string { return ""; }
+@extern("__rt_shadow_puts") kimo rt_puts(s: any) -> int { return 0; }
+@extern("shadow_print_str") kimo rt_print_str(s: any) -> int { return 0; }
+@extern("shadow_print_int") kimo rt_print_int(v: int) -> int { return 0; }
+@extern("__rt_shadow_print_long") kimo rt_print_long(v: long) -> int { return 0; }
+@extern("__rt_shadow_print_float") kimo rt_print_float(v: double) -> int { return 0; }
+@extern("__rt_shadow_str_cmp") kimo rt_str_cmp(s1: any, s2: any) -> int { return 0; }
+@extern("__rt_shadow_int_to_cstr") kimo rt_int_to_cstr(v: int) -> any { return 0 as any; }
+@extern("__rt_shadow_long_to_cstr") kimo rt_long_to_cstr(v: long) -> any { return 0 as any; }
+@extern("__rt_shadow_float_to_cstr") kimo rt_float_to_cstr(v: double) -> any { return 0 as any; }
+@extern("shadow_exit") kimo rt_exit(code: int) -> void {}
+
+// === String operations ===
+pub kimo shadow_string_concat(s1: any, s2: any) -> any {
+    let l1: int = rt_strlen(s1);
+    let l2: int = rt_strlen(s2);
+    let total: int = l1 + l2 + 1;
+    let p: any = rt_malloc(total);
+    rt_memcpy_at(p, 0, s1, 0, l1);
+    rt_memcpy_at(p, l1, s2, 0, l2);
+    rt_set_byte(p, l1 + l2, 0);
+    return p;
+}
+
+pub kimo shadow_string_len(s: any) -> int {
+    return rt_strlen(s);
+}
+
+pub kimo shadow_string_eq(s1: any, s2: any) -> int {
+    if (rt_str_cmp(s1, s2) == 0) { return 1; }
+    return 0;
+}
+
+pub kimo shadow_string_ne(s1: any, s2: any) -> int {
+    if (rt_str_cmp(s1, s2) == 0) { return 0; }
+    return 1;
+}
+
+pub kimo shadow_int_to_str(v: int) -> any {
+    return rt_int_to_cstr(v);
+}
+
+pub kimo shadow_long_to_str(v: long) -> any {
+    return rt_long_to_cstr(v);
+}
+
+pub kimo shadow_float_to_str(v: double) -> any {
+    return rt_float_to_cstr(v);
+}
+
+// === Array operations ===
+// 布局: [len:int@0][cap:int@4][elem_size:int@8][data:bytes@12+]
+// GC 扫描：elem_size==8 时保守逐元素查对象表（值恰好为堆指针才追踪）
+pub kimo shadow_array_new(elem_size: int, cap: int) -> any {
+    let header: int = 12;
+    let total: int = header + cap * elem_size;
+    let p: any = shadow_gc_alloc(total, 2);
+    rt_store_int(p, 0, 0);
+    rt_store_int(p, 4, cap);
+    rt_store_int(p, 8, elem_size);
+    return p;
+}
+
+pub kimo shadow_array_len(arr: any) -> int {
+    if (arr == null) { return 0; }
+    return rt_load_int(arr, 0);
+}
+
+pub kimo shadow_array_cap(arr: any) -> int {
+    if (arr == null) { return 0; }
+    return rt_load_int(arr, 4);
+}
+
+pub kimo shadow_array_elem_size(arr: any) -> int {
+    if (arr == null) { return 8; }
+    return rt_load_int(arr, 8);
+}
+
+pub kimo shadow_array_grow(arr: any, new_cap: int) -> any {
+    if (arr == null) { return shadow_array_new(8, new_cap); }
+    let elem_size: int = shadow_array_elem_size(arr);
+    let len: int = shadow_array_len(arr);
+    let new_arr: any = shadow_array_new(elem_size, new_cap);
+    rt_memcpy_at(new_arr, 12, arr, 12, len * elem_size);
+    rt_store_int(new_arr, 0, len);
+    rt_free(arr);
+    return new_arr;
+}
+
+@extern("shadow_throw_str") kimo rt_throw_str(msg: any) -> void {}
+@extern("shadow_panic_msg") kimo rt_panic_msg(msg: any) -> void {}
+@extern("shadow_exception_occurred") kimo rt_exception_occurred() -> int { return 0; }
+@extern("shadow_exception_clear") kimo rt_exception_clear() -> void {}
+
+// === 时间类型运行时原语（0.3 新增）===
+// 对应 C++ runtime_cpp/shadow_runtime_minimal.cpp 中的 rt_* 实现。
+//   rt_date_now()         -> date       返回 YYYYMMDD 整数（如 20260725）
+//   rt_timestamp_now()    -> timestamp  返回 YYYYMMDDHHMMSSmmm（0.2 long 截断，仅类型检查）
+//   rt_nanotimestamp_now() -> nanotimestamp 返回纳秒计数（QPC/clock_gettime）
+//   rt_date_to_str(d)     -> string     格式化为 "YYYY.MM.DD"
+//   rt_timestamp_to_str(t) -> string    格式化为 "YYYY.MM.DD HH:MM:SS.mmm"
+//   rt_nanotimestamp_to_str(n) -> string 格式化为纳秒计数字符串
+@extern("rt_date_now") kimo rt_date_now() -> int { return 0; }
+@extern("rt_timestamp_now") kimo rt_timestamp_now() -> long { return 0; }
+@extern("rt_nanotimestamp_now") kimo rt_nanotimestamp_now() -> long { return 0; }
+@extern("rt_date_to_str") kimo rt_date_to_str(d: int) -> any { return 0 as any; }
+@extern("rt_timestamp_to_str") kimo rt_timestamp_to_str(t: long) -> any { return 0 as any; }
+@extern("rt_nanotimestamp_to_str") kimo rt_nanotimestamp_to_str(n: long) -> any { return 0 as any; }
+
+// === String → Number parsing primitives（P2 数据转换）===
+// 对应 C++ runtime_cpp/shadow_runtime_minimal.cpp 中的 __rt_shadow_parse_* 实现。
+// 失败时通过 shadow_throw_str 设置全局异常标志（依赖 shadow 的 try/catch 机制向上传播）。
+// 设计参考 Rust 的 parse() —— shadow 已有 try/catch，无需 Result/Option 类型。
+@extern("__rt_shadow_parse_int") kimo rt_parse_int(s: any) -> int { return 0; }
+@extern("__rt_shadow_parse_long") kimo rt_parse_long(s: any) -> long { return 0; }
+@extern("__rt_shadow_parse_double") kimo rt_parse_double(s: any) -> double { return 0.0; }
+@extern("__rt_shadow_parse_bool") kimo rt_parse_bool(s: any) -> int { return 0; }
+
+// 用户可调用的 parse_* 包装（接受 string 参数）。
+// string 在运行时为 i8*，与 any 指针表示一致；显式声明 string 参数便于类型检查。
+pub kimo shadow_parse_int(s: any) -> int { return rt_parse_int(s); }
+pub kimo shadow_parse_long(s: any) -> long { return rt_parse_long(s); }
+pub kimo shadow_parse_float(s: any) -> double { return rt_parse_double(s); }
+pub kimo shadow_parse_bool(s: any) -> int { return rt_parse_bool(s); }
+
+// === bool / 时间类型 → string 转换 ===
+// bool_to_str：与 shadow_print_bool / shadow_to_string_bool 一致返回 "true"/"false"。
+pub kimo shadow_bool_to_str(v: int) -> any {
+    if (v == 0) { return "false"; }
+    return "true";
+}
+
+// 时间类型 → string：复用 C++ runtime 的格式化实现。
+// date → "YYYY.MM.DD"；timestamp → "YYYY.MM.DD HH:MM:SS.mmm"；nanotimestamp → 纳秒数字串。
+pub kimo shadow_date_to_str(d: int) -> any { return rt_date_to_str(d); }
+pub kimo shadow_timestamp_to_str(t: long) -> any { return rt_timestamp_to_str(t); }
+pub kimo shadow_nanotimestamp_to_str(n: long) -> any { return rt_nanotimestamp_to_str(n); }
+
+pub kimo shadow_array_push_int(arr: any, val: int) -> any {
+    let len: int = shadow_array_len(arr);
+    let cap: int = shadow_array_cap(arr);
+    if (len >= cap) {
+        let nc: int = cap * 2;
+        if (nc == 0) { nc = 4; }
+        arr = shadow_array_grow(arr, nc);
+    }
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + len * es;
+    if (es == 4) { rt_store_int(arr, off, val); }
+    else { rt_store_long(arr, off, val as long); }
+    rt_store_int(arr, 0, len + 1);
+    return arr;
+}
+
+pub kimo shadow_array_push_long(arr: any, val: long) -> any {
+    let len: int = shadow_array_len(arr);
+    let cap: int = shadow_array_cap(arr);
+    if (len >= cap) {
+        let nc: int = cap * 2;
+        if (nc == 0) { nc = 4; }
+        arr = shadow_array_grow(arr, nc);
+    }
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + len * es;
+    if (es == 4) { rt_store_int(arr, off, val as int); }
+    else { rt_store_long(arr, off, val); }
+    rt_store_int(arr, 0, len + 1);
+    return arr;
+}
+
+pub kimo shadow_array_push_float(arr: any, val: double) -> any {
+    let len: int = shadow_array_len(arr);
+    let cap: int = shadow_array_cap(arr);
+    if (len >= cap) {
+        let nc: int = cap * 2;
+        if (nc == 0) { nc = 4; }
+        arr = shadow_array_grow(arr, nc);
+    }
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + len * es;
+    rt_store_float(arr, off, val);
+    rt_store_int(arr, 0, len + 1);
+    return arr;
+}
+
+pub kimo shadow_array_push_ptr(arr: any, val: any) -> any {
+    let len: int = shadow_array_len(arr);
+    let cap: int = shadow_array_cap(arr);
+    if (len >= cap) {
+        let nc: int = cap * 2;
+        if (nc == 0) { nc = 4; }
+        arr = shadow_array_grow(arr, nc);
+    }
+    let off: int = 12 + len * 8;
+    rt_store_ptr(arr, off, val);
+    rt_store_int(arr, 0, len + 1);
+    return arr;
+}
+
+pub kimo shadow_array_get_int(arr: any, idx: int) -> int {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { return rt_load_int(arr, off); }
+    return rt_load_long(arr, off) as int;
+}
+
+pub kimo shadow_array_get_long(arr: any, idx: int) -> long {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { return rt_load_int(arr, off) as long; }
+    return rt_load_long(arr, off);
+}
+
+pub kimo shadow_array_get_float(arr: any, idx: int) -> double {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    return rt_load_float(arr, off);
+}
+
+pub kimo shadow_array_get_ptr(arr: any, idx: int) -> any {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { return rt_load_int(arr, off) as any; }
+    return rt_load_ptr(arr, off);
+}
+
+pub kimo shadow_array_set_int(arr: any, idx: int, val: int) -> void {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { rt_store_int(arr, off, val); return; }
+    rt_store_long(arr, off, val as long);
+}
+
+pub kimo shadow_array_set_long(arr: any, idx: int, val: long) -> void {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { rt_store_int(arr, off, val as int); return; }
+    rt_store_long(arr, off, val);
+}
+
+pub kimo shadow_array_set_float(arr: any, idx: int, val: double) -> void {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    rt_store_float(arr, off, val);
+}
+
+pub kimo shadow_array_set_ptr(arr: any, idx: int, val: any) -> void {
+    let es: int = shadow_array_elem_size(arr);
+    let off: int = 12 + idx * es;
+    if (es == 4) { rt_store_int(arr, off, val as int); return; }
+    rt_store_ptr(arr, off, val);
+}
+
+// === Any operations (tagged union) ===
+// 布局: [magic:int32@0][tag:int32@4][value:int64@8]（0.3 AnyBox；codegen GET_TAG 读 @4 / GET_PAYLOAD 读 @8）
+// tag: 0=int 1=long 2=float 3=string 4=bool 5=ptr 6=null
+let SHADOW_TAG_INT: int = 0;
+let SHADOW_TAG_LONG: int = 1;
+let SHADOW_TAG_FLOAT: int = 2;
+let SHADOW_TAG_STRING: int = 3;
+let SHADOW_TAG_BOOL: int = 4;
+let SHADOW_TAG_PTR: int = 5;
+let SHADOW_TAG_NULL: int = 6;
+
+pub kimo shadow_any_new() -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 6);
+    rt_store_long(p, 4, 0);
+    return p;
+}
+
+pub kimo shadow_any_box_int(v: int) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 0);
+    rt_store_int(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_box_long(v: long) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 1);
+    rt_store_long(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_box_float(v: double) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 2);
+    rt_store_float(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_box_string(v: any) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 3);
+    rt_store_ptr(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_box_bool(v: int) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 4);
+    rt_store_int(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_box_ptr(v: any) -> any {
+    let p: any = rt_malloc(12);
+    rt_store_int(p, 0, 5);
+    rt_store_ptr(p, 4, v);
+    return p;
+}
+
+pub kimo shadow_any_tag(v: any) -> int {
+    return rt_load_int(v, 4);
+}
+
+pub kimo shadow_any_unbox_int(v: any) -> int {
+    return rt_load_int(v, 8);
+}
+
+pub kimo shadow_any_unbox_long(v: any) -> long {
+    return rt_load_long(v, 8);
+}
+
+pub kimo shadow_any_unbox_float(v: any) -> double {
+    return rt_load_float(v, 8);
+}
+
+pub kimo shadow_any_unbox_string(v: any) -> any {
+    return rt_load_ptr(v, 8);
+}
+
+pub kimo shadow_any_unbox_bool(v: any) -> int {
+    return rt_load_int(v, 8);
+}
+
+pub kimo shadow_any_unbox_ptr(v: any) -> any {
+    return rt_load_ptr(v, 8);
+}
+
+pub kimo shadow_any_to_string(v: any) -> any {
+    let tag: int = shadow_any_tag(v);
+    if (tag == 0) { return shadow_int_to_str(shadow_any_unbox_int(v)); }
+    if (tag == 1) { return shadow_long_to_str(shadow_any_unbox_long(v)); }
+    if (tag == 2) { return shadow_float_to_str(shadow_any_unbox_float(v)); }
+    if (tag == 3) { return shadow_any_unbox_string(v); }
+    if (tag == 4) {
+        let b: int = shadow_any_unbox_bool(v);
+        if (b == 0) { return "false"; }
+        return "true";
+    }
+    if (tag == 6) { return "null"; }
+    return "<ptr>";
+}
+
+pub kimo shadow_any_print(v: any) -> void {
+    let s: any = shadow_any_to_string(v);
+    rt_print_str(s);
+}
+
+pub kimo shadow_any_println(v: any) -> void {
+    let s: any = shadow_any_to_string(v);
+    rt_puts(s);
+}
+
+pub kimo shadow_any_eq(a: any, b: any) -> int {
+    let ta: int = shadow_any_tag(a);
+    let tb: int = shadow_any_tag(b);
+    if (ta != tb) { return 0; }
+    if (ta == 0) {
+        if (shadow_any_unbox_int(a) == shadow_any_unbox_int(b)) { return 1; }
+        return 0;
+    }
+    if (ta == 3) {
+        return shadow_string_eq(shadow_any_unbox_string(a), shadow_any_unbox_string(b));
+    }
+    if (ta == 4) {
+        if (shadow_any_unbox_bool(a) == shadow_any_unbox_bool(b)) { return 1; }
+        return 0;
+    }
+    if (ta == 6) { return 1; }
+    return 0;
+}
+
+// === IO operations ===
+pub kimo shadow_println_str(s: any) -> void {
+    rt_puts(s);
+}
+
+pub kimo shadow_println_int(v: int) -> void {
+    rt_print_int(v);
+    rt_puts("");
+}
+
+pub kimo shadow_println_long(v: long) -> void {
+    rt_print_long(v);
+    rt_puts("");
+}
+
+pub kimo shadow_println_float(v: double) -> void {
+    rt_print_float(v);
+    rt_puts("");
+}
+
+pub kimo shadow_println_bool(v: int) -> void {
+    if (v == 0) { rt_puts("false"); }
+    else { rt_puts("true"); }
+}
+
+pub kimo shadow_print_long(v: long) -> void {
+    rt_print_long(v);
+}
+
+pub kimo shadow_print_float(v: double) -> void {
+    rt_print_float(v);
+}
+
+pub kimo shadow_print_bool(v: int) -> void {
+    if (v == 0) { rt_print_str("false"); }
+    else { rt_print_str("true"); }
+}
+
+// === to_string dispatch ===
+pub kimo shadow_to_string_int(v: int) -> any { return shadow_int_to_str(v); }
+pub kimo shadow_to_string_long(v: long) -> any { return shadow_long_to_str(v); }
+pub kimo shadow_to_string_float(v: double) -> any { return shadow_float_to_str(v); }
+pub kimo shadow_to_string_str(v: any) -> any { return v; }
+pub kimo shadow_to_string_bool(v: int) -> any { return shadow_bool_to_str(v); }
+// 时间类型 → string（底层 YYYYMMDD 整数 / 纳秒计数 → 可读字符串）
+pub kimo shadow_to_string_date(v: int) -> any { return shadow_date_to_str(v); }
+pub kimo shadow_to_string_timestamp(v: long) -> any { return shadow_timestamp_to_str(v); }
+pub kimo shadow_to_string_nanotimestamp(v: long) -> any { return shadow_nanotimestamp_to_str(v); }
+
+// === CLI args (Shadow implementation, uses Shadow array layout) ===
+let rt_cli_args: any = 0 as any;
+
+pub kimo shadow_set_cli_args(argc: int, argv: any) -> void {
+    rt_cli_args = shadow_array_new(8, argc);
+    let i: int = 0;
+    while (i < argc) {
+        let arg_ptr: any = rt_load_ptr(argv, i * 8);
+        rt_cli_args = shadow_array_push_ptr(rt_cli_args, arg_ptr);
+        i = i + 1;
+    }
+}
+
+pub kimo shadow_sys_args() -> any {
+    return rt_cli_args;
+}
+
+// === 字符串处理全套（0.4 自研，语义对齐 0.3 C++ runtime）===
+// 命名用 0.4 专属 shadow_*（非 shadow_string_*），避免与 runtime_for_selfhost.o
+// 中 C++ 同名符号重复定义。codegen 把 str_join/str_split/str_contains 等映射到这里。
+// 全部遵循原则 9：预计算总长、一次性分配、逐段拷贝，无裸 + 链。
+
+// str_join(parts, sep)：连接字符串数组
+pub kimo shadow_sjoin(arr: any, sep: any) -> any {
+    let n: int = shadow_array_len(arr);
+    let sep_len: int = rt_strlen(sep);
+    let total: int = 0;
+    let i: int = 0;
+    while (i < n) {
+        let p: any = shadow_array_get_ptr(arr, i);
+        if ((p as any) != 0) { total = total + rt_strlen(p); }
+        if (i > 0) { total = total + sep_len; }
+        i = i + 1;
+    }
+    let out: any = rt_malloc(total + 1);
+    let off: int = 0;
+    i = 0;
+    while (i < n) {
+        if (i > 0) {
+            rt_memcpy_at(out, off, sep, 0, sep_len);
+            off = off + sep_len;
+        }
+        let p2: any = shadow_array_get_ptr(arr, i);
+        if ((p2 as any) != 0) {
+            let pl: int = rt_strlen(p2);
+            rt_memcpy_at(out, off, p2, 0, pl);
+            off = off + pl;
+        }
+        i = i + 1;
+    }
+    rt_set_byte(out, off, 0);
+    return out;
+}
+
+// str_index_of(s, needle)：返回首次出现位置，无则 -1
+pub kimo shadow_index_of(s: any, needle: any) -> int {
+    let sl: int = rt_strlen(s);
+    let nl: int = rt_strlen(needle);
+    if (nl == 0) { return 0; }
+    let i: int = 0;
+    while (i <= sl - nl) {
+        let j: int = 0;
+        let ok: int = 1;
+        while (j < nl) {
+            if (rt_get_byte(s, i + j) != rt_get_byte(needle, j)) { ok = 0; break; }
+            j = j + 1;
+        }
+        if (ok == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// str_contains(s, needle)
+pub kimo shadow_contains(s: any, needle: any) -> int {
+    let i: int = shadow_index_of(s, needle);
+    if (i >= 0) { return 1; }
+    return 0;
+}
+
+// substr2(s, start, end)：end 为结束位置（半开区间 [start, end)）
+pub kimo shadow_substr(s: any, start: int, end_pos: int) -> any {
+    let sl: int = rt_strlen(s);
+    let st: int = start;
+    if (st < 0) { st = st + sl; if (st < 0) { st = 0; } }
+    if (st >= sl) { return ""; }
+    let ep: int = end_pos;
+    if (ep < 0) { ep = ep + sl; if (ep < 0) { ep = 0; } }
+    if (ep <= st) { return ""; }
+    if (ep > sl) { ep = sl; }
+    let n: int = ep - st;
+    let out: any = rt_malloc(n + 1);
+    rt_memcpy_at(out, 0, s, st, n);
+    rt_set_byte(out, n, 0);
+    return out;
+}
+
+// str_char_at(s, idx)：单字符子串；负索引回绕；越界返回 ""
+pub kimo shadow_schar(s: any, idx: int) -> any {
+    let sl: int = rt_strlen(s);
+    let i: int = idx;
+    if (i < 0) { i = i + sl; }
+    if (i < 0) { return ""; }
+    if (i >= sl) { return ""; }
+    let out: any = rt_malloc(2);
+    rt_set_byte(out, 0, rt_get_byte(s, i));
+    rt_set_byte(out, 1, 0);
+    return out;
+}
+
+// s[idx]：字符串下标（codegen 映射 shadow_subscript）
+pub kimo shadow_subscript(s: any, idx: int) -> any {
+    return shadow_schar(s, idx);
+}
+
+// str_replace(s, old_s, new_s)：全部替换；old 为空返回副本
+pub kimo shadow_str_replace(s: any, old_s: any, new_s: any) -> any {
+    let sl: int = rt_strlen(s);
+    let ol: int = rt_strlen(old_s);
+    let nl: int = rt_strlen(new_s);
+    if (ol == 0) { return shadow_string_concat(s, ""); }
+    let count: int = 0;
+    let i: int = 0;
+    while (i <= sl - ol) {
+        let j: int = 0;
+        let ok: int = 1;
+        while (j < ol) {
+            if (rt_get_byte(s, i + j) != rt_get_byte(old_s, j)) { ok = 0; break; }
+            j = j + 1;
+        }
+        if (ok == 1) { count = count + 1; i = i + ol; }
+        else { i = i + 1; }
+    }
+    let total: int = sl + count * (nl - ol);
+    let out: any = rt_malloc(total + 1);
+    let src_i: int = 0;
+    let dst_i: int = 0;
+    while (src_i < sl) {
+        let j2: int = 0;
+        let ok2: int = 1;
+        while (j2 < ol) {
+            if (src_i + j2 >= sl) { ok2 = 0; break; }
+            if (rt_get_byte(s, src_i + j2) != rt_get_byte(old_s, j2)) { ok2 = 0; break; }
+            j2 = j2 + 1;
+        }
+        if (ok2 == 1) {
+            rt_memcpy_at(out, dst_i, new_s, 0, nl);
+            dst_i = dst_i + nl;
+            src_i = src_i + ol;
+        }
+        else {
+            rt_set_byte(out, dst_i, rt_get_byte(s, src_i));
+            dst_i = dst_i + 1;
+            src_i = src_i + 1;
+        }
+    }
+    rt_set_byte(out, dst_i, 0);
+    return out;
+}
+
+// str_trim(s)：去首尾空白（空格/制表/CR/LF）
+pub kimo shadow_trim(s: any) -> any {
+    let sl: int = rt_strlen(s);
+    let l: int = 0;
+    while (l < sl) {
+        let c: int = rt_get_byte(s, l);
+        if (c == 32 || c == 9 || c == 13 || c == 10) { l = l + 1; }
+        else { break; }
+    }
+    if (l >= sl) { return ""; }
+    let r: int = sl - 1;
+    while (r >= 0) {
+        let c2: int = rt_get_byte(s, r);
+        if (c2 == 32 || c2 == 9 || c2 == 13 || c2 == 10) { r = r - 1; }
+        else { break; }
+    }
+    let n: int = r - l + 1;
+    let out: any = rt_malloc(n + 1);
+    rt_memcpy_at(out, 0, s, l, n);
+    rt_set_byte(out, n, 0);
+    return out;
+}
+
+// str_to_upper / str_to_lower（ASCII）
+pub kimo shadow_supper(s: any) -> any {
+    let sl: int = rt_strlen(s);
+    let out: any = rt_malloc(sl + 1);
+    let i: int = 0;
+    while (i < sl) {
+        let c: int = rt_get_byte(s, i);
+        if (c >= 97 && c <= 122) { c = c - 32; }
+        rt_set_byte(out, i, c);
+        i = i + 1;
+    }
+    rt_set_byte(out, sl, 0);
+    return out;
+}
+
+pub kimo shadow_slower(s: any) -> any {
+    let sl: int = rt_strlen(s);
+    let out: any = rt_malloc(sl + 1);
+    let i: int = 0;
+    while (i < sl) {
+        let c: int = rt_get_byte(s, i);
+        if (c >= 65 && c <= 90) { c = c + 32; }
+        rt_set_byte(out, i, c);
+        i = i + 1;
+    }
+    rt_set_byte(out, sl, 0);
+    return out;
+}
+
+// str_split(s, delim)：按分隔符切分；空分隔符返回 [整体]；保留尾部空段
+pub kimo shadow_ssplit(s: any, delim: any) -> any {
+    let sl: int = rt_strlen(s);
+    let dl: int = rt_strlen(delim);
+    if (dl == 0) {
+        let arr0: any = shadow_array_new(8, 1);
+        arr0 = shadow_array_push_ptr(arr0, shadow_string_concat(s, ""));
+        return arr0;
+    }
+    let count: int = 1;
+    let i: int = 0;
+    while (i <= sl - dl) {
+        let j: int = 0;
+        let ok: int = 1;
+        while (j < dl) {
+            if (rt_get_byte(s, i + j) != rt_get_byte(delim, j)) { ok = 0; break; }
+            j = j + 1;
+        }
+        if (ok == 1) { count = count + 1; i = i + dl; }
+        else { i = i + 1; }
+    }
+    let arr: any = shadow_array_new(8, count);
+    let start: int = 0;
+    i = 0;
+    while (i <= sl - dl) {
+        let j2: int = 0;
+        let ok2: int = 1;
+        while (j2 < dl) {
+            if (rt_get_byte(s, i + j2) != rt_get_byte(delim, j2)) { ok2 = 0; break; }
+            j2 = j2 + 1;
+        }
+        if (ok2 == 1) {
+            let n: int = i - start;
+            let part: any = rt_malloc(n + 1);
+            rt_memcpy_at(part, 0, s, start, n);
+            rt_set_byte(part, n, 0);
+            arr = shadow_array_push_ptr(arr, part);
+            start = i + dl;
+            i = i + dl;
+        }
+        else { i = i + 1; }
+    }
+    let n2: int = sl - start;
+    let last: any = rt_malloc(n2 + 1);
+    rt_memcpy_at(last, 0, s, start, n2);
+    rt_set_byte(last, n2, 0);
+    arr = shadow_array_push_ptr(arr, last);
+    return arr;
+}
+
+// str_format(fmt, args)：{N} 占位；{{/}} 转义字面花括号；非法索引保留原样
+pub kimo shadow_format(fmt: any, args: any) -> any {
+    let fl: int = rt_strlen(fmt);
+    let n_args: int = shadow_array_len(args);
+    // 预计算输出长度（一次分配）
+    let total: int = 0;
+    let i: int = 0;
+    while (i < fl) {
+        let c: int = rt_get_byte(fmt, i);
+        if (c == 123) {
+            if (i + 1 < fl && rt_get_byte(fmt, i + 1) == 123) { total = total + 1; i = i + 2; continue; }
+            // 找 }
+            let close: int = -1;
+            let k: int = i + 1;
+            while (k < fl) {
+                if (rt_get_byte(fmt, k) == 125) { close = k; break; }
+                k = k + 1;
+            }
+            if (close < 0) { total = total + 1; i = i + 1; continue; }
+            // 解析数字索引
+            let idx: int = 0;
+            let valid: int = 1;
+            let m: int = i + 1;
+            while (m < close) {
+                let dc: int = rt_get_byte(fmt, m);
+                if (dc >= 48 && dc <= 57) { idx = idx * 10 + (dc - 48); }
+                else { valid = 0; }
+                m = m + 1;
+            }
+            if (valid == 1 && idx >= 0 && idx < n_args) {
+                let elem: any = shadow_array_get_ptr(args, idx);
+                if ((elem as any) != 0) { total = total + rt_strlen(elem); }
+            }
+            else {
+                total = total + (close - i + 1);
+            }
+            i = close + 1;
+        }
+        else if (c == 125) {
+            if (i + 1 < fl && rt_get_byte(fmt, i + 1) == 125) { total = total + 1; i = i + 2; continue; }
+            total = total + 1;
+            i = i + 1;
+        }
+        else { total = total + 1; i = i + 1; }
+    }
+    // 生成
+    let out: any = rt_malloc(total + 1);
+    let dst: int = 0;
+    i = 0;
+    while (i < fl) {
+        let c2: int = rt_get_byte(fmt, i);
+        if (c2 == 123) {
+            if (i + 1 < fl && rt_get_byte(fmt, i + 1) == 123) {
+                rt_set_byte(out, dst, 123);
+                dst = dst + 1;
+                i = i + 2;
+                continue;
+            }
+            let close2: int = -1;
+            let k2: int = i + 1;
+            while (k2 < fl) {
+                if (rt_get_byte(fmt, k2) == 125) { close2 = k2; break; }
+                k2 = k2 + 1;
+            }
+            if (close2 < 0) {
+                rt_set_byte(out, dst, 123);
+                dst = dst + 1;
+                i = i + 1;
+                continue;
+            }
+            let idx2: int = 0;
+            let valid2: int = 1;
+            let m2: int = i + 1;
+            while (m2 < close2) {
+                let dc2: int = rt_get_byte(fmt, m2);
+                if (dc2 >= 48 && dc2 <= 57) { idx2 = idx2 * 10 + (dc2 - 48); }
+                else { valid2 = 0; }
+                m2 = m2 + 1;
+            }
+            if (valid2 == 1 && idx2 >= 0 && idx2 < n_args) {
+                let elem2: any = shadow_array_get_ptr(args, idx2);
+                if ((elem2 as any) != 0) {
+                    let el: int = rt_strlen(elem2);
+                    rt_memcpy_at(out, dst, elem2, 0, el);
+                    dst = dst + el;
+                }
+            }
+            else {
+                let seg: int = close2 - i + 1;
+                rt_memcpy_at(out, dst, fmt, i, seg);
+                dst = dst + seg;
+            }
+            i = close2 + 1;
+        }
+        else if (c2 == 125) {
+            if (i + 1 < fl && rt_get_byte(fmt, i + 1) == 125) {
+                rt_set_byte(out, dst, 125);
+                dst = dst + 1;
+                i = i + 2;
+                continue;
+            }
+            rt_set_byte(out, dst, 125);
+            dst = dst + 1;
+            i = i + 1;
+        }
+        else {
+            rt_set_byte(out, dst, rt_get_byte(fmt, i));
+            dst = dst + 1;
+            i = i + 1;
+        }
+    }
+    rt_set_byte(out, dst, 0);
+    return out;
+}

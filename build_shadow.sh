@@ -2,7 +2,9 @@
 set -e
 cd "$(dirname "$0")"
 BOOT=bootstrap
-LLVM="D:/llvm/clang+llvm-22.1.0-x86_64-pc-windows-msvc"
+# LLVM 工具链路径从环境变量 LLVM_HOME 读取（无内置默认路径）。
+: "${LLVM_HOME:?set LLVM_HOME to your LLVM installation (e.g. D:/llvm/clang+llvm-XX)}"
+LLVM="$LLVM_HOME"
 LLCC="$LLVM/bin/llc.exe"
 CLANG="$LLVM/bin/clang++.exe"
 CLANG_C="$LLVM/bin/clang.exe"
@@ -15,8 +17,10 @@ mkdir -p build/rt
 # 注意：rt_io.o 不参与 shadow.exe 链接——bootstrap/runtime_for_selfhost.o 已内置
 # shadow_stdin_read_line 等 6 个符号，重复链接会 duplicate symbol。
 # rt_io.o 只在 [6/7] 编译，供 tools/link_rt.py 链接用户程序时使用。
-echo "[0/7] precompile rt_zip.o"
+echo "[0/7] precompile rt_zip.o + shadow_gc_supplement.o"
 "$CLANG_C" -O0 -I "$BOOT" -c rt/rt_zip.c -o build/rt/rt_zip.o
+# shadow_gc_supplement.o 供编译器本体链接（no-op GC 符号），CI 干净环境必须显式编译
+"$CLANG_C" -O0 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o
 
 echo "[1/7] stage1: HOST($HOST) compile src/main.shadow"
 "$HOST" src/main.shadow -o build/stage1.ll
