@@ -295,15 +295,23 @@ pub kimo api_parse_to_sdiag(msg: string, rng: string) -> string {
     if (at_i >= 0) {
         seg = substr2(rest, at_i + 3, len(rest));
     }
+    // line/col 优先从 rng（ps_diag_ranges "L:C:EL:EC"，纯数字无路径）取；
+    // ⚠️ 不能从 msg 文本提取：Windows 路径 "C:/..." 的冒号会让"最后两个冒号"解析错位
+    // （L 取到 "C"、C 取到 "/Users/..."），导致诊断位置错乱。
     let lc = api_extract_lc(seg);
     let parts = str_split(lc, "|");
-    let line = "1";
-    let col = "1";
     let message = "";
     if (len(parts) >= 3) {
-        line = parts[0] as string;
-        col = parts[1] as string;
         message = parts[2] as string;
+    }
+    let line = "1";
+    let col = "1";
+    let rp = str_split(rng, ":");
+    if (len(rp) >= 1) {
+        if (len(rp[0] as string) > 0) { line = rp[0] as string; }
+    }
+    if (len(rp) >= 2) {
+        if (len(rp[1] as string) > 0) { col = rp[1] as string; }
     }
     let endlc = api_range_end(rng, line, col);
     let p = code + " error parse " + line + ":" + col + "-" + endlc + " " + message;
@@ -366,6 +374,12 @@ pub kimo api_type_none(t: Type) -> int {
 
 // 库模式编译：source → 全局结果；返回 stage（0=lex 1=parse 2=check）
 pub kimo api_check(source: string, file: string) -> int {
+    // 空 combined（import 图加载失败，main_load_combined 返回 ""）→ 直接返回，不做解析：
+    // parse 空 token 数组会越界（ps_at/ps_cur 访问空表）产生虚假 "Parse error at 1:1" 诊断。
+    // 模块图错误由调用方经 SH-MOD001 诊断呈现。
+    if (len(source) == 0) {
+        return 0;
+    }
     api_file = file;
     api_stage = 0;
     api_main_end = 0;
@@ -1380,12 +1394,14 @@ pub kimo api_sdiag_to_json(sdiag: string) -> string {
         mi = mi + 1;
     }
     // 解析 rng "L:C-EL:EC"（1-based）→ 0-based
+    // 防御：rng 可能为空段（诊断串多空格）→ 用默认 1:1-1:1，避免 sch 初始 0 产生 -1
+    if (len(rng) == 0) { rng = "1:1-1:1"; }
     let dash = str_index_of(rng, "-");
     let start_s = rng;
     if (dash >= 0) { start_s = substr2(rng, 0, dash); }
     let sc = str_index_of(start_s, ":");
     let sl = 1;
-    let sch = 0;
+    let sch = 1;
     if (sc >= 0) {
         sl = api_atoi(substr2(start_s, 0, sc));
         sch = api_atoi(substr2(start_s, sc + 1, len(start_s)));
@@ -1400,19 +1416,24 @@ pub kimo api_sdiag_to_json(sdiag: string) -> string {
             ech = api_atoi(substr2(end_s, ec2 + 1, len(end_s)));
         }
     }
+    // LSP 规范：line/character 必须 ≥ 0（VSCode 客户端对负值抛 Illegal argument）
+    let sl1 = sl - 1; if (sl1 < 0) { sl1 = 0; }
+    let sch1 = sch - 1; if (sch1 < 0) { sch1 = 0; }
+    let el1 = el - 1; if (el1 < 0) { el1 = 0; }
+    let ech1 = ech - 1; if (ech1 < 0) { ech1 = 0; }
     // source 名称：parse → shadow-parse；typecheck → shadow-typecheck
     let src_name = "shadow-parse";
     if (str_eq(source, "typecheck") == 1) { src_name = "shadow-typecheck"; }
     // 组装 JSON
     let parts: array<string> = [];
     parts = array_push(parts, "{\"range\":{\"start\":{\"line\":");
-    parts = array_push(parts, int_to_str(sl - 1));
+    parts = array_push(parts, int_to_str(sl1));
     parts = array_push(parts, ",\"character\":");
-    parts = array_push(parts, int_to_str(sch - 1));
+    parts = array_push(parts, int_to_str(sch1));
     parts = array_push(parts, "},\"end\":{\"line\":");
-    parts = array_push(parts, int_to_str(el - 1));
+    parts = array_push(parts, int_to_str(el1));
     parts = array_push(parts, ",\"character\":");
-    parts = array_push(parts, int_to_str(ech - 1));
+    parts = array_push(parts, int_to_str(ech1));
     parts = array_push(parts, "}},\"severity\":");
     parts = array_push(parts, int_to_str(sev));
     parts = array_push(parts, ",\"code\":\"");

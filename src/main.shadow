@@ -28,8 +28,15 @@ import lsp.lsp;
 // TIMING-DBG-TEMP
 @extern("clock") kimo c_clock() -> long { return 0; }
 
-// 打印到 stderr（错误消息）
+// 全局：LSP 模式标志（--lsp 入口置 1）。
+// LSP 的 stdout 是 JSON-RPC 帧通道，任何裸文本输出都会破坏帧协议
+// （VSCode 报 "Header must provide a Content-Length property"）；
+// 模块/编译错误在 LSP 模式经 SH-MOD001 等诊断通道呈现，不走 eprint。
+let main_lsp_active: int = 0;
+
+// 打印错误消息。CLI 模式写 stdout；LSP 模式抑制（stdout 是帧通道，禁止裸输出）。
 kimo main_eprint(s: string) -> void {
+    if (main_lsp_active == 1) { return; }
     rt_puts(s);
 }
 
@@ -1554,6 +1561,7 @@ kimo main_compile_source(source: string, file: string) -> string {
 //   shadow <f> --type-at <f> <l> <c> → 位置参数 args[4]/args[5]
 kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> int {
     if (str_eq(qflag, "--lsp") == 1) {
+        main_lsp_active = 1;
         lsp_set_arg0(args[0] as string);
         lsp_run();
         return 0;

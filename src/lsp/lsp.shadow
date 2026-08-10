@@ -296,17 +296,59 @@ pub kimo lsp_compile(uri: string) -> void {
     // 不存在单文件退化路径——模块图加载失败一律以诊断呈现，而非降级为单文件检查。
     let combined = api_load_combined(path, lsp_arg0, src);
     api_check(combined, path);
+    // 调试日志：编译结果（combined 长度 / parse 错误数 / tc 错误数 / 诊断数）
+    lsp_log("compile combined_len=" + int_to_str(len(combined)) +
+            " parse=" + int_to_str(len(api_parse_raw)) +
+            " tc=" + int_to_str(api_err_count) +
+            " sdiags=" + int_to_str(len(api_sdiags)));
     api_set_main_end(api_main_module_end());
     // 模块图加载失败（dsb 与文件名不符 / import 无法解析）→ 落一条模块诊断。
     // 必须在 api_check 之后，否则会被其清空。
     let merr = api_import_err();
     if (len(merr) > 0) {
-        api_push_sdiag("SH-MOD001 error shadow-module 1:1-1:1 " + merr);
+        // 定位到源码中 "import <mod>" 所在行（不再固定 1:1）
+        let il = lsp_import_err_line(src, merr);
+        let rng = int_to_str(il) + ":1-" + int_to_str(il) + ":200";
+        api_push_sdiag("SH-MOD001 error shadow-module " + rng + " " + merr);
     }
     lsp_last_uri = uri;
 }
 
-// 推送诊断通知（didChange 后）
+// 从模块加载错误串提取 import 语句行号（源码中 "import <mod>" 所在行，1-based；找不到返回 1）。
+// merr 形如 'no required module provides package "c" (...)'。
+kimo lsp_import_err_line(src: string, merr: string) -> int {
+    let q1 = str_index_of(merr, "\"");
+    let mod = "";
+    if (q1 >= 0) {
+        let tail = substr2(merr, q1 + 1, len(merr));
+        let q2 = str_index_of(tail, "\"");
+        if (q2 >= 0) {
+            mod = substr2(tail, 0, q2);
+        }
+    }
+    if (len(mod) == 0) { return 1; }
+    let lines = str_split(src, "\n");
+    let i = 0;
+    while (i < len(lines)) {
+        let l = lines[i] as string;
+        if (str_index_of(l, "import " + mod) >= 0) {
+            return i + 1;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 只读请求（hover/definition/references/highlight/symbols/semanticTokens）入口：
+// uri 与上次编译一致则跳过全量重编译——大项目（0.5 源码 13 模块）一次编译数分钟，
+// 若每次请求都重编译会导致 VSCode 一直"正在加载"。
+kimo lsp_ensure_compiled(uri: string) -> void {
+    if (str_eq(lsp_last_uri, uri) == 0) {
+        lsp_compile(uri);
+    }
+}
+
+// 推送诊断通知（didChange 后）——必须无条件重编译（要拿最新诊断）
 pub kimo lsp_publish_diagnostics(uri: string, version: int) -> void {
     lsp_compile(uri);
     let diags = api_sdiag_json_array();
@@ -437,6 +479,8 @@ pub kimo lsp_document_symbols_json() -> string {
     let parts: array<string> = [];
     parts = array_push(parts, "[");
     let first = 1;
+    // 主文件模块行上界：只显示主文件符号（combined 行号 ≤ mend），过滤 runtime_lib 噪音
+    let mend = api_main_module_end();
     // funcs（fmeta: name|L|C|EL|EC|rettype|sig）
     let i = 0;
     while (i < len(api_fmeta)) {
@@ -447,6 +491,9 @@ pub kimo lsp_document_symbols_json() -> string {
             let fel = api_atoi(fm[3] as string);
             let fec = api_atoi(fm[4] as string);
             let nm = fm[0] as string;
+            if (fl > mend) { i = i + 1; continue; }
+            let selc = fc + len(nm) - 1;
+            if (selc > fec) { selc = fec; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm + "\",\"kind\":12,\"detail\":\"function\"," +
@@ -457,7 +504,7 @@ pub kimo lsp_document_symbols_json() -> string {
                        "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(fl - 1) +
                        ",\"character\":" + int_to_str(fc - 1) +
                        "},\"end\":{\"line\":" + int_to_str(fl - 1) +
-                       ",\"character\":" + int_to_str(fc + len(nm) - 1) + "}}}";
+                       ",\"character\":" + int_to_str(selc) + "}}}";
             parts = array_push(parts, item);
         }
         i = i + 1;
@@ -472,6 +519,9 @@ pub kimo lsp_document_symbols_json() -> string {
             let sel2 = api_atoi(sm[3] as string);
             let sec2 = api_atoi(sm[4] as string);
             let nm2 = sm[0] as string;
+            if (sl2 > mend) { i = i + 1; continue; }
+            let selc2 = sc2 + len(nm2) - 1;
+            if (selc2 > sec2) { selc2 = sec2; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm2 + "\",\"kind\":5,\"detail\":\"struct\"," +
@@ -482,7 +532,7 @@ pub kimo lsp_document_symbols_json() -> string {
                        "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(sl2 - 1) +
                        ",\"character\":" + int_to_str(sc2 - 1) +
                        "},\"end\":{\"line\":" + int_to_str(sl2 - 1) +
-                       ",\"character\":" + int_to_str(sc2 + len(nm2) - 1) + "}}}";
+                       ",\"character\":" + int_to_str(selc2) + "}}}";
             parts = array_push(parts, item);
         }
         i = i + 1;
@@ -497,6 +547,9 @@ pub kimo lsp_document_symbols_json() -> string {
             let eel2 = api_atoi(em[3] as string);
             let eec2 = api_atoi(em[4] as string);
             let nm3 = em[0] as string;
+            if (el2 > mend) { i = i + 1; continue; }
+            let selc3 = ec2 + len(nm3) - 1;
+            if (selc3 > eec2) { selc3 = eec2; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm3 + "\",\"kind\":10,\"detail\":\"enum\"," +
@@ -507,7 +560,7 @@ pub kimo lsp_document_symbols_json() -> string {
                        "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(el2 - 1) +
                        ",\"character\":" + int_to_str(ec2 - 1) +
                        "},\"end\":{\"line\":" + int_to_str(el2 - 1) +
-                       ",\"character\":" + int_to_str(ec2 + len(nm3) - 1) + "}}}";
+                       ",\"character\":" + int_to_str(selc3) + "}}}";
             parts = array_push(parts, item);
         }
         i = i + 1;
@@ -522,6 +575,9 @@ pub kimo lsp_document_symbols_json() -> string {
             let gel2 = api_atoi(gm[3] as string);
             let gec2 = api_atoi(gm[4] as string);
             let nm4 = gm[0] as string;
+            if (gl2 > mend) { i = i + 1; continue; }
+            let selc4 = gc2 + len(nm4) - 1;
+            if (selc4 > gec2) { selc4 = gec2; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm4 + "\",\"kind\":13,\"detail\":\"variable\"," +
@@ -532,7 +588,7 @@ pub kimo lsp_document_symbols_json() -> string {
                        "\"selectionRange\":{\"start\":{\"line\":" + int_to_str(gl2 - 1) +
                        ",\"character\":" + int_to_str(gc2 - 1) +
                        "},\"end\":{\"line\":" + int_to_str(gl2 - 1) +
-                       ",\"character\":" + int_to_str(gc2 + len(nm4) - 1) + "}}}";
+                       ",\"character\":" + int_to_str(selc4) + "}}}";
             parts = array_push(parts, item);
         }
         i = i + 1;
@@ -876,6 +932,8 @@ pub kimo lsp_dispatch(body: string) -> void {
         // 纯响应（服务端→客户端请求的应答）——直接忽略
         return;
     }
+    // 调试日志：每条消息记录 method + id（VSCode 输出面板可见；崩溃定位用——最后一条即崩溃前请求）
+    lsp_log("recv " + method + " id=" + idraw);
     let params = lsp_json_get(body, "params");
     // 取消请求
     if (str_eq(method, "$/cancelRequest") == 1) {
@@ -1029,7 +1087,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // hover
     if (str_eq(method, "textDocument/hover") == 1) {
         if (len(uri) == 0) { return "{\"contents\":{\"kind\":\"markdown\",\"value\":\"\"}}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let info = api_hover_info(pline, pchar);
         let p1 = "{\"contents\":{\"kind\":\"markdown\",\"value\":\"```shadow\\n";
         let p2 = p1 + api_json_escape(info);
@@ -1042,7 +1100,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         str_eq(method, "textDocument/typeDefinition") == 1 ||
         str_eq(method, "textDocument/implementation") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         let def = api_find_definition(word);
         if (len(def) == 0) { return "null"; }
@@ -1056,7 +1114,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // references
     if (str_eq(method, "textDocument/references") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         let refs = api_find_references(word);
         let parts: array<string> = [];
@@ -1088,7 +1146,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // documentHighlight
     if (str_eq(method, "textDocument/documentHighlight") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         let refs = api_find_references(word);
         let parts: array<string> = [];
@@ -1122,31 +1180,31 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // documentSymbol
     if (str_eq(method, "textDocument/documentSymbol") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_document_symbols_json();
     }
     // semanticTokens/full
     if (str_eq(method, "textDocument/semanticTokens/full") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_semantic_tokens_json();
     }
     // semanticTokens/range（简化：返回 full）
     if (str_eq(method, "textDocument/semanticTokens/range") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_semantic_tokens_json();
     }
     // semanticTokens/full/delta（简化：返回 full 数据）
     if (str_eq(method, "textDocument/semanticTokens/full/delta") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_semantic_tokens_json();
     }
     // completion
     if (str_eq(method, "textDocument/completion") == 1) {
         if (len(uri) == 0) { return "{\"isIncomplete\":false,\"items\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
         return lsp_completion_json(prefix);
@@ -1154,19 +1212,19 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // signatureHelp
     if (str_eq(method, "textDocument/signatureHelp") == 1) {
         if (len(uri) == 0) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_signature_help_json(pline, pchar);
     }
     // foldingRange
     if (str_eq(method, "textDocument/foldingRange") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_folding_range_json();
     }
     // selectionRange
     if (str_eq(method, "textDocument/selectionRange") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         // 简化：返回包含位置的最深 Expr 区间（info = L|C|EL|EC|kind|str1|type）
         let info = api_deepest_expr_info(pline, pchar);
         if (len(info) == 0) { return "null"; }
@@ -1181,7 +1239,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // inlayHint
     if (str_eq(method, "textDocument/inlayHint") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_inlay_hint_json();
     }
     // documentColor
@@ -1203,7 +1261,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // linkedEditingRange（光标处标识符的所有引用区间，编辑其一即联动其余）
     if (str_eq(method, "textDocument/linkedEditingRange") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         if (len(word) == 0) { return "null"; }
         let refs = api_find_references(word);
@@ -1238,7 +1296,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // moniker
     if (str_eq(method, "textDocument/moniker") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         if (len(word) == 0) { return "[]"; }
         let idn = lsp_uri_to_path(uri) + "#" + word;
@@ -1259,7 +1317,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // prepareRename
     if (str_eq(method, "textDocument/prepareRename") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         if (len(word) == 0) { return "null"; }
         let rng = "{\"range\":{\"start\":{\"line\":" + int_to_str(pline - 1) +
@@ -1271,7 +1329,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // rename
     if (str_eq(method, "textDocument/rename") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let new_name = lsp_json_str(params, "newName");
         let word = api_ident_at(pline, pchar);
         let refs = api_find_references(word);
@@ -1303,13 +1361,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // codeAction
     if (str_eq(method, "textDocument/codeAction") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         return lsp_code_action_json(uri);
     }
     // codeLens（每个顶层函数显示引用计数，点击跳转到引用）
     if (str_eq(method, "textDocument/codeLens") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let defs = lsp_scan_func_defs(src);
         let parts: array<string> = [];
@@ -1351,7 +1409,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // inlineCompletion（复用补全结果生成行内补全）
     if (str_eq(method, "textDocument/inlineCompletion") == 1) {
         if (len(uri) == 0) { return "{\"items\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
         let cj = lsp_completion_json(prefix);
@@ -1364,7 +1422,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // diagnostic（LSP 3.17 pull）
     if (str_eq(method, "textDocument/diagnostic") == 1) {
         if (len(uri) == 0) { return "{\"kind\":\"full\",\"items\":[]}"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let diags = api_sdiag_json_array();
         let p1 = "{\"kind\":\"full\",\"items\":";
         return p1 + diags + "}";
@@ -1394,7 +1452,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // callHierarchy
     if (str_eq(method, "textDocument/prepareCallHierarchy") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         let def = api_find_definition(word);
         if (len(def) == 0) { return "null"; }
@@ -1481,7 +1539,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // typeHierarchy
     if (str_eq(method, "textDocument/prepareTypeHierarchy") == 1) {
         if (len(uri) == 0) { return "null"; }
-        lsp_compile(uri);
+        lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         let def = api_find_definition(word);
         if (len(def) == 0) { return "null"; }
@@ -1841,7 +1899,7 @@ pub kimo lsp_code_action_json(uri: string) -> string {
 // ============ 主循环 ============
 pub kimo lsp_run() -> void {
     lsp_exit_flag = 0;
-    lsp_log("shadow LSP server (0.4) started");
+    lsp_log("shadow LSP server (0.5) started");
     while (lsp_exit_flag == 0) {
         let body = lsp_read_message();
         if (len(body) == 0) { break; }
