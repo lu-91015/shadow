@@ -3869,8 +3869,15 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                 let root = nsp;
                 let d0 = tc_first_dot(nsp);
                 if (d0 >= 0) { root = substr2(nsp, 0, d0); }
-                let rvt = tc_env_get(env, root);
-                if (type_is_none(rvt) == 1) {
+                // 仅当 root 是真实值/结构体（方法接收者）才视为「局部变量遮蔽包名」而跳过
+                // FQN；import 进来的同名函数（裸名进入 env）不视为遮蔽，否则 mod 名 == 函数名
+                // 时会被错误当成变量，导致 FQN 剥离分支被跳过、模块被当 receiver 插入。
+                let rroot = tc_env_get(env, root);
+                let root_shadowed = 0;
+                if (type_is_none(rroot) == 0 && rroot.kind == TYPE_STRUCT) {
+                    root_shadowed = 1;
+                }
+                if (root_shadowed == 0) {
                     let ffd = tc_resolve_fqn_func(ctx, nsp + "." + name);
                     if (tc_func_is_none(ffd) == 0) {
                         let rest: array<Expr> = [];
@@ -3886,12 +3893,31 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                 }
             }
         }
-        // 单段模块限定调用：mod.f(x)（recv 是 EXPR_VAR 且为已登记模块名；0.3 用例
-        // import _dotqual_mod 后以 dsb 名 dotqual_mod.helper() 访问）。局部变量遮蔽包名。
+        // 单段模块限定调用：mod.f(x)（recv 是 EXPR_VAR 且为已登记模块名）。
+        // 仅当 recv 是真实值/结构体（方法接收者）才视为「局部变量遮蔽包名」而跳过 FQN；
+        // import 进来的同名函数（如模块 c 导出 pub 函数 c，裸名进入 env）不视为遮蔽，
+        // 否则会错误地把模块当 receiver 插入 → 「expects N args but got N+1」（c.c(1,1) 的 got 3）。
         else if (rk0 == EXPR_VAR && tc_is_known_ns(ctx, recv.str1) == 1) {
             let rvt1 = tc_env_get(env, recv.str1);
-            if (type_is_none(rvt1) == 1) {
+            let shadowed = 0;
+            if (type_is_none(rvt1) == 0 && rvt1.kind == TYPE_STRUCT) {
+                shadowed = 1;
+            }
+            if (shadowed == 0) {
                 let ffd1 = tc_resolve_fqn_func(ctx, recv.str1 + "." + name);
+                if (tc_func_is_none(ffd1) == 1) {
+                    // FQN 未命中（被调函数为同包非 pub，ns_funcs 仅登记 pub）：
+                    // 退化为裸名查找（tc_func_lookup 自动尊重可见性——同包私有可见、
+                    // 跨包私有不可见），并校验解析到的函数确属 recv 模块，避免误解析到
+                    // 其他同名模块（如 c.d 而 d 实际属于另一模块）。
+                    let fb = tc_func_lookup(ctx, name);
+                    if (tc_func_is_none(fb) == 0) {
+                        let want = "__mod_" + recv.str1 + "__";
+                        if (str_starts_with(fb.name, want) == 1) {
+                            ffd1 = fb;
+                        }
+                    }
+                }
                 if (tc_func_is_none(ffd1) == 0) {
                     let rest1: array<Expr> = [];
                     let ri1 = 1;
