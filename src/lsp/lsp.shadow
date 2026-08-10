@@ -1,4 +1,4 @@
-// Shadow 0.4 — LSP 服务器（Phase 14）
+// Shadow 0.5 — LSP 服务器（Phase 14）
 // ============================================================
 // JSON-RPC 2.0 over stdio，对齐 0.3 lsp.shadow 的行为语义，
 // 但基于 0.4 compile_api（src/api/compile_api.shadow）。
@@ -7,7 +7,7 @@
 //   FFI（stdin/stdout/JSON）→ 工具 → 文档存储 → 编译（compile_api）
 //   → 帧读写 → 生命周期/分发 → handlers → 主循环
 //
-// 0.3 宿主（s03.exe）编译约束：无嵌套数组索引、数组传参修改用全局、
+// 自举宿主编译约束：无嵌套数组索引、数组传参修改用全局、
 // struct 判空用 as any == 0、字符串拼接避免裸 + 长链（原则 9 str_join）。
 dsb lsp;
 

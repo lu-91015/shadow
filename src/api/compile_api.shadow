@@ -1,4 +1,4 @@
-// Shadow 0.4 — 编译器即库 API（compile_api）
+// Shadow 0.5 — 编译器即库 API（compile_api）
 // ============================================================
 // Phase 14（LSP）核心：把编译管线以库形式暴露，供 LSP 服务器与
 // 查询类 CLI（--check/--ranges/--at/--type-at/--diag-json）复用。
@@ -10,7 +10,7 @@
 // didChange 重新编译，所有查询 handler 复用同一编译结果。
 // 0.3 的 32 槽 LRU 在 0.4 暂以"每次请求编译"替代（后续可优化）。
 //
-// 0.3 宿主（s03.exe）编译约束（本文件被 stage1 编译）：
+// 自举宿主编译约束（本文件被 stage1/自举链编译）：
 //   - 无嵌套数组索引（用中间变量）；数组元素原地修改用全局数组；
 //   - struct 判空用 `as any == 0`（勿直接 ==）；
 //   - 字符串拼接大量使用原则 9 str_join 替代裸 + 链（本文件逻辑简单，
@@ -23,7 +23,7 @@ import core.const;
 import lexer.lexer;
 import parser.parser;
 import type_checker.type_checker;
-// 形成 main ↔ compile_api 循环依赖；宿主（0.4 shadow.exe）严格态已验证可容忍模块级循环 import。
+// 形成 main ↔ compile_api 循环依赖；宿主（shadow.exe）严格态已验证可容忍模块级循环 import。
 import main;
 
 

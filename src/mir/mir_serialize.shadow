@@ -1,4 +1,4 @@
-// Shadow 0.4 — MIR 序列化（.lu 二进制格式）
+// Shadow 0.5 — MIR 序列化（.lu 二进制格式）
 // ============================================================
 // 将 MirFunc[] 序列化为紧凑的二进制 .lu 文件，用于跨文件 MIR 缓存。
 // 导入模块时可直接加载 .lu 跳过 lex/parse/tc/hir/mir，加速编译。
@@ -24,7 +24,7 @@ import core.utils;
 
 let MIR_SER_MAGIC0: int = 76;   // 'L'
 let MIR_SER_MAGIC1: int = 85;   // 'U'
-let MIR_SER_VERSION: int = 9;   // v9：0.4 函数级增量缓存（Phase 11）——拒绝 s03 旧 v8 缓存（格式有细微差异，避免错读）
+let MIR_SER_VERSION: int = 9;   // v9：函数级增量缓存（Phase 11）——拒绝旧 v8 缓存（格式有细微差异，避免错读）
 let MIR_SER_BUF_SIZE: int = 4194304;  // 4MB 初始 buffer（不足时自动按精确尺寸重分配）
 
 let mir_ser_buf: any = 0 as any;
@@ -614,7 +614,7 @@ pub kimo mir_cache_load(source_path: string) -> any {
         return 0 as any;
     }
     if (ver < MIR_SER_VERSION) {
-        // 严格版本匹配：v9 只读 v9（旧 s03 v8 缓存一律作废，避免格式错读）
+        // 严格版本匹配：v9 只读 v9（旧 v8 缓存一律作废，避免格式错读）
         return 0 as any;
     }
     let off = 3;

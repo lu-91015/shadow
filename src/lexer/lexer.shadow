@@ -1,4 +1,4 @@
-// Shadow 0.4 — 词法分析器（Lexer）
+// Shadow 0.5 — 词法分析器（Lexer）
 // ============================================================
 // 语法完全复刻 shadow-0.3。Token 携带完整区间 [line:col, end_line:end_col)
 // （半开，1-based），parser 用它回填 AST 节点 Location 终点。

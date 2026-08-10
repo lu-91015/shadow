@@ -1,11 +1,11 @@
-// Shadow 0.4 — 语法分析器（Parser）
+// Shadow 0.5 — 语法分析器（Parser）
 // ============================================================
 // 语法完全复刻 shadow-0.3（dsb/kimo/import/pub/@extern/match/try/with/defer 等）。
 // 逻辑参考 0.3 parser.shadow，但 AST 完全适配 0.4 结构（core/ast.shadow），
 // **不使用 any 盒子**：Expr.items/items2/str_items/type_args、Stmt.items/items2/exprs、
 // DeferEntry 等全部具体类型。
 //
-// 宿主（s03.exe）import 模块内解析缺陷规避规范（见 core/utils.shadow 头部）：
+// 自举宿主 import 模块内解析缺陷规避规范（见 core/utils.shadow 头部）：
 //   1. return 0 as struct 必须经中间变量；2. return 表达式含 as any 必须经中间变量+if；
 //   3. return 表达式含跨模块常量必须经本地变量；4. 跨模块 pub 符号无需 import（P0.4-1）。
 //   5. `(expr as T).field` 连写不被支持，必须 `let t = x as T; t.field`。
@@ -21,7 +21,7 @@ let ps_tokens: array<Token> = [];
 let ps_idx: int = 0;
 let ps_file: string = "";
 // 大整数/长整型字面量解析走 C 层 strtoll（rt/rt_parse_only.c 补符号，rt_parse_only.o 进 shadow.exe 链接）。
-// ⚠️ 不能在此用 Shadow long 算术（v = v*10 + d）：自举链 s03/stage 会把 long 运算降级 i32，
+// ⚠️ 不能在此用 Shadow long 算术（v = v*10 + d）：自举链旧宿主会把 long 运算降级 i32，
 // 10^12 级字面量解析会溢出（-1000000000000L → 全局 727379968 / 局部 3567587328）。
 @extern("__rt_shadow_parse_long") kimo parser_rt_parse_long(s: any) -> long { return 0; }
 let ps_diags: array<string> = [];   // 本次 parse 收集的诊断（文本形式）

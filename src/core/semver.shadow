@@ -1,4 +1,4 @@
-// Shadow 0.4 — semver 2.0.0 实现（Phase 12a）
+// Shadow 0.5 — semver 2.0.0 实现（Phase 12a）
 // ============================================================
 // 语义版本：MAJOR.MINOR.PATCH[-prerelease][+build]
 // 约束：*（任意）/ 裸版本（精确 =）/ ^MAJOR.MINOR.PATCH（caret）/

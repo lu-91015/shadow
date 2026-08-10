@@ -1,9 +1,9 @@
-// Shadow 0.4 — core 工具函数
+// Shadow 0.5 — core 工具函数
 // ============================================================
 // 不使用 any 盒子：参数与返回全部具体类型。
 // 跨模块引用 core_ast 的 pub struct 依赖 P0.4-1 全局 pub 回退（无需 import）。
 //
-// ⚠️ 宿主（s03.exe）在 import 模块内的解析缺陷与规避规范（实测确认）：
+// ⚠️ 自举宿主在 import 模块内的解析缺陷与规避规范（实测确认）：
 //   1. `return 0 as <struct>` 表达式直接返回 → return type mismatch；
 //      必须经中间变量：`let x = 0 as T; return x;`
 //   2. `return <expr 含 as any>`（如 `return (e as any) == 0`）→ mismatch；
@@ -135,7 +135,7 @@ pub kimo char_digit(c: string) -> int {
 }
 
 // 数字 → double（返回值直接是 double 常量，避免 float 字面量赋给 double 变量——
-// s03 宿主的 STMT_ASSIGN 不设 inst.ty，float 存进 i64 slot 只写低 32 位，读 double 高 32 位垃圾）
+// 旧宿主的 STMT_ASSIGN 不设 inst.ty，float 存进 i64 slot 只写低 32 位，读 double 高 32 位垃圾）
 pub kimo digit_to_double(d: int) -> double {
     if (d == 0) { return 0.0; }
     if (d == 1) { return 1.0; }
@@ -153,7 +153,7 @@ pub kimo digit_to_double(d: int) -> double {
 // 字符串 → double（宿主无内置 str_to_double，手动解析）
 // 支持：123 / 123.45 / 1e3 / 1.0e-4 / -0.5
 // 规避：数字 → double 一律走 digit_to_double（返回 double 常量），禁止
-// `let dd: double = 0.0; dd = 3.0;` 这种 float 字面量赋值（s03 宿主 STMT_ASSIGN
+// `let dd: double = 0.0; dd = 3.0;` 这种 float 字面量赋值（旧宿主 STMT_ASSIGN
 // 无 inst.ty → float 存 i64 slot 低 32 位 → 读 double 高 32 位垃圾）。
 pub kimo str_to_double(s: string) -> double {
     let n = len(s);

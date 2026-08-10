@@ -20,7 +20,7 @@ import codegen.codegen;
 import api.compile_api;
 import lsp.lsp;
 
-// ============ Phase 12：SPK zip 工具 extern 声明（s03 宿主 TC 需要） ============
+// ============ Phase 12：SPK zip 工具 extern 声明 ============
 @extern("shadow_zip_pack") kimo zip_pack(dir: string, out: string) -> int { return 0; }
 @extern("shadow_zip_unpack") kimo zip_unpack(spk: string, out: string) -> int { return 0; }
 @extern("shadow_zip_list") kimo zip_list(spk: string) -> string { return ""; }
@@ -1034,8 +1034,8 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
 // 正确性依据：函数体检查只依赖「被调用符号的签名」，签名变化 ⟹ 源码变化 ⟹ hash 不匹配 ⟹ 缓存失效。
 
 // djb2 64 位 hash（与 0.3 sig_hash_source 同款），返回十进制字符串（与 .lu 存储一致）
-// ⚠️ 必须用 rt_get_byte 取字节：`s[i] as int` 在 0.3/0.4 编译器间的字符串语义不同，
-//    会导致 s03 编译的 stage1 与 0.4 编译的 stage2 算出不同键（缓存互相读不到）。
+// ⚠️ 必须用 rt_get_byte 取字节：不同版本编译器的字符串语义可能不同，
+//    否则缓存键会互相读不到（用 rt_get_byte 保证语义一致）。
 //    rt_get_byte 是 C 层函数（固定宿主 runtime_for_selfhost.o），两代编译器语义一致。
 kimo main_hash_src(s: string) -> string {
     let h: long = 5381;
@@ -1647,25 +1647,26 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
 }
 
 // 从 .ll 生成 .o 并链接为 exe，返回 0 成功
-// LLVM_HOME 从环境变量读取（默认 D:\llvm\clang+llvm-22.1.0-x86_64-pc-windows-msvc）
+// LLVM 工具链路径从环境变量 LLVM_HOME 读取（无内置默认路径）。
 kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir: string) -> int {
     let llvm_home = env_get("LLVM_HOME");
     if (len(llvm_home) == 0) {
-        llvm_home = "D:\\llvm\\clang+llvm-22.1.0-x86_64-pc-windows-msvc";
+        main_eprint("LLVM_HOME not set: set LLVM_HOME to your LLVM installation (e.g. C:\\llvm\\...)\n");
+        return 1;
     } else {
-        // MSYS/Git Bash 可能把反斜杠路径转成正斜杠（D://llvm//...），
+        // MSYS/Git Bash 可能把反斜杠路径转成正斜杠（C://llvm//...），
         // 与下方 \\bin\\ 拼接混用会令 cmd 无法定位。统一转回反斜杠。
         llvm_home = str_replace(llvm_home, "/", "\\");
     }
     let llc = llvm_home + "\\bin\\llc.exe";
     let clang = llvm_home + "\\bin\\clang++.exe";
-    // 产物链接 0.4 自研 rt/ 系统调用层（纯 C，仅系统库），不再依赖 C++ runtime。
+    // 产物链接 0.5 自研 rt/ 系统调用层（纯 C，仅系统库），不再依赖 C++ runtime。
     // 产物 .ll 已内嵌 Shadow runtime（main_load_combined 注入的 runtime_lib.shadow）。
     let rt_dir = self_dir + "\\rt\\";
     let rt_objs = "\"" + rt_dir + "rt_core.o\" \"" + rt_dir + "rt_fs.o\" \"" + rt_dir + "rt_proc.o\" \"" +
                   rt_dir + "rt_time.o\" \"" + rt_dir + "rt_err.o\" \"" + rt_dir + "rt_extra.o\" \"" +
                   rt_dir + "rt_gc.o\" \"" + rt_dir + "rt_thread.o\" \"" + rt_dir + "rt_io.o\"";
-    let miniz_obj = "bootstrap\\miniz.o";
+    let miniz_obj = self_dir + "\\bootstrap\\miniz.o";
     // llc -O0 -filetype=obj <ir> -o <obj>
     // cmd1：程序路径（llc）不带引号——LLVM_HOME 默认无空格；命令以引号开头会触发
     // cmd /c 的引号剥除陷阱（_popen 走 cmd.exe）。文件路径加引号（用户路径可能含空格）。

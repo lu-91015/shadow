@@ -1,10 +1,10 @@
-// Shadow 0.4 — LLVM-C API Codegen（MIR → LLVM Module）
+// Shadow 0.5 — LLVM-C API Codegen（MIR → LLVM Module）
 // ============================================================
-// 使用 @extern 声明的 LLVM-C API 构建 LLVM Module（编译器本体允许依赖 LLVM-C.dll，
-// 属工具链依赖，原则 3）。禁止字符串拼接 IR，所有 IR 通过 LLVM-C builder 生成。
+// 使用 @extern 声明的 LLVM-C API 构建 LLVM Module（LLVM-C 为编译期工具链依赖，
+// 产物 shadow.exe 运行时无需 LLVM-C.dll）。禁止字符串拼接 IR，所有 IR 通过 LLVM-C builder 生成。
 // 运行时 ABI：聚合类型（string/array/dict/struct/any）统一为 i8* 句柄。
 //
-// 与 0.3 的差异（0.4 架构）：
+// 与 0.3 的差异（0.5 架构）：
 //   - MirFunc.params 为 array<MirParam>（slot/type_kind 具体字段）
 //   - MirBlock.terminator 为 MirInst（0 as MirInst = 无）
 //   - MirInst.ty 为 Type（0 as Type = 无）
@@ -1204,7 +1204,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
 }
 
 // ============ cg_gen_inst 拆分 helpers ============
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_binop(mi: MirInst) -> void {
         let lhs_raw = cg_get_reg(mi.arg1);
         let rhs_raw = cg_get_reg(mi.arg2);
@@ -1360,7 +1360,7 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
         return;
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_call(mi: MirInst) -> void {
         let resolved_name = cg_resolve_extern_name(mi.strval);
         let k = cg_type_kind(mi.ty);
@@ -1477,7 +1477,7 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
 
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_closure(mi: MirInst) -> void {
         let fn_name = mi.strval;
         let fn_ptr = llvm_get_fn(cg_mod, fn_name);
@@ -1543,7 +1543,7 @@ pub kimo cg_gen_closure(mi: MirInst) -> void {
         return;
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_call_indirect(mi: MirInst) -> void {
         let closure_val = cg_get_reg(mi.arg1);
         let ret_kind = TYPE_VOID;
@@ -1620,7 +1620,7 @@ pub kimo cg_gen_call_indirect(mi: MirInst) -> void {
 
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_spawn(mi: MirInst) -> void {
         let fn_name = cg_resolve_extern_name(mi.strval);
         let arg_regs = mi.args;
@@ -1745,7 +1745,7 @@ pub kimo cg_gen_spawn(mi: MirInst) -> void {
 
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_await(mi: MirInst) -> void {
         let fut_val = cg_get_reg(mi.arg1);
         let await_args: array<any> = [];
@@ -1755,7 +1755,7 @@ pub kimo cg_gen_await(mi: MirInst) -> void {
         return;
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_cast(mi: MirInst) -> void {
         let val = cg_get_reg(mi.arg1);
         let dst_k = cg_type_kind(mi.ty);
@@ -1838,7 +1838,7 @@ pub kimo cg_gen_cast(mi: MirInst) -> void {
         return;
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_enum_construct(mi: MirInst) -> void {
         let tag_val = llvm_const_int(llvm_i32(cg_ctx), mi.longval as int, 1);
         let i64_val = llvm_const_int(llvm_i64(cg_ctx), 0, 1);
@@ -1888,7 +1888,7 @@ pub kimo cg_gen_enum_construct(mi: MirInst) -> void {
 
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_enum_gettag(mi: MirInst) -> void {
         let box_ptr = cg_get_reg(mi.arg1);
         if (file_exists("build/.qdbg") == 1) {
@@ -1912,7 +1912,7 @@ pub kimo cg_gen_enum_gettag(mi: MirInst) -> void {
 
 }
 
-// 拆分 helper：cg_gen_inst 过大触发 0.3 宿主 slot 256 上限
+// 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_enum_getpayload(mi: MirInst) -> void {
         let box_ptr = cg_get_reg(mi.arg1);
         if (file_exists("build/.qdbg") == 1) {

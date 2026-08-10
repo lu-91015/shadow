@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
-tools/link_rt.py — 用 0.4 自研 rt/ 系统调用层链接产物（Phase 8 验证用）。
+tools/link_rt.py — 用 0.5 自研 rt/ 系统调用层链接产物。
 
 用法：
     python tools/link_rt.py <obj.ll> <out.exe>
     将 .ll 汇编为 .o，链接 rt/ 层（纯 C，仅系统库）+ 可选 miniz.o，
     不依赖 0.3 C++ runtime（runtime_for_selfhost.o）。
 
-依赖 LLVM_HOME 环境变量或默认路径。
+依赖 LLVM_HOME 环境变量（无内置默认路径）。
 """
 import os, sys, subprocess, tempfile
-
-DEFAULT_LLVM_HOME = r"D:\llvm\clang+llvm-22.1.0-x86_64-pc-windows-msvc"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def llvm_bin():
     env = os.environ.get("LLVM_HOME")
-    base = env or DEFAULT_LLVM_HOME
-    return os.path.join(base, "bin")
+    if not env:
+        print("LLVM_HOME not set: set LLVM_HOME to your LLVM installation", file=sys.stderr)
+        sys.exit(1)
+    return os.path.join(env, "bin")
 
 
 def main():
