@@ -1200,6 +1200,29 @@ pub kimo api_find_definition(word: string) -> string {
     return "";
 }
 
+// 限定定义查找：module.symbol 形式（如 c.c）。
+// api_fmeta 布局（9 段）：name|line|col|end_line|end_col|rettype|sig|is_pub|module
+// 即下标 0=demangle 后的源码原名、8=模块名（tc_mod_of）。按 (name==sym && module==mod)
+// 精确匹配，返回 "line|col|end_line|end_col|func|sym"（""=未找到）。
+// 用于修复 ctrl+单击 module.func() 的模块名/函数名不跳转（api_ident_at 把 . 算进
+// 标识符，导致传入 "c.c" 整串而在 fmeta 里按裸名匹配失败）。
+pub kimo api_find_definition_qualified(sym: string, mod: string) -> string {
+    if (len(sym) == 0 || len(mod) == 0) { return ""; }
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 9 && str_eq(fm[0] as string, sym) == 1 && str_eq(fm[8] as string, mod) == 1) {
+            let m1 = fm[1] as string;
+            let m2 = fm[2] as string;
+            let m3 = fm[3] as string;
+            let m4 = fm[4] as string;
+            return m1 + "|" + m2 + "|" + m3 + "|" + m4 + "|func|" + sym;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
 pub kimo api_find_references(word: string) -> string {
     if (len(word) == 0) { return ""; }
     api_scan_word = word;

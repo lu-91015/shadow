@@ -47,6 +47,24 @@ def by_id(frames):
     return out
 
 
+def count_method(frames, method):
+    """统计服务端主动发出的通知帧数（无 id、method 匹配）。"""
+    n = 0
+    for f, _ in frames:
+        if f is not None and "id" not in f and f.get("method") == method:
+            n += 1
+    return n
+
+
+def first_location(res):
+    """definition 结果归一化：Location | Location[] | null → dict | None。"""
+    if isinstance(res, list):
+        return res[0] if res else None
+    if isinstance(res, dict):
+        return res
+    return None
+
+
 def run_lsp(messages, timeout=120):
     script = b"".join(frame(m) for m in messages)
     p = subprocess.run([EXE, "--lsp"], input=script, capture_output=True, timeout=timeout)
@@ -269,13 +287,169 @@ kimo main() -> int {
     return ok
 
 
+def _write_mod_c(d):
+    """写出被 import 的模块 c.shadow（函数 c 在 0-based 第 5 行）。"""
+    with open(os.path.join(d, "c.shadow"), "w", encoding="utf-8") as f:
+        f.write(
+            "dsb c;\n\n"
+            "// 计算两数之和\n"
+            "// paras m: 第一个整数\n"
+            "// paras n: 第二个整数\n"
+            "pub kimo c(m: int, n: int) -> int{\n"
+            "    return 1;\n"
+            "}\n\n"
+            "// 无参内部函数\n"
+            "pub kimo b() -> int{\n"
+            "    return 2;\n"
+            "}\n"
+        )
+
+
+def scenario_completion_snippet():
+    """c. 补全的函数项应自动补括号 + 参数占位，并触发参数提示。"""
+    d = tempfile.mkdtemp(prefix="shadow_lsp_snip_")
+    try:
+        _write_mod_c(d)
+        MAIN = ("dsb main;\nimport c;\n\n"
+                "kimo main() -> int {\n"
+                "    let a = c.;\n"
+                "    return 0;\n"
+                "}\n")
+        uri = "file:///" + d.replace("\\", "/") + "/main.shadow"
+        reqs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+             "params": {"textDocument": {"uri": uri, "languageId": "shadow", "version": 1, "text": MAIN}}},
+            # 光标紧跟 "    let a = c." 之后 → character = 14
+            {"jsonrpc": "2.0", "id": 2, "method": "textDocument/completion",
+             "params": {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 14}}},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ]
+        r = by_id(run_lsp(reqs, timeout=120))
+        items = (r.get("2", {}).get("result", {}) or {}).get("items") or []
+        byname = {it.get("label", ""): it for it in items}
+        ok = True
+        if "c" not in byname or "b" not in byname:
+            print(f"  [FAIL] snippet: members missing ({list(byname)})")
+            return False
+        # 有参函数 c(m, n) → c(${1:m}, ${2:n})
+        ic = byname["c"]
+        newtext = (ic.get("textEdit") or {}).get("newText", ic.get("insertText", ""))
+        if newtext != "c(${1:m}, ${2:n})":
+            ok = False
+            print(f"  [FAIL] snippet: c newText wrong (got {newtext!r})")
+        if ic.get("insertTextFormat") != 2:
+            ok = False
+            print(f"  [FAIL] snippet: c insertTextFormat != 2 (got {ic.get('insertTextFormat')!r})")
+        if (ic.get("command") or {}).get("command") != "editor.action.triggerParameterHints":
+            ok = False
+            print(f"  [FAIL] snippet: c missing triggerParameterHints ({ic.get('command')!r})")
+        # 无参函数 b() → b()
+        ib = byname["b"]
+        bnew = (ib.get("textEdit") or {}).get("newText", ib.get("insertText", ""))
+        if bnew != "b()":
+            ok = False
+            print(f"  [FAIL] snippet: b newText wrong (got {bnew!r})")
+        if ok:
+            print(f"  [PASS] snippet: c → {newtext!r}, b → {bnew!r}, 参数提示已挂载")
+        return ok
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def scenario_qualified_definition():
+    """c.c(1,2) 上 Ctrl+点击第二个 c，应跳到 c.shadow 里 c 的定义。"""
+    d = tempfile.mkdtemp(prefix="shadow_lsp_def_")
+    try:
+        _write_mod_c(d)
+        MAIN = ("dsb main;\nimport c;\n\n"
+                "kimo main() -> int {\n"
+                "    let a = c.c(1,2);\n"
+                "    return 0;\n"
+                "}\n")
+        uri = "file:///" + d.replace("\\", "/") + "/main.shadow"
+        # "    let a = c.c(1,2);" 索引：12='c' 13='.' 14='c'（被点击的函数名）
+        reqs = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+             "params": {"textDocument": {"uri": uri, "languageId": "shadow", "version": 1, "text": MAIN}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition",
+             "params": {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 14}}},
+            {"jsonrpc": "2.0", "method": "exit", "params": None},
+        ]
+        r = by_id(run_lsp(reqs, timeout=120))
+        loc = first_location(r.get("2", {}).get("result"))
+        if loc is None:
+            print(f"  [FAIL] qualified-definition: null result ({r.get('2')})")
+            return False
+        ok = True
+        luri = loc.get("uri", "")
+        line = ((loc.get("range") or {}).get("start") or {}).get("line", -1)
+        if not luri.endswith("c.shadow"):
+            ok = False
+            print(f"  [FAIL] qualified-definition: wrong file ({luri})")
+        if line != 5:
+            ok = False
+            print(f"  [FAIL] qualified-definition: wrong line (got {line}, want 5) uri={luri}")
+        if ok:
+            print(f"  [PASS] qualified-definition: c.c → {os.path.basename(luri)}:{line + 1}")
+        return ok
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def scenario_didchange_lazy_compile():
+    """didChange 不再同步全量编译（不推诊断）；随后的查询才编译并补推一次诊断。"""
+    DOC = """dsb lazy;
+
+kimo main() -> int {
+    let m = 1;
+    return 0;
+}
+"""
+    URI = "file:///C:/demo/lazy.shadow"
+    base = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": URI, "languageId": "shadow", "version": 1, "text": DOC}}},
+        {"jsonrpc": "2.0", "method": "textDocument/didChange",
+         "params": {"textDocument": {"uri": URI, "version": 2},
+                    "contentChanges": [{"range": {"start": {"line": 3, "character": 13},
+                                                  "end": {"line": 3, "character": 14}},
+                                        "text": "2"}]}},
+    ]
+    # A) 只编辑不查询 → 仅 didOpen 那一次诊断
+    fa = run_lsp(base + [{"jsonrpc": "2.0", "method": "exit", "params": None}])
+    na = count_method(fa, "textDocument/publishDiagnostics")
+    # B) 编辑后发一次查询 → 惰性编译时补推第二次诊断
+    fb = run_lsp(base + [
+        {"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
+         "params": {"textDocument": {"uri": URI}, "position": {"line": 3, "character": 9}}},
+        {"jsonrpc": "2.0", "method": "exit", "params": None},
+    ])
+    nb = count_method(fb, "textDocument/publishDiagnostics")
+    ok = True
+    if na != 1:
+        ok = False
+        print(f"  [FAIL] lazy-compile: didChange 仍在同步编译（诊断数 {na}，期望 1）")
+    if nb != 2:
+        ok = False
+        print(f"  [FAIL] lazy-compile: 查询后未补推诊断（诊断数 {nb}，期望 2）")
+    if ok:
+        print(f"  [PASS] lazy-compile: 编辑后 {na} 次诊断，查询后 {nb} 次（惰性编译生效）")
+    return ok
+
+
 def main():
     print(f"== LSP feature tests ({EXE}) ==")
     total = passed = 0
     for name, fn in [("inlay_hint", scenario_inlay_hint),
                      ("hover_internal", scenario_hover_internal),
                      ("module_completion_sighelp", scenario_module_completion_and_signature),
-                     ("value_completion", scenario_value_completion)]:
+                     ("value_completion", scenario_value_completion),
+                     ("completion_snippet", scenario_completion_snippet),
+                     ("qualified_definition", scenario_qualified_definition),
+                     ("didchange_lazy_compile", scenario_didchange_lazy_compile)]:
         total += 1
         try:
             ok = fn()

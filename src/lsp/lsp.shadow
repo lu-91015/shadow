@@ -282,6 +282,11 @@ pub kimo lsp_linecol_to_offset(lines: array<string>, line0: int, col0: int) -> i
 // ============ 编译（委托 compile_api，单槽缓存） ============
 let lsp_last_uri: string = "";
 let lsp_arg0: string = "";   // shadow.exe 路径（main 在 --lsp 入口注入，供模块图 std 根探测）
+// 文档自上次编译后是否被编辑过。didChange 只标脏不编译（见 lsp_ensure_compiled 注释）。
+let lsp_dirty: int = 0;
+
+// 标记文档已被编辑（下一次查询时才真正重编译）
+pub kimo lsp_mark_dirty() -> void { lsp_dirty = 1; }
 
 // main 在 --lsp 入口注入 exe 路径（供 main_load_combined 探测 src/std 根）
 pub kimo lsp_set_arg0(p: string) -> void { lsp_arg0 = p; }
@@ -312,6 +317,7 @@ pub kimo lsp_compile(uri: string) -> void {
         api_push_sdiag("SH-MOD001 error shadow-module " + rng + " " + merr);
     }
     lsp_last_uri = uri;
+    lsp_dirty = 0;
 }
 
 // 从模块加载错误串提取 import 语句行号（源码中 "import <mod>" 所在行，1-based；找不到返回 1）。
@@ -340,17 +346,34 @@ kimo lsp_import_err_line(src: string, merr: string) -> int {
 }
 
 // 只读请求（hover/definition/references/highlight/symbols/semanticTokens）入口：
-// uri 与上次编译一致则跳过全量重编译——大项目（0.5 源码 13 模块）一次编译数分钟，
-// 若每次请求都重编译会导致 VSCode 一直"正在加载"。
+// 仅在「换了文档」或「文档被编辑过（dirty）」时才全量重编译——大项目（0.5 源码 13 模块）
+// 一次严格态检查数秒，若每次请求都重编译会导致 VSCode 一直"正在加载"。
+//
+// 编辑后的首次惰性编译顺带补推一次诊断：didChange 已不再同步编译，
+// 而编辑后客户端必然会请求 semanticTokens/completion 等，诊断因此仍能及时刷新，
+// 不依赖客户端是否支持 pull diagnostics（textDocument/diagnostic）。
 kimo lsp_ensure_compiled(uri: string) -> void {
-    if (str_eq(lsp_last_uri, uri) == 0) {
-        lsp_compile(uri);
+    let need = 0;
+    if (str_eq(lsp_last_uri, uri) == 0) { need = 1; }
+    if (lsp_dirty == 1) { need = 1; }
+    if (need == 0) { return; }
+    let was_dirty = lsp_dirty;
+    lsp_compile(uri);
+    if (was_dirty == 1) {
+        let ver = lsp_doc_get_version(uri);
+        if (ver < 0) { ver = 0; }
+        lsp_push_diagnostics(uri, ver);
     }
 }
 
-// 推送诊断通知（didChange 后）——必须无条件重编译（要拿最新诊断）
+// 编译 + 推送诊断（didOpen/didSave：这些时机用户可接受一次同步编译）
 pub kimo lsp_publish_diagnostics(uri: string, version: int) -> void {
     lsp_compile(uri);
+    lsp_push_diagnostics(uri, version);
+}
+
+// 仅推送当前编译结果的诊断（不触发重编译）
+pub kimo lsp_push_diagnostics(uri: string, version: int) -> void {
     let diags = api_sdiag_json_array();
     let p1 = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"";
     let p2 = p1 + uri;
@@ -732,6 +755,87 @@ pub kimo lsp_full_edit_json(uri: string, new_text: string) -> string {
     return p4 + "\"}]";
 }
 
+// ============ completion snippet 辅助 ============
+// 单个参数声明 "a: int" / "a" → 参数名 "a"
+kimo lsp_param_name_of(seg: string) -> string {
+    let s = str_trim(seg);
+    let ci = str_index_of(s, ":");
+    if (ci >= 0) { s = str_trim(substr2(s, 0, ci)); }
+    return s;
+}
+
+// 从函数签名提取参数名列表。
+// 接受两种形态：编译器元数据 "fn f(a: int, b: string) -> int" 与内建表 "len(s) -> int"。
+// 顶层逗号切分时跳过 <> 与嵌套 () 内的逗号（如 dict<int, string>、fn(int, int) -> int）。
+pub kimo lsp_sig_param_names(sig: string) -> array<string> {
+    let out: array<string> = [];
+    let lp = str_index_of(sig, "(");
+    if (lp < 0) { return out; }
+    // 找与 lp 配对的右括号
+    let depth = 0;
+    let i = lp;
+    let rp = -1;
+    let n = len(sig);
+    while (i < n) {
+        let c = substr2(sig, i, i + 1);
+        if (str_eq(c, "(") == 1) { depth = depth + 1; }
+        else if (str_eq(c, ")") == 1) {
+            depth = depth - 1;
+            if (depth == 0) { rp = i; break; }
+        }
+        i = i + 1;
+    }
+    if (rp < 0) { return out; }
+    let inner = substr2(sig, lp + 1, rp);
+    if (len(str_trim(inner)) == 0) { return out; }
+    let seg = "";
+    let ad = 0;   // <> 深度
+    let pd = 0;   // () 深度
+    let k = 0;
+    while (k < len(inner)) {
+        let ch = substr2(inner, k, k + 1);
+        if (str_eq(ch, "<") == 1) { ad = ad + 1; }
+        else if (str_eq(ch, ">") == 1) { if (ad > 0) { ad = ad - 1; } }
+        else if (str_eq(ch, "(") == 1) { pd = pd + 1; }
+        else if (str_eq(ch, ")") == 1) { if (pd > 0) { pd = pd - 1; } }
+        if (str_eq(ch, ",") == 1 && ad == 0 && pd == 0) {
+            out = array_push(out, lsp_param_name_of(seg));
+            seg = "";
+        } else {
+            seg = seg + ch;
+        }
+        k = k + 1;
+    }
+    if (len(str_trim(seg)) > 0) { out = array_push(out, lsp_param_name_of(seg)); }
+    return out;
+}
+
+// 函数补全的调用 snippet：f(${1:a}, ${2:b})；无参 → f()。
+// 供 insertText / textEdit.newText 使用，需同时置 insertTextFormat=2。
+// 注意 api_json_escape 只转义 " \ \n \t \r，不会破坏 ${..} 占位语法。
+pub kimo lsp_call_snippet(name: string, sig: string) -> string {
+    let ps = lsp_sig_param_names(sig);
+    if (len(ps) == 0) { return name + "()"; }
+    let parts: array<string> = [];
+    parts = array_push(parts, name);
+    parts = array_push(parts, "(");
+    let i = 0;
+    while (i < len(ps)) {
+        if (i > 0) { parts = array_push(parts, ", "); }
+        let pn = ps[i] as string;
+        if (len(pn) == 0) { pn = "arg" + int_to_str(i + 1); }
+        parts = array_push(parts, "${" + int_to_str(i + 1) + ":" + pn + "}");
+        i = i + 1;
+    }
+    parts = array_push(parts, ")");
+    return str_join(parts, "");
+}
+
+// 补全项接受后触发参数提示浮层（对齐 0.3 行为）
+pub kimo lsp_param_hint_cmd() -> string {
+    return ",\"command\":{\"title\":\"参数提示\",\"command\":\"editor.action.triggerParameterHints\"}";
+}
+
 // ============ completion ============
 // 收集补全项 → LSP CompletionItem JSON
 pub kimo lsp_completion_json(prefix: string, pline0: int, pchar0: int, src: string, uri: string) -> string {
@@ -769,7 +873,13 @@ pub kimo lsp_completion_json(prefix: string, pline0: int, pchar0: int, src: stri
         if (first == 0) { parts = array_push(parts, ","); }
         first = 0;
         let item = "{\"label\":\"" + name + "\",\"kind\":" + kind +
-                   ",\"detail\":\"" + api_json_escape(detail) + "\"}";
+                   ",\"detail\":\"" + api_json_escape(detail) + "\"";
+        // 函数（CompletionItemKind.Function=3）：自动补 ()、填入参数占位并触发参数提示
+        if (str_eq(kind, "3") == 1) {
+            item = item + ",\"insertText\":\"" + api_json_escape(lsp_call_snippet(name, detail)) +
+                   "\",\"insertTextFormat\":2" + lsp_param_hint_cmd();
+        }
+        item = item + "}";
         parts = array_push(parts, item);
         i = i + 1;
     }
@@ -832,12 +942,22 @@ pub kimo lsp_module_completion(modseg: string, rest: string, src: string, uri: s
         first = 0;
         let mstart = pchar0 - len(rest);
         if (mstart < 0) { mstart = pchar0; }
+        // 函数成员（c.foo）：newText 用调用 snippet 自动补 () 与参数占位；
+        // textEdit.newText 在 insertTextFormat=2 时同样按 snippet 解析。
+        let newtext = name;
+        let fmt = "";
+        let cmd = "";
+        if (str_eq(kind, "func") == 1) {
+            newtext = lsp_call_snippet(name, detail);
+            fmt = ",\"insertTextFormat\":2";
+            cmd = lsp_param_hint_cmd();
+        }
         let te = ",\"textEdit\":{\"range\":{\"start\":{\"line\":" + int_to_str(pline0) +
                   ",\"character\":" + int_to_str(mstart) + "},\"end\":{\"line\":" + int_to_str(pline0) +
-                  ",\"character\":" + int_to_str(pchar0) + "}},\"newText\":\"" + name + "\"}";
+                  ",\"character\":" + int_to_str(pchar0) + "}},\"newText\":\"" + api_json_escape(newtext) + "\"}";
         let item = "{\"label\":\"" + name + "\",\"kind\":" + int_to_str(lspkind) + ",\"detail\":\"" + api_json_escape(detail) + "\"";
         if (len(doc) > 0) { item = item + ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"" + api_json_escape(doc) + "\"}"; }
-        item = item + te + "}";
+        item = item + te + fmt + cmd + "}";
         parts = array_push(parts, item);
         di = di + 1;
     }
@@ -1106,6 +1226,55 @@ pub kimo lsp_rindex(s: string, ch: string) -> int {
     return -1;
 }
 
+// 点分包名 → 下划线连写（a.b.c → a_b_c）
+kimo lsp_dots_to_underscores(p: string) -> string {
+    let out = "";
+    let i = 0;
+    while (i < len(p)) {
+        let c = substr2(p, i, i + 1);
+        if (str_eq(c, ".") == 1) { out = out + "_"; } else { out = out + c; }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 取模块限定名的符号段（"c.c" → "c"；无 '.' 时原样返回）
+pub kimo lsp_ident_tail(word: string) -> string {
+    let d = lsp_rindex(word, ".");
+    if (d < 0) { return word; }
+    return substr2(word, d + 1, len(word));
+}
+
+// 符号定义查找（支持模块限定名）。
+// api_ident_at 把 '.' 也算作标识符字符，因此在 "c.c(1,2)" 上点击第二个 c 时
+// 拿到的是整串 "c.c"；直接按裸名查 api_fmeta 必然落空——这正是模块限定调用
+// 无法 Ctrl+点击跳转的根因。此处先按 <模块>.<符号> 精确定位（api_fmeta 末段
+// 记录了 tc_mod_of 得到的模块名），失败再退回裸名查找。
+pub kimo lsp_lookup_definition(word: string) -> string {
+    if (len(word) == 0) { return ""; }
+    let dot = lsp_rindex(word, ".");
+    if (dot < 0) { return api_find_definition(word); }
+    let qual = substr2(word, 0, dot);
+    let sym = substr2(word, dot + 1, len(word));
+    if (len(sym) == 0) { return api_find_definition(qual); }
+    if (len(qual) > 0) {
+        let d1 = api_find_definition_qualified(sym, qual);
+        if (len(d1) > 0) { return d1; }
+        // 多段包名 a.b.c：mangle 里的模块名可能是叶子名或下划线连写，两种都试
+        let leaf = lsp_ident_tail(qual);
+        if (str_eq(leaf, qual) == 0) {
+            let d2 = api_find_definition_qualified(sym, leaf);
+            if (len(d2) > 0) { return d2; }
+        }
+        let flat = lsp_dots_to_underscores(qual);
+        if (str_eq(flat, qual) == 0) {
+            let d3 = api_find_definition_qualified(sym, flat);
+            if (len(d3) > 0) { return d3; }
+        }
+    }
+    return api_find_definition(sym);
+}
+
 pub kimo lsp_parent_dir(p: string) -> string {
     let si = lsp_rindex(p, "/");
     let bi = lsp_rindex(p, "\\");
@@ -1370,7 +1539,11 @@ pub kimo lsp_dispatch(body: string) -> void {
             ci = ci + 1;
         }
         lsp_doc_put(uri, lsp_doc_get(uri), ver);
-        lsp_publish_diagnostics(uri, ver);
+        // 这里不做同步全量编译：0.5 大项目一次严格态检查需数秒，
+        // 每次击键都编译会把随后的 completion/definition/hover 请求堵在串行队列里
+        // （实测输入 "c." 到出补全要等 ~10s）。改为只标脏，等真正的查询到来时
+        // （lsp_ensure_compiled）再编译一次，并在那时补推诊断。
+        lsp_mark_dirty();
         return;
     }
     if (str_eq(method, "textDocument/didClose") == 1) {
@@ -1479,7 +1652,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "null"; }
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
-        let def = api_find_definition(word);
+        // 支持 c.c(1,2) 这类模块限定名：先按 <模块>.<符号> 定位，失败退回裸名
+        let def = lsp_lookup_definition(word);
         if (len(def) == 0) { return "null"; }
         let dp = str_split(def, "|");
         if (len(dp) < 6) { return "null"; }
@@ -1493,7 +1667,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "[]"; }
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
-        let refs = api_find_references(word);
+        // 模块限定名（c.c）取符号段，否则按整串匹配必然落空
+        let refs = api_find_references(lsp_ident_tail(word));
         let parts: array<string> = [];
         parts = array_push(parts, "[");
         let first = 1;
@@ -1525,7 +1700,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "[]"; }
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
-        let refs = api_find_references(word);
+        // 模块限定名（c.c）取符号段，否则按整串匹配必然落空
+        let refs = api_find_references(lsp_ident_tail(word));
         let parts: array<string> = [];
         parts = array_push(parts, "[");
         let first = 1;
@@ -1581,9 +1757,19 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // completion
     if (str_eq(method, "textDocument/completion") == 1) {
         if (len(uri) == 0) { return "{\"isIncomplete\":false,\"items\":[]}"; }
-        lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
+        // 快路径：模块成员补全（c.）只需读取模块文件做文本扫描，不依赖编译结果。
+        // 放在 lsp_ensure_compiled 之前，避免刚敲完 "c." 时被一次全量严格态检查
+        // 拖住数秒才弹出候选。
+        let fdot = str_index_of(prefix, ".");
+        if (fdot >= 0) {
+            let fast = lsp_module_completion(substr2(prefix, 0, fdot),
+                                             substr2(prefix, fdot + 1, len(prefix)),
+                                             src, uri, pline - 1, pchar - 1);
+            if (len(fast) > 0) { return fast; }
+        }
+        lsp_ensure_compiled(uri);
         return lsp_completion_json(prefix, pline - 1, pchar - 1, src, uri);
     }
     // signatureHelp
@@ -1641,7 +1827,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
         if (len(word) == 0) { return "null"; }
-        let refs = api_find_references(word);
+        // 模块限定名（c.c）取符号段，否则按整串匹配必然落空
+        let refs = api_find_references(lsp_ident_tail(word));
         let parts: array<string> = [];
         parts = array_push(parts, "[");
         let first = 1;
@@ -1709,7 +1896,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         lsp_ensure_compiled(uri);
         let new_name = lsp_json_str(params, "newName");
         let word = api_ident_at(pline, pchar);
-        let refs = api_find_references(word);
+        // 模块限定名（c.c）取符号段，否则按整串匹配必然落空
+        let refs = api_find_references(lsp_ident_tail(word));
         let edits: array<string> = [];
         edits = array_push(edits, "{\"changes\":{\"" + uri + "\":[");
         let first = 1;
@@ -1831,7 +2019,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "null"; }
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
-        let def = api_find_definition(word);
+        // 支持 c.c(1,2) 这类模块限定名：先按 <模块>.<符号> 定位，失败退回裸名
+        let def = lsp_lookup_definition(word);
         if (len(def) == 0) { return "null"; }
         let dp = str_split(def, "|");
         if (len(dp) < 6) { return "null"; }
@@ -1918,7 +2107,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "null"; }
         lsp_ensure_compiled(uri);
         let word = api_ident_at(pline, pchar);
-        let def = api_find_definition(word);
+        // 支持 c.c(1,2) 这类模块限定名：先按 <模块>.<符号> 定位，失败退回裸名
+        let def = lsp_lookup_definition(word);
         if (len(def) == 0) { return "null"; }
         let dp = str_split(def, "|");
         if (len(dp) < 6) { return "null"; }
