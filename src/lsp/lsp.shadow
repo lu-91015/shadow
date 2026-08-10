@@ -630,19 +630,27 @@ pub kimo lsp_semantic_tokens_json() -> string {
     while (i < n) {
         let t = toks[i] as Token;
         let tok_type = -1;
+        let tmod = 0;
         let k = t.kind;
         if (k == TOK_INT_LIT || k == TOK_LONG_LIT || k == TOK_FLOAT_LIT) { tok_type = 7; }
         else if (k == TOK_STRING_LIT || k == TOK_CHAR_LIT) { tok_type = 8; }
         else if (k == TOK_IDENT) {
-            // 区分函数/类型/变量：前一个 token 为 kimo → function；为 struct/enum 名 → type
+            // 区分函数/类型/变量：前一个 token 为 kimo → 函数定义（粗体）；
+            // 已知函数名且紧跟 '(' → 函数调用（粗体）；否则按类型/变量处理。
             let prev_kind = -1;
             if (i > 0) {
                 let pt = toks[i - 1] as Token;
                 prev_kind = pt.kind;
             }
-            if (prev_kind == TOK_KIMO) { tok_type = 1; }          // function
+            if (prev_kind == TOK_KIMO) { tok_type = 1; tmod = 1; }   // 函数定义：粗体
+            else if (lsp_is_function_name(t.text) == 1) {
+                tok_type = 1;                                        // 函数引用/调用
+                let nxt = "";
+                if (i + 1 < n) { let nt = toks[i + 1] as Token; nxt = nt.text; }
+                if (str_eq(nxt, "(") == 1) { tmod = 1; }            // 调用处粗体
+            }
             else if (lsp_is_type_name(t.text) == 1) { tok_type = 5; }  // type
-            else { tok_type = 0; }                                 // variable
+            else { tok_type = 0; }                                   // variable
         }
         else if (k >= TOK_KIMO && k <= TOK_DSB) { tok_type = 4; }  // keyword
         else if (k == TOK_TRUE || k == TOK_FALSE || k == TOK_NULL) { tok_type = 4; }
@@ -656,7 +664,7 @@ pub kimo lsp_semantic_tokens_json() -> string {
                 data = array_push(data, dc);
                 data = array_push(data, tl);
                 data = array_push(data, tok_type);
-                data = array_push(data, 0);
+                data = array_push(data, tmod);
             } else {
                 let dc2 = t.col - 1;
                 let tl2 = len(t.text);
@@ -664,7 +672,7 @@ pub kimo lsp_semantic_tokens_json() -> string {
                 data = array_push(data, dc2);
                 data = array_push(data, tl2);
                 data = array_push(data, tok_type);
-                data = array_push(data, 0);
+                data = array_push(data, tmod);
             }
             prev_line = t.line - 1;
             prev_char = t.col - 1 + len(t.text);
@@ -697,6 +705,18 @@ pub kimo lsp_is_type_name(name: string) -> int {
         if (len(em) >= 1 && str_eq(em[0] as string, name) == 1) { return 1; }
         i = i + 1;
     }
+    return 0;
+}
+
+// 标识符是否为函数名（用户函数 api_fmeta 或内置函数）。供语义高亮区分调用/引用。
+pub kimo lsp_is_function_name(name: string) -> int {
+    let i = 0;
+    while (i < len(api_fmeta)) {
+        let fm = str_split(api_fmeta[i] as string, "|");
+        if (len(fm) >= 1 && str_eq(fm[0] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    if (api_is_builtin(name) == 1) { return 1; }
     return 0;
 }
 
@@ -1611,7 +1631,7 @@ pub kimo lsp_initialize_result() -> string {
         "\"monikerProvider\":true," +
         "\"callHierarchyProvider\":true," +
         "\"typeHierarchyProvider\":true," +
-        "\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"variable\",\"function\",\"parameter\",\"property\",\"keyword\",\"type\",\"comment\",\"number\",\"string\"],\"tokenModifiers\":[]},\"full\":{\"delta\":true},\"range\":true}," +
+        "\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[\"variable\",\"function\",\"parameter\",\"property\",\"keyword\",\"type\",\"comment\",\"number\",\"string\"],\"tokenModifiers\":[\"bold\"]},\"full\":{\"delta\":true},\"range\":true}," +
         "\"completionProvider\":{\"resolveProvider\":true,\"triggerCharacters\":[\".\",\" \"]}," +
         "\"diagnosticProvider\":{\"interFileDependencies\":false,\"workspaceDiagnostics\":true}," +
         "\"executeCommandProvider\":{\"commands\":[\"shadow.showReferences\",\"shadow.formatDocument\",\"shadow.applyEdit\"]}," +
@@ -2337,6 +2357,15 @@ pub kimo lsp_signature_help_json(line: int, col: int, src: string, uri: string) 
                     }
                     di = di + 1;
                 }
+            }
+            // 内置函数回退（len( 等触发参数提示）
+            let bname = "";
+            if (api_is_builtin(fname) == 1) { bname = fname; }
+            else if (api_is_builtin(bare) == 1) { bname = bare; }
+            if (len(bname) > 0) {
+                let bsig = api_builtin_sig(bname);
+                let bdoc = api_builtin_doc(bname);
+                return lsp_sighelp_build(bsig, bdoc, active_param);
             }
             break;
         }

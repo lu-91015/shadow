@@ -1242,6 +1242,99 @@ pub kimo api_find_references(word: string) -> string {
     return str_join(api_acc_refs, ";");
 }
 
+// ============ 内置函数注册表（单一数据源）============
+// 格式：name|sig|doc。供补全(api_collect_symbols)、hover(api_hover_info)、
+// 参数提示(lsp_signature_help_json)、语义高亮(lsp_is_function_name) 共用。
+// 常量表，进程级缓存避免每次查询重建。
+let api_g_builtin_cache: array<string> = [];
+pub kimo api_builtin_entries() -> array<string> {
+    if (len(api_g_builtin_cache) > 0) { return api_g_builtin_cache; }
+    let b: array<string> = [];
+    b = array_push(b, "len|len(s) -> int|返回字符串或数组长度");
+    b = array_push(b, "str_eq|str_eq(a, b) -> int|字符串相等比较，相等返回 1 否则 0");
+    b = array_push(b, "str_contains|str_contains(s, needle) -> int|检查 s 是否包含子串 needle");
+    b = array_push(b, "str_index_of|str_index_of(s, needle) -> int|返回子串起始下标，未找到返回 -1");
+    b = array_push(b, "str_replace|str_replace(s, old, new) -> string|替换所有匹配子串");
+    b = array_push(b, "str_trim|str_trim(s) -> string|去除首尾空白");
+    b = array_push(b, "str_to_upper|str_to_upper(s) -> string|转大写");
+    b = array_push(b, "str_to_lower|str_to_lower(s) -> string|转小写");
+    b = array_push(b, "str_char_at|str_char_at(s, idx) -> string|取第 idx 个字符");
+    b = array_push(b, "str_split|str_split(s, delim) -> array|按分隔符拆分为字符串数组");
+    b = array_push(b, "str_join|str_join(arr, sep) -> string|用分隔符连接数组元素");
+    b = array_push(b, "str_format|str_format(fmt, args) -> string|按 {0} 占位符格式化");
+    b = array_push(b, "substr2|substr2(s, start, end) -> string|取子串 [start, end)");
+    b = array_push(b, "int_to_str|int_to_str(v) -> string|整数转字符串");
+    b = array_push(b, "long_to_str|long_to_str(v) -> string|长整数转字符串");
+    b = array_push(b, "float_to_str|float_to_str(v) -> string|浮点转字符串");
+    b = array_push(b, "bool_to_str|bool_to_str(v) -> string|布尔转字符串");
+    b = array_push(b, "parse_int|parse_int(s) -> int|字符串解析为整数");
+    b = array_push(b, "parse_long|parse_long(s) -> long|字符串解析为长整数");
+    b = array_push(b, "parse_float|parse_float(s) -> float|字符串解析为浮点");
+    b = array_push(b, "parse_bool|parse_bool(s) -> bool|字符串解析为布尔");
+    b = array_push(b, "println|println(s)|打印并换行");
+    b = array_push(b, "print|print(s)|打印不换行");
+    b = array_push(b, "to_string|to_string(v) -> string|任意值转字符串");
+    b = array_push(b, "array_push|array_push(arr, v) -> array|数组尾部追加元素，返回新数组");
+    b = array_push(b, "file_read|file_read(path) -> string|读取文件内容");
+    b = array_push(b, "file_write|file_write(path, content) -> int|写入文件，返回写入字节数");
+    b = array_push(b, "file_exists|file_exists(path) -> int|检查文件是否存在");
+    b = array_push(b, "file_delete|file_delete(path) -> int|删除文件");
+    b = array_push(b, "file_list_dir|file_list_dir(path) -> string|列出目录文件（分号分隔）");
+    b = array_push(b, "dir_create|dir_create(path) -> int|创建目录");
+    b = array_push(b, "path_exists|path_exists(path) -> int|检查路径是否存在");
+    b = array_push(b, "path_join|path_join(base, child) -> string|拼接路径");
+    b = array_push(b, "path_dirname|path_dirname(path) -> string|取路径目录名");
+    b = array_push(b, "path_basename|path_basename(path) -> string|取路径文件名");
+    b = array_push(b, "hashmap_new|hashmap_new() -> map|创建 HashMap");
+    b = array_push(b, "hashmap_insert|hashmap_insert(m, k, v)|插入键值对");
+    b = array_push(b, "hashmap_get|hashmap_get(m, k) -> any|取键对应值");
+    b = array_push(b, "hashmap_contains|hashmap_contains(m, k) -> int|检查键是否存在");
+    b = array_push(b, "hashmap_remove|hashmap_remove(m, k)|删除键");
+    b = array_push(b, "hashmap_size|hashmap_size(m) -> int|返回元素数量");
+    b = array_push(b, "set_new|set_new() -> set|创建 Set");
+    b = array_push(b, "set_add|set_add(s, v)|添加元素");
+    b = array_push(b, "set_contains|set_contains(s, v) -> int|检查元素是否存在");
+    b = array_push(b, "set_remove|set_remove(s, v)|删除元素");
+    b = array_push(b, "set_size|set_size(s) -> int|返回元素数量");
+    b = array_push(b, "rt_spawn_nullary|rt_spawn_nullary(f)|spawn 无参协程");
+    b = array_push(b, "rt_future_await|rt_future_await(f)|等待 Future 完成");
+    api_g_builtin_cache = b;
+    return b;
+}
+
+pub kimo api_is_builtin(name: string) -> int {
+    let i = 0;
+    let b = api_builtin_entries();
+    while (i < len(b)) {
+        let e = str_split(b[i] as string, "|");
+        if (len(e) >= 1 && str_eq(e[0] as string, name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo api_builtin_sig(name: string) -> string {
+    let i = 0;
+    let b = api_builtin_entries();
+    while (i < len(b)) {
+        let e = str_split(b[i] as string, "|");
+        if (len(e) >= 2 && str_eq(e[0] as string, name) == 1) { return e[1] as string; }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub kimo api_builtin_doc(name: string) -> string {
+    let i = 0;
+    let b = api_builtin_entries();
+    while (i < len(b)) {
+        let e = str_split(b[i] as string, "|");
+        if (len(e) >= 3 && str_eq(e[0] as string, name) == 1) { return e[2] as string; }
+        i = i + 1;
+    }
+    return "";
+}
+
 pub kimo api_collect_symbols() -> string {
     let out: array<string> = [];
     let i = 0;
@@ -1286,55 +1379,18 @@ pub kimo api_collect_symbols() -> string {
         }
         i = i + 1;
     }
-    // 内置函数
-    out = array_push(out, "len|3|len(s) -> int|5");
-    out = array_push(out, "str_eq|3|str_eq(a, b) -> int|5");
-    out = array_push(out, "str_contains|3|str_contains(s, needle) -> int|5");
-    out = array_push(out, "str_index_of|3|str_index_of(s, needle) -> int|5");
-    out = array_push(out, "str_replace|3|str_replace(s, old, new) -> string|5");
-    out = array_push(out, "str_trim|3|str_trim(s) -> string|5");
-    out = array_push(out, "str_to_upper|3|str_to_upper(s) -> string|5");
-    out = array_push(out, "str_to_lower|3|str_to_lower(s) -> string|5");
-    out = array_push(out, "str_char_at|3|str_char_at(s, idx) -> string|5");
-    out = array_push(out, "str_split|3|str_split(s, delim) -> array|5");
-    out = array_push(out, "str_join|3|str_join(arr, sep) -> string|5");
-    out = array_push(out, "str_format|3|str_format(fmt, args) -> string|5");
-    out = array_push(out, "substr2|3|substr2(s, start, end) -> string|5");
-    out = array_push(out, "int_to_str|3|int_to_str(v) -> string|5");
-    out = array_push(out, "long_to_str|3|long_to_str(v) -> string|5");
-    out = array_push(out, "float_to_str|3|float_to_str(v) -> string|5");
-    out = array_push(out, "bool_to_str|3|bool_to_str(v) -> string|5");
-    out = array_push(out, "parse_int|3|parse_int(s) -> int|5");
-    out = array_push(out, "parse_long|3|parse_long(s) -> long|5");
-    out = array_push(out, "parse_float|3|parse_float(s) -> float|5");
-    out = array_push(out, "parse_bool|3|parse_bool(s) -> bool|5");
-    out = array_push(out, "println|3|println(s)|5");
-    out = array_push(out, "print|3|print(s)|5");
-    out = array_push(out, "to_string|3|to_string(v) -> string|5");
-    out = array_push(out, "array_push|3|array_push(arr, v) -> array|5");
-    out = array_push(out, "file_read|3|file_read(path) -> string|5");
-    out = array_push(out, "file_write|3|file_write(path, content) -> int|5");
-    out = array_push(out, "file_exists|3|file_exists(path) -> int|5");
-    out = array_push(out, "file_delete|3|file_delete(path) -> int|5");
-    out = array_push(out, "file_list_dir|3|file_list_dir(path) -> string|5");
-    out = array_push(out, "dir_create|3|dir_create(path) -> int|5");
-    out = array_push(out, "path_exists|3|path_exists(path) -> int|5");
-    out = array_push(out, "path_join|3|path_join(base, child) -> string|5");
-    out = array_push(out, "path_dirname|3|path_dirname(path) -> string|5");
-    out = array_push(out, "path_basename|3|path_basename(path) -> string|5");
-    out = array_push(out, "hashmap_new|3|hashmap_new() -> map|5");
-    out = array_push(out, "hashmap_insert|3|hashmap_insert(m, k, v)|5");
-    out = array_push(out, "hashmap_get|3|hashmap_get(m, k) -> any|5");
-    out = array_push(out, "hashmap_contains|3|hashmap_contains(m, k) -> int|5");
-    out = array_push(out, "hashmap_remove|3|hashmap_remove(m, k)|5");
-    out = array_push(out, "hashmap_size|3|hashmap_size(m) -> int|5");
-    out = array_push(out, "set_new|3|set_new() -> set|5");
-    out = array_push(out, "set_add|3|set_add(s, v)|5");
-    out = array_push(out, "set_contains|3|set_contains(s, v) -> int|5");
-    out = array_push(out, "set_remove|3|set_remove(s, v)|5");
-    out = array_push(out, "set_size|3|set_size(s) -> int|5");
-    out = array_push(out, "rt_spawn_nullary|3|rt_spawn_nullary(f)|5");
-    out = array_push(out, "rt_future_await|3|rt_future_await(f)|5");
+    // 内置函数（单一数据源：api_builtin_entries）
+    let bi = 0;
+    let bent = api_builtin_entries();
+    while (bi < len(bent)) {
+        let be = str_split(bent[bi] as string, "|");
+        if (len(be) >= 2) {
+            let bn = be[0] as string;
+            let bs = be[1] as string;
+            out = array_push(out, bn + "|3|" + bs + "|5");
+        }
+        bi = bi + 1;
+    }
     return str_join(out, ";");
 }
 
@@ -1374,6 +1430,14 @@ pub kimo api_hover_info(line: int, col: int) -> string {
             return sig + marker;
         }
         i = i + 1;
+    }
+    // 内置函数优先于变量类型（hover 在 len( 上应显示内置信息，而非类型推导结果）
+    if (api_is_builtin(word) == 1) {
+        let bsig = api_builtin_sig(word);
+        let bdoc = api_builtin_doc(word);
+        let marker = "\n\n（内置函数）";
+        if (len(bdoc) > 0) { return bsig + "\n\n" + bdoc + marker; }
+        return bsig + marker;
     }
     let t = api_type_at_pos(line, col);
     if (len(t) > 0) {

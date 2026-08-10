@@ -440,6 +440,132 @@ kimo main() -> int {
     return ok
 
 
+def scenario_builtin_hover_and_sighelp():
+    """内置函数 hover 标「（内置函数）」+ 签名 + 文档；len( 触发参数提示。"""
+    DOC = """dsb bi;
+
+kimo main() -> int {
+    let s = "abc";
+    let n = len(s);
+    return 0;
+}
+"""
+    URI = "file:///C:/demo/bi.shadow"
+    base = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": URI, "languageId": "shadow", "version": 1, "text": DOC}}},
+    ]
+    # hover 在 len 调用处：line 4 "    let n = len(s);" → len 起始 col 12，取 13
+    rh = run_lsp(base + [
+        {"jsonrpc": "2.0", "id": 2, "method": "textDocument/hover",
+         "params": {"textDocument": {"uri": URI}, "position": {"line": 4, "character": 13}}},
+        {"jsonrpc": "2.0", "method": "exit", "params": None},
+    ])
+    r = by_id(rh)
+    hov = json.dumps(r.get("2", {}).get("result", {}), ensure_ascii=False)
+    ok = True
+    if "len(s) -> int" not in hov:
+        ok = False
+        print(f"  [FAIL] builtin-hover: sig missing ({hov[:160]})")
+    if "（内置函数）" not in hov:
+        ok = False
+        print(f"  [FAIL] builtin-hover: marker missing ({hov[:160]})")
+    if "返回字符串或数组长度" not in hov:
+        ok = False
+        print(f"  [FAIL] builtin-hover: doc missing ({hov[:200]})")
+    if ok:
+        print("  [PASS] builtin-hover: len → sig + （内置函数） + doc")
+    # signatureHelp 在 len( 处：line 4，'(' 在 col 15，光标置于 16
+    rs = run_lsp(base + [
+        {"jsonrpc": "2.0", "id": 3, "method": "textDocument/signatureHelp",
+         "params": {"textDocument": {"uri": URI}, "position": {"line": 4, "character": 16}}},
+        {"jsonrpc": "2.0", "method": "exit", "params": None},
+    ])
+    r2 = by_id(rs)
+    sh = r2.get("3", {}).get("result", {})
+    sigs = sh.get("signatures", [])
+    if not sigs:
+        ok = False
+        print(f"  [FAIL] builtin-sighelp: no signatures ({sh})")
+    else:
+        sig0 = sigs[0]
+        label = sig0.get("label", "")
+        plabels = [p.get("label", "") for p in sig0.get("parameters", [])]
+        doc = json.dumps(sig0.get("documentation", {}), ensure_ascii=False)
+        if "len(s) -> int" not in label:
+            ok = False
+            print(f"  [FAIL] builtin-sighelp: label wrong ({label})")
+        if "s" not in plabels:
+            ok = False
+            print(f"  [FAIL] builtin-sighelp: param missing ({plabels})")
+        if "返回字符串或数组长度" not in doc:
+            ok = False
+            print(f"  [FAIL] builtin-sighelp: doc missing ({doc[:200]})")
+        if ok:
+            print("  [PASS] builtin-sighelp: len( → sig + param + doc")
+    return ok
+
+
+def decode_semantic(data):
+    """将 semanticTokens data（delta 编码 [dl,dc,len,type,mod]*）解码为绝对位置 token。"""
+    toks = []
+    line = 0
+    char = 0
+    i = 0
+    n = len(data)
+    while i + 5 <= n:
+        dl = data[i]; dc = data[i + 1]; ln = data[i + 2]; tt = data[i + 3]; tm = data[i + 4]
+        line += dl
+        if dl == 0:
+            char += dc
+        else:
+            char = dc
+        toks.append((line, char, ln, tt, tm))
+        i += 5
+    return toks
+
+
+def scenario_function_call_highlight():
+    """函数调用 a() 的 a 应标为 function 类型 + bold 修饰符（区别于普通变量）。"""
+    DOC = """dsb hl;
+
+kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    let r = add(1, 2);
+    return 0;
+}
+"""
+    URI = "file:///C:/demo/hl.shadow"
+    reqs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        {"jsonrpc": "2.0", "method": "textDocument/didOpen",
+         "params": {"textDocument": {"uri": URI, "languageId": "shadow", "version": 1, "text": DOC}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "textDocument/semanticTokens/full",
+         "params": {"textDocument": {"uri": URI}}},
+        {"jsonrpc": "2.0", "method": "exit", "params": None},
+    ]
+    r = by_id(run_lsp(reqs, timeout=120))
+    res = r.get("2", {}).get("result", {})
+    data = res.get("data") if isinstance(res, dict) else None
+    if not data:
+        print(f"  [FAIL] func-highlight: empty semantic data ({res})")
+        return False
+    toks = decode_semantic(data)
+    # function 类型 = 1，bold 修饰符 = 1（legend tokenModifiers[0] = "bold"）
+    fb = [(ln, ch, length, tt, tm) for (ln, ch, length, tt, tm) in toks if tt == 1 and tm == 1]
+    ok = True
+    if len(fb) < 2:
+        ok = False
+        print(f"  [FAIL] func-highlight: too few function+bold tokens ({len(fb)}); sample={toks[:8]}")
+    else:
+        print(f"  [PASS] func-highlight: {len(fb)} function+bold tokens (def + call), e.g. {fb[0]}")
+    return ok
+
+
 def main():
     print(f"== LSP feature tests ({EXE}) ==")
     total = passed = 0
@@ -449,7 +575,9 @@ def main():
                      ("value_completion", scenario_value_completion),
                      ("completion_snippet", scenario_completion_snippet),
                      ("qualified_definition", scenario_qualified_definition),
-                     ("didchange_lazy_compile", scenario_didchange_lazy_compile)]:
+                     ("didchange_lazy_compile", scenario_didchange_lazy_compile),
+                     ("builtin_hover_sighelp", scenario_builtin_hover_and_sighelp),
+                     ("function_call_highlight", scenario_function_call_highlight)]:
         total += 1
         try:
             ok = fn()
