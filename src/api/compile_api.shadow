@@ -173,7 +173,9 @@ pub kimo api_type_name(t: Type) -> string {
         parts = array_push(parts, api_type_name(t.ret_type));
         return str_join(parts, "");
     }
-    return ty_display_name(t);
+    // 具名类型在严格态被 mangle 成 __mod_<mod>__<Name>，API/LSP 是面向用户的
+    // 展示层（hover / inlayHint / 签名 / 成员 detail），必须回显源码原名。
+    return api_demangle(ty_display_name(t));
 }
 
 // 位置区间半开 [line:col, end_line:end_col) 包含判断
@@ -434,7 +436,9 @@ pub kimo api_check(source: string, file: string) -> int {
         api_walk_stmt_rec(bf.body, 0);
         let sp: array<string> = [];
         sp = array_push(sp, "fn ");
-        sp = array_push(sp, bf.name);
+        // 签名同样回显源码原名：严格态下私有/模块函数被 mangle 成
+        // __mod_<mod>__<name>，直接吐给 hover/signatureHelp 会暴露内部名。
+        sp = array_push(sp, api_demangle(bf.name));
         sp = array_push(sp, "(");
         let pi2 = 0;
         while (pi2 < len(bf.params)) {
@@ -456,7 +460,8 @@ pub kimo api_check(source: string, file: string) -> int {
         // __mod_<mod>__<name>（符号隔离），若原样吐给 LSP/查询层，用户会看到
         // `func: __mod_rng_basic__add` 这种内部名（rng_basic / rng_multiline 回归）。
         let fm = api_demangle(bf.name) + "|" + int_to_str(bf.loc.line) + "|" + int_to_str(bf.loc.col) + "|" +
-                 int_to_str(bf.loc.end_line) + "|" + int_to_str(bf.loc.end_col) + "|" + rtname + "|" + sig;
+                 int_to_str(bf.loc.end_line) + "|" + int_to_str(bf.loc.end_col) + "|" + rtname + "|" + sig +
+                 "|" + int_to_str(bf.is_pub) + "|" + tc_mod_of(bf.name);
         api_fmeta = array_push(api_fmeta, fm);
         bi = bi + 1;
     }
@@ -920,6 +925,47 @@ pub kimo api_type_at_pos(line: int, col: int) -> string {
     return "";
 }
 
+// 类型名 → 成员列表（struct 字段 / enum 变体）。
+// 返回每行 "name|type"（enum 变体的 type 为空），行以 '\n' 分隔。
+// 用编译器 AST 精确解析，覆盖本模块与 import 进来的类型（名字可能带 __mod_<mod>__ 前缀）。
+pub kimo api_type_members(type_name: string) -> string {
+    if (api_prog_none() == 1) { return ""; }
+    if (len(type_name) == 0) { return ""; }
+    let bare = tc_bare_name(type_name);
+    let out = "";
+    // struct 字段
+    let i = 0;
+    while (i < len(api_prog.structs)) {
+        let sd = api_prog.structs[i] as StructDef;
+        if (str_eq(sd.name, type_name) == 1 || str_eq(tc_bare_name(sd.name), bare) == 1) {
+            let j = 0;
+            while (j < len(sd.fields)) {
+                let fd = sd.fields[j] as StructField;
+                out = out + fd.name + "|" + api_type_name(fd.type_ref) + "\n";
+                j = j + 1;
+            }
+            return out;
+        }
+        i = i + 1;
+    }
+    // enum 变体（无负载 → type 空）
+    i = 0;
+    while (i < len(api_prog.enums)) {
+        let ed = api_prog.enums[i] as EnumDef;
+        if (str_eq(ed.name, type_name) == 1 || str_eq(tc_bare_name(ed.name), bare) == 1) {
+            let j = 0;
+            while (j < len(ed.variants)) {
+                let vd = ed.variants[j] as EnumVariant;
+                out = out + vd.name + "|\n";
+                j = j + 1;
+            }
+            return out;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 // 位置 → AST 节点描述（--at）
 pub kimo api_node_at_pos(line: int, col: int) -> string {
     let r0 = int_to_str(line) + ":" + int_to_str(col);
@@ -1295,11 +1341,14 @@ pub kimo api_hover_info(line: int, col: int) -> string {
     let i = 0;
     while (i < len(api_fmeta)) {
         let fm = str_split(api_fmeta[i] as string, "|");
-        if (len(fm) >= 7 && str_eq(fm[0] as string, word) == 1) {
+        if (len(fm) >= 8 && str_eq(fm[0] as string, word) == 1) {
             let sig = fm[6] as string;
             let doc = api_func_doc_at(api_atoi(fm[1] as string));
-            if (len(doc) > 0) { return sig + "\n\n" + doc; }
-            return sig;
+            let marker = "";
+            // 内部函数（非 pub）标注
+            if (api_atoi(fm[7] as string) == 0) { marker = "\n\n（内部函数）"; }
+            if (len(doc) > 0) { return sig + "\n\n" + doc + marker; }
+            return sig + marker;
         }
         i = i + 1;
     }

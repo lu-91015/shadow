@@ -49,6 +49,34 @@ pub kimo tc_unmangle(name: string) -> string {
     return name;
 }
 
+// 从 mangle 名（__mod_<mod>__<func>）提取所属模块；非 mangle 名返回 ""
+pub kimo tc_mod_of(name: string) -> string {
+    if (str_starts_with(name, "__mod_") == 0) { return ""; }
+    let body = substr2(name, 6, len(name));   // <mod>__<func>
+    let d = tc_last_index_of(body, "__");
+    if (d < 0) { return ""; }
+    return substr2(body, 0, d);
+}
+
+// 字符串末次出现位置
+pub kimo tc_last_index_of(s: string, needle: string) -> int {
+    let i = len(s) - 1;
+    while (i >= 0) {
+        if (str_eq(substr2(s, i, i + len(needle)), needle) == 1) { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+// 去 __mod_<mod>__ 前缀，返回裸名（无前缀则原样返回）
+pub kimo tc_bare_name(name: string) -> string {
+    if (str_starts_with(name, "__mod_") == 0) { return name; }
+    let body = substr2(name, 6, len(name));   // <mod>__<rest>
+    let d = tc_last_index_of(body, "__");
+    if (d < 0) { return name; }
+    return substr2(body, d + 2, len(body));
+}
+
 // 统计字符串中某字符出现次数
 pub kimo tc_count_chars(s: string, ch: string) -> int {
     let n = len(s);
