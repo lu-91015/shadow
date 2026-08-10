@@ -734,7 +734,20 @@ pub kimo lsp_full_edit_json(uri: string, new_text: string) -> string {
 
 // ============ completion ============
 // 收集补全项 → LSP CompletionItem JSON
-pub kimo lsp_completion_json(prefix: string) -> string {
+pub kimo lsp_completion_json(prefix: string, pline0: int, pchar0: int, src: string, uri: string) -> string {
+    // 限定补全：c. → 模块成员；p. → 值成员（struct 字段 / enum 变体）
+    if (str_index_of(prefix, ".") >= 0) {
+        let dot = str_index_of(prefix, ".");
+        let modseg = substr2(prefix, 0, dot);
+        let rest = substr2(prefix, dot + 1, len(prefix));
+        // 1) 模块命名空间补全（import x → x.）
+        let moditems = lsp_module_completion(modseg, rest, src, uri, pline0, pchar0);
+        if (len(moditems) > 0) { return moditems; }
+        // 2) 值成员补全（p.field / e.variant）：编译器 type-at-cursor 优先，失败回退文档扫描
+        let valitems = lsp_value_completion(modseg, rest, pline0, pchar0, src, uri);
+        if (len(valitems) > 0) { return valitems; }
+    }
+    // 普通补全（顶层符号）
     let syms = api_collect_symbols();
     let items = str_split(syms, ";");
     let parts: array<string> = [];
@@ -764,6 +777,305 @@ pub kimo lsp_completion_json(prefix: string) -> string {
     return str_join(parts, "");
 }
 
+// 解析 import <modseg...> 对应的模块文件路径（<主文件父目录>/<点分路径>.shadow）
+pub kimo lsp_resolve_module_file(modseg: string, src: string, uri: string) -> string {
+    let lines = str_split(src, "\n");
+    let li = 0;
+    while (li < len(lines)) {
+        let ln = str_trim(lines[li] as string);
+        if (str_starts_with(ln, "import ") == 1) {
+            let rest = str_trim(substr2(ln, 7, len(ln)));
+            let rlen = len(rest);
+            if (rlen > 0 && str_eq(substr2(rest, rlen - 1, rlen), ";") == 1) { rest = substr2(rest, 0, rlen - 1); }
+            let seg0 = rest;
+            let d = str_index_of(rest, ".");
+            if (d >= 0) { seg0 = substr2(rest, 0, d); }
+            if (str_eq(seg0, modseg) == 1) {
+                let parent = lsp_parent_dir(lsp_uri_to_path(uri));
+                let rel = lsp_dots_to_slashes(rest);
+                return parent + "/" + rel + ".shadow";
+            }
+        }
+        li = li + 1;
+    }
+    return "";
+}
+
+// 列出模块 <modseg> 中名字以 <rest> 开头的函数，作为补全项
+pub kimo lsp_module_completion(modseg: string, rest: string, src: string, uri: string, pline0: int, pchar0: int) -> string {
+    let mpath = lsp_resolve_module_file(modseg, src, uri);
+    if (len(mpath) == 0) { return ""; }
+    let modsrc = file_read(mpath);
+    if (len(modsrc) == 0) { return ""; }
+    // 扫描模块内所有顶层定义：函数 / 结构体 / 枚举 / trait / 全局量
+    let defs = lsp_scan_top_defs(modsrc);
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"isIncomplete\":false,\"items\":[");
+    let first = 1;
+    let di = 0;
+    while (di < len(defs)) {
+        let d = str_split(defs[di] as string, "|");
+        if (len(d) < 4) { di = di + 1; continue; }
+        let name = d[0] as string;
+        if (len(rest) > 0 && str_starts_with(name, rest) == 0) { di = di + 1; continue; }
+        let line1 = api_atoi(d[1] as string);
+        let kind = d[3] as string;
+        let detail = "";
+        let lspkind = 3;
+        if (str_eq(kind, "func") == 1) { detail = lsp_func_header_from_src(modsrc, line1); lspkind = 3; }
+        else if (str_eq(kind, "struct") == 1) { detail = lsp_type_header_from_src(modsrc, line1); lspkind = 23; }
+        else if (str_eq(kind, "enum") == 1) { detail = lsp_type_header_from_src(modsrc, line1); lspkind = 13; }
+        else if (str_eq(kind, "trait") == 1) { detail = lsp_type_header_from_src(modsrc, line1); lspkind = 11; }
+        else { detail = ""; lspkind = 21; }
+        let doc = lsp_doc_at_line(modsrc, line1);
+        if (first == 0) { parts = array_push(parts, ","); }
+        first = 0;
+        let mstart = pchar0 - len(rest);
+        if (mstart < 0) { mstart = pchar0; }
+        let te = ",\"textEdit\":{\"range\":{\"start\":{\"line\":" + int_to_str(pline0) +
+                  ",\"character\":" + int_to_str(mstart) + "},\"end\":{\"line\":" + int_to_str(pline0) +
+                  ",\"character\":" + int_to_str(pchar0) + "}},\"newText\":\"" + name + "\"}";
+        let item = "{\"label\":\"" + name + "\",\"kind\":" + int_to_str(lspkind) + ",\"detail\":\"" + api_json_escape(detail) + "\"";
+        if (len(doc) > 0) { item = item + ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"" + api_json_escape(doc) + "\"}"; }
+        item = item + te + "}";
+        parts = array_push(parts, item);
+        di = di + 1;
+    }
+    parts = array_push(parts, "]}");
+    return str_join(parts, "");
+}
+
+// 值成员补全：已知接收者名字 recv（如 "p"），推断其类型并列出 struct 字段 / enum 变体。
+// 类型推断：优先编译器 type-at-cursor（api_type_at_pos），失败时回退文档扫描 let <recv> = <Type>。
+pub kimo lsp_value_completion(recv: string, rest: string, pline0: int, pchar0: int, src: string, uri: string) -> string {
+    // 候选类型逐个尝试，取第一个「能解析出成员」的：
+    //  1) 编译器 type-at-cursor —— 注意它在未命中表达式时会回退到所在函数的
+    //     返回类型（非空但错误），因此不能只看「非空」就停，必须看有无成员；
+    //  2) 文档启发式 let <recv> = <Type> / let <recv>: <Type>。
+    let mem = lsp_members_for_type(api_type_at_pos(pline0 + 1, pchar0 - 1), src, uri);
+    if (len(mem) == 0) { mem = lsp_members_for_type(lsp_infer_var_type(src, recv), src, uri); }
+    if (len(mem) == 0) { return ""; }
+    let lines = str_split(mem, "\n");
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"isIncomplete\":false,\"items\":[");
+    let first = 1;
+    let i = 0;
+    while (i < len(lines)) {
+        let ln = lines[i] as string;
+        if (len(ln) == 0) { i = i + 1; continue; }
+        let dm = str_split(ln, "|");   // name | type
+        let name = dm[0] as string;
+        let mtype = "";
+        if (len(dm) >= 2) { mtype = dm[1] as string; }
+        if (len(rest) > 0 && str_starts_with(name, rest) == 0) { i = i + 1; continue; }
+        // enum 变体（type 为空）→ EnumMember(13)；否则 Field(5)
+        let kind = 5;
+        if (len(mtype) == 0) { kind = 13; }
+        if (first == 0) { parts = array_push(parts, ","); }
+        first = 0;
+        let mstart = pchar0 - len(rest);
+        if (mstart < 0) { mstart = pchar0; }
+        let te = ",\"textEdit\":{\"range\":{\"start\":{\"line\":" + int_to_str(pline0) +
+                  ",\"character\":" + int_to_str(mstart) + "},\"end\":{\"line\":" + int_to_str(pline0) +
+                  ",\"character\":" + int_to_str(pchar0) + "}},\"newText\":\"" + name + "\"}";
+        let item = "{\"label\":\"" + name + "\",\"kind\":" + int_to_str(kind) + ",\"detail\":\"" + api_json_escape(mtype) + "\"";
+        item = item + te + "}";
+        parts = array_push(parts, item);
+        i = i + 1;
+    }
+    parts = array_push(parts, "]}");
+    return str_join(parts, "");
+}
+
+// 类型名 → 成员表：编译结果优先，编辑中代码不完整时回退源码扫描。
+// 类型名可能带 mod. 前缀或 __mod_x__ mangle，统一取最后一段再查。
+pub kimo lsp_members_for_type(ty: string, src: string, uri: string) -> string {
+    if (len(ty) == 0) { return ""; }
+    let t = ty;
+    let d = lsp_rindex(t, ".");
+    if (d >= 0) { t = substr2(t, d + 1, len(t)); }
+    let m = api_type_members(t);
+    if (len(m) == 0) { m = lsp_type_members_any(src, uri, t); }
+    return m;
+}
+
+// 在当前文档 + 所有 import 模块文件中查找类型 <tyname> 的成员表
+pub kimo lsp_type_members_any(src: string, uri: string, tyname: string) -> string {
+    let m = lsp_type_members_from_src(src, tyname);
+    if (len(m) > 0) { return m; }
+    let lines = str_split(src, "\n");
+    let li = 0;
+    while (li < len(lines)) {
+        let ln = str_trim(lines[li] as string);
+        if (str_starts_with(ln, "import ") == 1) {
+            let rest = str_trim(substr2(ln, 7, len(ln)));
+            let rlen = len(rest);
+            if (rlen > 0 && str_eq(substr2(rest, rlen - 1, rlen), ";") == 1) { rest = substr2(rest, 0, rlen - 1); }
+            let seg0 = rest;
+            let dp = str_index_of(rest, ".");
+            if (dp >= 0) { seg0 = substr2(rest, 0, dp); }
+            let mp = lsp_resolve_module_file(seg0, src, uri);
+            if (len(mp) > 0) {
+                let msrc = file_read(mp);
+                if (len(msrc) > 0) {
+                    let mm = lsp_type_members_from_src(msrc, tyname);
+                    if (len(mm) > 0) { return mm; }
+                }
+            }
+        }
+        li = li + 1;
+    }
+    return "";
+}
+
+// 从源码解析类型成员（struct 字段 / enum 变体），返回每行 "name|type"（变体 type 为空）。
+// 编辑过程中代码往往无法通过 parse，此路径不依赖编译结果。
+pub kimo lsp_type_members_from_src(src: string, tyname: string) -> string {
+    let defs = lsp_scan_top_defs(src);
+    let line1 = 0;
+    let kind = "";
+    let di = 0;
+    while (di < len(defs)) {
+        let d = str_split(defs[di] as string, "|");
+        if (len(d) >= 4) {
+            let dn = d[0] as string;
+            let dk = d[3] as string;
+            if (str_eq(dn, tyname) == 1 && (str_eq(dk, "struct") == 1 || str_eq(dk, "enum") == 1)) {
+                line1 = api_atoi(d[1] as string);
+                kind = dk;
+                break;
+            }
+        }
+        di = di + 1;
+    }
+    if (line1 == 0) { return ""; }
+    let lines = str_split(src, "\n");
+    let out = "";
+    let i = line1 - 1;
+    let started = 0;
+    while (i < len(lines)) {
+        let ln = str_trim(lines[i] as string);
+        if (started == 0) {
+            if (str_index_of(ln, "{") >= 0) { started = 1; }
+            i = i + 1;
+            continue;
+        }
+        if (str_index_of(ln, "}") >= 0) { break; }
+        if (len(ln) == 0 || str_starts_with(ln, "//") == 1) { i = i + 1; continue; }
+        if (str_eq(kind, "struct") == 1) {
+            let cp = str_index_of(ln, ":");
+            if (cp > 0) {
+                let nm = str_trim(substr2(ln, 0, cp));
+                let ty = str_trim(substr2(ln, cp + 1, len(ln)));
+                let sc = str_index_of(ty, ";");
+                if (sc >= 0) { ty = str_trim(substr2(ty, 0, sc)); }
+                if (len(nm) > 0) { out = out + nm + "|" + ty + "\n"; }
+            }
+        } else {
+            let e = len(ln);
+            let k2 = 0;
+            while (k2 < e) {
+                let c = substr2(ln, k2, k2 + 1);
+                if (str_eq(c, "(") == 1 || str_eq(c, ",") == 1 || str_eq(c, " ") == 1 || str_eq(c, ";") == 1) { break; }
+                k2 = k2 + 1;
+            }
+            let nm2 = str_trim(substr2(ln, 0, k2));
+            if (len(nm2) > 0) { out = out + nm2 + "|\n"; }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// 启发式：从文档文本推断局部变量 recv 的类型（let <recv> = <Type> / let <recv>: <Type>）
+pub kimo lsp_infer_var_type(src: string, recv: string) -> string {
+    let lines = str_split(src, "\n");
+    let pat = "let " + recv;
+    let i = 0;
+    while (i < len(lines)) {
+        let ln = lines[i] as string;
+        let p = str_index_of(ln, pat);
+        if (p >= 0) {
+            let after = substr2(ln, p + len(pat), len(ln));
+            // recv 必须是完整 token：跳过空白后紧跟 '=' 或 ':'
+            let k = 0;
+            let al = len(after);
+            while (k < al && str_eq(substr2(after, k, k + 1), " ") == 1) { k = k + 1; }
+            let ck = "";
+            if (k < al) { ck = substr2(after, k, k + 1); }
+            if (k < al && (str_eq(ck, "=") == 1 || str_eq(ck, ":") == 1)) {
+                // 跳过 '='/':' 与空白，取到类型起点
+                let q = k + 1;
+                while (q < al) {
+                    let cq = substr2(after, q, q + 1);
+                    if (str_eq(cq, " ") == 1 || str_eq(cq, "=") == 1 || str_eq(cq, ":") == 1) { q = q + 1; continue; }
+                    break;
+                }
+                let ty = substr2(after, q, al);
+                let j = 0;
+                let tl = len(ty);
+                while (j < tl) {
+                    let c = substr2(ty, j, j + 1);
+                    if (str_eq(c, " ") == 1 || str_eq(c, "{") == 1 || str_eq(c, "(") == 1 || str_eq(c, ";") == 1 || str_eq(c, "/") == 1) { break; }
+                    j = j + 1;
+                }
+                let typename = str_trim(substr2(ty, 0, j));
+                if (len(typename) > 0) { return typename; }
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 从模块源码提取函数签名（"fn NAME(params) -> ret"），header 取到首个 '{' 为止
+pub kimo lsp_func_header_from_src(src: string, line1: int) -> string {
+    let lines = str_split(src, "\n");
+    if (line1 < 1 || line1 > len(lines)) { return ""; }
+    let li = line1 - 1;
+    let ln = lines[li] as string;
+    let ki = str_index_of(ln, "kimo ");
+    if (ki < 0) { return ""; }
+    let header = substr2(ln, ki, len(ln));
+    let j = li + 1;
+    while (j < len(lines) && str_index_of(header, "{") < 0) {
+        header = header + " " + str_trim(lines[j] as string);
+        j = j + 1;
+    }
+    let bo = str_index_of(header, "{");
+    if (bo >= 0) { header = substr2(header, 0, bo); }
+    let h = str_trim(header);
+    let idx = str_index_of(h, "kimo ");
+    if (idx >= 0) { h = substr2(h, idx + 5, len(h)); }
+    return "fn " + h;
+}
+
+// 从源码指定行向上提取 // 文档注释（与 api_func_doc_at 同逻辑，但接受 src 参数）
+pub kimo lsp_doc_at_line(src: string, start_line: int) -> string {
+    let lines = str_split(src, "\n");
+    let sl = start_line;
+    if (sl <= 1) { return ""; }
+    let docs: array<string> = [];
+    let i = sl - 2;
+    while (i >= 0) {
+        let ln = str_trim(lines[i] as string);
+        if (str_starts_with(ln, "//") == 1) {
+            docs = array_push(docs, str_trim(substr2(ln, 2, len(ln))));
+        } else {
+            break;
+        }
+        i = i - 1;
+    }
+    if (len(docs) == 0) { return ""; }
+    let rev: array<string> = [];
+    let j = len(docs) - 1;
+    while (j >= 0) {
+        rev = array_push(rev, docs[j] as string);
+        j = j - 1;
+    }
+    return str_join(rev, "\n");
+}
+
 // ============ 补全触发前缀（光标前标识符） ============
 pub kimo lsp_completion_prefix(src: string, line0: int, char0: int) -> string {
     let lines = str_split(src, "\n");
@@ -773,7 +1085,7 @@ pub kimo lsp_completion_prefix(src: string, line0: int, char0: int) -> string {
     let i = char0 - 1;
     while (i >= 0) {
         let c = substr2(ln, i, i + 1);
-        if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq(c, "_") == 1) {
+        if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || str_eq(c, "_") == 1 || str_eq(c, ".") == 1) {
             start = i;
             i = i - 1;
             continue;
@@ -875,6 +1187,71 @@ pub kimo lsp_scan_func_defs(src: string) -> array<string> {
         li = li + 1;
     }
     return out;
+}
+
+// 扫描模块源码中所有顶层定义（func/struct/enum/trait/global），返回 "name|line|col|kind"
+// 仅扫描无缩进的顶层定义，跳过 impl 方法、局部 let 等嵌套定义
+pub kimo lsp_scan_top_defs(src: string) -> array<string> {
+    let out: array<string> = [];
+    let lines = str_split(src, "\n");
+    let li = 0;
+    while (li < len(lines)) {
+        let raw = lines[li] as string;
+        // 仅扫描顶层定义（无前导缩进）
+        if (len(raw) > 0) {
+            let c0 = substr2(raw, 0, 1);
+            if (str_eq(c0, " ") == 1 || str_eq(c0, "\t") == 1) { li = li + 1; continue; }
+        }
+        let ln = str_trim(raw);
+        if (len(ln) == 0 || str_starts_with(ln, "//") == 1) { li = li + 1; continue; }
+        let kind = "";
+        let ki = -1;
+        let fk = str_index_of(ln, "kimo ");
+        if (fk >= 0) { kind = "func"; ki = fk + 5; }
+        else if (str_starts_with(ln, "pub struct ") == 1) { kind = "struct"; ki = 11; }
+        else if (str_starts_with(ln, "pub enum ") == 1) { kind = "enum"; ki = 9; }
+        else if (str_starts_with(ln, "pub trait ") == 1) { kind = "trait"; ki = 10; }
+        else if (str_starts_with(ln, "pub let ") == 1) { kind = "global"; ki = 8; }
+        else if (str_starts_with(ln, "struct ") == 1) { kind = "struct"; ki = 7; }
+        else if (str_starts_with(ln, "enum ") == 1) { kind = "enum"; ki = 5; }
+        else if (str_starts_with(ln, "trait ") == 1) { kind = "trait"; ki = 6; }
+        else if (str_starts_with(ln, "let ") == 1) { kind = "global"; ki = 4; }
+        if (ki >= 0 && len(kind) > 0) {
+            let r = substr2(ln, ki, len(ln));
+            let name = "";
+            let j = 0;
+            while (j < len(r)) {
+                let c = substr2(r, j, j + 1);
+                if (str_eq(c, " ") == 1 || str_eq(c, "\t") == 1 || str_eq(c, "(") == 1 ||
+                    str_eq(c, "{") == 1 || str_eq(c, ":") == 1 || str_eq(c, "<") == 1 ||
+                    str_eq(c, "=") == 1) { break; }
+                name = name + c;
+                j = j + 1;
+            }
+            if (len(name) > 0) {
+                out = array_push(out, name + "|" + int_to_str(li + 1) + "|" + int_to_str(ki + 1) + "|" + kind);
+            }
+        }
+        li = li + 1;
+    }
+    return out;
+}
+
+// 从模块源码提取类型定义头（"struct Foo {...}" / "enum E {...}"），取到首个 '{' 或 ';' 为止
+pub kimo lsp_type_header_from_src(src: string, line1: int) -> string {
+    let lines = str_split(src, "\n");
+    if (line1 < 1 || line1 > len(lines)) { return ""; }
+    let header = str_trim(lines[line1 - 1] as string);
+    let j = line1;
+    while (j < len(lines) && str_index_of(header, "{") < 0 && str_index_of(header, ";") < 0) {
+        header = header + " " + str_trim(lines[j] as string);
+        j = j + 1;
+    }
+    let bo = str_index_of(header, "{");
+    if (bo >= 0) { header = substr2(header, 0, bo); }
+    let so = str_index_of(header, ";");
+    if (so >= 0) { header = substr2(header, 0, so); }
+    return str_trim(header);
 }
 
 // 扫描文档中所有 "word(" 调用点：返回 "line|col"（1-based）
@@ -1207,13 +1584,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
-        return lsp_completion_json(prefix);
+        return lsp_completion_json(prefix, pline - 1, pchar - 1, src, uri);
     }
     // signatureHelp
     if (str_eq(method, "textDocument/signatureHelp") == 1) {
         if (len(uri) == 0) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
         lsp_ensure_compiled(uri);
-        return lsp_signature_help_json(pline, pchar);
+        return lsp_signature_help_json(pline, pchar, lsp_doc_get(uri), uri);
     }
     // foldingRange
     if (str_eq(method, "textDocument/foldingRange") == 1) {
@@ -1412,7 +1789,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         lsp_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
-        let cj = lsp_completion_json(prefix);
+        let cj = lsp_completion_json(prefix, pline - 1, pchar - 1, src, uri);
         let ib = str_index_of(cj, "[");
         let ie = lsp_rindex(cj, "]");
         if (ib < 0 || ie < 0) { return "{\"items\":[]}"; }
@@ -1606,9 +1983,83 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
 }
 
 // ============ signatureHelp ============
-pub kimo lsp_signature_help_json(line: int, col: int) -> string {
+// 统计行区间 [open+1, close) 内、括号深度为 0 的逗号数 → 当前活跃参数下标
+pub kimo lsp_count_commas(ln: string, open: int, close: int) -> int {
+    let depth = 0;
+    let count = 0;
+    let i = open + 1;
+    if (close > len(ln)) { close = len(ln); }
+    while (i < close) {
+        let c = substr2(ln, i, i + 1);
+        if (str_eq(c, "(") == 1) { depth = depth + 1; }
+        else if (str_eq(c, ")") == 1) { depth = depth - 1; }
+        else if (str_eq(c, ",") == 1 && depth == 0) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// 从签名串 "fn f(a: int, b: int) -> ret" 解析顶层参数 label 列表（每项为 "a: int"）
+pub kimo lsp_parse_sig_params(sig: string) -> array<string> {
+    let res: array<string> = [];
+    let pstart = str_index_of(sig, "(");
+    if (pstart < 0) { return res; }
+    let depth = 0;
+    let pend = -1;
+    let i = pstart;
+    while (i < len(sig)) {
+        let c = substr2(sig, i, i + 1);
+        if (str_eq(c, "(") == 1) { depth = depth + 1; }
+        else if (str_eq(c, ")") == 1) { depth = depth - 1; if (depth == 0) { pend = i; break; } }
+        i = i + 1;
+    }
+    if (pend < 0) { return res; }
+    let inner = str_trim(substr2(sig, pstart + 1, pend));
+    if (len(inner) == 0) { return res; }
+    let segs = str_split(inner, ",");
+    let si = 0;
+    while (si < len(segs)) {
+        let s = str_trim(segs[si] as string);
+        if (len(s) > 0) { res = array_push(res, s); }
+        si = si + 1;
+    }
+    return res;
+}
+
+// 从参数 label "name: type" 提取参数名
+pub kimo lsp_extract_param_name(label: string) -> string {
+    let ci = str_index_of(label, ":");
+    if (ci < 0) { return label; }
+    return str_trim(substr2(label, 0, ci));
+}
+
+// 从文档注释中解析 "paras <param>: <desc>" 格式的参数说明；找不到返回 ""
+pub kimo lsp_parse_param_doc(doc: string, pname: string) -> string {
+    if (len(doc) == 0 || len(pname) == 0) { return ""; }
+    let lns = str_split(doc, "\n");
+    let i = 0;
+    while (i < len(lns)) {
+        let trimmed = str_trim(lns[i] as string);
+        if (str_starts_with(trimmed, "paras ") == 1) {
+            let rest = str_trim(substr2(trimmed, 6, len(trimmed)));
+            let ci = str_index_of(rest, ":");
+            if (ci >= 0) {
+                let pn = str_trim(substr2(rest, 0, ci));
+                if (str_eq(pn, pname) == 1) {
+                    return str_trim(substr2(rest, ci + 1, len(rest)));
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+pub kimo lsp_signature_help_json(line: int, col: int, src: string, uri: string) -> string {
     // 找光标所在行的函数调用：行内 '(' 之前的标识符
-    let lines = str_split(api_source(), "\n");
+    let text = src;
+    if (len(text) == 0) { text = api_source(); }
+    let lines = str_split(text, "\n");
     if (line < 1 || line > len(lines)) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
     let ln = lines[line - 1] as string;
     // 从 col-1 往前找最近 '('
@@ -1617,12 +2068,14 @@ pub kimo lsp_signature_help_json(line: int, col: int) -> string {
     while (i >= 0) {
         let c = substr2(ln, i, i + 1);
         if (str_eq(c, "(") == 1) {
-            // 找 '(' 前的标识符
+            // 计算活跃参数：'(' 与光标之间顶层逗号数
+            let active_param = lsp_count_commas(ln, i, col - 1);
+            // 找 '(' 前的标识符（允许 '.'，以支持 mod.func 限定调用）
             let j = i - 1;
             let start = j + 1;
             while (j >= 0) {
                 let cj = substr2(ln, j, j + 1);
-                if ((cj >= "a" && cj <= "z") || (cj >= "A" && cj <= "Z") || (cj >= "0" && cj <= "9") || str_eq(cj, "_") == 1) {
+                if ((cj >= "a" && cj <= "z") || (cj >= "A" && cj <= "Z") || (cj >= "0" && cj <= "9") || str_eq(cj, "_") == 1 || str_eq(cj, ".") == 1) {
                     start = j;
                     j = j - 1;
                     continue;
@@ -1630,23 +2083,128 @@ pub kimo lsp_signature_help_json(line: int, col: int) -> string {
                 break;
             }
             let fname = substr2(ln, start, i);
-            // 查函数签名（fmeta: name|L|C|EL|EC|rettype|sig）
+            // 拆分 <modseg>.<bare>
+            let dotp = lsp_rindex(fname, ".");
+            let qmod = "";
+            let bare = fname;
+            if (dotp >= 0) {
+                qmod = substr2(fname, 0, dotp);
+                bare = substr2(fname, dotp + 1, len(fname));
+            }
+            // 查函数签名（fmeta: name|L|C|EL|EC|rettype|sig|is_pub|module）
             let k = 0;
             while (k < len(api_fmeta)) {
                 let fm = str_split(api_fmeta[k] as string, "|");
-                if (len(fm) >= 7 && str_eq(fm[0] as string, fname) == 1) {
+                let nm = "";
+                if (len(fm) >= 1) { nm = fm[0] as string; }
+                let fmod = "";
+                if (len(fm) >= 9) { fmod = fm[8] as string; }
+                let hit = 0;
+                if (str_eq(nm, fname) == 1) { hit = 1; }
+                else if (str_eq(nm, bare) == 1) {
+                    if (len(qmod) == 0 || str_eq(fmod, qmod) == 1) { hit = 1; }
+                }
+                if (len(fm) >= 7 && hit == 1) {
                     let sig = fm[6] as string;
-                    let p1 = "{\"signatures\":[{\"label\":\"" + api_json_escape(sig) +
-                             "\",\"documentation\":\"\",\"parameters\":[]}],\"activeSignature\":0,\"activeParameter\":0}";
-                    return p1;
+                    // 文档注释：fmeta 的行号是「combined 源」的全局行号，拿它去索引
+                    // 单个模块文件必然越界，因此一律按函数名在源码中重新定位。
+                    let doc = "";
+                    if (len(fmod) > 0) {
+                        let mp = lsp_resolve_module_file(fmod, text, uri);
+                        if (len(mp) > 0) {
+                            let msrc = file_read(mp);
+                            if (len(msrc) > 0) { doc = lsp_doc_for_func(msrc, bare); }
+                        }
+                    }
+                    if (len(doc) == 0) { doc = lsp_doc_for_func(text, bare); }
+                    return lsp_sighelp_build(sig, doc, active_param);
                 }
                 k = k + 1;
+            }
+            // 回退：编辑过程中代码往往不完整（如刚敲下 `c.c(`），parse 失败 →
+            // 无 fmeta。此时直接扫描源文件顶层定义，保证参数提示照常可用。
+            let ssrc = "";
+            if (len(qmod) > 0) {
+                let mp2 = lsp_resolve_module_file(qmod, text, uri);
+                if (len(mp2) > 0) { ssrc = file_read(mp2); }
+            } else {
+                ssrc = text;
+            }
+            if (len(ssrc) > 0) {
+                let defs = lsp_scan_top_defs(ssrc);
+                let di = 0;
+                while (di < len(defs)) {
+                    let d = str_split(defs[di] as string, "|");
+                    if (len(d) >= 4) {
+                        let dn = d[0] as string;
+                        let dk = d[3] as string;
+                        if (str_eq(dn, bare) == 1 && str_eq(dk, "func") == 1) {
+                            let line1 = api_atoi(d[1] as string);
+                            let sig2 = lsp_func_header_from_src(ssrc, line1);
+                            let doc2 = lsp_doc_at_line(ssrc, line1);
+                            if (len(sig2) > 0) { return lsp_sighelp_build(sig2, doc2, active_param); }
+                        }
+                    }
+                    di = di + 1;
+                }
             }
             break;
         }
         i = i - 1;
     }
     return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}";
+}
+
+// 按函数名在源码中定位定义行，取其上方 // 文档注释块
+pub kimo lsp_doc_for_func(src: string, name: string) -> string {
+    if (len(src) == 0 || len(name) == 0) { return ""; }
+    let defs = lsp_scan_top_defs(src);
+    let di = 0;
+    while (di < len(defs)) {
+        let d = str_split(defs[di] as string, "|");
+        if (len(d) >= 4) {
+            let dn = d[0] as string;
+            let dk = d[3] as string;
+            if (str_eq(dn, name) == 1 && str_eq(dk, "func") == 1) {
+                return lsp_doc_at_line(src, api_atoi(d[1] as string));
+            }
+        }
+        di = di + 1;
+    }
+    return "";
+}
+
+// 构造 SignatureHelp JSON：签名 label + 函数级文档 + 逐参数（paras）文档
+pub kimo lsp_sighelp_build(sig: string, doc: string, active_param: int) -> string {
+    let params = lsp_parse_sig_params(sig);
+    let parts: array<string> = [];
+    parts = array_push(parts, "{\"signatures\":[{\"label\":\"" + api_json_escape(sig) + "\"");
+    if (len(doc) > 0) {
+        parts = array_push(parts, ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"" + api_json_escape(doc) + "\"}");
+    }
+    parts = array_push(parts, ",\"parameters\":[");
+    let pfirst = 1;
+    let pi = 0;
+    while (pi < len(params)) {
+        let plabel = params[pi] as string;
+        let pdoc = "";
+        if (len(doc) > 0) {
+            let pname = lsp_extract_param_name(plabel);
+            pdoc = lsp_parse_param_doc(doc, pname);
+        }
+        if (pfirst == 0) { parts = array_push(parts, ","); }
+        pfirst = 0;
+        let item = "{\"label\":\"" + api_json_escape(plabel) + "\"";
+        if (len(pdoc) > 0) {
+            item = item + ",\"documentation\":{\"kind\":\"markdown\",\"value\":\"" + api_json_escape(pdoc) + "\"}";
+        }
+        item = item + "}";
+        parts = array_push(parts, item);
+        pi = pi + 1;
+    }
+    parts = array_push(parts, "],\"activeParameter\":" + int_to_str(active_param) + "}");
+    parts = array_push(parts, "],\"activeSignature\":0}");
+    return str_join(parts, "");
 }
 
 // ============ foldingRange（基于 {} 配对） ============
@@ -1709,7 +2267,7 @@ pub kimo lsp_inlay_hint_json() -> string {
                 first = 0;
                 let item = "{\"position\":{\"line\":" + int_to_str(api_atoi(lp[0] as string) - 1) +
                            ",\"character\":" + int_to_str(api_atoi(lp[1] as string) + 3) +
-                           "},\"label\":\": " + api_json_escape(tyname) + "\",\"kind\":1}";
+                           "},\"label\":\": " + api_json_escape(tyname) + " \",\"kind\":1}";
                 parts = array_push(parts, item);
             }
         }
