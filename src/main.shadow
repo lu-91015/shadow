@@ -1634,6 +1634,36 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
     }
     if (str_eq(qflag, "--diag-json") == 1) {
         println(api_sdiag_json_array());
+        // --refs：第二行输出主模块各顶层函数的引用计数（"name|count;..."），
+        // 供 LSP codeLens 异步刷新（子进程后台跑完整检查，不阻塞编辑器）。
+        let ri = 1;
+        let want_refs = 0;
+        while (ri < n_args) {
+            if (str_eq(args[ri] as string, "--refs") == 1) { want_refs = 1; }
+            ri = ri + 1;
+        }
+        if (want_refs == 1) {
+            let refs_out = "";
+            let fi = 0;
+            while (fi < len(api_fmeta)) {
+                let fm = str_split(api_fmeta[fi] as string, "|");
+                if (len(fm) >= 2) {
+                    let ln = api_atoi(fm[1] as string);
+                    if (ln > 0 && ln <= api_main_end) {
+                        let nm = fm[0] as string;
+                        let r = api_find_references(nm);
+                        let cnt = 0;
+                        let segs = str_split(r, ";");
+                        let sj = 0;
+                        while (sj < len(segs)) { if (len(segs[sj] as string) > 0) { cnt = cnt + 1; } sj = sj + 1; }
+                        if (len(refs_out) > 0) { refs_out = refs_out + ";"; }
+                        refs_out = refs_out + nm + "|" + int_to_str(cnt);
+                    }
+                }
+                fi = fi + 1;
+            }
+            println(refs_out);
+        }
         return 0;
     }
     if (str_eq(qflag, "--ranges") == 1) {

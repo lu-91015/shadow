@@ -89,6 +89,13 @@ extern const char* shadow_sys_exec(const char* cmd) {
     return out ? out : rt_dup("");
 }
 
+/* ============================================================
+ * 注：非阻塞子进程 spawn（shadow_proc_launch/poll/reap）已迁到
+ * rt/rt_proc_spawn.c，仅链接进编译器本体；本文件保留 shadow_sys_exec /
+ * shadow_exit / shadow_env_get，与 bootstrap/runtime_for_selfhost.o
+ * 协同（runtime_for_selfhost 提供其定义，本文件为 user 运行时提供）。
+ * ============================================================ */
+
 extern void shadow_exit(int code) {
     ExitProcess((UINT)code);
 }

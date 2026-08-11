@@ -26,6 +26,12 @@ import core.const;
 // 单调毫秒时钟（QueryPerformanceCounter，rt/shadow_index.c 提供），用于 DBG 时间戳与诊断防抖
 @extern("shadow_now_ms") kimo lsp_rt_now_ms() -> int { return 0; }
 
+// 非阻塞子进程（rt/rt_proc.c 提供）：用于异步编译 worker。
+// launch 立即返回 job id（>=0），子进程 stdout 重定向到 out 文件；poll 非阻塞探测；reap 回收。
+@extern("shadow_proc_launch") kimo lsp_proc_launch(cmd: string, out: string) -> int { return -1; }
+@extern("shadow_proc_poll") kimo lsp_proc_poll(job: int) -> int { return -1; }
+@extern("shadow_proc_reap") kimo lsp_proc_reap(job: int) -> void {}
+
 // stderr 调试日志（带单调毫秒时间戳前缀，便于定位耗时）
 pub kimo lsp_log(msg: string) -> void {
     lsp_rt_dbg("[" + int_to_str(lsp_rt_now_ms()) + "][LSP] " + msg);
@@ -302,6 +308,19 @@ let LSP_DEBOUNCE_MS: int = 400;
 let lsp_diag_cache_uri: array<string> = [];
 let lsp_diag_cache_json: array<string> = [];
 
+// ============ 异步编译 worker（消除 diagnostic/codeLens 的 ~900ms 全量编译阻塞）============
+// 子进程队列：每个在途 job 用四条平行数组记录，下标对齐。
+let lsp_job_id: array<int> = [];
+let lsp_job_uri: array<string> = [];
+let lsp_job_out: array<string> = [];   // worker 输出文件（sdiags JSON + refs 两行）
+let lsp_job_tmp: array<string> = [];   // worker 用的临时源文件（写入真实文件同目录以正确解析 import）
+let lsp_job_ver: array<int> = [];      // 触发编译时的文档版本，完成时比对以决定是否清 dirty
+let lsp_async_seq: int = 0;            // 临时文件名去重计数
+// 引用数缓存（codeLens 的 "N references" 由异步 worker 刷新）：
+// lsp_ref_cache_uri[i] <-> lsp_ref_cache_json[i]（"name|count;name|count;..." 格式）。
+let lsp_ref_cache_uri: array<string> = [];
+let lsp_ref_cache_json: array<string> = [];
+
 // 标记文档已被编辑（下一次查询时才真正重编译）
 pub kimo lsp_mark_dirty() -> void {
     lsp_dirty = 1;
@@ -425,7 +444,7 @@ kimo lsp_ensure_compiled(uri: string) -> void {
     if (was_dirty == 1) {
         let ver = lsp_doc_get_version(uri);
         if (ver < 0) { ver = 0; }
-        lsp_push_diagnostics(uri, ver);
+        lsp_push_diagnostics(uri, ver, api_sdiag_json_array());
     }
 }
 
@@ -472,7 +491,7 @@ kimo lsp_recompile_dirty() -> void {
     lsp_compile(uri);
     let ver = lsp_doc_get_version(uri);
     if (ver < 0) { ver = 0; }
-    lsp_push_diagnostics(uri, ver);
+    lsp_push_diagnostics(uri, ver, api_sdiag_json_array());
 }
 
 // 防抖闸门：lsp_dispatch 每条消息分发前调用。文档脏且用户已停手超过窗口 →
@@ -481,7 +500,8 @@ kimo lsp_tick() -> void {
     if (lsp_dirty == 0) { return; }
     let now = lsp_rt_now_ms();
     if (now - lsp_dirty_at < LSP_DEBOUNCE_MS) { return; }
-    lsp_recompile_dirty();
+    // 异步编译：spawn 子进程跑全量检查，本请求立即返回，结果由 lsp_poll_jobs 完成后推送。
+    lsp_compile_async(lsp_dirty_uri);
 }
 
 // 诊断类请求的惰性编译入口（与 lsp_ensure_compiled 区别：编辑中不打断）。
@@ -493,10 +513,17 @@ kimo lsp_ensure_diag(uri: string) -> void {
         if (lsp_dirty == 0) { return; }
         if (str_eq(uri, lsp_dirty_uri) == 1) {
             let now = lsp_rt_now_ms();
-            if (now - lsp_dirty_at >= LSP_DEBOUNCE_MS) { lsp_recompile_dirty(); }
+            if (now - lsp_dirty_at >= LSP_DEBOUNCE_MS) { lsp_compile_async(uri); }
         }
         return;
     }
+    // 缓存未命中，分两种情形：
+    //   1) 本 uri 已有在途异步 job（编辑热路径：tick 已在后台起了编译）→ 立即返回。本请求
+    //      给空/陈旧诊断，job 完成后由 lsp_poll_jobs 填缓存并 publishDiagnostics 推送。
+    //      这是消除「编辑后诊断拉取阻塞 ~900ms」的关键闸门。
+    //   2) 无在途 job（真·冷文档的首个诊断拉取）→ 同步惰性编译，才能在本请求响应里返回
+    //      真实诊断（"真实诊断由 pull 触发惰性编译后产出"）。每文档一次性成本。
+    if (lsp_async_job_pending(uri) == 1) { return; }
     lsp_compile(uri);
 }
 
@@ -506,6 +533,141 @@ kimo lsp_ensure_diag(uri: string) -> void {
 kimo lsp_ensure_diag_action(uri: string) -> void {
     lsp_ensure_diag(uri);
     if (str_eq(lsp_last_uri, uri) == 0) { lsp_compile(uri); }
+}
+
+// ============ 异步编译 worker 实现 ============
+// 触发一次后台编译：把当前内存缓冲区写入「文档同目录」临时 .shadow（保证 import 解析一致），
+// spawn 独立 shadow.exe --diag-json <tmp> --refs 子进程，stdout 重定向到临时 .diag 文件。
+// 子进程跑完整类型检查（~900ms），但完全在后台，不阻塞当前 LSP 请求。
+// 同一 uri 已有在途 job 时跳过，避免重复 spawn。
+// 本 uri 是否已有在途异步 job（后台 worker 正在编译）。
+// 诊断拉取据此区分「真·冷文档（须同步惰性编译）」与「已有后台编译在跑（立即返回，别阻塞）」。
+kimo lsp_async_job_pending(uri: string) -> int {
+    let k = 0;
+    while (k < len(lsp_job_uri)) {
+        if (str_eq(lsp_job_uri[k] as string, uri) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+
+kimo lsp_compile_async(uri: string) -> void {
+    // 同一 uri 已有在途 job：跳过避免重复 spawn（更新内容的刷新由下一轮 tick 补上）
+    if (lsp_async_job_pending(uri) == 1) { return; }
+    let src = lsp_doc_get(uri);
+    if (len(src) == 0) { return; }
+    let path = lsp_uri_to_path(uri);
+    let dir = lsp_parent_dir(path);
+    lsp_async_seq = lsp_async_seq + 1;
+    let seqs = int_to_str(lsp_async_seq);
+    let tmp_src = dir + "/.shadow_lsp_" + seqs + ".shadow";
+    let tmp_out = dir + "/.shadow_lsp_" + seqs + ".diag";
+    file_write(tmp_src, src);
+    let cmdexe = "\"" + lsp_arg0 + "\" --diag-json \"" + tmp_src + "\" --refs";
+    let jid = lsp_proc_launch(cmdexe, tmp_out);
+    if (jid < 0) {
+        file_delete(tmp_src);
+        file_delete(tmp_out);
+        return;
+    }
+    lsp_job_id = array_push(lsp_job_id, jid);
+    lsp_job_uri = array_push(lsp_job_uri, uri);
+    lsp_job_out = array_push(lsp_job_out, tmp_out);
+    lsp_job_tmp = array_push(lsp_job_tmp, tmp_src);
+    lsp_job_ver = array_push(lsp_job_ver, lsp_doc_get_version(uri));
+}
+
+// 收割完成的在途 job：读临时 .diag（首行 sdiags JSON、次行 refs），更新诊断/引用缓存并推送
+// 新鲜诊断；清理临时文件 + reap 子进程句柄。每次 lsp_dispatch 入口调用，串行、无并发风险。
+kimo lsp_poll_jobs() -> void {
+    if (len(lsp_job_id) == 0) { return; }
+    let k_id: array<int> = [];
+    let k_uri: array<string> = [];
+    let k_out: array<string> = [];
+    let k_tmp: array<string> = [];
+    let k_ver: array<int> = [];
+    let i = 0;
+    while (i < len(lsp_job_id)) {
+        let jid = lsp_job_id[i] as int;
+        let done = lsp_proc_poll(jid);
+        if (done == 1) {
+            let outp = lsp_job_out[i] as string;
+            let txt = file_read(outp);
+            let nl = str_index_of(txt, "\n");
+            let sdiags = "";
+            let refs = "";
+            if (nl < 0) {
+                sdiags = txt;
+            } else {
+                sdiags = substr2(txt, 0, nl);
+                refs = substr2(txt, nl + 1, len(txt));
+            }
+            let u = lsp_job_uri[i] as string;
+            lsp_diag_cache_put(u, sdiags);
+            lsp_ref_cache_put(u, refs);
+            let ver = lsp_job_ver[i] as int;
+            lsp_push_diagnostics(u, ver, sdiags);
+            file_delete(outp);
+            file_delete(lsp_job_tmp[i] as string);
+            lsp_proc_reap(jid);
+            // 仅在无更新的编辑发生时，才清掉该 uri 的脏标记（否则下一轮仍会重新触发异步编译）
+            if (str_eq(lsp_dirty_uri, u) == 1 && lsp_doc_get_version(u) == ver) {
+                lsp_dirty = 0;
+            }
+        } else {
+            k_id = array_push(k_id, jid);
+            k_uri = array_push(k_uri, lsp_job_uri[i] as string);
+            k_out = array_push(k_out, lsp_job_out[i] as string);
+            k_tmp = array_push(k_tmp, lsp_job_tmp[i] as string);
+            k_ver = array_push(k_ver, lsp_job_ver[i] as int);
+        }
+        i = i + 1;
+    }
+    lsp_job_id = k_id;
+    lsp_job_uri = k_uri;
+    lsp_job_out = k_out;
+    lsp_job_tmp = k_tmp;
+    lsp_job_ver = k_ver;
+}
+
+// 引用数缓存（codeLens 的 "N references" 由异步 worker 刷新）："name|count;name|count;..."
+kimo lsp_ref_cache_put(uri: string, j: string) -> void {
+    let i = 0;
+    while (i < len(lsp_ref_cache_uri)) {
+        if (str_eq(lsp_ref_cache_uri[i] as string, uri) == 1) {
+            lsp_ref_cache_json[i] = j;
+            return;
+        }
+        i = i + 1;
+    }
+    lsp_ref_cache_uri = array_push(lsp_ref_cache_uri, uri);
+    lsp_ref_cache_json = array_push(lsp_ref_cache_json, j);
+}
+kimo lsp_ref_cache_get(uri: string) -> string {
+    let i = 0;
+    while (i < len(lsp_ref_cache_uri)) {
+        if (str_eq(lsp_ref_cache_uri[i] as string, uri) == 1) {
+            return lsp_ref_cache_json[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+kimo lsp_ref_count_of(cache: string, name: string) -> int {
+    if (len(cache) == 0) { return 0; }
+    let segs = str_split(cache, ";");
+    let i = 0;
+    while (i < len(segs)) {
+        let s = segs[i] as string;
+        if (len(s) > 0) {
+            let kv = str_split(s, "|");
+            if (len(kv) >= 2 && str_eq(kv[0] as string, name) == 1) {
+                return api_atoi(kv[1] as string);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 // 文档是否「脏或新」：workspace/diagnostic 只对这类文档重编译，其余复用缓存。
@@ -518,12 +680,12 @@ kimo lsp_doc_is_dirty_or_new(uri: string) -> int {
 // 编译 + 推送诊断（didOpen/didSave：这些时机用户可接受一次同步编译）
 pub kimo lsp_publish_diagnostics(uri: string, version: int) -> void {
     lsp_compile(uri);
-    lsp_push_diagnostics(uri, version);
+    lsp_push_diagnostics(uri, version, api_sdiag_json_array());
 }
 
-// 仅推送当前编译结果的诊断（不触发重编译）
-pub kimo lsp_push_diagnostics(uri: string, version: int) -> void {
-    let diags = api_sdiag_json_array();
+// 仅推送诊断（不触发重编译）。diags 为诊断 JSON 数组串；异步路径传入 worker 文件内容，
+// 同步路径传入 api_sdiag_json_array()。
+pub kimo lsp_push_diagnostics(uri: string, version: int, diags: string) -> void {
     let p1 = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"";
     let p2 = p1 + uri;
     let p3 = p2 + "\",\"version\":" + int_to_str(version) + ",\"diagnostics\":";
@@ -1669,7 +1831,9 @@ pub kimo lsp_dispatch(body: string) -> void {
     }
     // 调试日志：每条消息记录 method + id（VSCode 输出面板可见；崩溃定位用——最后一条即崩溃前请求）
     lsp_log("recv " + method + " id=" + idraw);
-    // 防抖闸门：连续输入期间不重编译，停手超过窗口后在此触发一次重编译并推送最新诊断
+    // 先收割完成的异步编译 job（推送新鲜诊断/引用数），再走防抖闸门（可能触发新的异步编译）
+    lsp_poll_jobs();
+    // 防抖闸门：连续输入期间不重编译，停手超过窗口后触发一次异步重编译（不阻塞）
     lsp_tick();
     let params = lsp_json_get(body, "params");
     // 取消请求
@@ -1710,7 +1874,7 @@ pub kimo lsp_dispatch(body: string) -> void {
         // 真正的诊断延迟到首次查询（hover/completion/semanticTokens/diagnostic）的
         // 惰性编译时补推。
         api_sdiags_clear();
-        lsp_push_diagnostics(uri, ver);
+        lsp_push_diagnostics(uri, ver, api_sdiag_json_array());
         // 打开即打脏：停手后由 lsp_tick 触发一次重编译并推送真实诊断，
         // 不阻塞 didOpen（避免大项目打开即卡死串行队列）。
         lsp_mark_dirty();
@@ -2139,11 +2303,14 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         return lsp_code_action_json(uri);
     }
     // codeLens（每个顶层函数显示引用计数，点击跳转到引用）
+    // 装饰（函数名/行/列）由 lsp_scan_func_defs 即时给出（纯词法）；引用计数走异步 ref 缓存，
+    // 触发一次非阻塞后台编译后由 worker 刷新——本请求不再卡 ~900ms 全量编译。
     if (str_eq(method, "textDocument/codeLens") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_ensure_diag(uri);
+        lsp_compile_async(uri);
         let src = lsp_doc_get(uri);
         let defs = lsp_scan_func_defs(src);
+        let refs_cache = lsp_ref_cache_get(uri);
         let parts: array<string> = [];
         parts = array_push(parts, "[");
         let first = 1;
@@ -2154,11 +2321,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
             let name = d[0] as string;
             let dl = api_atoi(d[1] as string);
             let dc = api_atoi(d[2] as string);
-            let refs = api_find_references(name);
-            let nref = 0;
-            let rh = str_split(refs, ";");
-            let j = 0;
-            while (j < len(rh)) { if (len(rh[j] as string) > 0) { nref = nref + 1; } j = j + 1; }
+            let nref = lsp_ref_count_of(refs_cache, name);
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let lens = "{\"range\":{\"start\":{\"line\":" + int_to_str(dl - 1) +
@@ -2865,6 +3028,21 @@ pub kimo lsp_code_action_json(uri: string) -> string {
 }
 
 // ============ 主循环 ============
+// 退出时清理在途异步 job（reap 子进程 + 删除临时源/输出文件），避免项目目录残留 .shadow_lsp_* 文件。
+pub kimo lsp_cleanup_jobs() -> void {
+    let i = 0;
+    while (i < len(lsp_job_id)) {
+        lsp_proc_reap(lsp_job_id[i] as int);
+        file_delete(lsp_job_tmp[i] as string);
+        file_delete(lsp_job_out[i] as string);
+        i = i + 1;
+    }
+    lsp_job_id = [];
+    lsp_job_uri = [];
+    lsp_job_out = [];
+    lsp_job_tmp = [];
+    lsp_job_ver = [];
+}
 pub kimo lsp_run() -> void {
     lsp_exit_flag = 0;
     lsp_log("shadow LSP server (0.5) started");
@@ -2874,5 +3052,6 @@ pub kimo lsp_run() -> void {
         lsp_dispatch(body);
         lsp_gc_tick();
     }
+    lsp_cleanup_jobs();
     lsp_log("shadow LSP server exited");
 }
