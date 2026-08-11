@@ -602,6 +602,12 @@ kimo lsp_poll_jobs() -> void {
                 sdiags = substr2(txt, 0, nl);
                 refs = substr2(txt, nl + 1, len(txt));
             }
+            // 防御：worker 输出必须是合法 JSON 数组（首字符 '['）。若因异常得到裸文本
+            // （如旧版本 worker 的 "module error: ..."），绝不当诊断 JSON 发出，否则会向
+            // 客户端推送非法 JSON-RPC 帧导致连接断开。退化为空诊断。
+            if (str_eq(substr2(sdiags, 0, 1), "[") == 0) {
+                sdiags = "[]";
+            }
             let u = lsp_job_uri[i] as string;
             lsp_diag_cache_put(u, sdiags);
             lsp_ref_cache_put(u, refs);

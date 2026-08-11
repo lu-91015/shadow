@@ -33,6 +33,10 @@ import lsp.lsp;
 // （VSCode 报 "Header must provide a Content-Length property"）；
 // 模块/编译错误在 LSP 模式经 SH-MOD001 等诊断通道呈现，不走 eprint。
 let main_lsp_active: int = 0;
+// 机器可读模式（--diag-json 等供 LSP 异步 worker 消费）：置 1 时放宽面向人的 lint
+// 检查（如 dsb 名↔文件名一致性），保证 worker 对任意临时副本都能产出合法 JSON，
+// 绝不让裸报错文本污染 stdout（否则 LSP 把它当诊断 JSON 解析 → 连接断开）。
+let main_machine_mode: int = 0;
 
 // 打印错误消息。CLI 模式写 stdout；LSP 模式抑制（stdout 是帧通道，禁止裸输出）。
 kimo main_eprint(s: string) -> void {
@@ -804,8 +808,13 @@ kimo main_collect_module(project_root: string, key: string, keep_dsb: int, ns_ov
     if (len(d) > 0) {
         let bnm = main_basename_of(key);
         if (str_eq(d, bnm) == 0) {
-            main_import_err = "dsb '" + d + "' does not match file name '" + bnm + "' (expected 'dsb " + bnm + ";' for " + full + ")";
-            return 0;
+            // 机器可读模式（LSP 异步 worker 跑临时副本）下，dsb 名↔文件名不一致属正常
+            // （临时副本文件名由 LSP 生成，不可能匹配 dsb），不应阻断诊断产出；仅记录不报错。
+            // 面向人的 CLI 模式仍严格报错，保持原语义。
+            if (main_machine_mode == 0) {
+                main_import_err = "dsb '" + d + "' does not match file name '" + bnm + "' (expected 'dsb " + bnm + ";' for " + full + ")";
+                return 0;
+            }
         }
     }
     // Phase 11：记录模块源码全文与路径（.lu 缓存 hash 用；与 tc_mod_ns 平行）
@@ -1566,6 +1575,9 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
         lsp_run();
         return 0;
     }
+    // 机器可读模式（--diag-json 供 LSP 异步 worker）：放宽 dsb 名↔文件名一致性等面向人的检查，
+    // 使 worker 对任意临时副本都能产出合法 JSON（见 main_collect_module）。
+    if (str_eq(qflag, "--diag-json") == 1) { main_machine_mode = 1; }
     // 文件参数：优先 flag 之后；否则 flag 之前（run_tests 格式：<file> --check）。
     // 跳过 "--" 开头的 flag（查询模式可与 --strict 组合：<file> --strict --check）。
     let f = "";
@@ -1592,6 +1604,12 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
     // 主文件在 combined 最前（行号不偏移），import 模块随后，runtime 最后。
     let src = main_load_combined(f, args[0] as string);
     if (len(src) == 0) {
+        // 机器可读模式（--diag-json）：必须输出合法 JSON，绝不能把报错文本写进 stdout
+        // （否则 LSP 把它当诊断 JSON 解析 → "Unexpected token" → 客户端断开连接）。
+        if (str_eq(qflag, "--diag-json") == 1) {
+            println("[]");
+            return 0;
+        }
         if (len(main_import_err) > 0) {
             main_eprint("module error: " + main_import_err + "\n");
         } else {
