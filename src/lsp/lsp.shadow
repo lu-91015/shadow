@@ -284,9 +284,17 @@ let lsp_last_uri: string = "";
 let lsp_arg0: string = "";   // shadow.exe 路径（main 在 --lsp 入口注入，供模块图 std 根探测）
 // 文档自上次编译后是否被编辑过。didChange 只标脏不编译（见 lsp_ensure_compiled 注释）。
 let lsp_dirty: int = 0;
+// C 轻量索引器的独立惰性态：只读符号请求（completion/signatureHelp/documentSymbol）
+// 优先走索引快路径（0.1s 级），不触发全量严格态检查。与编译态分开跟踪，
+// 避免索引重建把编译态的 dirty 清掉（诊断推送仍依赖编译态）。
+let lsp_index_uri: string = "";
+let lsp_index_dirty: int = 1;
 
 // 标记文档已被编辑（下一次查询时才真正重编译）
-pub kimo lsp_mark_dirty() -> void { lsp_dirty = 1; }
+pub kimo lsp_mark_dirty() -> void {
+    lsp_dirty = 1;
+    lsp_index_dirty = 1;
+}
 
 // main 在 --lsp 入口注入 exe 路径（供 main_load_combined 探测 src/std 根）
 pub kimo lsp_set_arg0(p: string) -> void { lsp_arg0 = p; }
@@ -318,6 +326,32 @@ pub kimo lsp_compile(uri: string) -> void {
     }
     lsp_last_uri = uri;
     lsp_dirty = 0;
+}
+
+// C 轻量索引器快路径：纯词法扫描（0.1s 级）填充 fmeta/smeta/emeta/gmeta 四表。
+// 语义与 api_check 的 meta 输出一致（已验证逐字节相同），仅不含运行期生成的
+// 泛型特化符号。索引不可用（parse 报错 / import 无法解析）返回 0，调用方回退全量编译。
+// 注意：不产生 api_nodes / api_tokens / api_sdiags —— 表达式级查询与诊断不走此路径。
+pub kimo lsp_index_compile(uri: string) -> int {
+    let src = lsp_doc_get(uri);
+    let path = lsp_uri_to_path(uri);
+    let ok = api_index_compile(path, lsp_arg0, src);
+    if (ok == 0) { return 0; }
+    lsp_index_uri = uri;
+    lsp_index_dirty = 0;
+    return 1;
+}
+
+// 只读符号请求（completion/signatureHelp/documentSymbol）的惰性索引入口：
+// 仅在「换了文档」或「文档被编辑过」时重建索引。
+kimo lsp_index_ensure_compiled(uri: string) -> void {
+    let need = 0;
+    if (str_eq(lsp_index_uri, uri) == 0) { need = 1; }
+    if (lsp_index_dirty == 1) { need = 1; }
+    if (need == 0) { return; }
+    let ok = lsp_index_compile(uri);
+    // 索引不可用（含非法源码）→ 回退全量编译，保证符号表语义完整
+    if (ok == 0) { lsp_ensure_compiled(uri); }
 }
 
 // 从模块加载错误串提取 import 语句行号（源码中 "import <mod>" 所在行，1-based；找不到返回 1）。
@@ -502,8 +536,11 @@ pub kimo lsp_document_symbols_json() -> string {
     let parts: array<string> = [];
     parts = array_push(parts, "[");
     let first = 1;
-    // 主文件模块行上界：只显示主文件符号（combined 行号 ≤ mend），过滤 runtime_lib 噪音
-    let mend = api_main_module_end();
+    // 主文件模块行上界：只显示主文件符号（combined 行号 ≤ mend），过滤 runtime_lib 噪音。
+    // 索引模式用 api_main_end（C 索引器已对齐 tc_main_module_end）；全量编译模式它也被
+    // lsp_compile 设置。退化取 api_main_module_end()（tc 侧，仅全量编译时有效）。
+    let mend = api_main_end;
+    if (mend <= 0) { mend = api_main_module_end(); }
     // funcs（fmeta: name|L|C|EL|EC|rettype|sig）
     let i = 0;
     while (i < len(api_fmeta)) {
@@ -1753,7 +1790,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // documentSymbol
     if (str_eq(method, "textDocument/documentSymbol") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_ensure_compiled(uri);
+        lsp_index_ensure_compiled(uri);
         return lsp_document_symbols_json();
     }
     // semanticTokens/full
@@ -1779,8 +1816,8 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         if (len(uri) == 0) { return "{\"isIncomplete\":false,\"items\":[]}"; }
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
-        // 快路径：模块成员补全（c.）只需读取模块文件做文本扫描，不依赖编译结果。
-        // 放在 lsp_ensure_compiled 之前，避免刚敲完 "c." 时被一次全量严格态检查
+        // completion 快路径：模块成员补全（c.）只需读取模块文件做文本扫描，不依赖编译结果。
+        // 放在 lsp_index_ensure_compiled 之前，避免刚敲完 "c." 时被一次全量严格态检查
         // 拖住数秒才弹出候选。
         let fdot = str_index_of(prefix, ".");
         if (fdot >= 0) {
@@ -1789,13 +1826,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
                                              src, uri, pline - 1, pchar - 1);
             if (len(fast) > 0) { return fast; }
         }
-        lsp_ensure_compiled(uri);
+        lsp_index_ensure_compiled(uri);
         return lsp_completion_json(prefix, pline - 1, pchar - 1, src, uri);
     }
     // signatureHelp
     if (str_eq(method, "textDocument/signatureHelp") == 1) {
         if (len(uri) == 0) { return "{\"signatures\":[],\"activeSignature\":0,\"activeParameter\":0}"; }
-        lsp_ensure_compiled(uri);
+        lsp_index_ensure_compiled(uri);
         return lsp_signature_help_json(pline, pchar, lsp_doc_get(uri), uri);
     }
     // foldingRange

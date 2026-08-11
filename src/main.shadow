@@ -1640,6 +1640,19 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
         println(api_ranges());
         return 0;
     }
+    // --fmeta：dump 符号索引原文（供 C 轻量索引器逐字节对照 / 回归比对）。
+    // 四段以 ---SMETA--- / ---EMETA--- / ---GMETA--- 分隔，段内每行一条，字段以 "|" 分隔。
+    // 不含 imeta/pmeta：二者在 src/ 内无任何消费者（死代码），索引器亦无需产出。
+    if (str_eq(qflag, "--fmeta") == 1) {
+        println(str_join(api_fmeta, "\n"));
+        println("---SMETA---");
+        println(str_join(api_smeta, "\n"));
+        println("---EMETA---");
+        println(str_join(api_emeta, "\n"));
+        println("---GMETA---");
+        println(str_join(api_gmeta, "\n"));
+        return 0;
+    }
     if (str_eq(qflag, "--at") == 1) {
         if (pos_line <= 0) { main_eprint("usage: shadow --at <file> <line> <col>\n"); return 1; }
         println(api_node_at_pos(pos_line, pos_col));
@@ -1765,7 +1778,8 @@ kimo main() -> int {
     while (i2 < n_args) {
         let a2 = args[i2] as string;
         if (str_eq(a2, "--lsp") == 1 || str_eq(a2, "--check") == 1 || str_eq(a2, "--ranges") == 1 ||
-            str_eq(a2, "--diag-json") == 1 || str_eq(a2, "--at") == 1 || str_eq(a2, "--type-at") == 1) {
+            str_eq(a2, "--diag-json") == 1 || str_eq(a2, "--at") == 1 || str_eq(a2, "--type-at") == 1 ||
+            str_eq(a2, "--fmeta") == 1) {
             return main_query_mode(a2, args, n_args, i2);
         }
         i2 = i2 + 1;

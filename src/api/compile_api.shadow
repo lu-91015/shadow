@@ -26,6 +26,40 @@ import type_checker.type_checker;
 // 形成 main ↔ compile_api 循环依赖；宿主（shadow.exe）严格态已验证可容忍模块级循环 import。
 import main;
 
+// === C 轻量索引器（rt/shadow_index.c）@extern ===
+// 与 runtime_lib.shadow 同款：@extern 的 extern_name 非空 → 不 mangle、保持原名。
+// 返回给 shadow 的字符串由 C 侧 __rt_shadow_malloc 分配（宿主分配器，GC 可见）。
+@extern("shadow_index_build") kimo idx_build(entry_path: string, entry_src: string, arg0: string) -> int { return 0; }
+@extern("shadow_index_fmeta") kimo idx_fmeta() -> string { return ""; }
+@extern("shadow_index_smeta") kimo idx_smeta() -> string { return ""; }
+@extern("shadow_index_emeta") kimo idx_emeta() -> string { return ""; }
+@extern("shadow_index_gmeta") kimo idx_gmeta() -> string { return ""; }
+@extern("shadow_index_ok") kimo idx_ok() -> int { return 0; }
+@extern("shadow_index_main_end") kimo idx_main_end() -> int { return 0; }
+@extern("shadow_index_lines") kimo idx_lines() -> int { return 0; }
+
+// 索引快路径：用 C 轻量索引器（纯词法，0.1s 级）填充四张 meta 表。
+// 语义 = 编译器 api_check 的 fmeta/smeta/emeta/gmeta 输出（已逐字节验证）；
+// 差异仅 ① 泛型单态化特化副本不产出（运行期产物，索引器无法预知）；
+// ② parse 报错 / import 无法解析时返回 0（由调用方回退全量编译）。
+// 返回 1=索引成功（meta 表已填，api_nodes 为空——只读符号类查询可用）；
+// 返回 0=索引不可用（调用方走 api_load_combined + api_check 全量编译）。
+pub kimo api_index_compile(path: string, arg0: string, mem_src: string) -> int {
+    if (idx_build(path, mem_src, arg0) == 0) { return 0; }
+    if (idx_ok() == 0) { return 0; }
+    // 空串保护：str_split("", "\n") 返回 ["\"]，与编译器空表语义（[]）不一致
+    let f = idx_fmeta();
+    let s = idx_smeta();
+    let e = idx_emeta();
+    let g = idx_gmeta();
+    if (len(f) == 0) { api_fmeta = []; } else { api_fmeta = str_split(f, "\n"); }
+    if (len(s) == 0) { api_smeta = []; } else { api_smeta = str_split(s, "\n"); }
+    if (len(e) == 0) { api_emeta = []; } else { api_emeta = str_split(e, "\n"); }
+    if (len(g) == 0) { api_gmeta = []; } else { api_gmeta = str_split(g, "\n"); }
+    api_main_end = idx_main_end();
+    return 1;
+}
+
 
 
 // ============ 全局编译结果 ============

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # 等待 stage2 IR 生成完毕后，llc + clang 链接出 build/lspfix.exe
+# 链接含 C 轻量索引器（rt/shadow_index.c → build/rt/shadow_index.o），供 LSP 索引快路径调用。
 set -u
 cd "$(dirname "$0")/.."
 LLVM="D:/llvm/clang+llvm-22.1.0-x86_64-pc-windows-msvc"
+
+echo "[0/3] precompile shadow_index.o (C light indexer)"
+"$LLVM/bin/clang.exe" -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o || exit 1
 
 echo "[1/3] waiting for stage2 compile to finish ..."
 for _ in $(seq 1 240); do
@@ -26,6 +30,7 @@ echo "[3/3] clang++ link ..."
 "$LLVM/bin/clang++" build/lspfix.o \
     bootstrap/runtime_for_selfhost.o bootstrap/miniz.o \
     build/rt/shadow_gc_supplement.o build/rt/rt_zip.o \
+    build/rt/shadow_index.o \
     -o build/lspfix.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$LLVM/lib" || exit 1
 
 ls -la build/lspfix.exe
