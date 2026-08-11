@@ -21,6 +21,8 @@ APP_NAME = "Shadow 0.5"
 ENV_SHADOW = "shadow"          # 用户要求的环境变量名（小写）
 ENV_HOME = "SHADOW_HOME"
 ENV_COMPILER = "SHADOW_COMPILER"
+ENV_LLVM_HOME = "LLVM_HOME"    # 打包的 LLVM 工具链根（llc/clang++/lld-link 所在）
+ENV_LIB = "LIB"                # lld 搜索库路径（打包的 CRT/系统库）
 
 
 def resource_dir():
@@ -53,25 +55,52 @@ def set_user_env(name, value):
         pass
 
 
-def append_user_path(entry):
-    """把 entry 追加到用户 PATH（读旧值去重后写回）。"""
+def append_user_env(name, value):
+    """把 value 追加到用户级环境变量 name（旧值保留，去重后写回）。返回新值。"""
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
                         winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
         try:
-            cur, _ = winreg.QueryValueEx(key, "Path")
+            cur, _ = winreg.QueryValueEx(key, name)
         except FileNotFoundError:
             cur = ""
-        parts = [p for p in cur.split(";") if p]
-        if entry not in parts:
-            parts.append(entry)
-            winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, ";".join(parts))
+        parts = [p for p in str(cur).split(";") if p]
+        if value not in parts:
+            parts.append(value)
+            new = ";".join(parts)
+            winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, new)
     try:
         import ctypes
         ctypes.windll.user32.SendMessageTimeoutW(
             0xFFFF, 0x001A, 0, "Environment", 0x0002, 5000, None)
     except Exception:
         pass
+    return new
+
+
+def remove_user_env(name, remove_part):
+    """从用户级环境变量 name 中移除 remove_part（其余保留）。"""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as key:
+            try:
+                cur, _ = winreg.QueryValueEx(key, name)
+            except FileNotFoundError:
+                return
+            parts = [p for p in str(cur).split(";") if p and p != remove_part]
+            new = ";".join(parts)
+            if new:
+                winreg.SetValueEx(key, name, 0, winreg.REG_EXPAND_SZ, new)
+            else:
+                winreg.DeleteValue(key, name)
+    except Exception:
+        pass
+
+
+def append_user_path(entry):
+    """把 entry 追加到用户 PATH（读旧值去重后写回）。"""
+    append_user_env("Path", entry)
 
 
 def write_uninstall(target):
@@ -80,8 +109,10 @@ def write_uninstall(target):
     lines = [
         "@echo off",
         "rem Shadow 0.5 卸载脚本",
-        'echo 正在清除用户环境变量（shadow / SHADOW_HOME / SHADOW_COMPILER / PATH 中的 bin 项）...',
-        'powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable(\'shadow\',\'\',\'User\'); [Environment]::SetEnvironmentVariable(\'SHADOW_HOME\',\'\',\'User\'); [Environment]::SetEnvironmentVariable(\'SHADOW_COMPILER\',\'\',\'User\')" >nul 2>&1',
+        'echo 正在清除用户环境变量（shadow / SHADOW_HOME / SHADOW_COMPILER / LLVM_HOME / LIB / PATH）...',
+        'powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable(\'shadow\',\'\',\'User\'); [Environment]::SetEnvironmentVariable(\'SHADOW_HOME\',\'\',\'User\'); [Environment]::SetEnvironmentVariable(\'SHADOW_COMPILER\',\'\',\'User\'); [Environment]::SetEnvironmentVariable(\'LLVM_HOME\',\'\',\'User\')" >nul 2>&1',
+        'powershell -NoProfile -Command "$lib=[Environment]::GetEnvironmentVariable(\'LIB\',\'User\'); if($lib){ $new=($lib -split \';\' | Where-Object { $_ -ne \'%TARGET%llvm\\crt\' -and $_ -ne \'' + target.replace("'", "''") + '\\llvm\\crt\' }) -join \';\'; [Environment]::SetEnvironmentVariable(\'LIB\',$new,\'User\') }" >nul 2>&1',
+        'powershell -NoProfile -Command "$p=[Environment]::GetEnvironmentVariable(\'Path\',\'User\'); if($p){ $new=($p -split \';\' | Where-Object { $_ -ne \'%TARGET%bin\' -and $_ -ne \'' + target.replace("'", "''") + '\\bin\' -and $_ -ne \'%TARGET%llvm\\bin\' -and $_ -ne \'' + target.replace("'", "''") + '\\llvm\\bin\' }) -join \';\'; [Environment]::SetEnvironmentVariable(\'Path\',$new,\'User\') }" >nul 2>&1',
         "echo 环境变量已清除（重新打开终端生效）。",
         'echo 正在删除安装目录...',
         'set "TARGET=%~dp0"',
@@ -118,7 +149,11 @@ def install(target):
     set_user_env(ENV_SHADOW, target)
     set_user_env(ENV_HOME, target)
     set_user_env(ENV_COMPILER, os.path.join(target, "bin", "shadow.exe"))
+    # LLVM 工具链（打包内嵌，--run 链接需要 LLVM_HOME + LIB）
+    set_user_env(ENV_LLVM_HOME, os.path.join(target, "llvm"))
+    append_user_env(ENV_LIB, os.path.join(target, "llvm", "crt"))
     append_user_path(os.path.join(target, "bin"))
+    append_user_path(os.path.join(target, "llvm", "bin"))
 
     write_uninstall(target)
 
@@ -219,10 +254,11 @@ def main():
 
     # GUI 模式（ctypes 原生控件，无第三方依赖）
     if not msg_box(APP_NAME,
-                   "即将安装 Shadow 0.5 编译器。\n\n"
+                   "即将安装 Shadow 0.5 编译器（含 LLVM 工具链）。\n\n"
                    "将设置用户环境变量：\n"
                    "  shadow / SHADOW_HOME / SHADOW_COMPILER\n"
-                   "  PATH 追加 <安装目录>\\bin\n\n"
+                   "  LLVM_HOME（内嵌工具链）/ LIB（内嵌 CRT 库）\n"
+                   "  PATH 追加 <安装目录>\\bin 与 <安装目录>\\llvm\\bin\n\n"
                    "继续？", "yesno"):
         return 1
 

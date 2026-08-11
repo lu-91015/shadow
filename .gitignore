@@ -46,3 +46,6 @@ pkg/build_tmp*/
 pkg/dist/
 pkg/*.spec
 pkg/*.exe.old
+# 载荷构建产物（stage_llvm.sh 收集的 LLVM 工具链 380MB + bin 二进制，不入库）
+pkg/shadow/bin/
+pkg/shadow/llvm/
