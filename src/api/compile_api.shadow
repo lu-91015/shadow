@@ -37,6 +37,8 @@ import main;
 @extern("shadow_index_ok") kimo idx_ok() -> int { return 0; }
 @extern("shadow_index_main_end") kimo idx_main_end() -> int { return 0; }
 @extern("shadow_index_lines") kimo idx_lines() -> int { return 0; }
+// 语义 token 流（轻量词法 + delta 编码，对齐 lsp_semantic_tokens_json）
+@extern("shadow_index_tokens") kimo idx_tokens(mem_src: string) -> string { return ""; }
 
 // 索引快路径：用 C 轻量索引器（纯词法，0.1s 级）填充四张 meta 表。
 // 语义 = 编译器 api_check 的 fmeta/smeta/emeta/gmeta 输出（已逐字节验证）；
@@ -1538,6 +1540,9 @@ pub kimo api_sdiag_json_array() -> string {
     parts = array_push(parts, "]");
     return str_join(parts, "");
 }
+
+// 清空诊断（didOpen 推空诊断前调用，避免泄漏上一文件的残留诊断）
+pub kimo api_sdiags_clear() -> void { api_sdiags = []; }
 
 // sdiag 行 "CODE severity source L:C-L:C message" → LSP Diagnostic JSON（0-based）
 pub kimo api_sdiag_to_json(sdiag: string) -> string {

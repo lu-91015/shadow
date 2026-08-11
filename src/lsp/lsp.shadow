@@ -728,6 +728,22 @@ pub kimo lsp_semantic_tokens_json() -> string {
     return str_join(parts, "");
 }
 
+// 语义高亮快路径：C 轻量索引器（0.1s 级）直接产出 delta 编码 JSON，免全量编译。
+// 索引不可用（含非法源码 / import 无法解析）回退全量编译 + lsp_semantic_tokens_json。
+pub kimo lsp_index_tokens_json(uri: string) -> string {
+    let need = 0;
+    if (str_eq(lsp_index_uri, uri) == 0) { need = 1; }
+    if (lsp_index_dirty == 1) { need = 1; }
+    if (need == 1) {
+        let ok = lsp_index_compile(uri);
+        if (ok == 0) {
+            lsp_ensure_compiled(uri);
+            return lsp_semantic_tokens_json();
+        }
+    }
+    return idx_tokens(lsp_doc_get(uri));
+}
+
 // 判断标识符是否为当前程序中的类型名（struct/enum）
 pub kimo lsp_is_type_name(name: string) -> int {
     let i = 0;
@@ -1571,7 +1587,12 @@ pub kimo lsp_dispatch(body: string) -> void {
         let text = lsp_json_str(td, "text");
         let ver = lsp_atoi(lsp_json_get(td, "version"));
         lsp_doc_put(uri, text, ver);
-        lsp_publish_diagnostics(uri, ver);
+        // 打开即全量编译是最大瓶颈：0.5 大项目（13 模块）一次严格态检查需数秒~十余分钟，
+        // 会卡死整个 LSP 串行队列。改为：先清掉上一文件残留诊断，再立即推送空诊断，
+        // 真正的诊断延迟到首次查询（hover/completion/semanticTokens/diagnostic）的
+        // 惰性编译时补推。
+        api_sdiags_clear();
+        lsp_push_diagnostics(uri, ver);
         return;
     }
     if (str_eq(method, "textDocument/didChange") == 1) {
@@ -1793,23 +1814,20 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
         lsp_index_ensure_compiled(uri);
         return lsp_document_symbols_json();
     }
-    // semanticTokens/full
+    // semanticTokens/full —— C 轻量索引器快路径（0.1s 级，免全量编译）
     if (str_eq(method, "textDocument/semanticTokens/full") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_ensure_compiled(uri);
-        return lsp_semantic_tokens_json();
+        return lsp_index_tokens_json(uri);
     }
-    // semanticTokens/range（简化：返回 full）
+    // semanticTokens/range（简化：返回 full；同样走 C 索引器快路径）
     if (str_eq(method, "textDocument/semanticTokens/range") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_ensure_compiled(uri);
-        return lsp_semantic_tokens_json();
+        return lsp_index_tokens_json(uri);
     }
-    // semanticTokens/full/delta（简化：返回 full 数据）
+    // semanticTokens/full/delta（简化：返回 full 数据；走 C 索引器快路径）
     if (str_eq(method, "textDocument/semanticTokens/full/delta") == 1) {
         if (len(uri) == 0) { return "{\"data\":[]}"; }
-        lsp_ensure_compiled(uri);
-        return lsp_semantic_tokens_json();
+        return lsp_index_tokens_json(uri);
     }
     // completion
     if (str_eq(method, "textDocument/completion") == 1) {

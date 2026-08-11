@@ -21,17 +21,19 @@ echo "[0/7] precompile rt_zip.o + shadow_gc_supplement.o"
 "$CLANG_C" -O0 -I "$BOOT" -c rt/rt_zip.c -o build/rt/rt_zip.o
 # shadow_gc_supplement.o 供编译器本体链接（no-op GC 符号），CI 干净环境必须显式编译
 "$CLANG_C" -O0 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o
+# C 轻量索引器（rt/shadow_index.c）：LSP 索引快路径（completion/semanticTokens 等），免全量编译
+"$CLANG_C" -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o
 
 echo "[1/7] stage1: HOST($HOST) compile src/main.shadow"
 "$HOST" src/main.shadow -o build/stage1.ll
 "$LLCC" -O0 -filetype=obj build/stage1.ll -o build/stage1.o
-"$CLANG" -std=c++17 build/stage1.o "$BOOT/runtime_for_selfhost.o" "$BOOT/miniz.o" build/rt/shadow_gc_supplement.o build/rt/rt_zip.o -o build/shadow-stage1.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$RT_LIB"
+"$CLANG" -std=c++17 build/stage1.o "$BOOT/runtime_for_selfhost.o" "$BOOT/miniz.o" build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o -o build/shadow-stage1.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$RT_LIB"
 echo "    wrote build/shadow-stage1.exe"
 
 echo "[2/7] stage2: shadow-stage1 compile src/main.shadow"
 build/shadow-stage1.exe src/main.shadow -o build/stage2.ll
 "$LLCC" -O0 -filetype=obj build/stage2.ll -o build/stage2.o
-"$CLANG" -std=c++17 build/stage2.o "$BOOT/runtime_for_selfhost.o" "$BOOT/miniz.o" build/rt/shadow_gc_supplement.o build/rt/rt_zip.o -o build/shadow-stage2.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$RT_LIB"
+"$CLANG" -std=c++17 build/stage2.o "$BOOT/runtime_for_selfhost.o" "$BOOT/miniz.o" build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o -o build/shadow-stage2.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$RT_LIB"
 echo "    wrote build/shadow-stage2.exe"
 
 echo "[3/7] stage3: shadow-stage2 compile src/main.shadow"

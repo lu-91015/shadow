@@ -1423,6 +1423,169 @@ const char* shadow_index_gmeta(void) { return sx_host_dup(g_inited ? buf_cstr(&g
 int  shadow_index_ok(void) { return g_ok; }
 int  shadow_index_lines(void) { return g_combined; }
 int  shadow_index_main_end(void) { return g_main_end; }
+
+/* ---------------- semanticTokens：轻量词法 + delta 编码 ----------------
+ * 对齐 src/lsp/lsp.shadow 的 lsp_semantic_tokens_json 语义：
+ *   tokenType: variable=0 function=1 keyword=4 type=5 number=7 string=8
+ *   tokenModifiers: bold=1；delta 每 token 5 int：[deltaLine, deltaChar, len, type, mod]
+ *   输出 JSON {"data":[...]}（宿主分配，GC 可见）。
+ * 仅扫 mem_src（LSP 内存文档，didChange 后镜像），不读文件。
+ * ident 分类：prev token == "kimo" → 函数定义(1,bold)；函数名(fmeta+内建) → 1
+ *   （后跟 '(' → bold）；类型名(smeta+emeta) → 5；否则 0（variable）。
+ */
+static const char* const SX_KWS[] = {
+    "kimo","let","if","else","while","for","return","break","continue","true",
+    "false","as","struct","enum","import","pub","in","type","null","int",
+    "long","float","double","bool","string","void","any","char","short","match",
+    "new","mut","impl","try","catch","throw","panic","macro","async","await",
+    "spawn","yield","trait","interface","do","date","timestamp","nanotimestamp",
+    "opaque","with","dsb","defer"
+};
+#define SX_KW_N ((int)(sizeof(SX_KWS) / sizeof(SX_KWS[0])))
+static const char* const SX_BUILTINS[] = {
+    "len","str_eq","str_contains","str_index_of","str_replace","str_trim",
+    "str_to_upper","str_to_lower","str_char_at","str_split","str_join",
+    "str_format","substr2","int_to_str","str_to_int","array_push","array_pop",
+    "print","println","str_len","array_len"
+};
+#define SX_BUILTIN_N ((int)(sizeof(SX_BUILTINS) / sizeof(SX_BUILTINS[0])))
+
+typedef struct { const char** v; int n; int cap; } SxSet;
+static void sx_set_push(SxSet* s, const char* str) {
+    if (s->n >= s->cap) { int nc = s->cap ? s->cap * 2 : 64; const char** nv = (const char**)realloc(s->v, sizeof(char*) * nc); if (!nv) return; s->v = nv; s->cap = nc; }
+    s->v[s->n++] = str;
+}
+static int sx_set_cmp(const void* a, const void* b) { return strcmp(*(const char* const*)a, *(const char* const*)b); }
+static void sx_set_sort(SxSet* s) { if (s->n > 1) qsort(s->v, s->n, sizeof(char*), sx_set_cmp); }
+static int sx_set_has(const SxSet* s, const char* name) {
+    const char** r = (const char**)bsearch(&name, s->v, s->n, sizeof(char*), sx_set_cmp);
+    return r != NULL;
+}
+/* 从 meta 文本提取每行第一字段（name|...）到集合 */
+static void sx_set_from_meta(SxSet* s, const char* meta) {
+    const char* p = meta;
+    while (p && *p) {
+        const char* nl = strchr(p, '\n');
+        const char* bar = strchr(p, '|');
+        int n = (nl ? (int)(nl - p) : (int)strlen(p));
+        int m = bar ? (int)(bar - p) : n;
+        if (m > n) m = n;
+        if (m > 0) {
+            char* dup = (char*)malloc((size_t)m + 1);
+            if (dup) { memcpy(dup, p, (size_t)m); dup[m] = 0; sx_set_push(s, dup); }
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+}
+static void sx_set_free(SxSet* s) { int i; for (i = 0; i < s->n; i++) free((void*)s->v[i]); free(s->v); s->v = NULL; s->n = s->cap = 0; }
+
+static int sx_is_keyword(const char* s, int n) {
+    int i;
+    for (i = 0; i < SX_KW_N; i++) {
+        if ((int)strlen(SX_KWS[i]) == n && memcmp(SX_KWS[i], s, (size_t)n) == 0) return 1;
+    }
+    return 0;
+}
+static void sx_tok_emit(Buf* out, int* first, int* prev_line, int* prev_char,
+                        int line0, int col0, int len, int type, int mod) {
+    int dl = line0 - *prev_line;
+    int dc = (dl == 0) ? (col0 - *prev_char) : col0;
+    if (!*first) buf_putc(out, ',');
+    *first = 0;
+    buf_puti(out, dl); buf_putc(out, ',');
+    buf_puti(out, dc); buf_putc(out, ',');
+    buf_puti(out, len); buf_putc(out, ',');
+    buf_puti(out, type); buf_putc(out, ',');
+    buf_puti(out, mod);
+    *prev_line = line0;
+    *prev_char = col0 + len;
+}
+
+const char* shadow_index_tokens(const char* src) {
+    SxSet funcs = {0}, types = {0};
+    Buf out;
+    int i, first = 1, prev_line = 0, prev_char = 0, line0 = 0, col0 = 0;
+    char prev_tok[64] = "";
+    const char* s = src ? src : "";
+    if (!g_inited) return sx_host_dup("");
+    /* 符号集合：fmeta → 函数名；smeta+emeta → 类型名；+ 内建函数 */
+    sx_set_from_meta(&funcs, buf_cstr(&g_fmeta));
+    sx_set_from_meta(&types, buf_cstr(&g_smeta));
+    sx_set_from_meta(&types, buf_cstr(&g_emeta));
+    for (i = 0; i < SX_BUILTIN_N; i++) {
+        char* dup = (char*)malloc(strlen(SX_BUILTINS[i]) + 1);
+        if (dup) { strcpy(dup, SX_BUILTINS[i]); sx_set_push(&funcs, dup); }
+    }
+    sx_set_sort(&funcs); sx_set_sort(&types);
+
+    buf_init(&out);
+    buf_puts(&out, "{\"data\":[");
+    while (*s) {
+        unsigned char ch = (unsigned char)*s;
+        if (ch == '\n') { line0++; col0 = 0; s++; continue; }
+        if (ch == ' ' || ch == '\t' || ch == '\r') { col0++; s++; continue; }
+        if (ch == '/' && s[1] == '/') {           /* 行注释：跳过（不产 token） */
+            while (*s && *s != '\n') { col0++; s++; }
+            continue;
+        }
+        if (ch == '/' && s[1] == '*') {           /* 块注释：跳过，跨行维护行列 */
+            s += 2; col0 += 2;
+            while (*s && !(*s == '*' && s[1] == '/')) {
+                if (*s == '\n') { line0++; col0 = 0; } else col0++;
+                s++;
+            }
+            if (*s) { s += 2; col0 += 2; }
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {            /* 字符串/字符：含引号，处理转义 */
+            char q = (char)ch;
+            int sl = line0, sc = col0;
+            s++; col0++;
+            while (*s && *s != q) {
+                if (*s == '\\' && s[1]) { s += 2; col0 += 2; }
+                else { if (*s == '\n') { line0++; col0 = 0; } else col0++; s++; }
+            }
+            if (*s == q) { s++; col0++; }
+            sx_tok_emit(&out, &first, &prev_line, &prev_char, sl, sc, col0 - sc, 8, 0);
+            continue;
+        }
+        if (ch >= '0' && ch <= '9') {             /* 数字字面量 */
+            int sl = line0, sc = col0;
+            while (*s && (isalnum((unsigned char)*s) || *s == '_' || *s == '.')) { col0++; s++; }
+            sx_tok_emit(&out, &first, &prev_line, &prev_char, sl, sc, col0 - sc, 7, 0);
+            continue;
+        }
+        if (isalpha((unsigned char)ch) || ch == '_') {  /* 标识符/关键字 */
+            int sl = line0, sc = col0;
+            int n = 0, type = -1, mod = 0;
+            char tok[128];
+            while (*s && (isalnum((unsigned char)*s) || *s == '_')) { if (n < 126) tok[n++] = (char)*s; col0++; s++; }
+            tok[n] = 0;
+            if (sx_is_keyword(tok, n)) { type = 4; }
+            else {
+                if (strcmp(prev_tok, "kimo") == 0) { type = 1; mod = 1; }
+                else if (sx_set_has(&funcs, tok)) {
+                    type = 1;
+                    if (*s == '(') mod = 1;
+                }
+                else if (sx_set_has(&types, tok)) { type = 5; }
+                else { type = 0; }
+            }
+            if (type >= 0) sx_tok_emit(&out, &first, &prev_line, &prev_char, sl, sc, n, type, mod);
+            memcpy(prev_tok, tok, (size_t)n + 1);
+            continue;
+        }
+        {   /* 标点/运算符：单字符 token，仅记录 prev */
+            prev_tok[0] = (char)ch; prev_tok[1] = 0;
+            col0++; s++;
+        }
+    }
+    buf_puts(&out, "]}");
+    sx_set_free(&funcs); sx_set_free(&types);
+    return sx_host_dup(buf_cstr(&out));
+}
+
 void shadow_index_reset(void) { sx_state_reset(); }
 
 /* ---------------- 独立自测入口 ---------------- */
@@ -1437,13 +1600,22 @@ int main(int argc, char** argv) {
     arg0 = (argc > 2 && strncmp(argv[2], "--", 2) != 0) ? argv[2] : argv[0];
     ok = shadow_index_build(argv[1], "", arg0);
     {
-        int i, want_s = 0, want_e = 0, want_g = 0, want_stat = 0, want_all = 0;
+        int i, want_s = 0, want_e = 0, want_g = 0, want_stat = 0, want_t = 0, want_all = 0;
         for (i = 2; i < argc; i++) {
             if (strcmp(argv[i], "--smeta") == 0) want_s = 1;
             else if (strcmp(argv[i], "--emeta") == 0) want_e = 1;
             else if (strcmp(argv[i], "--gmeta") == 0) want_g = 1;
             else if (strcmp(argv[i], "--stat") == 0) want_stat = 1;
+            else if (strcmp(argv[i], "--tokens") == 0) want_t = 1;
             else if (strcmp(argv[i], "--all") == 0) want_all = 1;
+        }
+        if (want_t) {
+            /* 语义 token 快照（delta 编码 JSON），自测 shadow_index_tokens */
+            char* src = sx_read_file(argv[1]);
+            if (!src) { fprintf(stderr, "read fail\n"); return 1; }
+            printf("%s\n", shadow_index_tokens(src));
+            free(src);
+            return 0;
         }
         if (want_stat) {
             int nf = 0, ns = 0, ne = 0, ng = 0;

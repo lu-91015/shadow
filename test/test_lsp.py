@@ -185,24 +185,22 @@ def scenario_diagnostics():
     ]
     frames = run_lsp(reqs)
     ok = True
-    diags = notifications(frames, "textDocument/publishDiagnostics")
-    if not diags or not diags[0].get("params", {}).get("diagnostics"):
+    # didOpen 已即时化（推空诊断，不再同步全量编译）。真实诊断由 pull
+    # (textDocument/diagnostic, id=2) 触发惰性编译后产出。
+    # didOpen 推送的 publishDiagnostics 允许为空——这是即时化后的预期行为。
+    r = by_id(frames)
+    pull = r.get("2", {}).get("result", {})
+    items = pull.get("items", []) if pull else []
+    if not items:
         ok = False
-        print("  [FAIL] bad doc should produce diagnostics")
+        print("  [FAIL] textDocument/diagnostic pull returns items")
     else:
-        items = diags[0]["params"]["diagnostics"]
         joined = json.dumps(items)
         if "SH-TC001" not in joined:
             ok = False
-            print(f"  [FAIL] diagnostics contain SH-TC001 (got {joined[:150]})")
+            print(f"  [FAIL] pull diagnostics contain SH-TC001 (got {joined[:150]})")
         else:
-            print(f"  [PASS] bad doc diagnostics: {len(items)} items")
-    # pull 模式
-    r = by_id(frames)
-    pull = r.get("2", {}).get("result", {})
-    if not pull.get("items"):
-        ok = False
-        print("  [FAIL] textDocument/diagnostic pull returns items")
+            print(f"  [PASS] bad doc pull diagnostics: {len(items)} items")
     return ok
 
 
@@ -275,25 +273,37 @@ def scenario_multimodule():
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             {"jsonrpc": "2.0", "method": "textDocument/didOpen",
              "params": {"textDocument": {"uri": uri, "languageId": "shadow", "version": 1, "text": MAIN}}},
+            # didOpen 不再同步全量编译（推空诊断）；用 pull diagnostic 触发惰性编译验证跨模块解析
+            {"jsonrpc": "2.0", "id": 2, "method": "textDocument/diagnostic",
+             "params": {"textDocument": {"uri": uri}}},
             {"jsonrpc": "2.0", "method": "exit", "params": None},
         ]
         frames = run_lsp(reqs)
-        diags = notifications(frames, "textDocument/publishDiagnostics")
+        r = by_id(frames)
         ok = True
+        # didOpen 推空诊断（清残留），不应含错误
+        diags = notifications(frames, "textDocument/publishDiagnostics")
         if not diags:
             ok = False
-            print("  [FAIL] multimodule: no publishDiagnostics pushed")
+            print("  [FAIL] multimodule: no publishDiagnostics pushed on didOpen")
         else:
-            items = diags[0].get("params", {}).get("diagnostics", [])
-            joined = json.dumps(items)
-            if "undefined function" in joined:
+            oitems = diags[0].get("params", {}).get("diagnostics", [])
+            ojoined = json.dumps(oitems)
+            if "undefined function" in ojoined or "module error" in ojoined:
                 ok = False
-                print(f"  [FAIL] multimodule: cross-module symbol unresolved: {joined[:200]}")
-            elif "cannot read module" in joined or "module error" in joined:
-                ok = False
-                print(f"  [FAIL] multimodule: module load failed: {joined[:200]}")
-            else:
-                print(f"  [PASS] multimodule: cross-module 'area' resolved ({len(items)} diag items)")
+                print(f"  [FAIL] multimodule: didOpen diag unexpected: {ojoined[:200]}")
+        # pull diagnostic（id=2）触发惰性全量编译 → 验证跨模块 'area' 已解析
+        pulled = r.get("2", {}).get("result", {})
+        items = pulled.get("items", []) if pulled else []
+        joined = json.dumps(items)
+        if "undefined function" in joined:
+            ok = False
+            print(f"  [FAIL] multimodule: cross-module symbol unresolved: {joined[:200]}")
+        elif "cannot read module" in joined or "module error" in joined:
+            ok = False
+            print(f"  [FAIL] multimodule: module load failed: {joined[:200]}")
+        else:
+            print(f"  [PASS] multimodule: cross-module 'area' resolved/clean ({len(items)} diag items)")
         return ok
     finally:
         shutil.rmtree(d, ignore_errors=True)
