@@ -39,6 +39,8 @@ import main;
 @extern("shadow_index_lines") kimo idx_lines() -> int { return 0; }
 // 语义 token 流（轻量词法 + delta 编码，对齐 lsp_semantic_tokens_json）
 @extern("shadow_index_tokens") kimo idx_tokens(mem_src: string) -> string { return ""; }
+// hover 快路径（1-based line/col；返回空串表示索引不足以判定，需回退全量 TC）
+@extern("shadow_index_hover") kimo idx_hover(mem_src: string, line: int, col: int) -> string { return ""; }
 
 // 索引快路径：用 C 轻量索引器（纯词法，0.1s 级）填充四张 meta 表。
 // 语义 = 编译器 api_check 的 fmeta/smeta/emeta/gmeta 输出（已逐字节验证）；

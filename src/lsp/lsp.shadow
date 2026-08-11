@@ -23,10 +23,12 @@ import core.const;
 @extern("shadow_json_get_raw") kimo lsp_rt_json_raw(json: string, key: string) -> string { return ""; }
 @extern("shadow_json_array_get") kimo lsp_rt_arr_get(json: string, idx: int) -> string { return ""; }
 @extern("shadow_dbg_mark") kimo lsp_rt_dbg(s: string) -> void {}
+// 单调毫秒时钟（QueryPerformanceCounter，rt/shadow_index.c 提供），用于 DBG 时间戳与诊断防抖
+@extern("shadow_now_ms") kimo lsp_rt_now_ms() -> int { return 0; }
 
-// stderr 调试日志
+// stderr 调试日志（带单调毫秒时间戳前缀，便于定位耗时）
 pub kimo lsp_log(msg: string) -> void {
-    lsp_rt_dbg("[LSP] " + msg);
+    lsp_rt_dbg("[" + int_to_str(lsp_rt_now_ms()) + "][LSP] " + msg);
 }
 
 // ============ 小工具 ============
@@ -284,11 +286,21 @@ let lsp_last_uri: string = "";
 let lsp_arg0: string = "";   // shadow.exe 路径（main 在 --lsp 入口注入，供模块图 std 根探测）
 // 文档自上次编译后是否被编辑过。didChange 只标脏不编译（见 lsp_ensure_compiled 注释）。
 let lsp_dirty: int = 0;
+// 脏标记的时间戳（单调毫秒，见 lsp_rt_now_ms）与脏文档 uri——用于诊断防抖：
+// 连续输入期间不重编译，停手超过 LSP_DEBOUNCE_MS 后才由 lsp_tick 触发一次重编译。
+let lsp_dirty_at: int = 0;
+let lsp_dirty_uri: string = "";
 // C 轻量索引器的独立惰性态：只读符号请求（completion/signatureHelp/documentSymbol）
 // 优先走索引快路径（0.1s 级），不触发全量严格态检查。与编译态分开跟踪，
 // 避免索引重建把编译态的 dirty 清掉（诊断推送仍依赖编译态）。
 let lsp_index_uri: string = "";
 let lsp_index_dirty: int = 1;
+// 诊断防抖窗口（毫秒）：编辑后此窗口内的 diagnostic 拉取返回缓存诊断，不触发全量编译。
+let LSP_DEBOUNCE_MS: int = 400;
+// 每文档诊断缓存（workspace/diagnostic 不重编译未改动文档，直接复用）：
+// lsp_diag_cache_uri[i] <-> lsp_diag_cache_json[i]（api_sdiag_json_array 产出的 JSON 串）。
+let lsp_diag_cache_uri: array<string> = [];
+let lsp_diag_cache_json: array<string> = [];
 
 // 标记文档已被编辑（下一次查询时才真正重编译）
 pub kimo lsp_mark_dirty() -> void {
@@ -301,6 +313,7 @@ pub kimo lsp_set_arg0(p: string) -> void { lsp_arg0 = p; }
 
 // 对文档 uri 编译（didChange/didOpen 后调用；查询前确保调用）
 pub kimo lsp_compile(uri: string) -> void {
+    let t0 = lsp_rt_now_ms();
     let src = lsp_doc_get(uri);
     let path = lsp_uri_to_path(uri);
     api_set_source(src);
@@ -309,11 +322,6 @@ pub kimo lsp_compile(uri: string) -> void {
     // 不存在单文件退化路径——模块图加载失败一律以诊断呈现，而非降级为单文件检查。
     let combined = api_load_combined(path, lsp_arg0, src);
     api_check(combined, path);
-    // 调试日志：编译结果（combined 长度 / parse 错误数 / tc 错误数 / 诊断数）
-    lsp_log("compile combined_len=" + int_to_str(len(combined)) +
-            " parse=" + int_to_str(len(api_parse_raw)) +
-            " tc=" + int_to_str(api_err_count) +
-            " sdiags=" + int_to_str(len(api_sdiags)));
     api_set_main_end(api_main_module_end());
     // 模块图加载失败（dsb 与文件名不符 / import 无法解析）→ 落一条模块诊断。
     // 必须在 api_check 之后，否则会被其清空。
@@ -324,6 +332,16 @@ pub kimo lsp_compile(uri: string) -> void {
         let rng = int_to_str(il) + ":1-" + int_to_str(il) + ":200";
         api_push_sdiag("SH-MOD001 error shadow-module " + rng + " " + merr);
     }
+    // 缓存本 uri 的诊断（diagnostic 拉取与 workspace/diagnostic 直接复用，免重编译）
+    let dj = api_sdiag_json_array();
+    lsp_diag_cache_put(uri, dj);
+    // 调试日志：编译耗时（took=毫秒）+ 结果（combined 长度 / parse / tc / 诊断数）
+    let dt = lsp_rt_now_ms() - t0;
+    lsp_log("compile uri=" + uri + " combined_len=" + int_to_str(len(combined)) +
+            " parse=" + int_to_str(len(api_parse_raw)) +
+            " tc=" + int_to_str(api_err_count) +
+            " sdiags=" + int_to_str(len(api_sdiags)) +
+            " took=" + int_to_str(dt) + "ms");
     lsp_last_uri = uri;
     lsp_dirty = 0;
 }
@@ -389,7 +407,18 @@ kimo lsp_import_err_line(src: string, merr: string) -> int {
 kimo lsp_ensure_compiled(uri: string) -> void {
     let need = 0;
     if (str_eq(lsp_last_uri, uri) == 0) { need = 1; }
-    if (lsp_dirty == 1) { need = 1; }
+    if (lsp_dirty == 1) {
+        // 正在编辑的脏文档且仍在防抖窗口内（用户连续输入）→ 不复编译，直接复用
+        // 已有编译结果（api_prog / api_sdiags 仍有效）。否则每个 foldingRange /
+        // inlayHint / hover 请求都会触发 ~900ms 全量重编译，卡死单线程串行队列。
+        // 跨文档脏（别的文档被编辑）或停手超过窗口 → 仍需重编译以保证结果新鲜。
+        if (str_eq(uri, lsp_dirty_uri) == 1) {
+            let now = lsp_rt_now_ms();
+            if (now - lsp_dirty_at >= LSP_DEBOUNCE_MS) { need = 1; }
+        } else {
+            need = 1;
+        }
+    }
     if (need == 0) { return; }
     let was_dirty = lsp_dirty;
     lsp_compile(uri);
@@ -398,6 +427,92 @@ kimo lsp_ensure_compiled(uri: string) -> void {
         if (ver < 0) { ver = 0; }
         lsp_push_diagnostics(uri, ver);
     }
+}
+
+// ============ 诊断缓存 + 防抖（根治「每次击键 → diagnostic 拉取 → 全量编译 → 卡死串行队列」） ============
+
+// 每文档诊断缓存读写
+pub kimo lsp_diag_cache_put(uri: string, j: string) -> void {
+    let i = 0;
+    while (i < len(lsp_diag_cache_uri)) {
+        if (str_eq(lsp_diag_cache_uri[i] as string, uri) == 1) {
+            lsp_diag_cache_json[i] = j;
+            return;
+        }
+        i = i + 1;
+    }
+    lsp_diag_cache_uri = array_push(lsp_diag_cache_uri, uri);
+    lsp_diag_cache_json = array_push(lsp_diag_cache_json, j);
+}
+
+kimo lsp_diag_cache_get(uri: string) -> string {
+    let i = 0;
+    while (i < len(lsp_diag_cache_uri)) {
+        if (str_eq(lsp_diag_cache_uri[i] as string, uri) == 1) {
+            return lsp_diag_cache_json[i] as string;
+        }
+        i = i + 1;
+    }
+    return "[]";
+}
+
+kimo lsp_diag_cache_has(uri: string) -> int {
+    let i = 0;
+    while (i < len(lsp_diag_cache_uri)) {
+        if (str_eq(lsp_diag_cache_uri[i] as string, uri) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 重编译「脏文档」并推送最新诊断（单次，不阻塞后续请求）。
+kimo lsp_recompile_dirty() -> void {
+    let uri = lsp_dirty_uri;
+    if (len(uri) == 0) { lsp_dirty = 0; return; }
+    lsp_compile(uri);
+    let ver = lsp_doc_get_version(uri);
+    if (ver < 0) { ver = 0; }
+    lsp_push_diagnostics(uri, ver);
+}
+
+// 防抖闸门：lsp_dispatch 每条消息分发前调用。文档脏且用户已停手超过窗口 →
+// 触发一次重编译并推送最新诊断；连续输入期间直接返回，让 diagnostic 拉取走缓存分支。
+kimo lsp_tick() -> void {
+    if (lsp_dirty == 0) { return; }
+    let now = lsp_rt_now_ms();
+    if (now - lsp_dirty_at < LSP_DEBOUNCE_MS) { return; }
+    lsp_recompile_dirty();
+}
+
+// 诊断类请求的惰性编译入口（与 lsp_ensure_compiled 区别：编辑中不打断）。
+//   - 已编译过（有缓存）：脏且本 uri 正是脏文档且已停手 → 重编译；否则返回缓存。
+//   - 未编译过（新文档）：编译一次填充缓存（一次性成本）。
+// 注意：调用方应读 lsp_diag_cache_get(uri) 取诊断，而非全局 api_sdiags。
+kimo lsp_ensure_diag(uri: string) -> void {
+    if (lsp_diag_cache_has(uri) == 1) {
+        if (lsp_dirty == 0) { return; }
+        if (str_eq(uri, lsp_dirty_uri) == 1) {
+            let now = lsp_rt_now_ms();
+            if (now - lsp_dirty_at >= LSP_DEBOUNCE_MS) { lsp_recompile_dirty(); }
+        }
+        return;
+    }
+    lsp_compile(uri);
+}
+
+// codeAction 专用：quickfix 需要 api_sdiags 与 uri 对应。在 lsp_ensure_diag 基础上，
+// 若当前 api_sdiags 不属于本 uri（切到其它文档），补一次重编译保证 quickfix 正确；
+// 编辑中（同文档且未停手）则走缓存分支，不卡输入。
+kimo lsp_ensure_diag_action(uri: string) -> void {
+    lsp_ensure_diag(uri);
+    if (str_eq(lsp_last_uri, uri) == 0) { lsp_compile(uri); }
+}
+
+// 文档是否「脏或新」：workspace/diagnostic 只对这类文档重编译，其余复用缓存。
+kimo lsp_doc_is_dirty_or_new(uri: string) -> int {
+    if (str_eq(uri, lsp_dirty_uri) == 1 && lsp_dirty == 1) { return 1; }
+    if (lsp_diag_cache_has(uri) == 0) { return 1; }
+    return 0;
 }
 
 // 编译 + 推送诊断（didOpen/didSave：这些时机用户可接受一次同步编译）
@@ -1542,6 +1657,7 @@ pub kimo lsp_gc_tick() -> void {
 
 // ============ 分发 ============
 pub kimo lsp_dispatch(body: string) -> void {
+    let t0 = lsp_rt_now_ms();
     let method = lsp_json_str(body, "method");
     let idraw = lsp_json_get(body, "id");
     // 通知（无 id）：不响应
@@ -1553,6 +1669,8 @@ pub kimo lsp_dispatch(body: string) -> void {
     }
     // 调试日志：每条消息记录 method + id（VSCode 输出面板可见；崩溃定位用——最后一条即崩溃前请求）
     lsp_log("recv " + method + " id=" + idraw);
+    // 防抖闸门：连续输入期间不重编译，停手超过窗口后在此触发一次重编译并推送最新诊断
+    lsp_tick();
     let params = lsp_json_get(body, "params");
     // 取消请求
     if (str_eq(method, "$/cancelRequest") == 1) {
@@ -1593,6 +1711,11 @@ pub kimo lsp_dispatch(body: string) -> void {
         // 惰性编译时补推。
         api_sdiags_clear();
         lsp_push_diagnostics(uri, ver);
+        // 打开即打脏：停手后由 lsp_tick 触发一次重编译并推送真实诊断，
+        // 不阻塞 didOpen（避免大项目打开即卡死串行队列）。
+        lsp_mark_dirty();
+        lsp_dirty_at = lsp_rt_now_ms();
+        lsp_dirty_uri = uri;
         return;
     }
     if (str_eq(method, "textDocument/didChange") == 1) {
@@ -1622,6 +1745,8 @@ pub kimo lsp_dispatch(body: string) -> void {
         // （实测输入 "c." 到出补全要等 ~10s）。改为只标脏，等真正的查询到来时
         // （lsp_ensure_compiled）再编译一次，并在那时补推诊断。
         lsp_mark_dirty();
+        lsp_dirty_at = lsp_rt_now_ms();
+        lsp_dirty_uri = uri;
         return;
     }
     if (str_eq(method, "textDocument/didClose") == 1) {
@@ -1653,6 +1778,8 @@ pub kimo lsp_dispatch(body: string) -> void {
             lsp_write_message(lsp_error(idraw, "method not found: " + method));
             return;
         }
+        let dt = lsp_rt_now_ms() - t0;
+        lsp_log("done " + method + " id=" + idraw + " dt=" + int_to_str(dt) + "ms");
         lsp_write_message(lsp_response(idraw, result));
         return;
     }
@@ -1715,8 +1842,15 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // hover
     if (str_eq(method, "textDocument/hover") == 1) {
         if (len(uri) == 0) { return "{\"contents\":{\"kind\":\"markdown\",\"value\":\"\"}}"; }
-        lsp_ensure_compiled(uri);
-        let info = api_hover_info(pline, pchar);
+        // 快路径：先走 C 索引（~100ms 纯词法，无全量 TC）。索引命中即用；
+        // 索引不足以判定（局部变量推断类型/方法等）才回退全量编译（~900ms）。
+        lsp_index_ensure_compiled(uri);
+        let hsrc = lsp_doc_get(uri);
+        let info = idx_hover(hsrc, pline, pchar);
+        if (len(info) == 0) {
+            lsp_ensure_compiled(uri);
+            info = api_hover_info(pline, pchar);
+        }
         let p1 = "{\"contents\":{\"kind\":\"markdown\",\"value\":\"```shadow\\n";
         let p2 = p1 + api_json_escape(info);
         let p3 = p2 + "\\n```\"}}";
@@ -2001,13 +2135,13 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // codeAction
     if (str_eq(method, "textDocument/codeAction") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_ensure_compiled(uri);
+        lsp_ensure_diag_action(uri);
         return lsp_code_action_json(uri);
     }
     // codeLens（每个顶层函数显示引用计数，点击跳转到引用）
     if (str_eq(method, "textDocument/codeLens") == 1) {
         if (len(uri) == 0) { return "[]"; }
-        lsp_ensure_compiled(uri);
+        lsp_ensure_diag(uri);
         let src = lsp_doc_get(uri);
         let defs = lsp_scan_func_defs(src);
         let parts: array<string> = [];
@@ -2049,7 +2183,7 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // inlineCompletion（复用补全结果生成行内补全）
     if (str_eq(method, "textDocument/inlineCompletion") == 1) {
         if (len(uri) == 0) { return "{\"items\":[]}"; }
-        lsp_ensure_compiled(uri);
+        lsp_index_ensure_compiled(uri);
         let src = lsp_doc_get(uri);
         let prefix = lsp_completion_prefix(src, pline - 1, pchar - 1);
         let cj = lsp_completion_json(prefix, pline - 1, pchar - 1, src, uri);
@@ -2062,21 +2196,23 @@ pub kimo lsp_handle_query(method: string, params: string, idraw: string) -> stri
     // diagnostic（LSP 3.17 pull）
     if (str_eq(method, "textDocument/diagnostic") == 1) {
         if (len(uri) == 0) { return "{\"kind\":\"full\",\"items\":[]}"; }
-        lsp_ensure_compiled(uri);
-        let diags = api_sdiag_json_array();
+        lsp_ensure_diag(uri);
+        let diags = lsp_diag_cache_get(uri);
         let p1 = "{\"kind\":\"full\",\"items\":";
         return p1 + diags + "}";
     }
     // workspace/diagnostic（扫描所有已打开文档）
     if (str_eq(method, "workspace/diagnostic") == 1) {
+        lsp_tick();
         let parts: array<string> = [];
         parts = array_push(parts, "{\"items\":[");
         let first = 1;
         let i = 0;
         while (i < len(lsp_uris)) {
             let u = lsp_uris[i] as string;
-            lsp_compile(u);
-            let diags = api_sdiag_json_array();
+            // 仅脏/新文档重编译（防抖），其余直接复用诊断缓存，避免每次拉取重编译全部打开文档
+            if (lsp_doc_is_dirty_or_new(u) == 1) { lsp_ensure_diag(u); }
+            let diags = lsp_diag_cache_get(u);
             if (len(diags) > 2) {
                 if (first == 0) { parts = array_push(parts, ","); }
                 first = 0;

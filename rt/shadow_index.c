@@ -1586,7 +1586,288 @@ const char* shadow_index_tokens(const char* src) {
     return sx_host_dup(buf_cstr(&out));
 }
 
+/* ---------------- hover：纯索引快路径（无需完整 TC） ----------------
+ * 给定文档源码 src 与 1-based (line, col)，定位光标下的标识符（不含 '.'），
+ * 从 fmeta/gmeta/smeta/emeta + 内建表 + 源码局部声明 推断其类型/签名，
+ * 返回与 api_hover_info 同格式的 hover 内容串；定位不到或索引不足以判定时
+ * 返回 ""（宿主回退全量 TC）。优先级对齐 api_hover_info：
+ *   函数(fmeta) → 内建 → 局部变量/参数 → 全局(gmeta) → 结构体(smeta) → 枚举(emeta)
+ * 说明：局部变量类型仅做"源码向前扫描最后一个同名 let/mut/参数声明"的启发式，
+ *   可能误命中同名外层变量；这是快路径的已知近似，索引无法判定时仍走全量 TC。 */
+static int sx_ident_char_c(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+/* 在 src 的 1-based (line,col) 处定位标识符，成功写入 out 返回 1（不含 '.'） */
+static int sx_ident_at(const char* src, int line, int col, char* out, int cap) {
+    out[0] = 0;
+    if (!src || line < 1 || col < 1) return 0;
+    int i = 0, cur = 1;
+    while (src[i] && cur < line) { if (src[i] == '\n') cur++; i++; }
+    if (cur != line) return 0;
+    int line_start = i;
+    int line_end = i;
+    while (src[line_end] && src[line_end] != '\n') line_end++;
+    int c0 = line_start + (col - 1);
+    if (c0 < line_start || c0 > line_end) return 0;
+    int s = c0, e = c0;
+    while (s > line_start && sx_ident_char_c(src[s - 1])) s--;
+    while (e < line_end && sx_ident_char_c(src[e])) e++;
+    if (e <= s) return 0;
+    int n = e - s;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, src + s, (size_t)n); out[n] = 0;
+    if (!(isalpha((unsigned char)out[0]) || out[0] == '_')) return 0;
+    return 1;
+}
+/* 取 line[0..linelen) 第 idx 个 '|' 字段，写入 ob 返回长度（不含结尾 '\0'） */
+static int sx_field_copy(const char* line, int linelen, int idx, char* ob, int obcap) {
+    int f = 0; const char* p = line; const char* end = line + linelen;
+    while (p < end && f < idx) { if (*p == '|') f++; p++; }
+    if (f != idx) { if (obcap > 0) ob[0] = 0; return 0; }
+    const char* q = p;
+    while (q < end && *q != '|') q++;
+    int n = (int)(q - p);
+    if (n >= obcap) n = obcap - 1;
+    if (n > 0) memcpy(ob, p, (size_t)n);
+    if (obcap > 0) ob[n] = 0;
+    return n;
+}
+/* meta 的 name 段可能带 __mod_<ns>__ 前缀（smeta/emeta/gmeta 的 compiler mangle），
+ * fmeta 顶层函数名则不带。返回去掉该前缀后的裸名（NUL 结尾，写入内部静态缓冲），
+ * 用于与源码标识符比较。注意 name 是 meta 行内指针，strlen 会越界，必须按 namelen 截断。 */
+static const char* sx_bare_name(const char* name, int namelen) {
+    static char s_bn[512];
+    const char* b = name;
+    int n = namelen;
+    if (namelen >= 6 && memcmp(name, "__mod_", 6) == 0) {
+        int i;
+        for (i = 6; i + 1 < namelen; i++) {
+            if (name[i] == '_' && name[i + 1] == '_') {
+                b = name + i + 2;
+                n = namelen - (i + 2);
+                break;
+            }
+        }
+    }
+    if (n >= (int)sizeof(s_bn)) n = (int)sizeof(s_bn) - 1;
+    if (n < 0) n = 0;
+    memcpy(s_bn, b, (size_t)n);
+    s_bn[n] = 0;
+    return s_bn;
+}
+/* meta 首行 name 段匹配 ident 即按 kind 产出 hover 串到 out；命中返回 1。
+ * kind: 0=fmeta(sig+内部标记) 1=gmeta(let type) 2=smeta(struct) 3=emeta(enum) */
+static int sx_meta_first(const char* meta, const char* ident, Buf* out, int kind) {
+    buf_clear(out);
+    if (!meta || !*meta) return 0;
+    int ilen = (int)strlen(ident);
+    const char* p = meta;
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        int linelen = nl ? (int)(nl - p) : (int)strlen(p);
+        const char* bar = (const char*)memchr(p, '|', (size_t)linelen);
+        int namelen = bar ? (int)(bar - p) : linelen;
+        const char* bn = sx_bare_name(p, namelen);
+        int bnlen = (int)strlen(bn);
+        if (bnlen == ilen && memcmp(bn, ident, (size_t)ilen) == 0) {
+            char fld[2048], fld2[64];
+            if (kind == 0) {
+                sx_field_copy(p, linelen, 6, fld, sizeof(fld));
+                sx_field_copy(p, linelen, 7, fld2, sizeof(fld2));
+                buf_puts(out, fld);
+                if (!(fld2[0] == '1' && fld2[1] == 0)) buf_puts(out, "\n\n（内部函数）");
+            } else if (kind == 1) {
+                sx_field_copy(p, linelen, 5, fld, sizeof(fld));
+                buf_puts(out, "let "); buf_puts(out, ident); buf_puts(out, ": "); buf_puts(out, fld);
+            } else if (kind == 2) {
+                buf_puts(out, "struct "); buf_puts(out, ident);
+            } else {
+                buf_puts(out, "enum "); buf_puts(out, ident);
+            }
+            return 1;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 0;
+}
+/* 内建函数 hover 表（与 api_builtin_entries 同数据源） */
+static const char* const SX_BUILTIN_HOVER[][3] = {
+    {"len","len(s) -> int","返回字符串或数组长度"},
+    {"str_eq","str_eq(a, b) -> int","字符串相等比较，相等返回 1 否则 0"},
+    {"str_contains","str_contains(s, needle) -> int","检查 s 是否包含子串 needle"},
+    {"str_index_of","str_index_of(s, needle) -> int","返回子串起始下标，未找到返回 -1"},
+    {"str_replace","str_replace(s, old, new) -> string","替换所有匹配子串"},
+    {"str_trim","str_trim(s) -> string","去除首尾空白"},
+    {"str_to_upper","str_to_upper(s) -> string","转大写"},
+    {"str_to_lower","str_to_lower(s) -> string","转小写"},
+    {"str_char_at","str_char_at(s, idx) -> string","取第 idx 个字符"},
+    {"str_split","str_split(s, delim) -> array","按分隔符拆分为字符串数组"},
+    {"str_join","str_join(arr, sep) -> string","用分隔符连接数组元素"},
+    {"str_format","str_format(fmt, args) -> string","按 {0} 占位符格式化"},
+    {"substr2","substr2(s, start, end) -> string","取子串 [start, end)"},
+    {"int_to_str","int_to_str(v) -> string","整数转字符串"},
+    {"long_to_str","long_to_str(v) -> string","长整数转字符串"},
+    {"float_to_str","float_to_str(v) -> string","浮点转字符串"},
+    {"bool_to_str","bool_to_str(v) -> string","布尔转字符串"},
+    {"parse_int","parse_int(s) -> int","字符串解析为整数"},
+    {"parse_long","parse_long(s) -> long","字符串解析为长整数"},
+    {"parse_float","parse_float(s) -> float","字符串解析为浮点"},
+    {"parse_bool","parse_bool(s) -> bool","字符串解析为布尔"},
+    {"println","println(s)","打印并换行"},
+    {"print","print(s)","打印不换行"},
+    {"to_string","to_string(v) -> string","任意值转字符串"},
+    {"array_push","array_push(arr, v) -> array","数组尾部追加元素，返回新数组"},
+    {"file_read","file_read(path) -> string","读取文件内容"},
+    {"file_write","file_write(path, content) -> int","写入文件，返回写入字节数"},
+    {"file_exists","file_exists(path) -> int","检查文件是否存在"},
+    {"file_delete","file_delete(path) -> int","删除文件"},
+    {"file_list_dir","file_list_dir(path) -> string","列出目录文件（分号分隔）"},
+    {"dir_create","dir_create(path) -> int","创建目录"},
+    {"path_exists","path_exists(path) -> int","检查路径是否存在"},
+    {"path_join","path_join(base, child) -> string","拼接路径"},
+    {"path_dirname","path_dirname(path) -> string","取路径目录名"},
+    {"path_basename","path_basename(path) -> string","取路径文件名"},
+    {"hashmap_new","hashmap_new() -> map","创建 HashMap"},
+    {"hashmap_insert","hashmap_insert(m, k, v)","插入键值对"},
+    {"hashmap_get","hashmap_get(m, k) -> any","取键对应值"},
+    {"hashmap_contains","hashmap_contains(m, k) -> int","检查键是否存在"},
+    {"hashmap_remove","hashmap_remove(m, k)","删除键"},
+    {"hashmap_size","hashmap_size(m) -> int","返回元素数量"},
+    {"set_new","set_new() -> set","创建 Set"},
+    {"set_add","set_add(s, v)","添加元素"},
+    {"set_contains","set_contains(s, v) -> int","检查元素是否存在"},
+    {"set_remove","set_remove(s, v)","删除元素"},
+    {"set_size","set_size(s) -> int","返回元素数量"},
+    {"rt_spawn_nullary","rt_spawn_nullary(f)","spawn 无参协程"},
+    {"rt_future_await","rt_future_await(f)","等待 Future 完成"},
+    {NULL, NULL, NULL}
+};
+static int sx_builtin_hover(const char* ident, Buf* out) {
+    buf_clear(out);
+    int i = 0;
+    while (SX_BUILTIN_HOVER[i][0]) {
+        if (strcmp(SX_BUILTIN_HOVER[i][0], ident) == 0) {
+            buf_puts(out, SX_BUILTIN_HOVER[i][1]);
+            buf_puts(out, "\n\n（内置函数）");
+            if (SX_BUILTIN_HOVER[i][2] && SX_BUILTIN_HOVER[i][2][0]) {
+                buf_puts(out, "\n\n"); buf_puts(out, SX_BUILTIN_HOVER[i][2]);
+            }
+            return 1;
+        }
+        i++;
+    }
+    return 0;
+}
+/* 源码向前扫描最后一个同名 let/mut/var 或函数参数声明，产出 "let ident: TYPE" 启发式结果 */
+static int sx_decl_has(const char* line, int linelen, const char* ident, Buf* out) {
+    char buf[8192];
+    int n = linelen < (int)sizeof(buf) - 1 ? linelen : (int)sizeof(buf) - 1;
+    memcpy(buf, line, (size_t)n); buf[n] = 0;
+    int ilen = (int)strlen(ident);
+    if (ilen == 0) return 0;
+    const char* kws[3] = { "let ", "mut ", "var " };
+    int ki;
+    for (ki = 0; ki < 3; ki++) {
+        const char* kp = strstr(buf, kws[ki]);
+        while (kp) {
+            const char* t = kp + strlen(kws[ki]);
+            while (*t == ' ' || *t == '\t') t++;
+            if (strncmp(t, ident, (size_t)ilen) == 0 && !sx_ident_char_c(t[ilen])) {
+                const char* colon = strchr(t + ilen, ':');
+                if (colon) {
+                    const char* ty = colon + 1;
+                    while (*ty == ' ' || *ty == '\t') ty++;
+                    const char* te = ty;
+                    while (*te && *te != '=' && *te != ',' && *te != ')' && *te != ';' && *te != '\n') te++;
+                    int tlen = (int)(te - ty);
+                    buf_clear(out);
+                    buf_puts(out, "let "); buf_puts(out, ident); buf_puts(out, ": ");
+                    if (tlen > 0) buf_putn(out, ty, tlen);
+                    return 1;
+                }
+            }
+            kp = strstr(kp + 1, kws[ki]);
+        }
+    }
+    /* 函数参数：fn ...( ... ident : TYPE ... ) */
+    const char* fn = strstr(buf, "fn ");
+    if (fn) {
+        const char* ob = strchr(fn, '(');
+        if (ob) {
+            const char* cb = strchr(ob, ')');
+            const char* pend = cb ? cb : (buf + n);
+            const char* q = ob + 1;
+            while (q < pend) {
+                while (q < pend && (*q == ' ' || *q == '\t')) q++;
+                if (strncmp(q, ident, (size_t)ilen) == 0 && !sx_ident_char_c(q[ilen])) {
+                    const char* colon = strchr(q + ilen, ':');
+                    if (colon && colon < pend) {
+                        const char* ty = colon + 1;
+                        while (*ty == ' ' || *ty == '\t') ty++;
+                        const char* te = ty;
+                        while (te < pend && *te != ',' && *te != ')' && *te != '\n') te++;
+                        int tlen = (int)(te - ty);
+                        buf_clear(out);
+                        buf_puts(out, "let "); buf_puts(out, ident); buf_puts(out, ": ");
+                        if (tlen > 0) buf_putn(out, ty, tlen);
+                        return 1;
+                    }
+                }
+                const char* comma = strchr(q + 1, ',');
+                if (!comma || comma >= pend) break;
+                q = comma + 1;
+            }
+        }
+    }
+    return 0;
+}
+static int sx_local_type(const char* src, int line, const char* ident, Buf* out) {
+    buf_clear(out);
+    int cur = 1;
+    const char* p = src;
+    while (*p && cur <= line) {
+        const char* nl = strchr(p, '\n');
+        int linelen = nl ? (int)(nl - p) : (int)strlen(p);
+        sx_decl_has(p, linelen, ident, out); /* 命中则填充 out；循环继续取更靠近 hover 的声明 */
+        cur++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return buf_cstr(out)[0] ? 1 : 0;
+}
+const char* shadow_index_hover(const char* src, int line, int col) {
+    char ident[256];
+    Buf out; buf_init(&out);
+    if (!g_inited) return sx_host_dup("");
+    if (!sx_ident_at(src, line, col, ident, sizeof(ident))) return sx_host_dup("");
+    if (sx_meta_first(buf_cstr(&g_fmeta), ident, &out, 0)) return sx_host_dup(buf_cstr(&out));
+    if (sx_builtin_hover(ident, &out)) return sx_host_dup(buf_cstr(&out));
+    if (sx_local_type(src, line, ident, &out)) return sx_host_dup(buf_cstr(&out));
+    if (sx_meta_first(buf_cstr(&g_gmeta), ident, &out, 1)) return sx_host_dup(buf_cstr(&out));
+    if (sx_meta_first(buf_cstr(&g_smeta), ident, &out, 2)) return sx_host_dup(buf_cstr(&out));
+    if (sx_meta_first(buf_cstr(&g_emeta), ident, &out, 3)) return sx_host_dup(buf_cstr(&out));
+    return sx_host_dup("");
+}
+
 void shadow_index_reset(void) { sx_state_reset(); }
+
+/* 单调毫秒时钟：进程启动以来的毫秒数（QueryPerformanceCounter）。
+   供 LSP DBG 日志打时间戳、诊断防抖窗口判定。返回 int（进程存活期内不会溢出 32 位）。 */
+static LARGE_INTEGER g_clock_freq;
+static LARGE_INTEGER g_clock_base;
+static int g_clock_inited = 0;
+int shadow_now_ms(void) {
+    if (!g_clock_inited) {
+        QueryPerformanceFrequency(&g_clock_freq);
+        QueryPerformanceCounter(&g_clock_base);
+        g_clock_inited = 1;
+    }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    LONGLONG ms = (now.QuadPart - g_clock_base.QuadPart) * 1000 / g_clock_freq.QuadPart;
+    return (int)ms;
+}
 
 /* ---------------- 独立自测入口 ---------------- */
 #ifdef SHADOW_INDEX_STANDALONE
@@ -1607,6 +1888,16 @@ int main(int argc, char** argv) {
             else if (strcmp(argv[i], "--gmeta") == 0) want_g = 1;
             else if (strcmp(argv[i], "--stat") == 0) want_stat = 1;
             else if (strcmp(argv[i], "--tokens") == 0) want_t = 1;
+            else if (strcmp(argv[i], "--hover") == 0) {
+                int hl = (i + 1 < argc) ? atoi(argv[i + 1]) : 0;
+                int hc = (i + 2 < argc) ? atoi(argv[i + 2]) : 0;
+                char* hsrc = sx_read_file(argv[1]);
+                if (!hsrc) { fprintf(stderr, "read fail\n"); return 1; }
+                const char* h = shadow_index_hover(hsrc, hl, hc);
+                printf("hover(%d,%d)=[%s]\n", hl, hc, h ? h : "");
+                free(hsrc);
+                return 0;
+            }
             else if (strcmp(argv[i], "--all") == 0) want_all = 1;
         }
         if (want_t) {
