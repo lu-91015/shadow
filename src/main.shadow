@@ -41,7 +41,9 @@ let main_machine_mode: int = 0;
 // main_load_combined 跳过永不变的 30KB runtime_lib，且 api_check 只做 lex+parse
 // （不类型检查）。语法错误（如缺分号）以 ~100ms 而非 ~1.4s 反馈。完整类型检查仍由
 // 普通 --diag-json worker 异步补齐。默认 0 → 与 --diag-json 完全一致，固定点安全。
-let main_diag_fast: int = 0;
+pub let main_diag_fast: int = 0;
+// 跨包接口：供 lsp 包做进程内快诊断时切换 runtime_lib 跳过标志（parse-only 不需要 runtime_lib）。
+pub kimo main_set_diag_fast(v: int) -> void { main_diag_fast = v; }
 
 // 打印错误消息。CLI 模式写 stdout；LSP 模式抑制（stdout 是帧通道，禁止裸输出）。
 kimo main_eprint(s: string) -> void {

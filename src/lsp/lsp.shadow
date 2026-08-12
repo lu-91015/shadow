@@ -15,6 +15,7 @@ import api.compile_api;
 import core.ast;
 import core.utils;
 import core.const;
+import main;
 
 // ============ FFI：stdio/JSON（0.3 runtime_for_selfhost.o 提供符号） ============
 @extern("shadow_stdin_read_line") kimo lsp_rt_read_line() -> string { return ""; }
@@ -366,6 +367,38 @@ pub kimo lsp_compile(uri: string) -> void {
     lsp_dirty = 0;
 }
 
+// 常驻快诊断（进程内 parse-only）：不 spawn 子进程（消除 ~520ms 启动 + LLVM-C.dll 加载），
+// 且 parse-only 跳过 30KB runtime_lib 重解析（~530ms），仅解析编辑器缓冲区 → ~50-100ms 给出
+// 语法级诊断（缺分号 / 错 token / 未闭合括号等），坐标与完整编译一致。用于 didChange/didOpen
+// 后即时反馈；完整类型检查由 lsp_compile_async 交后台子进程补推。标志先保存后还原，避免污染
+// 后续全量编译（lsp_compile 依赖 main_diag_fast==0 才拼接 runtime_lib）。
+kimo lsp_compile_fast_inproc(uri: string) -> void {
+    let src = lsp_doc_get(uri);
+    if (len(src) == 0) { return; }
+    let path = lsp_uri_to_path(uri);
+    let t0 = lsp_rt_now_ms();
+    let sv_parse = api_parse_only;
+    api_parse_only = 1;
+    main_set_diag_fast(1);
+    api_set_source(src);
+    let combined = api_load_combined(path, lsp_arg0, src);
+    api_check(combined, path);
+    api_set_main_end(api_main_module_end());
+    let dj = api_sdiag_json_array();
+    let ver = lsp_doc_get_version(uri);
+    if (ver < 0) { ver = 0; }
+    lsp_diag_cache_put(uri, dj);
+    lsp_push_diagnostics(uri, ver, dj);
+    api_parse_only = sv_parse;
+    main_set_diag_fast(0);
+    lsp_last_uri = uri;
+    let dt = lsp_rt_now_ms() - t0;
+    lsp_log("tick-fast-inproc uri=" + uri + " combined_len=" + int_to_str(len(combined)) +
+            " parse=" + int_to_str(len(api_parse_raw)) +
+            " sdiags=" + int_to_str(len(api_sdiags)) +
+            " took=" + int_to_str(dt) + "ms");
+}
+
 // C 轻量索引器快路径：纯词法扫描（0.1s 级）填充 fmeta/smeta/emeta/gmeta 四表。
 // 语义与 api_check 的 meta 输出一致（已验证逐字节相同），仅不含运行期生成的
 // 泛型特化符号。索引不可用（parse 报错 / import 无法解析）返回 0，调用方回退全量编译。
@@ -507,8 +540,11 @@ kimo lsp_tick() -> void {
     if (lsp_dirty == 0) { return; }
     let now = lsp_rt_now_ms();
     if (now - lsp_dirty_at < LSP_DEBOUNCE_MS) { return; }
-    // 异步编译：spawn 子进程跑全量检查，本请求立即返回，结果由 lsp_poll_jobs 完成后推送。
+    // 常驻编译：进程内快诊断（~100ms 即时语法反馈）+ 后台子进程补完整类型检查。两者均在
+    // 本条消息分发前的空闲间隙执行，不阻塞客户端输入；清 dirty 以免下一轮重复触发。
+    lsp_log("tick compile_async uri=" + lsp_dirty_uri);
     lsp_compile_async(lsp_dirty_uri);
+    lsp_dirty = 0;
 }
 
 // 诊断类请求的惰性编译入口（与 lsp_ensure_compiled 区别：编辑中不打断）。
@@ -531,7 +567,16 @@ kimo lsp_ensure_diag(uri: string) -> void {
     //   2) 无在途 job（真·冷文档的首个诊断拉取）→ 同步惰性编译，才能在本请求响应里返回
     //      真实诊断（"真实诊断由 pull 触发惰性编译后产出"）。每文档一次性成本。
     if (lsp_async_job_pending(uri, "any") == 1) { return; }
-    lsp_compile(uri);
+    // 冷文档首查：先进程内快诊断（~100ms 语法级，覆盖缺分号等高频语法错误，即时返回）；
+    // 若无语法错误，再同步全量类型检查（保证 SH-TC001 等类型错误在 pull 响应里返回，
+    // 满足 pull 语义与测试）。完整类型检查亦交后台子进程补推，供后续 push 刷新。
+    lsp_compile_fast_inproc(uri);
+    if (len(api_sdiags) == 0) {
+        lsp_compile(uri);
+    } else {
+        lsp_spawn_worker(uri, "full");
+    }
+    lsp_dirty = 0;
 }
 
 // codeAction 专用：quickfix 需要 api_sdiags 与 uri 对应。在 lsp_ensure_diag 基础上，
@@ -578,6 +623,7 @@ kimo lsp_spawn_worker(uri: string, kind: string) -> void {
     let flag = "--diag-json";
     if (str_eq(kind, "fast") == 1) { flag = "--diag-fast"; }
     let cmdexe = "\"" + lsp_arg0 + "\" " + flag + " \"" + tmp_src + "\"";
+    lsp_log("spawn-worker uri=" + uri + " kind=" + kind + " tmp=" + tmp_src);
     let jid = lsp_proc_launch(cmdexe, tmp_out);
     if (jid < 0) {
         file_delete(tmp_src);
@@ -593,10 +639,11 @@ kimo lsp_spawn_worker(uri: string, kind: string) -> void {
 }
 
 kimo lsp_compile_async(uri: string) -> void {
-    // 双 worker：fast(parse-only 快诊断) + full(完整类型检查)。同一 uri 每种通道已有在途 job
-    // 时跳过，避免重复 spawn（内容刷新由下一轮 tick 补上）。fast 先完成 → 语法错误（如缺分号）
-    // 即时（~100ms）反馈；full 后完成 → 完整诊断（含类型错误）覆盖。
-    lsp_spawn_worker(uri, "fast");
+    // 常驻快诊断：进程内 parse-only 编译，跳过 520ms 子进程启动 + 30KB runtime_lib 重解析，
+    // ~100ms 内给出语法级诊断（如缺分号 / 错 token）；完整类型检查仍交后台子进程（off-server，
+    // 保持主进程对 hover/completion/definition 等即时响应）。同一 uri 已有在途 full job 时
+    // lsp_spawn_worker 内部去重，避免重复 spawn（内容刷新由下一轮 tick 补上）。
+    lsp_compile_fast_inproc(uri);
     lsp_spawn_worker(uri, "full");
 }
 
