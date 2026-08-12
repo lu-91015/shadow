@@ -956,7 +956,8 @@ pub kimo lsp_document_symbols_json() -> string {
             let nm = fm[0] as string;
             if (fl > mend) { i = i + 1; continue; }
             let selc = fc + len(nm) - 1;
-            if (selc > fec) { selc = fec; }
+            if (selc > fec - 1) { selc = fec - 1; }
+            if (selc < fc - 1) { selc = fc - 1; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm + "\",\"kind\":12,\"detail\":\"function\"," +
@@ -984,7 +985,8 @@ pub kimo lsp_document_symbols_json() -> string {
             let nm2 = sm[0] as string;
             if (sl2 > mend) { i = i + 1; continue; }
             let selc2 = sc2 + len(nm2) - 1;
-            if (selc2 > sec2) { selc2 = sec2; }
+            if (selc2 > sec2 - 1) { selc2 = sec2 - 1; }
+            if (selc2 < sc2 - 1) { selc2 = sc2 - 1; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm2 + "\",\"kind\":5,\"detail\":\"struct\"," +
@@ -1012,7 +1014,8 @@ pub kimo lsp_document_symbols_json() -> string {
             let nm3 = em[0] as string;
             if (el2 > mend) { i = i + 1; continue; }
             let selc3 = ec2 + len(nm3) - 1;
-            if (selc3 > eec2) { selc3 = eec2; }
+            if (selc3 > eec2 - 1) { selc3 = eec2 - 1; }
+            if (selc3 < ec2 - 1) { selc3 = ec2 - 1; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm3 + "\",\"kind\":10,\"detail\":\"enum\"," +
@@ -1040,7 +1043,8 @@ pub kimo lsp_document_symbols_json() -> string {
             let nm4 = gm[0] as string;
             if (gl2 > mend) { i = i + 1; continue; }
             let selc4 = gc2 + len(nm4) - 1;
-            if (selc4 > gec2) { selc4 = gec2; }
+            if (selc4 > gec2 - 1) { selc4 = gec2 - 1; }
+            if (selc4 < gc2 - 1) { selc4 = gc2 - 1; }
             if (first == 0) { parts = array_push(parts, ","); }
             first = 0;
             let item = "{\"name\":\"" + nm4 + "\",\"kind\":13,\"detail\":\"variable\"," +
