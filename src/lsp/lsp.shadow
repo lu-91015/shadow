@@ -38,6 +38,19 @@ pub kimo lsp_log(msg: string) -> void {
     lsp_rt_dbg("[" + int_to_str(lsp_rt_now_ms()) + "][LSP] " + msg);
 }
 
+// 源码内容指纹（滚动 hash + 长度），用于判断「后台 worker 编译时的源码」与
+// 「当前内存缓冲区」是否一致——不一致说明编辑发生在 worker 运行期间，其结果已陈旧，
+// 必须丢弃，否则会用旧源码的诊断覆盖新源码的正确诊断（「改对了报错还在」的根因之一）。
+kimo lsp_src_fp(s: string) -> string {
+    let h = 0;
+    let i = 0;
+    while (i < len(s)) {
+        h = (h * 31 + (s[i] as int)) % 1000000007;
+        i = i + 1;
+    }
+    return int_to_str(len(s)) + ":" + int_to_str(h);
+}
+
 // ============ 小工具 ============
 
 // 手写 atoi（数字字符码 48-57）
@@ -317,6 +330,7 @@ let lsp_job_out: array<string> = [];   // worker 输出文件（sdiags JSON + re
 let lsp_job_tmp: array<string> = [];   // worker 用的临时源文件（写入真实文件同目录以正确解析 import）
 let lsp_job_ver: array<int> = [];      // 触发编译时的文档版本，完成时比对以决定是否清 dirty
 let lsp_job_kind: array<string> = [];  // 每个 job 的通道："fast"(parse-only 快诊断) / "full"(完整类型检查)
+let lsp_job_fp: array<string> = [];    // 触发编译时的源码指纹，完成时比对以丢弃陈旧结果
 let lsp_async_seq: int = 0;            // 临时文件名去重计数
 // 引用数缓存（codeLens 的 "N references" 由异步 worker 刷新）：
 // lsp_ref_cache_uri[i] <-> lsp_ref_cache_json[i]（"name|count;name|count;..." 格式）。
@@ -396,7 +410,7 @@ kimo lsp_compile_fast_inproc(uri: string) -> void {
     lsp_log("tick-fast-inproc uri=" + uri + " combined_len=" + int_to_str(len(combined)) +
             " parse=" + int_to_str(len(api_parse_raw)) +
             " sdiags=" + int_to_str(len(api_sdiags)) +
-            " took=" + int_to_str(dt) + "ms");
+            " took=" + int_to_str(dt) + "ms" + " fp=" + lsp_src_fp(src));
 }
 
 // C 轻量索引器快路径：纯词法扫描（0.1s 级）填充 fmeta/smeta/emeta/gmeta 四表。
@@ -524,6 +538,24 @@ kimo lsp_diag_cache_has(uri: string) -> int {
     return 0;
 }
 
+// 编辑文档后使诊断缓存失效：移除该 uri 的缓存项，迫使下一次 diagnostic 拉取（pull）走
+// 缓存未命中分支重新编译当前内存缓冲区，而不是返回编辑前的陈旧诊断（「改对了报错还在」
+// 的根因之二：lsp_ensure_diag 在 dirty==0 时直接返回缓存）。
+kimo lsp_diag_cache_invalidate(uri: string) -> void {
+    let nw_u: array<string> = [];
+    let nw_j: array<string> = [];
+    let i = 0;
+    while (i < len(lsp_diag_cache_uri)) {
+        if (str_eq(lsp_diag_cache_uri[i] as string, uri) == 0) {
+            nw_u = array_push(nw_u, lsp_diag_cache_uri[i] as string);
+            nw_j = array_push(nw_j, lsp_diag_cache_json[i] as string);
+        }
+        i = i + 1;
+    }
+    lsp_diag_cache_uri = nw_u;
+    lsp_diag_cache_json = nw_j;
+}
+
 // 重编译「脏文档」并推送最新诊断（单次，不阻塞后续请求）。
 kimo lsp_recompile_dirty() -> void {
     let uri = lsp_dirty_uri;
@@ -552,6 +584,7 @@ kimo lsp_tick() -> void {
 //   - 未编译过（新文档）：编译一次填充缓存（一次性成本）。
 // 注意：调用方应读 lsp_diag_cache_get(uri) 取诊断，而非全局 api_sdiags。
 kimo lsp_ensure_diag(uri: string) -> void {
+    lsp_log("ensure_diag uri=" + uri + " cache_has=" + int_to_str(lsp_diag_cache_has(uri)) + " dirty=" + int_to_str(lsp_dirty) + " fp=" + lsp_src_fp(lsp_doc_get(uri)));
     if (lsp_diag_cache_has(uri) == 1) {
         if (lsp_dirty == 0) { return; }
         if (str_eq(uri, lsp_dirty_uri) == 1) {
@@ -611,6 +644,7 @@ kimo lsp_async_job_pending(uri: string, kind: string) -> int {
 kimo lsp_spawn_worker(uri: string, kind: string) -> void {
     if (lsp_async_job_pending(uri, kind) == 1) { return; }
     let src = lsp_doc_get(uri);
+    let fp = lsp_src_fp(src);
     if (len(src) == 0) { return; }
     let path = lsp_uri_to_path(uri);
     let dir = lsp_parent_dir(path);
@@ -636,6 +670,7 @@ kimo lsp_spawn_worker(uri: string, kind: string) -> void {
     lsp_job_tmp = array_push(lsp_job_tmp, tmp_src);
     lsp_job_ver = array_push(lsp_job_ver, lsp_doc_get_version(uri));
     lsp_job_kind = array_push(lsp_job_kind, kind);
+    lsp_job_fp = array_push(lsp_job_fp, fp);
 }
 
 kimo lsp_compile_async(uri: string) -> void {
@@ -680,16 +715,28 @@ kimo lsp_poll_jobs() -> void {
                 sdiags = "[]";
             }
             let u = lsp_job_uri[i] as string;
-            lsp_diag_cache_put(u, sdiags);
-            lsp_ref_cache_put(u, refs);
-            let ver = lsp_job_ver[i] as int;
-            lsp_push_diagnostics(u, ver, sdiags);
-            file_delete(outp);
-            file_delete(lsp_job_tmp[i] as string);
-            lsp_proc_reap(jid);
-            // 仅在无更新的编辑发生时，才清掉该 uri 的脏标记（否则下一轮仍会重新触发异步编译）
-            if (str_eq(lsp_dirty_uri, u) == 1 && lsp_doc_get_version(u) == ver) {
-                lsp_dirty = 0;
+            // 陈旧判定：worker 编译时的源码指纹与当前内存缓冲区不一致 → 编辑发生在
+            // worker 运行期间，结果已过期，必须丢弃，否则会用旧源码的诊断覆盖新源码的
+            // 正确诊断（「改对了报错还在」的根因之一）。
+            let cur_fp = lsp_src_fp(lsp_doc_get(u));
+            if (str_eq(cur_fp, lsp_job_fp[i] as string) == 0) {
+                lsp_log("poll-discard uri=" + u + " jobfp=" + (lsp_job_fp[i] as string) + " curfp=" + cur_fp);
+                file_delete(outp);
+                file_delete(lsp_job_tmp[i] as string);
+                lsp_proc_reap(jid);
+            } else {
+                lsp_diag_cache_put(u, sdiags);
+                lsp_ref_cache_put(u, refs);
+                let ver = lsp_job_ver[i] as int;
+                lsp_log("poll-push uri=" + u + " ver=" + int_to_str(ver) + " sdiags_len=" + int_to_str(len(sdiags)));
+                lsp_push_diagnostics(u, ver, sdiags);
+                file_delete(outp);
+                file_delete(lsp_job_tmp[i] as string);
+                lsp_proc_reap(jid);
+                // 仅在无更新的编辑发生时，才清掉该 uri 的脏标记（否则下一轮仍会重新触发异步编译）
+                if (str_eq(lsp_dirty_uri, u) == 1 && lsp_doc_get_version(u) == ver) {
+                    lsp_dirty = 0;
+                }
             }
         } else {
             k_id = array_push(k_id, jid);
@@ -1948,6 +1995,8 @@ pub kimo lsp_dispatch(body: string) -> void {
         let text = lsp_json_str(td, "text");
         let ver = lsp_atoi(lsp_json_get(td, "version"));
         lsp_doc_put(uri, text, ver);
+        lsp_diag_cache_invalidate(uri);
+        lsp_log("didOpen uri=" + uri + " ver=" + int_to_str(ver) + " fp=" + lsp_src_fp(text));
         // 打开即全量编译是最大瓶颈：0.5 大项目（13 模块）一次严格态检查需数秒~十余分钟，
         // 会卡死整个 LSP 串行队列。改为：先清掉上一文件残留诊断，再立即推送空诊断，
         // 真正的诊断延迟到首次查询（hover/completion/semanticTokens/diagnostic）的
@@ -1983,6 +2032,8 @@ pub kimo lsp_dispatch(body: string) -> void {
             ci = ci + 1;
         }
         lsp_doc_put(uri, lsp_doc_get(uri), ver);
+        lsp_diag_cache_invalidate(uri);
+        lsp_log("didChange uri=" + uri + " ver=" + int_to_str(ver) + " fp=" + lsp_src_fp(lsp_doc_get(uri)));
         // 这里不做同步全量编译：0.5 大项目一次严格态检查需数秒，
         // 每次击键都编译会把随后的 completion/definition/hover 请求堵在串行队列里
         // （实测输入 "c." 到出补全要等 ~10s）。改为只标脏，等真正的查询到来时

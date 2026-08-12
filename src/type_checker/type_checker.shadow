@@ -1053,6 +1053,11 @@ let tc_g_collect: int = 0;   // 0=CLI（println）；1=收集（LSP/库模式）
 // 且这样 tc_check_program 得以保持单参签名，compile_api 调用点零改动。
 let tc_g_mod_ns: array<string> = [];
 let tc_g_mod_starts: array<int> = [];
+// 模块真实路径表与 dsb 行表（与 tc_g_mod_ns / tc_g_mod_starts 平行，由 main 的
+// main_mod_paths / main_mod_dsb_line 经 tc_set_mod_map 注入）。tc_error_at 据此把
+// combined 拼接行号还原成「真实模块路径:模块内行号」，根治跨模块错误统一归因主文件的假象。
+let tc_g_mod_paths: array<string> = [];
+let tc_g_mod_dsb_line: array<int> = [];
 // 闭包提升注册表：闭包字面量提升的 __closure_<n> 函数（tc_check 闭包分支收集，
 // main_compile_source 合并进 prog.funcs 参与 lower+codegen 发射——否则 link undefined symbol）。
 let tc_g_closure_funcs: array<FuncDef> = [];
@@ -1094,10 +1099,13 @@ kimo tc_closure_mod_tag(mod_name: string) -> string {
     return mod_name;
 }
 
-// 注入模块行映射。未调用时两数组为空 → tc_is_known_ns 恒假 → FQN 解析自动降级关闭。
-pub kimo tc_set_mod_map(ns: array<string>, starts: array<int>) -> void {
+// 注入模块行映射。paths/dsblines 与 ns/starts 平行（main_mod_paths / main_mod_dsb_line）。
+// 未调用时四数组皆空 → tc_error_at 退化为原行为（直接打印 loc.file:loc.line）。
+pub kimo tc_set_mod_map(ns: array<string>, starts: array<int>, paths: array<string>, dsblines: array<int>) -> void {
     tc_g_mod_ns = ns;
     tc_g_mod_starts = starts;
+    tc_g_mod_paths = paths;
+    tc_g_mod_dsb_line = dsblines;
 }
 
 // dsb 别名表：兼容态 0.3 用例以 dsb 名访问模块符号（_dotqual_mod 文件访问 dotqual_mod.X），
@@ -1331,12 +1339,39 @@ pub kimo tc_end_collect() -> array<string> {
     tc_g_collect = 0;
     return e;
 }
+// combined 拼接行号 → 所属模块下标（取「起始行 <= line 的最后一个模块」），
+// 与 tc_module_of_line 同逻辑但返回下标，供 tc_error_at 取真实路径 + dsb 补偿。
+kimo tc_mod_idx_of_line(line: int) -> int {
+    let best = -1;
+    let best_start = -1;
+    let i = 0;
+    while (i < len(tc_g_mod_starts)) {
+        let st = tc_g_mod_starts[i] as int;
+        if (st <= line && st > best_start) { best = i; best_start = st; }
+        i = i + 1;
+    }
+    return best;
+}
+
 pub kimo tc_error_at(ctx: CompileContext, loc: Location, msg: string) -> void {
     let line = loc.line;
     if (line < 1) { line = 1; }
     let col = loc.col;
     if (col < 1) { col = 1; }
-    let full = loc.file + ":" + int_to_str(line) + ":" + int_to_str(col) + ": SH-TC001: error: " + msg;
+    // 行号还原：combined 拼接源码的行号 → 真实模块路径 + 模块内行号（含 dsb 补偿），
+    // 避免跨模块错误一律显示成「主文件:组合大行号」（如 src/main.shadow:19349）的假象。
+    let rpath = loc.file;
+    let rline = line;
+    let ridx = tc_mod_idx_of_line(line);
+    if (ridx >= 0 && ridx < len(tc_g_mod_paths)) {
+        rpath = tc_g_mod_paths[ridx] as string;
+        rline = line - (tc_g_mod_starts[ridx] as int) + 1;
+        if (ridx < len(tc_g_mod_dsb_line)) {
+            let rdl = tc_g_mod_dsb_line[ridx] as int;
+            if (rdl > 0 && rline >= rdl) { rline = rline + 1; }
+        }
+    }
+    let full = rpath + ":" + int_to_str(rline) + ":" + int_to_str(col) + ": SH-TC001: error: " + msg;
     if (tc_g_collect == 1) {
         tc_g_errors = array_push(tc_g_errors, full);
         // 旁路记录 AST 节点区间；终点缺失或早于起点时退化为点区间

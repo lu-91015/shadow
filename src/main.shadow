@@ -1041,7 +1041,7 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
     // 5. shadow.lock（记录解析出的依赖；仅当有 deps 时写入）
     if (len(main_sbg_deps_names) > 0) { main_lock_write(dir); }
     // 5.5 §3.8 兼容态：把模块行映射注入 TC 模块（CLI 与 LSP/API 共用同一份状态）
-    tc_set_mod_map(tc_mod_ns, tc_mod_starts);
+    tc_set_mod_map(tc_mod_ns, tc_mod_starts, main_mod_paths, main_mod_dsb_line);
     tc_set_mod_dsbmap(tc_mod_dsb_alias, tc_mod_dsb_path);
     // 严格态（Phase 15）：由 `--strict` CLI 标志触发（tc_set_strict 在参数解析阶段设置）；
     // dsb 声明保持纯 `dsb <name>;` 语义（0.3/0.4/0.5 一致），不再承载 strict 关键字。
