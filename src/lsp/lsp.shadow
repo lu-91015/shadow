@@ -315,6 +315,7 @@ let lsp_job_uri: array<string> = [];
 let lsp_job_out: array<string> = [];   // worker 输出文件（sdiags JSON + refs 两行）
 let lsp_job_tmp: array<string> = [];   // worker 用的临时源文件（写入真实文件同目录以正确解析 import）
 let lsp_job_ver: array<int> = [];      // 触发编译时的文档版本，完成时比对以决定是否清 dirty
+let lsp_job_kind: array<string> = [];  // 每个 job 的通道："fast"(parse-only 快诊断) / "full"(完整类型检查)
 let lsp_async_seq: int = 0;            // 临时文件名去重计数
 // 引用数缓存（codeLens 的 "N references" 由异步 worker 刷新）：
 // lsp_ref_cache_uri[i] <-> lsp_ref_cache_json[i]（"name|count;name|count;..." 格式）。
@@ -439,6 +440,12 @@ kimo lsp_ensure_compiled(uri: string) -> void {
         }
     }
     if (need == 0) { return; }
+    // 已有在途异步 worker（fast/full）正在为本 uri 编译 → 不重复同步全量编译。否则每个
+    // 只读请求（hover/completion/semanticTokens/foldingRange/codeLens...）在停手后各触发一次
+    // ~1.4s 阻塞编译，卡死串行队列、让 let 等语法错误反馈滞后。复用上一次编译的 api_prog
+    // （≤~1.4s 陈旧），worker 完成后由 lsp_poll_jobs 推送新鲜诊断。冷文档（首查、无在途 job）
+    // 仍走下方同步编译一次以填充 api_prog，保证 hover/definition 等正确。
+    if (lsp_async_job_pending(uri, "any") == 1) { return; }
     let was_dirty = lsp_dirty;
     lsp_compile(uri);
     if (was_dirty == 1) {
@@ -523,7 +530,7 @@ kimo lsp_ensure_diag(uri: string) -> void {
     //      这是消除「编辑后诊断拉取阻塞 ~900ms」的关键闸门。
     //   2) 无在途 job（真·冷文档的首个诊断拉取）→ 同步惰性编译，才能在本请求响应里返回
     //      真实诊断（"真实诊断由 pull 触发惰性编译后产出"）。每文档一次性成本。
-    if (lsp_async_job_pending(uri) == 1) { return; }
+    if (lsp_async_job_pending(uri, "any") == 1) { return; }
     lsp_compile(uri);
 }
 
@@ -540,20 +547,24 @@ kimo lsp_ensure_diag_action(uri: string) -> void {
 // spawn 独立 shadow.exe --diag-json <tmp> --refs 子进程，stdout 重定向到临时 .diag 文件。
 // 子进程跑完整类型检查（~900ms），但完全在后台，不阻塞当前 LSP 请求。
 // 同一 uri 已有在途 job 时跳过，避免重复 spawn。
-// 本 uri 是否已有在途异步 job（后台 worker 正在编译）。
-// 诊断拉取据此区分「真·冷文档（须同步惰性编译）」与「已有后台编译在跑（立即返回，别阻塞）」。
-kimo lsp_async_job_pending(uri: string) -> int {
+// 本 uri 是否已有在途异步 job（后台 worker 正在编译）。kind: "any" 任一通道；
+// "fast" / "full" 指定通道。诊断拉取据此区分「真·冷文档（须同步惰性编译）」与「已有后台
+// 编译在跑（立即返回，别阻塞）」；双 worker 靠 kind 去重，避免同一通道重复 spawn。
+kimo lsp_async_job_pending(uri: string, kind: string) -> int {
     let k = 0;
     while (k < len(lsp_job_uri)) {
-        if (str_eq(lsp_job_uri[k] as string, uri) == 1) { return 1; }
+        if (str_eq(lsp_job_uri[k] as string, uri) == 1) {
+            if (str_eq(kind, "any") == 1) { return 1; }
+            if (str_eq(lsp_job_kind[k] as string, kind) == 1) { return 1; }
+        }
         k = k + 1;
     }
     return 0;
 }
 
-kimo lsp_compile_async(uri: string) -> void {
-    // 同一 uri 已有在途 job：跳过避免重复 spawn（更新内容的刷新由下一轮 tick 补上）
-    if (lsp_async_job_pending(uri) == 1) { return; }
+// 派发单个 worker（指定通道）。同一 uri+kind 已有在途 job 则跳过。
+kimo lsp_spawn_worker(uri: string, kind: string) -> void {
+    if (lsp_async_job_pending(uri, kind) == 1) { return; }
     let src = lsp_doc_get(uri);
     if (len(src) == 0) { return; }
     let path = lsp_uri_to_path(uri);
@@ -563,7 +574,10 @@ kimo lsp_compile_async(uri: string) -> void {
     let tmp_src = dir + "/.shadow_lsp_" + seqs + ".shadow";
     let tmp_out = dir + "/.shadow_lsp_" + seqs + ".diag";
     file_write(tmp_src, src);
-    let cmdexe = "\"" + lsp_arg0 + "\" --diag-json \"" + tmp_src + "\" --refs";
+    // fast 通道用 --diag-fast（parse-only，跳过 30KB runtime_lib，~100ms）；full 用 --diag-json（完整）。
+    let flag = "--diag-json";
+    if (str_eq(kind, "fast") == 1) { flag = "--diag-fast"; }
+    let cmdexe = "\"" + lsp_arg0 + "\" " + flag + " \"" + tmp_src + "\"";
     let jid = lsp_proc_launch(cmdexe, tmp_out);
     if (jid < 0) {
         file_delete(tmp_src);
@@ -575,6 +589,15 @@ kimo lsp_compile_async(uri: string) -> void {
     lsp_job_out = array_push(lsp_job_out, tmp_out);
     lsp_job_tmp = array_push(lsp_job_tmp, tmp_src);
     lsp_job_ver = array_push(lsp_job_ver, lsp_doc_get_version(uri));
+    lsp_job_kind = array_push(lsp_job_kind, kind);
+}
+
+kimo lsp_compile_async(uri: string) -> void {
+    // 双 worker：fast(parse-only 快诊断) + full(完整类型检查)。同一 uri 每种通道已有在途 job
+    // 时跳过，避免重复 spawn（内容刷新由下一轮 tick 补上）。fast 先完成 → 语法错误（如缺分号）
+    // 即时（~100ms）反馈；full 后完成 → 完整诊断（含类型错误）覆盖。
+    lsp_spawn_worker(uri, "fast");
+    lsp_spawn_worker(uri, "full");
 }
 
 // 收割完成的在途 job：读临时 .diag（首行 sdiags JSON、次行 refs），更新诊断/引用缓存并推送
@@ -586,6 +609,7 @@ kimo lsp_poll_jobs() -> void {
     let k_out: array<string> = [];
     let k_tmp: array<string> = [];
     let k_ver: array<int> = [];
+    let k_kind: array<string> = [];
     let i = 0;
     while (i < len(lsp_job_id)) {
         let jid = lsp_job_id[i] as int;
@@ -626,6 +650,7 @@ kimo lsp_poll_jobs() -> void {
             k_out = array_push(k_out, lsp_job_out[i] as string);
             k_tmp = array_push(k_tmp, lsp_job_tmp[i] as string);
             k_ver = array_push(k_ver, lsp_job_ver[i] as int);
+            k_kind = array_push(k_kind, lsp_job_kind[i] as string);
         }
         i = i + 1;
     }
@@ -634,6 +659,7 @@ kimo lsp_poll_jobs() -> void {
     lsp_job_out = k_out;
     lsp_job_tmp = k_tmp;
     lsp_job_ver = k_ver;
+    lsp_job_kind = k_kind;
 }
 
 // 引用数缓存（codeLens 的 "N references" 由异步 worker 刷新）："name|count;name|count;..."
@@ -3048,6 +3074,7 @@ pub kimo lsp_cleanup_jobs() -> void {
     lsp_job_out = [];
     lsp_job_tmp = [];
     lsp_job_ver = [];
+    lsp_job_kind = [];
 }
 pub kimo lsp_run() -> void {
     lsp_exit_flag = 0;

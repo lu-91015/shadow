@@ -37,6 +37,11 @@ let main_lsp_active: int = 0;
 // 检查（如 dsb 名↔文件名一致性），保证 worker 对任意临时副本都能产出合法 JSON，
 // 绝不让裸报错文本污染 stdout（否则 LSP 把它当诊断 JSON 解析 → 连接断开）。
 let main_machine_mode: int = 0;
+// 快诊断模式（--diag-fast，LSP 异步 worker 的「即时语法反馈」通道）：置 1 时
+// main_load_combined 跳过永不变的 30KB runtime_lib，且 api_check 只做 lex+parse
+// （不类型检查）。语法错误（如缺分号）以 ~100ms 而非 ~1.4s 反馈。完整类型检查仍由
+// 普通 --diag-json worker 异步补齐。默认 0 → 与 --diag-json 完全一致，固定点安全。
+let main_diag_fast: int = 0;
 
 // 打印错误消息。CLI 模式写 stdout；LSP 模式抑制（stdout 是帧通道，禁止裸输出）。
 kimo main_eprint(s: string) -> void {
@@ -1004,7 +1009,9 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
     }
     let rt_src = main_read_or_empty(rt_path);
     // 4. runtime_lib.shadow 内容（去 dsb）—— 放最后；0.3 声明收集无顺序问题
-    if (len(rt_src) > 0) {
+    // 快诊断模式（main_diag_fast==1）：跳过永不变的 30KB runtime_lib——它只用于类型检查，
+    // 而语法错误（如缺分号）在 parse 阶段即可定位，坐标与完整编译一致。省去 ~530ms 重解析。
+    if (main_diag_fast == 0 && len(rt_src) > 0) {
         // §3.8 兼容态：runtime 作为独立命名空间 shadow.runtime
         main_record_mod("shadow.runtime");
         // Phase 11：runtime 模块源码/路径收集（.lu 缓存用）
@@ -1578,6 +1585,13 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
     // 机器可读模式（--diag-json 供 LSP 异步 worker）：放宽 dsb 名↔文件名一致性等面向人的检查，
     // 使 worker 对任意临时副本都能产出合法 JSON（见 main_collect_module）。
     if (str_eq(qflag, "--diag-json") == 1) { main_machine_mode = 1; }
+    // --diag-fast：LSP 快诊断通道。复用 --diag-json 的输出协议（首行 sdiags JSON、次行 refs），
+    // 但置 main_diag_fast=1 → 跳过 runtime_lib 且只 parse。重写 qflag 让后续逻辑一致处理。
+    if (str_eq(qflag, "--diag-fast") == 1) {
+        main_machine_mode = 1;
+        main_diag_fast = 1;
+        qflag = "--diag-json";
+    }
     // 文件参数：优先 flag 之后；否则 flag 之前（run_tests 格式：<file> --check）。
     // 跳过 "--" 开头的 flag（查询模式可与 --strict 组合：<file> --strict --check）。
     let f = "";
@@ -1617,7 +1631,9 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
         }
         return 1;
     }
-    // 库模式编译（收集诊断，不打印）
+    // 库模式编译（收集诊断，不打印）。快诊断模式（--diag-fast）只 parse：
+    // main_diag_fast 已使 main_load_combined 跳过 runtime_lib，这里再令 api_check 跳过类型检查。
+    api_parse_only = main_diag_fast;
     api_check(src, f);
     // 查询计数只统计主文件模块（tc_mod_starts[0]=主文件起始 1，[1]=首个非主文件模块起始行）
     if (len(tc_mod_starts) > 1) {
@@ -1659,6 +1675,10 @@ kimo main_query_mode(qflag: string, args: any, n_args: int, flag_idx: int) -> in
         while (ri < n_args) {
             if (str_eq(args[ri] as string, "--refs") == 1) { want_refs = 1; }
             ri = ri + 1;
+        }
+        if (want_refs == 1) {
+            // 快诊断模式（--diag-fast）：跳过类型检查，引用计数无意义，不输出第二行。
+            if (main_diag_fast == 1) { want_refs = 0; }
         }
         if (want_refs == 1) {
             let refs_out = "";
@@ -1826,8 +1846,8 @@ kimo main() -> int {
     while (i2 < n_args) {
         let a2 = args[i2] as string;
         if (str_eq(a2, "--lsp") == 1 || str_eq(a2, "--check") == 1 || str_eq(a2, "--ranges") == 1 ||
-            str_eq(a2, "--diag-json") == 1 || str_eq(a2, "--at") == 1 || str_eq(a2, "--type-at") == 1 ||
-            str_eq(a2, "--fmeta") == 1) {
+            str_eq(a2, "--diag-json") == 1 || str_eq(a2, "--diag-fast") == 1 || str_eq(a2, "--at") == 1 ||
+            str_eq(a2, "--type-at") == 1 || str_eq(a2, "--fmeta") == 1) {
             return main_query_mode(a2, args, n_args, i2);
         }
         i2 = i2 + 1;

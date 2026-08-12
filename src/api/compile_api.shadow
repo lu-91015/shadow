@@ -73,6 +73,10 @@ pub let api_tokens: array<Token> = [];
 pub let api_prog: Program = 0 as Program;
 pub let api_sdiags: array<string> = [];   // sdiag 行（结构化文本）
 pub let api_parse_raw: array<string> = []; // parser 原始诊断
+// parse-only 开关：置 1 时 api_check 只做 lex+parse（跳过类型检查与 runtime_lib），
+// 用于 LSP 的「快诊断」——语法错误（如缺分号）以 ~100ms 即时反馈，不花 ~530ms 重解析
+// 永不变的 30KB runtime_lib。默认 0 → 完整类型检查，行为不变（固定点安全）。
+pub let api_parse_only: int = 0;
 pub let api_tc_raw: array<string> = [];   // typechecker 原始诊断
 pub let api_err_count: int = 0;           // parse + tc 错误总数
 pub let api_ok: int = 0;                  // 1=无错误
@@ -447,17 +451,23 @@ pub kimo api_check(source: string, file: string) -> int {
     if (np > 0) { api_stage = 1; }
     // TC（收集模式）——即使 parse 有错也跑（0.3：语法错误下返回部分 AST，TC 容错）
     // 0.5：唯一入口 tc_check_program（恒严格态）
-    tc_begin_collect();
-    let n_errs = tc_check_program(prog);
-    api_tc_raw = tc_end_collect();
-    let tc_rngs = tc_collected_ranges();
-    let nt = len(api_tc_raw);
-    i = 0;
-    while (i < nt) {
-        api_sdiags = array_push(api_sdiags, api_tc_to_sdiag(api_tc_raw[i] as string, api_range_at(tc_rngs, i)));
-        i = i + 1;
+    // parse-only 模式（api_parse_only==1，LSP 快诊断）跳过整段类型检查：不加载 runtime_lib
+    // 符号、不做 TC，仅返回语法级诊断。语法错误（如缺分号 / 错 token）与完整编译坐标一致。
+    if (api_parse_only == 0) {
+        tc_begin_collect();
+        let n_errs = tc_check_program(prog);
+        api_tc_raw = tc_end_collect();
+        let tc_rngs = tc_collected_ranges();
+        let nt = len(api_tc_raw);
+        i = 0;
+        while (i < nt) {
+            api_sdiags = array_push(api_sdiags, api_tc_to_sdiag(api_tc_raw[i] as string, api_range_at(tc_rngs, i)));
+            i = i + 1;
+        }
+        api_err_count = np + n_errs;
+    } else {
+        api_err_count = np;
     }
-    api_err_count = np + n_errs;
     // 转存符号元信息（局部 prog 上下文安全）
     api_nodes = [];
     api_fmeta = [];
