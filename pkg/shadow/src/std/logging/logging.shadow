@@ -1,0 +1,49 @@
+dsb logging;
+// std/log — Shadow 0.5 标准库：分级日志
+// 时间戳复用运行时符号 rt_timestamp_now / rt_timestamp_to_str（runtime 始终链接，无需 [native]）。
+// 级别：0=DEBUG 1=INFO 2=WARN 3=ERROR（数值越小越详细；默认 2=WARN）。
+// 输出到 stdout（println），格式：<时间戳> [LEVEL] <消息>。
+
+@extern("rt_timestamp_now") kimo log_ts_now() -> long { return 0; }
+@extern("rt_timestamp_to_str") kimo log_ts_str(t: long) -> string { return ""; }
+
+// 模块级可变全局：当前日志级别
+let LOG_LEVEL: int = 2;
+
+pub kimo log_set_level(lv: int) -> void {
+    LOG_LEVEL = lv;
+}
+
+pub kimo log_level() -> int {
+    return LOG_LEVEL;
+}
+
+// 内部发射（同模块调用，无需 pub）
+kimo log_emit(lvl: string, s: string) -> void {
+    let ts: string = log_ts_str(log_ts_now());
+    println(ts + " [" + lvl + "] " + s);
+}
+
+pub kimo log_debug(s: string) -> void {
+    if (LOG_LEVEL <= 0) { log_emit("DEBUG", s); }
+}
+
+pub kimo log_info(s: string) -> void {
+    if (LOG_LEVEL <= 1) { log_emit("INFO", s); }
+}
+
+pub kimo log_warn(s: string) -> void {
+    if (LOG_LEVEL <= 2) { log_emit("WARN", s); }
+}
+
+pub kimo log_error(s: string) -> void {
+    if (LOG_LEVEL <= 3) { log_emit("ERROR", s); }
+}
+
+// 便捷：按显式级别发射（lv<0 视为 DEBUG，>=4 视为 ERROR）
+pub kimo log_at(lv: int, s: string) -> void {
+    if (lv <= 0) { log_debug(s); }
+    else if (lv == 1) { log_info(s); }
+    else if (lv == 2) { log_warn(s); }
+    else { log_error(s); }
+}

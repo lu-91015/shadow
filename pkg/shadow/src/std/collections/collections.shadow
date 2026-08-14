@@ -1,0 +1,131 @@
+dsb collections;
+// std/collections — Shadow 0.5 标准库：集合与数组算法
+// 设计：复用内建 hashmap<string,string> 与 array<T>（已验证透明存取）。
+//   Set：以 hashmap 存成员，并用并行 keys 数组维护顺序（便于遍历）。
+//   数组算法：基于 array<int>/array<string> 的 [] / len / array_push。
+
+// ===== Set（字符串键集合）=====
+pub struct StringSet {
+    map: hashmap<string, string>;
+    keys: array<string>;
+}
+
+pub kimo set_new() -> StringSet {
+    let s: StringSet;
+    s.map = hashmap_new();
+    s.keys = [];
+    return s;
+}
+
+// 返回更新后的集合（结构体按值传递，需重新赋值）
+pub kimo set_add(s: StringSet, k: string) -> StringSet {
+    if (hashmap_contains(s.map, k) == 0) {
+        hashmap_insert(s.map, k, "1");
+        s.keys = array_push(s.keys, k);
+    }
+    return s;
+}
+
+pub kimo set_contains(s: StringSet, k: string) -> int {
+    return hashmap_contains(s.map, k);
+}
+
+pub kimo set_remove(s: StringSet, k: string) -> StringSet {
+    if (hashmap_contains(s.map, k) == 1) {
+        hashmap_remove(s.map, k);
+        let n = len(s.keys);
+        let out: array<string> = [];
+        let i = 0;
+        while (i < n) {
+            let kk = s.keys[i];
+            if (str_eq(kk, k) == 0) { out = array_push(out, kk); }
+            i = i + 1;
+        }
+        s.keys = out;
+    }
+    return s;
+}
+
+pub kimo set_size(s: StringSet) -> int {
+    return hashmap_size(s.map);
+}
+
+pub kimo set_keys(s: StringSet) -> array<string> {
+    return s.keys;
+}
+
+// ===== 数组算法（int）=====
+pub kimo arr_sum_int(a: array<int>) -> int {
+    let n = len(a);
+    let i = 0;
+    let s = 0;
+    while (i < n) { s = s + a[i]; i = i + 1; }
+    return s;
+}
+
+pub kimo arr_max_int(a: array<int>) -> int {
+    let n = len(a);
+    if (n == 0) { return 0; }
+    let m = a[0];
+    let i = 1;
+    while (i < n) { if (a[i] > m) { m = a[i]; } i = i + 1; }
+    return m;
+}
+
+pub kimo arr_min_int(a: array<int>) -> int {
+    let n = len(a);
+    if (n == 0) { return 0; }
+    let m = a[0];
+    let i = 1;
+    while (i < n) { if (a[i] < m) { m = a[i]; } i = i + 1; }
+    return m;
+}
+
+pub kimo arr_contains_int(a: array<int>, v: int) -> int {
+    let n = len(a);
+    let i = 0;
+    while (i < n) { if (a[i] == v) { return 1; } i = i + 1; }
+    return 0;
+}
+
+// 返回首次出现下标，无则 -1
+pub kimo arr_find_int(a: array<int>, v: int) -> int {
+    let n = len(a);
+    let i = 0;
+    while (i < n) { if (a[i] == v) { return i; } i = i + 1; }
+    return -1;
+}
+
+// 升序排序（插入排序，返回新数组，不修改入参）
+pub kimo arr_sort_int(a: array<int>) -> array<int> {
+    let n = len(a);
+    let out: array<int> = [];
+    let i = 0;
+    while (i < n) {
+        let v = a[i];
+        let m = len(out);
+        let tmp: array<int> = [];
+        let k = 0;
+        let placed = 0;
+        while (k < m) {
+            if (placed == 0 && out[k] > v) {
+                tmp = array_push(tmp, v);
+                placed = 1;
+            }
+            tmp = array_push(tmp, out[k]);
+            k = k + 1;
+        }
+        if (placed == 0) { tmp = array_push(tmp, v); }
+        out = tmp;
+        i = i + 1;
+    }
+    return out;
+}
+
+pub kimo arr_reverse_int(a: array<int>) -> array<int> {
+    let n = len(a);
+    let out: array<int> = [];
+    let i = n - 1;
+    while (i >= 0) { out = array_push(out, a[i]); i = i - 1; }
+    return out;
+}

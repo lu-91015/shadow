@@ -1,0 +1,8 @@
+# std/https — Shadow 0.5 标准库包
+# HTTPS（TLS）客户端，native 通过动态加载 winhttp.dll 提供 TLS（无需导入库）
+[package]
+name = "https"
+version = "0.5.0"
+
+[native]
+sources = ["native/https_bind.c"]

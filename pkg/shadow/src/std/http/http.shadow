@@ -1,0 +1,100 @@
+/* ============================================================
+ * Shadow 0.5 标准库 std/http — 纯 Shadow HTTP/1.1 客户端
+ * 建立在 std/net（TCP 原语）之上，不依赖 WinHttp/openssl 等外部库。
+ * 仅支持 HTTP/1.1 明文（http://）短连接（Connection: close）。
+ * 能力：URL 解析、GET/POST、状态码与 body 解析。
+ * 句柄/端口类型沿用 net（long / int）。
+ * ============================================================ */
+dsb http;
+
+import net.net;
+
+// URL 解析结果（模块级全局暂存，因 Shadow 暂不支持多返回值语法）
+let H_HOST: string = "";
+let H_PORT: int = 80;
+let H_PATH: string = "/";
+
+// 解析 "http://host[:port][/path]"（无 scheme 时按 host 处理）
+kimo http_parse_url(url: string) -> void {
+    let u = url;
+    let sc = str_index_of(u, "://");
+    if (sc >= 0) { u = substr2(u, sc + 3, len(u)); }
+    let slash = str_index_of(u, "/");
+    let hostpart = u;
+    if (slash > 0) {
+        hostpart = substr2(u, 0, slash);
+        H_PATH = substr2(u, slash, len(u));
+    } else {
+        H_PATH = "/";
+    }
+    let colon = str_index_of(hostpart, ":");
+    if (colon > 0) {
+        H_HOST = substr2(hostpart, 0, colon);
+        let pstr = substr2(hostpart, colon + 1, len(hostpart));
+        H_PORT = shadow_parse_int(pstr);
+    } else {
+        H_HOST = hostpart;
+        H_PORT = 80;
+    }
+}
+
+// 构造 GET 请求报文字符串（同时供 http_get 内部与测试断言复用）
+pub kimo http_build_get(url: string) -> string {
+    http_parse_url(url);
+    return "GET " + H_PATH + " HTTP/1.1\r\nHost: " + H_HOST + "\r\nConnection: close\r\n\r\n";
+}
+
+// 构造 POST 请求报文字符串（含 Content-Length）
+pub kimo http_build_post(url: string, body: string) -> string {
+    http_parse_url(url);
+    let bl = int_to_str(shadow_string_len(body));
+    return "POST " + H_PATH + " HTTP/1.1\r\nHost: " + H_HOST + "\r\nContent-Length: " + bl + "\r\nConnection: close\r\n\r\n" + body;
+}
+
+// http_get(url) -> 完整响应文本（空串表示连接失败）
+pub kimo http_get(url: string) -> string {
+    http_parse_url(url);
+    let h = net_dial(H_HOST, H_PORT);
+    if (h == -1) { return ""; }
+    let req = http_build_get(url);
+    net_send(h, req);
+    let resp = net_recv_all(h);   // 对端关闭后收完
+    net_close(h);
+    return resp;
+}
+
+// http_post(url, body) -> 完整响应文本（空串表示连接失败）
+pub kimo http_post(url: string, body: string) -> string {
+    http_parse_url(url);
+    let h = net_dial(H_HOST, H_PORT);
+    if (h == -1) { return ""; }
+    let req = http_build_post(url, body);
+    net_send(h, req);
+    let resp = net_recv_all(h);
+    net_close(h);
+    return resp;
+}
+
+// 从响应文本解析 HTTP 状态码（首行 "HTTP/1.1 200 OK" 的第二个 token）
+pub kimo http_status(resp: string) -> int {
+    let nl = str_index_of(resp, "\n");
+    let line = resp;
+    if (nl > 0) { line = substr2(resp, 0, nl); }
+    let cr = str_index_of(line, "\r");
+    if (cr > 0) { line = substr2(line, 0, cr); }
+    let parts = str_split(line, " ");
+    if (len(parts) < 2) { return 0; }
+    return shadow_parse_int(parts[1] as string);
+}
+
+// 从响应文本提取 body（首个空行之后），兼容 \r\n\r\n 与 \n\n
+pub kimo http_body(resp: string) -> string {
+    let i = str_index_of(resp, "\r\n\r\n");
+    let sep = 4;
+    if (i < 0) {
+        i = str_index_of(resp, "\n\n");
+        sep = 2;
+        if (i < 0) { return ""; }
+    }
+    return substr2(resp, i + sep, len(resp));
+}

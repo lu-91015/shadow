@@ -1,0 +1,76 @@
+/* ============================================================
+ * Shadow 0.5 标准库 std/reflect — 用户态反射（类型标签值）
+ *
+ * 重要约束（已评估）：0.5 自举编译器没有 RTTI，用户程序无法在运行时
+ * 查询任意值的真实类型（无 typeof / is / 结构体字段枚举）。编译器内部
+ * 确有 api_type_name / api_type_members 等编译期内省 API，但仅编译器
+ * 自身可用，不向用户程序暴露。
+ *
+ * 因此在「不改编译器源码」的前提下，本模块提供用户态反射的务实形态：
+ * 类型标签值（tagged value）。调用方显式把值包成 ReflectValue（带 kind
+ * 标签 + any 载荷），后续可查询 kind 并按类型取出。这等价于 Go 的
+ * interface{} / Rust 的 Box<dyn> 的「手动标签」版本，是 Shadow 0.5 下
+ * 可行的反射能力。
+ *
+ * 能力：reflect_int/string/bool/long/any 构造；reflect_kind / reflect_is_*
+ *       类型判定；reflect_get_* 按类型取出（配合 `as` 转型）。
+ * ============================================================ */
+dsb reflect;
+
+// 类型标签常量
+pub let REFLECT_INT: int = 1;
+pub let REFLECT_STRING: int = 2;
+pub let REFLECT_BOOL: int = 3;
+pub let REFLECT_LONG: int = 4;
+pub let REFLECT_ANY: int = 5;
+
+// 类型标签值：显式携带 kind，载荷存于 any
+pub struct ReflectValue {
+    kind: int;
+    data: any;
+}
+
+// 构造器：把标量包成带标签的 ReflectValue
+pub kimo reflect_int(v: int) -> ReflectValue {
+    let r: ReflectValue;
+    r.kind = REFLECT_INT;
+    r.data = v as any;
+    return r;
+}
+pub kimo reflect_string(s: string) -> ReflectValue {
+    let r: ReflectValue;
+    r.kind = REFLECT_STRING;
+    r.data = s as any;
+    return r;
+}
+pub kimo reflect_bool(b: int) -> ReflectValue {
+    let r: ReflectValue;
+    r.kind = REFLECT_BOOL;
+    r.data = b as any;
+    return r;
+}
+pub kimo reflect_long(l: long) -> ReflectValue {
+    let r: ReflectValue;
+    r.kind = REFLECT_LONG;
+    r.data = l as any;
+    return r;
+}
+pub kimo reflect_any(a: any) -> ReflectValue {
+    let r: ReflectValue;
+    r.kind = REFLECT_ANY;
+    r.data = a;
+    return r;
+}
+
+// 类型判定
+pub kimo reflect_kind(r: ReflectValue) -> int { return r.kind; }
+pub kimo reflect_is_int(r: ReflectValue) -> int { if (r.kind == REFLECT_INT) { return 1; } return 0; }
+pub kimo reflect_is_string(r: ReflectValue) -> int { if (r.kind == REFLECT_STRING) { return 1; } return 0; }
+pub kimo reflect_is_bool(r: ReflectValue) -> int { if (r.kind == REFLECT_BOOL) { return 1; } return 0; }
+pub kimo reflect_is_long(r: ReflectValue) -> int { if (r.kind == REFLECT_LONG) { return 1; } return 0; }
+
+// 按类型取出（调用方需先确认 kind，否则类型不匹配会得到 0 / 空串）
+pub kimo reflect_get_int(r: ReflectValue) -> int { return r.data as int; }
+pub kimo reflect_get_string(r: ReflectValue) -> string { return r.data as string; }
+pub kimo reflect_get_bool(r: ReflectValue) -> int { return r.data as int; }
+pub kimo reflect_get_long(r: ReflectValue) -> long { return r.data as long; }

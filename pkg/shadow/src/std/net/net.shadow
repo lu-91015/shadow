@@ -1,0 +1,58 @@
+/* ============================================================
+ * Shadow 0.5 标准库 std/net — Shadow 封装层
+ * 提供 TCP 客户端/服务端原语：dial/connect/send/recv/recv_all/close/listen/accept。
+ * 所有对外 API 为 pub，@extern 裸符号仅本模块内部使用。
+ * 句柄类型 long（C 侧 int64），-1 表示失败。
+ * ============================================================ */
+dsb net;
+
+// ---- @extern 裸 FFI 声明（C 侧见 native/net_bind.c；string 显式带长度）----
+@extern("shadow_net_socket")      kimo net_socket_raw() -> long { return 0; }
+@extern("shadow_net_connect")     kimo net_connect_raw(h: long, host: string, hostlen: int, port: int) -> int { return 0; }
+@extern("shadow_net_send")        kimo net_send_raw(h: long, data: string, datalen: int) -> int { return 0; }
+@extern("shadow_net_recv")        kimo net_recv_raw(h: long, maxlen: int) -> string { return ""; }
+@extern("shadow_net_recv_all")    kimo net_recv_all_raw(h: long) -> string { return ""; }
+@extern("shadow_net_close")       kimo net_close_raw(h: long) -> int { return 0; }
+@extern("shadow_net_bind")        kimo net_bind_raw(port: int) -> long { return 0; }
+@extern("shadow_net_accept")      kimo net_accept_raw(server_h: long) -> long { return 0; }
+
+// ---- 客户端 API ----
+// net_dial(host, port) -> handle（自动建 socket 并 connect；失败返回 -1）
+pub kimo net_dial(host: string, port: int) -> long {
+    let h = net_socket_raw();
+    if (h == -1) { return -1; }
+    let r = net_connect_raw(h, host, shadow_string_len(host), port);
+    if (r != 0) { net_close_raw(h); return -1; }
+    return h;
+}
+
+// net_send(h, data) -> 已发送字节数（-1 失败）
+pub kimo net_send(h: long, data: string) -> int {
+    return net_send_raw(h, data, shadow_string_len(data));
+}
+
+// net_recv(h, maxlen) -> string（单次接收，最多 maxlen 字节；空串表示关闭/错误）
+pub kimo net_recv(h: long, maxlen: int) -> string {
+    return net_recv_raw(h, maxlen);
+}
+
+// net_recv_all(h) -> string（持续接收直到对端关闭，用于 HTTP 等短连接）
+pub kimo net_recv_all(h: long) -> string {
+    return net_recv_all_raw(h);
+}
+
+// net_close(h) -> int（1 成功 / 0 失败）
+pub kimo net_close(h: long) -> int {
+    return net_close_raw(h);
+}
+
+// ---- 服务端 API ----
+// net_listen(port) -> server handle（-1 失败）
+pub kimo net_listen(port: int) -> long {
+    return net_bind_raw(port);
+}
+
+// net_accept(server_h) -> client handle（-1 失败）
+pub kimo net_accept(server_h: long) -> long {
+    return net_accept_raw(server_h);
+}

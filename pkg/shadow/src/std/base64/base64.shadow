@@ -1,0 +1,15 @@
+dsb base64;
+// std/base64 — Shadow 0.5 标准库：base64 / hex 编解码
+// 实现见 native/base64_bind.c（[native] 节在 shadow.sbg 声明）。
+// FFI ABI：Shadow string 的 data 指针不以 \0 结尾，故 @extern 函数显式接收
+// len 参数；对外暴露的 base64_encode/decode/hex_encode/hex_decode 是普通
+// pub 封装，内部用 shadow_string_len 取长度后转调 @extern 原生函数。
+@extern("shadow_base64_encode") kimo base64_encode_raw(s: string, n: int) -> string { return ""; }
+@extern("shadow_base64_decode") kimo base64_decode_raw(s: string, n: int) -> string { return ""; }
+@extern("shadow_hex_encode") kimo hex_encode_raw(s: string, n: int) -> string { return ""; }
+@extern("shadow_hex_decode") kimo hex_decode_raw(s: string, n: int) -> string { return ""; }
+
+pub kimo base64_encode(s: string) -> string { return base64_encode_raw(s, shadow_string_len(s)); }
+pub kimo base64_decode(s: string) -> string { return base64_decode_raw(s, shadow_string_len(s)); }
+pub kimo hex_encode(s: string) -> string { return hex_encode_raw(s, shadow_string_len(s)); }
+pub kimo hex_decode(s: string) -> string { return hex_decode_raw(s, shadow_string_len(s)); }
