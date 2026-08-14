@@ -119,6 +119,10 @@ let main_import_err: string = "";            // 解析错误消息（非空即�
 //      → 改为 AST 全程序判定 main_prog_has_generic + main_cache_revoke。
 // 另配套把缓存键世代从 v9_s6 提到 v10_s1，物理隔离 0.4 兼容态写下的旧缓存。
 let main_g_lu_cache: int = 1;
+// 缓存基目录：默认 "build/lu_cache"，可被环境变量 SHADOW_LU_CACHE_DIR 覆盖。
+// 用途：run_tests.exe 的 -j 并行子进程各自拿到独立目录，互不再写同一份 .lu，
+// 彻底消除多个 shadow.exe 并发写 build/lu_cache 造成的缓存竞态损坏。
+let main_lu_base: string = "build\\lu_cache";
 
 // L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
 // 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
@@ -1796,7 +1800,7 @@ kimo main_mod_in_src(idx: int) -> int {
 //   0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
 //   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
 kimo main_lu_key(path: string) -> string {
-    return "build\\lu_cache\\v10_s1_" + main_hash_src(path);
+    return main_lu_base + "\\v10_s1_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
@@ -1816,10 +1820,14 @@ kimo main_cache_setup() -> any {
     }
     tc_set_valid_ns([]);
     if (main_g_lu_cache == 0) { return queues; }   // 缓存总开关关闭：全部模块视为未命中
+    // 并行隔离：读取 SHADOW_LU_CACHE_DIR 覆盖缓存基目录（默认 build/lu_cache）。
+    // run_tests.exe 的 -j 并行子进程各自拿到独立目录，互不再写同一份 .lu，消除竞态损坏。
+    let lu_dir = env_get("SHADOW_LU_CACHE_DIR");
+    if (len(lu_dir) > 0) { main_lu_base = lu_dir; }
     // dir_create → CreateDirectoryA 只建**单层**，父目录缺失会静默失败。
     // 0.4 自身仓库恰好已有 build/，掩盖了这点；用户新工程首次编译会拿不到缓存目录。
     dir_create("build");
-    dir_create("build\\lu_cache");   // 幂等；已存在时失败静默
+    dir_create(main_lu_base);   // 幂等；已存在时失败静默
 
     // ---- Pass 1：算每模块自身 hash 与签名 hash，顺带把 .lu 载入备用 ----
     // 优化：源码未变的模块直接复用 .lu 里存的 sig（避免每次全量重扫签名）；

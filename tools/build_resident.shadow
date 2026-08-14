@@ -1,0 +1,128 @@
+// Shadow 0.5 — 自举接力脚本（Shadow 原生版，替代 tools/build_resident.sh）
+//
+// 自举接力：本文件由【冻结的 build/shadow.exe】编译为 build/build_resident.exe
+// （鸡生蛋问题的标准解法：用上一轮的编译器编出本轮的构建工具）。运行时假设
+// build/r_stage2.ll 已由现有 build/shadow.exe 编出，负责：链接 -> r.exe ->
+// stage3/4 自举固定点比对 -> 部署为 build/shadow.exe。
+//
+// 用法（仓库根执行）：
+//   export LLVM_HOME="D:/llvm/clang+llvm-22.1.0-x86_64-pc-windows-msvc"
+//   build/build_resident.exe
+//
+// 说明：
+//   - rt_sys_exec 由编译器作为内建提供（无需 @extern）；env_get 需显式声明。
+//   - 全程相对路径（cwd=仓库根），LLVM 路径与 bootstrap/ 均不含空格。
+//   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；故用「产物是否非空 /
+//     字节比对」近似原 .sh 的 cmp -s 与 set -e 语义。
+
+dsb build_resident;
+
+@extern("shadow_env_get") kimo env_get(name: string) -> string { return ""; }
+@extern("rt_read_bytes") kimo rt_read_bytes(path: any) -> any { return 0 as any; }
+@extern("rt_buf_len") kimo rt_buf_len(p: any) -> int { return 0; }
+@extern("rt_write_bytes") kimo rt_write_bytes(path: any, p: any, n: int) -> int { return 0; }
+@extern("shadow_get_byte") kimo rt_get_byte(p: any, off: int) -> int { return 0; }
+
+// 文件非空（存在且大小 > 0）
+kimo file_ok(path: string) -> int {
+    let b = rt_read_bytes(path);
+    if (rt_buf_len(b) > 0) { return 1; }
+    return 0;
+}
+
+// 逐字节比对两文件（替代 cmp -s）
+kimo files_equal(a: string, b: string) -> int {
+    let ba = rt_read_bytes(a);
+    let bb = rt_read_bytes(b);
+    let la = rt_buf_len(ba);
+    let lb = rt_buf_len(bb);
+    if (la != lb) { return 0; }
+    let i = 0;
+    while (i < la) {
+        if (rt_get_byte(ba, i) != rt_get_byte(bb, i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 复制文件（替代 cp a b）
+kimo file_copy(a: string, b: string) -> int {
+    let src = rt_read_bytes(a);
+    let n = rt_buf_len(src);
+    return rt_write_bytes(b, src, n);
+}
+
+kimo main() -> int {
+    let llvm = env_get("LLVM_HOME");
+    if (len(llvm) == 0) {
+        println("set LLVM_HOME to your LLVM installation (e.g. D:/llvm/clang+llvm-XX)");
+        return 1;
+    }
+    let bin = llvm + "/bin";
+    let clang_c = bin + "/clang.exe";
+    let llc = bin + "/llc.exe";
+    let clang = bin + "/clang++.exe";
+    let rt_lib = llvm + "/lib";
+
+    println("build_resident (shadow): LLVM_HOME=" + llvm);
+
+    // [precompile shadow_index.o]
+    println("== [link] precompile shadow_index.o ==");
+    rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
+
+    if (file_ok("build/r_stage2.ll") == 0) {
+        println("[X] stage2 IR missing");
+        return 1;
+    }
+
+    // [link] llc + clang++ -> r.exe
+    println("== [link] llc r_stage2.ll ==");
+    rt_sys_exec(llc + " -O0 -filetype=obj build/r_stage2.ll -o build/r.o");
+    println("== [link] clang++ -> build/r.exe ==");
+    rt_sys_exec(clang + " build/r.o" +
+        " bootstrap/runtime_for_selfhost.o bootstrap/miniz.o" +
+        " build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o" +
+        " -o build/r.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + rt_lib);
+
+    let rexe = "build/r.exe";
+
+    // [stage3] r.exe compiles src -> r_stage3.ll
+    println("== [stage3] r.exe compiles src/main.shadow ==");
+    rt_sys_exec(rexe + " src/main.shadow -o build/r_stage3.ll");
+    if (file_ok("build/r_stage3.ll") == 0) {
+        println("[X] stage3 IR empty");
+        return 1;
+    }
+
+    // [cmp] stage2 vs stage3
+    println("== [cmp] stage2 vs stage3 ==");
+    if (files_equal("build/r_stage2.ll", "build/r_stage3.ll") == 1) {
+        println("FIXEDPOINT_OK stage2==stage3");
+    } else {
+        println("[X] stage2 != stage3");
+        return 1;
+    }
+
+    // [stage4] r.exe compiles src -> r_stage4.ll (复用 .lu 缓存)
+    println("== [stage4] r.exe compiles src/main.shadow (reuse .lu cache) ==");
+    rt_sys_exec(rexe + " src/main.shadow -o build/r_stage4.ll");
+    if (file_ok("build/r_stage4.ll") == 0) {
+        println("[X] stage4 IR empty");
+        return 1;
+    }
+
+    // [cmp] stage3 vs stage4
+    println("== [cmp] stage3 vs stage4 ==");
+    if (files_equal("build/r_stage3.ll", "build/r_stage4.ll") == 1) {
+        println("FIXEDPOINT_OK stage3==stage4");
+    } else {
+        println("[X] stage3 != stage4");
+        return 1;
+    }
+
+    // [deploy] r.exe -> build/shadow.exe
+    println("== [deploy] r.exe -> build/shadow.exe ==");
+    file_copy("build/r.exe", "build/shadow.exe");
+    println("BUILD_DEPLOYED");
+    return 0;
+}

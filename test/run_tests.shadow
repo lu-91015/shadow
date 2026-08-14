@@ -10,6 +10,8 @@
 //   bash tools/build_run_tests.sh        # 编译 + 链接 -> build/run_tests.exe
 //   build/run_tests.exe                  # 全部用例（从仓库根启动）
 //   build/run_tests.exe -k struct        # 关键字过滤（路径子串）
+//   build/run_tests.exe -j 4             # 4 路并行（默认 1 = 串行）
+//   build/run_tests.exe --jobs 8         # 同上，长选项
 //   build/run_tests.exe --list           # 仅列出用例
 //   build/run_tests.exe --cases DIR --shadow-exe EXE   # 显式覆盖路径
 //
@@ -17,10 +19,25 @@
 //   - 各模式语义与 run_tests.py 对齐（exe/codegen/check/ranges/diagjson/typeat/tc/tc-fail）。
 //   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；故 tc/tc-fail 等依赖退出码的逻辑
 //     用「错误标记启发式」近似（输出含 error:/SH-/FATAL/undefined 等视为失败）。
-//   - 当前为串行执行（正确性优先）；并行 -j 后续可基于 rt_spawn + rt_future 扩展。
+//   - 并行（-j N, N>1）：每个用例作为独立 shadow.exe 子进程启动（CreateProcessA，
+//     见 rt/rt_test_par.c），stdout+stderr 合并捕获到 build/_rj_<idx>.txt，父进程用
+//     wait_any 阻塞等待完成、按完成顺序回收并判定。中间产物按用例下标命名
+//     （_rt_<idx>.ll / _rj_<idx>.txt），避免同名用例并发写同一文件。
+//     该方案不依赖 Shadow 原生线程/GC，可干净链入 run_tests.exe（见 rt/rt_test_par.c 头注）。
 //   - 被测 exe 的工作目录继承本进程；为与 python 版一致，请从仓库根启动本运行器。
 
 dsb run_tests;
+
+// rt_sys_exec 由编译器作为内建提供（无需 @extern 声明）。
+// 以下为 run_tests.exe 需要、但非内建的 runtime 符号，显式 @extern 声明后由
+// runtime_for_selfhost_wk.o / rt_test_par.o 提供实现。
+@extern("shadow_delete_file") kimo rt_delete_file(path: string) -> int { return 0; }
+@extern("__rt_shadow_parse_int") kimo rt_parse_int(s: any) -> int { return 0; }
+// 并行子进程启动器（rt/rt_test_par.c）
+@extern("shadow_test_launch") kimo shadow_test_launch(cmd: string, outpath: string, tag: int) -> int { return -1; }
+@extern("shadow_test_wait_any") kimo shadow_test_wait_any() -> int { return -1; }
+@extern("shadow_test_job_tag") kimo shadow_test_job_tag(job: int) -> int { return -1; }
+@extern("shadow_test_reap") kimo shadow_test_reap(job: int) -> int { return 0; }
 
 // str_starts_with / str_ends_with 内联自实现：这两个名字在 type_checker 的 builtin 表里被
 // 声明为内建（故类型检查放行），但 str_ends_with 全标准库无定义、str_starts_with 定义所在的
@@ -65,6 +82,12 @@ struct TestCase {
 struct Result {
     status: string;
     msg: string;
+}
+
+struct Counters {
+    passed: int;
+    failed: int;
+    skipped: int;
 }
 
 // 目录名 -> 测试模式（与 run_tests.py 的 FOLDER_MODE 对齐）
@@ -200,20 +223,68 @@ kimo expect_check(tc: TestCase, out: string) -> Result {
     return Result { status: "PASS", msg: "" };
 }
 
-// 运行单个用例（已确定 mode）
-kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string) -> Result {
+// 解析用例的最终模式（目录优先，其次 //@mode）
+kimo resolve_mode(tc: TestCase) -> string {
     let parent = path_dirname(tc.full);
     let dn = path_basename(parent);
     let fm = folder_mode(dn);
     let mode = fm;
     if (len(mode) == 0) { mode = tc.mode; }
-    if (len(mode) == 0) { return Result { status: "SKIP", msg: "no mode" }; }
+    return mode;
+}
+
+// 构造单用例的命令行（不含执行）。idx 用于 codegen 中间文件命名（按用例下标，
+// 避免不同目录下同名用例在 build/ 下写同一 _rt_<base>.ll）。命令为空串表示无模式。
+kimo build_cmd(tc: TestCase, shadow_exe: string, build_dir: string, idx: int) -> string {
+    let mode = resolve_mode(tc);
+    if (len(mode) == 0) { return ""; }
 
     if (str_eq(mode, "exe") == 1) {
         let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\"";
         if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
         cmd = cmd + " --run";
-        let out = rt_sys_exec(cmd);
+        return cmd;
+    }
+    if (str_eq(mode, "codegen") == 1) {
+        let ll = path_join(build_dir, "_rt_" + int_to_str(idx) + ".ll");
+        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\" -o \"" + ll + "\"";
+        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
+        return cmd;
+    }
+    if (str_eq(mode, "check") == 1 || str_eq(mode, "ranges") == 1 || str_eq(mode, "diagjson") == 1) {
+        let flag = "--check";
+        if (str_eq(mode, "ranges") == 1) { flag = "--ranges"; }
+        if (str_eq(mode, "diagjson") == 1) { flag = "--diag-json"; }
+        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\" " + flag;
+        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
+        return cmd;
+    }
+    if (str_eq(mode, "typeat") == 1) {
+        // main_query_mode 对 --type-at 的解析是「flag 在前、文件紧跟其后、再跟 <line> <col>」
+        // （shadow --type-at <file> <line> <col>）：位置参数取 flag 之后的第 2/3 个参数。
+        // 若写成「文件在前」（shadow <file> --type-at <l> <c>），main 会把 <line> 误当成文件路径。
+        let cmd = "\"" + shadow_exe + "\" --type-at \"" + tc.full + "\" " + tc.pos;
+        return cmd;
+    }
+    if (str_eq(mode, "tc") == 1) {
+        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\"";
+        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
+        return cmd;
+    }
+    if (str_eq(mode, "tc-fail") == 1) {
+        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\"";
+        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
+        return cmd;
+    }
+    return "";
+}
+
+// 判定单用例结果。out 为捕获到的（合并）输出；codegen 模式还会读 _rt_<idx>.ll 比对 IR。
+kimo judge(tc: TestCase, out: string, build_dir: string, idx: int) -> Result {
+    let mode = resolve_mode(tc);
+    if (len(mode) == 0) { return Result { status: "SKIP", msg: "no mode" }; }
+
+    if (str_eq(mode, "exe") == 1) {
         if (len(tc.expect_stderr) > 0) {
             if (str_contains(out, tc.expect_stderr) == 0) {
                 return Result { status: "FAIL", msg: "stderr missing '" + tc.expect_stderr + "'" };
@@ -222,11 +293,7 @@ kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string) -> Result {
         return expect_check(tc, out);
     }
     if (str_eq(mode, "codegen") == 1) {
-        let base = path_basename(tc.full);
-        let ll = path_join(build_dir, "_rt_" + base + ".ll");
-        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\" -o \"" + ll + "\"";
-        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
-        rt_sys_exec(cmd);
+        let ll = path_join(build_dir, "_rt_" + int_to_str(idx) + ".ll");
         let content = file_read(ll);
         if (len(content) == 0) { return Result { status: "FAIL", msg: "no .ll produced" }; }
         if (len(tc.expect_ir) > 0) {
@@ -237,26 +304,12 @@ kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string) -> Result {
         return Result { status: "PASS", msg: "" };
     }
     if (str_eq(mode, "check") == 1 || str_eq(mode, "ranges") == 1 || str_eq(mode, "diagjson") == 1) {
-        let flag = "--check";
-        if (str_eq(mode, "ranges") == 1) { flag = "--ranges"; }
-        if (str_eq(mode, "diagjson") == 1) { flag = "--diag-json"; }
-        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\" " + flag;
-        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
-        let out = rt_sys_exec(cmd);
         return expect_check(tc, out);
     }
     if (str_eq(mode, "typeat") == 1) {
-        // main_query_mode 对 --type-at 的解析是「flag 在前、文件紧跟其后、再跟 <line> <col>」
-        // （shadow --type-at <file> <line> <col>）：位置参数取 flag 之后的第 2/3 个参数。
-        // 若写成「文件在前」（shadow <file> --type-at <l> <c>），main 会把 <line> 误当成文件路径。
-        let cmd = "\"" + shadow_exe + "\" --type-at \"" + tc.full + "\" " + tc.pos;
-        let out = rt_sys_exec(cmd);
         return expect_check(tc, out);
     }
     if (str_eq(mode, "tc") == 1) {
-        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\"";
-        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
-        let out = rt_sys_exec(cmd);
         // 复刻 run_tests.py：tc = 编译通过（rc==0）。rt_sys_exec 不回传退出码，
         // 用 has_error 启发式近似“编译无错”。//@expect: typecheck: 1 是遗留文档，
         // 基线 py 在 tc 模式下本就忽略 //@expect，故此处直接以“无错即 PASS”判定。
@@ -264,13 +317,39 @@ kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string) -> Result {
         return Result { status: "PASS", msg: "" };
     }
     if (str_eq(mode, "tc-fail") == 1) {
-        let cmd = "\"" + shadow_exe + "\" \"" + tc.full + "\"";
-        if (len(tc.args) > 0) { cmd = cmd + " " + tc.args; }
-        let out = rt_sys_exec(cmd);
         if (has_error(out) == 0) { return Result { status: "FAIL", msg: "expected rejection but rc==0" }; }
         return expect_check(tc, out);
     }
     return Result { status: "SKIP", msg: "unknown mode " + mode };
+}
+
+// 串行执行单个用例（build_cmd + rt_sys_exec + judge），保留与旧版完全一致的行为。
+kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string, idx: int) -> Result {
+    let cmd = build_cmd(tc, shadow_exe, build_dir, idx);
+    if (len(cmd) == 0) { return Result { status: "SKIP", msg: "no mode" }; }
+    let out = rt_sys_exec(cmd);
+    return judge(tc, out, build_dir, idx);
+}
+
+// 统一上报：处理 xfail 翻转 + 打印 + 更新计数，返回更新后的 Counters。
+kimo report(tc: TestCase, res: Result, c: Counters) -> Counters {
+    let status = res.status;
+    let msg = res.msg;
+    if (len(tc.xfail) > 0) {
+        if (str_eq(status, "FAIL") == 1) { status = "PASS"; msg = "xfail (known bug)"; }
+        else if (str_eq(status, "PASS") == 1) { status = "FAIL"; msg = "UNEXPECTED PASS - remove //@xfail"; }
+    }
+    if (str_eq(status, "PASS") == 1) {
+        c.passed = c.passed + 1;
+        println("[PASS] " + tc.full);
+    } else if (str_eq(status, "SKIP") == 1) {
+        c.skipped = c.skipped + 1;
+        println("[SKIP] " + tc.full + " " + msg);
+    } else {
+        c.failed = c.failed + 1;
+        println("[" + status + "] " + tc.full + " " + msg);
+    }
+    return c;
 }
 
 kimo main() -> int {
@@ -287,6 +366,7 @@ kimo main() -> int {
 
     let keyword = "";
     let do_list = 0;
+    let jobs = 1;
     let i = 1;
     while (i < na) {
         let a = args[i] as string;
@@ -296,6 +376,15 @@ kimo main() -> int {
             if (i < na) { keyword = args[i] as string; }
         }
         else if (str_starts_with(a, "-k") == 1) { keyword = substr2(a, 2, len(a)); }
+        else if (str_eq(a, "-j") == 1) {
+            i = i + 1;
+            if (i < na) { jobs = rt_parse_int(args[i]); }
+        }
+        else if (str_starts_with(a, "-j") == 1) { jobs = rt_parse_int(substr2(a, 2, len(a))); }
+        else if (str_eq(a, "--jobs") == 1) {
+            i = i + 1;
+            if (i < na) { jobs = rt_parse_int(args[i]); }
+        }
         else if (str_eq(a, "--cases") == 1) {
             i = i + 1;
             if (i < na) { cases_dir = args[i] as string; }
@@ -306,6 +395,9 @@ kimo main() -> int {
         }
         i = i + 1;
     }
+    // 防御：jobs 必须 >=1；上限 64（与 rt/rt_test_par.c 的 TEST_PAR_MAX 对齐）。
+    if (jobs < 1) { jobs = 1; }
+    if (jobs > 64) { jobs = 64; }
 
     let files = discover(cases_dir);
     let nf = len(files);
@@ -321,16 +413,16 @@ kimo main() -> int {
 
     if (nf == 0) {
         println("no test cases found under: " + cases_dir);
-        println("usage: run_tests.exe [--cases DIR] [--shadow-exe EXE] [-k KEY] [--list]");
+        println("usage: run_tests.exe [--cases DIR] [--shadow-exe EXE] [-k KEY] [-j N] [--list]");
         return 1;
     }
 
     println("shadow test runner: " + int_to_str(nf) + " cases under " + cases_dir);
-    println("shadow_exe = " + shadow_exe);
+    println("shadow_exe = " + shadow_exe + "  jobs = " + int_to_str(jobs));
 
-    let passed = 0;
-    let failed = 0;
-    let skipped = 0;
+    // 预过滤：关键字 + //@skip。run_full 仅保留「需要执行」的用例（按文件顺序）。
+    let run_full: array<string> = [];
+    let c = Counters { passed: 0, failed: 0, skipped: 0 };
     let k = 0;
     while (k < nf) {
         let full = files[k];
@@ -342,33 +434,78 @@ kimo main() -> int {
         if (do_proc == 1) {
             let tc = parse_directives(full);
             if (len(tc.skip) > 0) {
-                skipped = skipped + 1;
+                c.skipped = c.skipped + 1;
                 println("[SKIP] " + full + " (" + tc.skip + ")");
             } else {
-                let res = run_case(tc, shadow_exe, build_dir);
-                let status = res.status;
-                let msg = res.msg;
-                if (len(tc.xfail) > 0) {
-                    if (str_eq(status, "FAIL") == 1) { status = "PASS"; msg = "xfail (known bug)"; }
-                    else if (str_eq(status, "PASS") == 1) { status = "FAIL"; msg = "UNEXPECTED PASS - remove //@xfail"; }
-                }
-                if (str_eq(status, "PASS") == 1) {
-                    passed = passed + 1;
-                    println("[PASS] " + full);
-                } else if (str_eq(status, "SKIP") == 1) {
-                    skipped = skipped + 1;
-                    println("[SKIP] " + full + " " + msg);
-                } else {
-                    failed = failed + 1;
-                    println("[" + status + "] " + full + " " + msg);
-                }
+                run_full = array_push(run_full, full);
             }
+        }
+    }
+    let total_to_run = len(run_full);
+
+    if (jobs <= 1) {
+        // ===== 串行路径（默认，行为与旧版逐字节一致）=====
+        let ri = 0;
+        while (ri < total_to_run) {
+            let full = run_full[ri];
+            let tc = parse_directives(full);
+            let res = run_case(tc, shadow_exe, build_dir, ri);
+            c = report(tc, res, c);
+            ri = ri + 1;
+        }
+    } else {
+        // ===== 并行路径（-j N, N>1）=====
+        // 把最多 jobs 个用例作为独立子进程并发启动；wait_any 阻塞等待任一完成，
+        // 按完成顺序回收并判定。stdout+stderr 合并捕获到 build/_rj_<idx>.txt。
+        let in_flight = 0;
+        let next_idx = 0;
+        let done = 0;
+        while (done < total_to_run) {
+            // 尽可能把在途任务填到 jobs 个
+            while (in_flight < jobs && next_idx < total_to_run) {
+                let full = run_full[next_idx];
+                let lid = next_idx;
+                next_idx = next_idx + 1;
+                let tc = parse_directives(full);
+                let cmd = build_cmd(tc, shadow_exe, build_dir, lid);
+                if (len(cmd) == 0) {
+                    // 无模式 -> 当作 SKIP（与串行 run_case 返回 SKIP "no mode" 一致）
+                    c.skipped = c.skipped + 1;
+                    println("[SKIP] " + full + " no mode");
+                    done = done + 1;
+                    continue;
+                }
+                let out_path = path_join(build_dir, "_rj_" + int_to_str(lid) + ".txt");
+                let job = shadow_test_launch(cmd, out_path, lid);
+                if (job < 0) {
+                    // 启动失败：退化为串行执行该用例
+                    let out = rt_sys_exec(cmd);
+                    let res = judge(tc, out, build_dir, lid);
+                    c = report(tc, res, c);
+                    done = done + 1;
+                    continue;
+                }
+                in_flight = in_flight + 1;
+            }
+            let job = shadow_test_wait_any();
+            if (job < 0) { break; }
+            let lid = shadow_test_job_tag(job);
+            let full = run_full[lid];
+            let tc = parse_directives(full);
+            let out_path = path_join(build_dir, "_rj_" + int_to_str(lid) + ".txt");
+            let out = file_read(out_path);
+            let res = judge(tc, out, build_dir, lid);
+            shadow_test_reap(job);
+            rt_delete_file(out_path);
+            c = report(tc, res, c);
+            in_flight = in_flight - 1;
+            done = done + 1;
         }
     }
 
     println("");
-    println("PASS=" + int_to_str(passed) + " FAIL=" + int_to_str(failed) +
-            " SKIP=" + int_to_str(skipped) + " TOTAL=" + int_to_str(nf));
-    if (failed > 0) { return 1; }
+    println("PASS=" + int_to_str(c.passed) + " FAIL=" + int_to_str(c.failed) +
+            " SKIP=" + int_to_str(c.skipped) + " TOTAL=" + int_to_str(nf));
+    if (c.failed > 0) { return 1; }
     return 0;
 }

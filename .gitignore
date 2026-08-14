@@ -24,6 +24,7 @@ test/**/__pycache__/
 *.tmp
 tmp_*
 _spk_extracted/
+*_spk_extracted/
 
 # 例外：bootstrap 冻结工件必须入库（自举链硬依赖）
 !bootstrap/s03.exe
@@ -69,3 +70,6 @@ test/lsp_selfhost_probe.py
 pkg/installer.py
 pkg/shadow/tools/link_rt.py
 pkg/shadow/tools/verify_fixed_point.py
+
+# 项目文档（不入库）
+开发原则.md
