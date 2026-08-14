@@ -3,6 +3,7 @@
 // 完整管线：读文件 → tokenize → parse → TC → HIR → MIR → Codegen → .ll
 //   shadow <file.shadow> -o <out.ll>    只生成 .ll
 //   shadow <file.shadow> --run          编译 + llc + 链接 + 运行
+//   shadow <file.shadow> --exe          编译 + llc + 链接（仅生成 exe，不运行）
 //   shadow --version                    打印版本
 //
 dsb main;
@@ -2320,7 +2321,7 @@ kimo main() -> int {
     let args = rt_sys_args();
     let n_args = len(args);
     if (n_args < 2) {
-        main_eprint("usage: shadow <file.shadow> [-o out.ll | --run] [--strict]\n");
+        main_eprint("usage: shadow <file.shadow> [-o out.ll | --run | --exe] [--strict]\n");
         main_eprint("       shadow pack <dir> <out.spk> | unpack <spk> <out_dir> | list <spk> | -init <dir>\n");
         main_eprint("       shadow pkg list | shadow pkg install [name@version]   (registry: $SHADOW_REGISTRY)\n");
         main_eprint("       shadow --lsp | --check <f> | --ranges <f> | --diag-json <f> | --at <f> <l> <c> | --type-at <f> <l> <c>\n");
@@ -2461,9 +2462,10 @@ kimo main() -> int {
         }
         return 1;
     }
-    // 解析参数：找 -o 或 --run
+    // 解析参数：找 -o / --run / --exe
     let out_path = "";
     let do_run = 0;
+    let do_exe = 0;
     let i = 2;
     while (i < n_args) {
         let a = args[i] as string;
@@ -2472,6 +2474,7 @@ kimo main() -> int {
             i = i + 1;
         }
         if (str_eq(a, "--run") == 1) { do_run = 1; }
+        if (str_eq(a, "--exe") == 1) { do_exe = 1; }
         i = i + 1;
     }
     // 编译
@@ -2488,12 +2491,11 @@ kimo main() -> int {
         main_eprint("cannot write: " + ir_path + "\n");
         return 1;
     }
-    if (do_run == 0) {
+    if (do_run == 0 && do_exe == 0) {
         println(ir_path);
         return 0;
     }
-    // --run：llc + 链接 + 运行
-    let base = main_file;
+    // --run / --exe：llc + 链接
     let exe_path = main_file + ".exe";
     let obj_path = main_file + ".obj";
     let self_dir = main_exe_dir(args[0] as string);
@@ -2503,7 +2505,14 @@ kimo main() -> int {
     if (link_rc != 0) {
         return 1;
     }
-    // 运行
+    if (do_exe == 1) {
+        // 仅生成 exe，不运行
+        rt_delete_file(obj_path);
+        rt_delete_file(ir_path);
+        println(exe_path);
+        return 0;
+    }
+    // --run：运行
     let run_cmd = "\"" + exe_path + "\"";
     let out = rt_sys_exec(run_cmd);
     let ol = len(out);
