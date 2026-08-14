@@ -1869,6 +1869,314 @@ int shadow_now_ms(void) {
     return (int)ms;
 }
 
+/* ============ 工作区级精确符号表（真实坐标 JSON，供扩展侧 goto-def/hover） ============
+ * 与 sx_scan_module 同源逻辑，但：① 对单文件扫描（Cur.li/col 即真实文件行/列）；
+ *   ② 直接产出 JSON（{symbols:[...]}），不绕 combined 坐标、不依赖 import 图；
+ *   ③ 仅编译进独立 cindex.exe（本段整体在 SHADOW_INDEX_STANDALONE 内），
+ *      不影响 link 进 shadow.exe 的快路径，更不触及自举固定点 IR。 */
+#ifdef SHADOW_INDEX_STANDALONE
+
+/* JSON 字符串转义（" \ 及控制字符） */
+static void sj_str(Buf* b, const char* s) {
+    static const char* hex = "0123456789abcdef";
+    unsigned char ch;
+    if (!s) return;
+    for (; *s; s++) {
+        ch = (unsigned char)*s;
+        if (ch == '"' || ch == '\\') { buf_putc(b, '\\'); buf_putc(b, (char)ch); }
+        else if (ch == '\n') buf_puts(b, "\\n");
+        else if (ch == '\r') buf_puts(b, "\\r");
+        else if (ch == '\t') buf_puts(b, "\\t");
+        else if (ch < 0x20) { buf_puts(b, "\\u00"); buf_putc(b, hex[(ch >> 4) & 0xf]); buf_putc(b, hex[ch & 0xf]); }
+        else buf_putc(b, (char)ch);
+    }
+}
+
+static void sj_emit(Buf* out, int* first, const char* file, int line, int col,
+                    const char* kind, const char* name, int is_pub,
+                    const char* ns, const char* sig) {
+    if (!*first) buf_putc(out, ',');
+    *first = 0;
+    buf_puts(out, "{\"file\":\"");
+    sj_str(out, file);
+    buf_puts(out, "\",\"line\":");
+    buf_puti(out, line);
+    buf_puts(out, ",\"col\":");
+    buf_puti(out, col);
+    buf_puts(out, ",\"kind\":\"");
+    buf_puts(out, kind);
+    buf_puts(out, "\",\"name\":\"");
+    sj_str(out, name);
+    buf_puts(out, "\",\"is_pub\":");
+    buf_puti(out, is_pub);
+    buf_puts(out, ",\"ns\":\"");
+    sj_str(out, ns ? ns : "");
+    buf_puts(out, "\",\"sig\":\"");
+    sj_str(out, sig ? sig : "");
+    buf_puts(out, "\"}");
+}
+
+/* 镜像 sx_scan_kimo，但产出 JSON（真实坐标） */
+static void sx_scan_kimo_real(Cur* c, int kw_li, int kw_col, int is_pub, int is_extern,
+                              const char* name_prefix, const char* file, const char* ns,
+                              Buf* out, int* first) {
+    char name[256], full[512], rtbuf[256];
+    Buf praw, sig, rett;
+    int eli, ecol, nli = 0, ncol = 1;
+    (void)is_extern;
+    buf_init(&praw); buf_init(&sig); buf_init(&rett);
+    cur_skip_ws(c);
+    name[0] = 0;
+    nli = c->li; ncol = c->col;
+    if (is_ident_start(c->s[c->i])) cur_read_ident(c, name, sizeof(name));
+    cur_skip_ws(c);
+    if (c->s[c->i] == '<') cur_skip_balanced(c, '<', '>', NULL);
+    cur_skip_ws(c);
+    if (c->s[c->i] == '(') cur_skip_balanced(c, '(', ')', &praw);
+    cur_skip_ws(c);
+    if (c->s[c->i] == '-' && c->s[c->i + 1] == '>') {
+        cur_adv(c); cur_adv(c);
+        cur_skip_ws(c);
+        while (c->s[c->i] && c->s[c->i] != '{' && c->s[c->i] != ';' && c->s[c->i] != '\n') {
+            buf_putc(&rett, c->s[c->i]); cur_adv(c);
+        }
+    }
+    cur_skip_ws(c);
+    eli = c->li; ecol = c->col;
+    if (c->s[c->i] == '{') { cur_skip_balanced(c, '{', '}', NULL); eli = c->li; ecol = c->col; }
+    else if (c->s[c->i] == ';') { cur_adv(c); eli = c->li; ecol = c->col; }
+    if (name[0]) {
+        const char* rt;
+        snprintf(full, sizeof(full), "%s%s", name_prefix ? name_prefix : "", name);
+        sx_canon_type_buf(buf_cstr(&rett), rtbuf, sizeof(rtbuf));
+        if (!rtbuf[0]) snprintf(rtbuf, sizeof(rtbuf), "any");
+        rt = rtbuf;
+        buf_puts(&sig, "fn "); buf_puts(&sig, full); buf_putc(&sig, '(');
+        sx_format_params(buf_cstr(&praw), &sig);
+        buf_puts(&sig, ") -> "); buf_puts(&sig, rt);
+        sj_emit(out, first, file, nli, ncol, "fn", full, is_pub, ns, buf_cstr(&sig));
+    }
+    buf_free(&praw); buf_free(&sig); buf_free(&rett);
+}
+
+/* 单文件实时坐标扫描（顶层循环镜像 sx_scan_module） */
+static void sx_scan_file_real(const char* path, const char* rel_key, const char* src,
+                              Buf* out, int* first) {
+    Cur c;
+    int pend_pub = 0, pend_extern = 0;
+    char ns[512];
+    if (rel_key && rel_key[0]) {
+        int i, ln = (int)strlen(rel_key);
+        snprintf(ns, sizeof(ns), "%s", rel_key);
+        if (ln > 7 && strcmp(ns + ln - 7, ".shadow") == 0) ns[ln - 7] = 0;
+        for (i = 0; ns[i]; i++) if (ns[i] == '\\') ns[i] = '.';
+    } else ns[0] = 0;
+
+    c.s = src; c.i = 0; c.li = 0; c.col = 1;
+    for (;;) {
+        char ch;
+        cur_skip_ws(&c);
+        ch = c.s[c.i];
+        if (ch == 0) return;
+        if (ch == '@') {
+            char attr[64];
+            cur_adv(&c);
+            if (is_ident_start(c.s[c.i])) cur_read_ident(&c, attr, sizeof(attr));
+            cur_skip_ws(&c);
+            if (c.s[c.i] == '(') cur_skip_balanced(&c, '(', ')', NULL);
+            continue;
+        }
+        if (ch == '"' || ch == '\'') { cur_skip_quoted(&c); continue; }
+        if (!is_ident_start(ch)) {
+            if (ch == '{') { cur_skip_balanced(&c, '{', '}', NULL); pend_pub = 0; pend_extern = 0; continue; }
+            cur_adv(&c); continue;
+        }
+        {
+            char kw[64];
+            int kw_li = c.li, kw_col = c.col;
+            cur_read_ident(&c, kw, sizeof(kw));
+            if (strcmp(kw, "pub") == 0) { pend_pub = 1; continue; }
+            if (strcmp(kw, "kimo") == 0) {
+                sx_scan_kimo_real(&c, kw_li, kw_col, pend_pub, pend_extern, "", path, ns, out, first);
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            if (strcmp(kw, "struct") == 0 || strcmp(kw, "enum") == 0) {
+                char name[256]; int eli, ecol, nli = 0, ncol = 1; int is_struct = (kw[0] == 's');
+                cur_skip_ws(&c); name[0] = 0;
+                nli = c.li; ncol = c.col;
+                if (is_ident_start(c.s[c.i])) cur_read_ident(&c, name, sizeof(name));
+                cur_skip_ws(&c);
+                if (c.s[c.i] == '<') cur_skip_balanced(&c, '<', '>', NULL);
+                cur_skip_ws(&c);
+                eli = c.li; ecol = c.col;
+                if (c.s[c.i] == '{') { cur_skip_balanced(&c, '{', '}', NULL); eli = c.li; ecol = c.col; }
+                if (name[0]) sj_emit(out, first, path, nli, ncol, is_struct ? "struct" : "enum", name, pend_pub, ns, "");
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            if (strcmp(kw, "trait") == 0 || strcmp(kw, "interface") == 0) {
+                char name[256]; int nli = 0, ncol = 1;
+                cur_skip_ws(&c); name[0] = 0;
+                nli = c.li; ncol = c.col;
+                if (is_ident_start(c.s[c.i])) cur_read_ident(&c, name, sizeof(name));
+                while (c.s[c.i] && c.s[c.i] != '{') {
+                    if (c.s[c.i] == '"' || c.s[c.i] == '\'') { cur_skip_quoted(&c); continue; }
+                    cur_adv(&c);
+                }
+                if (c.s[c.i] == '{') cur_skip_balanced(&c, '{', '}', NULL);
+                if (name[0]) sj_emit(out, first, path, nli, ncol, "trait", name, pend_pub, ns, "");
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            if (strcmp(kw, "impl") == 0) {
+                char first_[256], type_name[256], prefix[600];
+                int mpub = 0, depth;
+                first_[0] = 0; type_name[0] = 0; prefix[0] = 0;
+                cur_skip_ws(&c);
+                if (is_ident_start(c.s[c.i])) cur_read_ident(&c, first_, sizeof(first_));
+                cur_skip_ws(&c);
+                if (c.s[c.i] == '<') { cur_skip_balanced(&c, '<', '>', NULL); cur_skip_ws(&c); }
+                if (is_ident_start(c.s[c.i])) {
+                    char kw2[64]; int si = c.i, sli = c.li, scol = c.col;
+                    cur_read_ident(&c, kw2, sizeof(kw2));
+                    if (strcmp(kw2, "for") == 0) {
+                        cur_skip_ws(&c);
+                        if (is_ident_start(c.s[c.i])) cur_read_ident(&c, type_name, sizeof(type_name));
+                        cur_skip_ws(&c);
+                        if (c.s[c.i] == '<') { cur_skip_balanced(&c, '<', '>', NULL); cur_skip_ws(&c); }
+                        snprintf(prefix, sizeof(prefix), "__impl__%s__%s__", type_name, first_);
+                    } else { c.i = si; c.li = sli; c.col = scol; }
+                }
+                while (c.s[c.i] && c.s[c.i] != '{') {
+                    if (c.s[c.i] == '"' || c.s[c.i] == '\'') { cur_skip_quoted(&c); continue; }
+                    cur_adv(&c);
+                }
+                if (c.s[c.i] != '{') { pend_pub = 0; pend_extern = 0; continue; }
+                cur_adv(&c); depth = 1;
+                while (depth > 0 && c.s[c.i]) {
+                    char mkw[64]; int mli, mcol;
+                    cur_skip_ws(&c);
+                    if (!c.s[c.i]) break;
+                    if (c.s[c.i] == '}') { cur_adv(&c); depth--; continue; }
+                    if (c.s[c.i] == '"' || c.s[c.i] == '\'') { cur_skip_quoted(&c); continue; }
+                    if (c.s[c.i] == '{') { cur_skip_balanced(&c, '{', '}', NULL); continue; }
+                    if (!is_ident_start(c.s[c.i])) { cur_adv(&c); continue; }
+                    mli = c.li; mcol = c.col;
+                    cur_read_ident(&c, mkw, sizeof(mkw));
+                    if (strcmp(mkw, "pub") == 0) { mpub = 1; continue; }
+                    if (strcmp(mkw, "kimo") == 0) {
+                        sx_scan_kimo_real(&c, mli, mcol, mpub, 0, prefix, path, ns, out, first);
+                        mpub = 0; continue;
+                    }
+                    mpub = 0;
+                }
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            if (strcmp(kw, "let") == 0 || strcmp(kw, "mut") == 0) {
+                char gname[256], tybuf[512]; int nli, ncol, ang = 0; Buf gty;
+                cur_skip_ws(&c); nli = c.li; ncol = c.col; gname[0] = 0;
+                if (is_ident_start(c.s[c.i])) cur_read_ident(&c, gname, sizeof(gname));
+                cur_skip_ws(&c); buf_init(&gty);
+                if (c.s[c.i] == ':') {
+                    cur_adv(&c); cur_skip_ws(&c);
+                    while (c.s[c.i]) {
+                        char t = c.s[c.i];
+                        if (t == '<') ang++;
+                        else if (t == '>') { if (ang > 0) ang--; }
+                        else if (ang == 0 && (t == '=' || t == ';')) break;
+                        else if (t == '\n') break;
+                        buf_putc(&gty, t); cur_adv(&c);
+                    }
+                }
+                if (gname[0]) {
+                    sx_canon_type_buf(buf_cstr(&gty), tybuf, sizeof(tybuf));
+                    if (!tybuf[0]) snprintf(tybuf, sizeof(tybuf), "unresolved");
+                    sj_emit(out, first, path, nli, ncol, "global", gname, pend_pub, ns, tybuf);
+                }
+                buf_free(&gty);
+                { int par = 0, brk = 0, brc = 0;
+                  while (c.s[c.i]) {
+                      char t = c.s[c.i];
+                      if (t == '"' || t == '\'') { cur_skip_quoted(&c); continue; }
+                      if (t == '(') { cur_skip_balanced(&c, '(', ')', NULL); continue; }
+                      if (t == '[') { cur_skip_balanced(&c, '[', ']', NULL); continue; }
+                      if (t == '{') { cur_skip_balanced(&c, '{', '}', NULL); continue; }
+                      if (t == ';' && par == 0 && brk == 0 && brc == 0) { cur_adv(&c); break; }
+                      cur_adv(&c);
+                  } }
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            if (strcmp(kw, "type") == 0) {
+                char tname[256]; int tnli = 0, tncol = 1;
+                cur_skip_ws(&c); tname[0] = 0;
+                tnli = c.li; tncol = c.col;
+                if (is_ident_start(c.s[c.i])) cur_read_ident(&c, tname, sizeof(tname));
+                if (tname[0]) sj_emit(out, first, path, tnli, tncol, "type", tname, pend_pub, ns, "");
+                while (c.s[c.i] && c.s[c.i] != ';' && c.s[c.i] != '\n') {
+                    if (c.s[c.i] == '"' || c.s[c.i] == '\'') { cur_skip_quoted(&c); continue; }
+                    cur_adv(&c);
+                }
+                if (c.s[c.i] == ';') cur_adv(&c);
+                pend_pub = 0; pend_extern = 0; continue;
+            }
+            pend_pub = 0; pend_extern = 0; continue;
+        }
+    }
+}
+
+/* 递归遍历 root 下所有 .shadow，跳过无关目录；产出工作区级符号表 JSON */
+static void sx_walk(const char* root, const char* dir, Buf* out, int* first) {
+    char search[1400];
+    WIN32_FIND_DATAA fd; HANDLE h;
+    snprintf(search, sizeof(search), "%s\\*", dir);
+    h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+        if (fd.cFileName[0] == '.') continue;   /* 隐藏/临时文件（.shadow_lsp_* 等） */
+        char full[1400];
+        snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            /* 外部/构建/工具链目录一律跳过 */
+            if (strcmp(fd.cFileName, "node_modules") == 0 ||
+                strcmp(fd.cFileName, "build") == 0 || strcmp(fd.cFileName, "target") == 0 ||
+                strcmp(fd.cFileName, "dist") == 0 || strcmp(fd.cFileName, "out") == 0 ||
+                strcmp(fd.cFileName, "vendor") == 0 ||
+                strcmp(fd.cFileName, ".workbuddy") == 0 || strcmp(fd.cFileName, ".vscode") == 0) continue;
+            /* 项目边界：含 shadow.sbg 的子目录 = 独立项目（shadow.exe -init 生成），
+               递归扫描时跳过，避免把同目录树下的其他项目文件扫进本项目的符号表 */
+            {
+                char sbgp[1400];
+                snprintf(sbgp, sizeof(sbgp), "%s\\shadow.sbg", full);
+                if (sx_is_file(sbgp)) continue;
+            }
+            sx_walk(root, full, out, first);
+        } else {
+            int nl = (int)strlen(fd.cFileName);
+            if (nl > 7 && strcmp(fd.cFileName + nl - 7, ".shadow") == 0) {
+                char* src = sx_read_file(full);
+                if (src && src[0]) {
+                    const char* rel = full;
+                    int rl = (int)strlen(root);
+                    if (rl > 0 && strncmp(full, root, rl) == 0 && full[rl] == '\\') rel = full + rl + 1;
+                    sx_scan_file_real(full, rel, src, out, first);
+                    free(src);
+                }
+            }
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+static const char* sx_workspace_json(const char* root) {
+    Buf out; int first = 1;
+    buf_init(&out);
+    buf_puts(&out, "{\"symbols\":[");
+    sx_walk(root, root, &out, &first);
+    buf_puts(&out, "]}");
+    return sx_host_dup(buf_cstr(&out));
+}
+
+#endif  /* SHADOW_INDEX_STANDALONE（工作区符号表） */
+
 /* ---------------- 独立自测入口 ---------------- */
 #ifdef SHADOW_INDEX_STANDALONE
 int main(int argc, char** argv) {
@@ -1879,6 +2187,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     arg0 = (argc > 2 && strncmp(argv[2], "--", 2) != 0) ? argv[2] : argv[0];
+    /* 工作区模式：-w <root> 扫描 root 下所有 .shadow，输出精确符号表 JSON */
+    if (strcmp(argv[1], "-w") == 0) {
+        const char* root = (argc > 2) ? argv[2] : ".";
+        const char* j = sx_workspace_json(root);
+        printf("%s\n", j ? j : "{\"symbols\":[]}");
+        return 0;
+    }
     ok = shadow_index_build(argv[1], "", arg0);
     {
         int i, want_s = 0, want_e = 0, want_g = 0, want_stat = 0, want_t = 0, want_all = 0;

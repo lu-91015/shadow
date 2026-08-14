@@ -1,0 +1,295 @@
+dsb json;
+// std/json — Shadow 0.5 标准库：JSON 解析与序列化
+// DOM 模型（规避 hashmap<any,any> 装箱陷阱）：
+//   对象 = JsonObject{ map: hashmap<string,string>, keys: array<string> }，
+//          每个值以「原始 JSON 文本」存储（42→"42"，"x"→"\"x\""，嵌套对象→其 JSON 文本）。
+//   数组 = array<string>，每个元素以「原始 JSON 文本」存储。
+//   解析器把文本切成原始片段存入 DOM；类型化访问器（json_get_*）按需把片段解析为具体类型。
+
+@extern("__rt_shadow_parse_int") kimo json_parse_int_raw(s: string) -> int { return 0; }
+
+pub struct JsonObject {
+    map: hashmap<string, string>;
+    keys: array<string>;
+}
+
+let J_S: string = "";
+let J_I: int = 0;
+
+kimo j_init(s: string) -> void {
+    J_S = s;
+    J_I = 0;
+}
+
+kimo j_skip_ws() -> void {
+    let n = len(J_S);
+    while (J_I < n) {
+        let c = J_S[J_I];
+        if (str_eq(c, " ") == 1 || str_eq(c, "\t") == 1 || str_eq(c, "\n") == 1 || str_eq(c, "\r") == 1) {
+            J_I = J_I + 1;
+        } else {
+            break;
+        }
+    }
+}
+
+kimo j_skip_string() -> int {
+    J_I = J_I + 1;
+    let n = len(J_S);
+    while (J_I < n) {
+        let c = J_S[J_I];
+        if (str_eq(c, "\\") == 1) { J_I = J_I + 2; continue; }
+        if (str_eq(c, "\"") == 1) { J_I = J_I + 1; return J_I; }
+        J_I = J_I + 1;
+    }
+    return J_I;
+}
+
+kimo j_skip_balanced(open: string, close: string) -> int {
+    let depth = 0;
+    let n = len(J_S);
+    while (J_I < n) {
+        let c = J_S[J_I];
+        if (str_eq(c, "\"") == 1) { J_I = j_skip_string(); continue; }
+        if (str_eq(c, open) == 1) { depth = depth + 1; }
+        else if (str_eq(c, close) == 1) {
+            depth = depth - 1;
+            if (depth == 0) { J_I = J_I + 1; return J_I; }
+        }
+        J_I = J_I + 1;
+    }
+    return J_I;
+}
+
+kimo j_read_value_raw() -> string {
+    j_skip_ws();
+    let start = J_I;
+    let c = J_S[J_I];
+    if (str_eq(c, "{") == 1) { J_I = j_skip_balanced("{", "}"); }
+    else if (str_eq(c, "[") == 1) { J_I = j_skip_balanced("[", "]"); }
+    else if (str_eq(c, "\"") == 1) { J_I = j_skip_string(); }
+    else {
+        let n = len(J_S);
+        while (J_I < n) {
+            let d = J_S[J_I];
+            if (str_eq(d, ",") == 1 || str_eq(d, "}") == 1 || str_eq(d, "]") == 1 ||
+                str_eq(d, " ") == 1 || str_eq(d, "\n") == 1 || str_eq(d, "\t") == 1 || str_eq(d, "\r") == 1) {
+                break;
+            }
+            J_I = J_I + 1;
+        }
+    }
+    return substr2(J_S, start, J_I);
+}
+
+kimo j_unescape(s: string) -> string {
+    let out: string = "";
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "\\") == 1 && i + 1 < n) {
+            let nx = s[i + 1];
+            if (str_eq(nx, "n") == 1) { out = out + "\n"; }
+            else if (str_eq(nx, "t") == 1) { out = out + "\t"; }
+            else if (str_eq(nx, "r") == 1) { out = out + "\r"; }
+            else if (str_eq(nx, "\"") == 1) { out = out + "\""; }
+            else if (str_eq(nx, "\\") == 1) { out = out + "\\"; }
+            else if (str_eq(nx, "/") == 1) { out = out + "/"; }
+            else { out = out + nx; }
+            i = i + 2;
+            continue;
+        }
+        out = out + c;
+        i = i + 1;
+    }
+    return out;
+}
+
+kimo j_read_string_literal() -> string {
+    J_I = J_I + 1;
+    let out: string = "";
+    let n = len(J_S);
+    while (J_I < n) {
+        let c = J_S[J_I];
+        if (str_eq(c, "\\") == 1 && J_I + 1 < n) {
+            let nx = J_S[J_I + 1];
+            if (str_eq(nx, "n") == 1) { out = out + "\n"; }
+            else if (str_eq(nx, "t") == 1) { out = out + "\t"; }
+            else if (str_eq(nx, "r") == 1) { out = out + "\r"; }
+            else if (str_eq(nx, "\"") == 1) { out = out + "\""; }
+            else if (str_eq(nx, "\\") == 1) { out = out + "\\"; }
+            else if (str_eq(nx, "/") == 1) { out = out + "/"; }
+            else { out = out + nx; }
+            J_I = J_I + 2;
+            continue;
+        }
+        if (str_eq(c, "\"") == 1) { J_I = J_I + 1; return out; }
+        out = out + c;
+        J_I = J_I + 1;
+    }
+    return out;
+}
+
+kimo j_parse_object() -> JsonObject {
+    let o: JsonObject;
+    o.map = hashmap_new();
+    o.keys = [];
+    J_I = J_I + 1;
+    j_skip_ws();
+    if (str_eq(J_S[J_I], "}") == 1) { J_I = J_I + 1; return o; }
+    while (1) {
+        j_skip_ws();
+        let key = j_read_string_literal();
+        j_skip_ws();
+        J_I = J_I + 1; // 消费 ':'
+        let raw = j_read_value_raw();
+        if (hashmap_contains(o.map, key) == 0) { o.keys = array_push(o.keys, key); }
+        hashmap_insert(o.map, key, raw);
+        j_skip_ws();
+        let c = J_S[J_I];
+        if (str_eq(c, ",") == 1) { J_I = J_I + 1; continue; }
+        if (str_eq(c, "}") == 1) { J_I = J_I + 1; break; }
+        break;
+    }
+    return o;
+}
+
+kimo j_parse_array() -> array<string> {
+    let a: array<string> = [];
+    J_I = J_I + 1;
+    j_skip_ws();
+    if (str_eq(J_S[J_I], "]") == 1) { J_I = J_I + 1; return a; }
+    while (1) {
+        j_skip_ws();
+        let raw = j_read_value_raw();
+        a = array_push(a, raw);
+        j_skip_ws();
+        let c = J_S[J_I];
+        if (str_eq(c, ",") == 1) { J_I = J_I + 1; continue; }
+        if (str_eq(c, "]") == 1) { J_I = J_I + 1; break; }
+        break;
+    }
+    return a;
+}
+
+// ===== 公开 API =====
+pub kimo json_obj_new() -> JsonObject {
+    let o: JsonObject;
+    o.map = hashmap_new();
+    o.keys = [];
+    return o;
+}
+
+pub kimo json_parse_obj(text: string) -> JsonObject {
+    j_init(text);
+    j_skip_ws();
+    return j_parse_object();
+}
+
+pub kimo json_parse_arr(text: string) -> array<string> {
+    j_init(text);
+    j_skip_ws();
+    return j_parse_array();
+}
+
+pub kimo json_set(o: JsonObject, key: string, rawJson: string) -> JsonObject {
+    if (hashmap_contains(o.map, key) == 0) { o.keys = array_push(o.keys, key); }
+    hashmap_insert(o.map, key, rawJson);
+    return o;
+}
+
+pub kimo json_get_str(o: JsonObject, key: string) -> string {
+    let raw = o.map[key];
+    let n = len(raw);
+    if (n >= 2 && str_eq(raw[0], "\"") == 1) {
+        return j_unescape(substr2(raw, 1, n - 1));
+    }
+    return raw;
+}
+
+pub kimo json_get_int(o: JsonObject, key: string) -> int {
+    let raw = o.map[key];
+    return json_parse_int_raw(raw);
+}
+
+pub kimo json_get_bool(o: JsonObject, key: string) -> int {
+    let raw = o.map[key];
+    if (str_eq(raw, "true") == 1) { return 1; }
+    return 0;
+}
+
+pub kimo json_get_obj(o: JsonObject, key: string) -> JsonObject {
+    let raw = o.map[key];
+    return json_parse_obj(raw);
+}
+
+pub kimo json_get_arr(o: JsonObject, key: string) -> array<string> {
+    let raw = o.map[key];
+    return json_parse_arr(raw);
+}
+
+// 数组元素访问（按索引）
+pub kimo json_arr_get_str(a: array<string>, idx: int) -> string {
+    let raw = a[idx];
+    let n = len(raw);
+    if (n >= 2 && str_eq(raw[0], "\"") == 1) {
+        return j_unescape(substr2(raw, 1, n - 1));
+    }
+    return raw;
+}
+
+pub kimo json_arr_get_int(a: array<string>, idx: int) -> int {
+    return json_parse_int_raw(a[idx]);
+}
+
+pub kimo json_arr_get_obj(a: array<string>, idx: int) -> JsonObject {
+    return json_parse_obj(a[idx]);
+}
+
+// 序列化
+pub kimo json_str(s: string) -> string {
+    let out: string = "\"";
+    let n = len(s);
+    let i = 0;
+    while (i < n) {
+        let c = s[i];
+        if (str_eq(c, "\"") == 1) { out = out + "\\\""; }
+        else if (str_eq(c, "\\") == 1) { out = out + "\\\\"; }
+        else if (str_eq(c, "\n") == 1) { out = out + "\\n"; }
+        else if (str_eq(c, "\t") == 1) { out = out + "\\t"; }
+        else if (str_eq(c, "\r") == 1) { out = out + "\\r"; }
+        else { out = out + c; }
+        i = i + 1;
+    }
+    out = out + "\"";
+    return out;
+}
+
+pub kimo json_encode_obj(o: JsonObject) -> string {
+    let out: string = "{";
+    let n = len(o.keys);
+    let i = 0;
+    while (i < n) {
+        let k = o.keys[i];
+        let v = o.map[k];
+        out = out + json_str(k) + ":" + v;
+        if (i < n - 1) { out = out + ","; }
+        i = i + 1;
+    }
+    out = out + "}";
+    return out;
+}
+
+pub kimo json_encode_arr(a: array<string>) -> string {
+    let out: string = "[";
+    let n = len(a);
+    let i = 0;
+    while (i < n) {
+        out = out + a[i];
+        if (i < n - 1) { out = out + ","; }
+        i = i + 1;
+    }
+    out = out + "]";
+    return out;
+}

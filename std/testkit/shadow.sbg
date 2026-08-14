@@ -1,0 +1,4 @@
+# shadow.sbg — std/testkit 标准库
+[package]
+name = "testkit"
+version = "0.5.0"

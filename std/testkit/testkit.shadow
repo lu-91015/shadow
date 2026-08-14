@@ -1,0 +1,70 @@
+dsb testkit;
+// std/testkit — Shadow 0.5 标准库：单元测试 + 微基准框架
+// 计时复用运行时符号 rt_nanotimestamp_now（纳秒，QPC/clock_gettime）。
+
+@extern("rt_nanotimestamp_now") kimo bench_now() -> long { return 0; }
+
+// 全局计数（模块级可变全局）
+let TEST_PASS: int = 0;
+let TEST_FAIL: int = 0;
+
+pub kimo test_reset() -> void {
+    TEST_PASS = 0;
+    TEST_FAIL = 0;
+}
+
+pub kimo assert_eq_int(expected: int, actual: int, name: string) -> void {
+    if (expected == actual) {
+        TEST_PASS = TEST_PASS + 1;
+    } else {
+        TEST_FAIL = TEST_FAIL + 1;
+        println("FAIL: " + name + " (expected " + expected + ", got " + actual + ")");
+    }
+}
+
+pub kimo assert_eq_str(expected: string, actual: string, name: string) -> void {
+    if (str_eq(expected, actual) == 1) {
+        TEST_PASS = TEST_PASS + 1;
+    } else {
+        TEST_FAIL = TEST_FAIL + 1;
+        println("FAIL: " + name + " (string mismatch)");
+    }
+}
+
+pub kimo assert_true(cond: int, name: string) -> void {
+    if (cond == 1) {
+        TEST_PASS = TEST_PASS + 1;
+    } else {
+        TEST_FAIL = TEST_FAIL + 1;
+        println("FAIL: " + name + " (expected true)");
+    }
+}
+
+pub kimo assert_false(cond: int, name: string) -> void {
+    if (cond == 0) {
+        TEST_PASS = TEST_PASS + 1;
+    } else {
+        TEST_FAIL = TEST_FAIL + 1;
+        println("FAIL: " + name + " (expected false)");
+    }
+}
+
+// 返回失败数（0 表示全部通过）
+pub kimo test_summary() -> int {
+    println("==== TEST SUMMARY: PASS=" + TEST_PASS + " FAIL=" + TEST_FAIL + " ====");
+    return TEST_FAIL;
+}
+
+// ===== 微基准 =====
+// 用法：let t = bench_start(); <被测代码>; bench_report("name", bench_elapsed_ns(t));
+pub kimo bench_start() -> long {
+    return bench_now();
+}
+
+pub kimo bench_elapsed_ns(start: long) -> long {
+    return bench_now() - start;
+}
+
+pub kimo bench_report(name: string, ns: long) -> void {
+    println("BENCH " + name + ": " + ns + " ns");
+}

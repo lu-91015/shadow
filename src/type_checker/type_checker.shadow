@@ -2129,7 +2129,24 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
         // 0.5 多 node：符号按所属模块注册到对应模块 node（兼容态回退 combined）
         let node = tc_mg_node_for(ctx, tc_module_of_line(ctx, gv.loc.line));
         let gty = gv.type_ref;
-        if (type_is_none(gty) == 1) { gty = mk_type(TYPE_INFER); }
+        // 无注解全局：parser 给的 type_ref 是 type_none_inner()（kind=TYPE_INFER 的非空对象，
+        // 不是空指针），故必须同时捕获 type_is_none 与 TYPE_INFER 两种情况，否则推断分支被跳过。
+        if (type_is_none(gty) == 1 || gty.kind == TYPE_INFER) {
+            // 无注解全局：从初始化字面量推断类型（否则 TYPE_INFER 占位 → 运行时按 any 处理，
+            // 存字符串后读到的是裸指针 → 打印 <ptr> / 拼接垃圾，2026-08-13 实测）。
+            // 与局部 let（tc_check_stmt STMT_LET 用 init_t）语义对齐；复杂表达式保持 TYPE_INFER。
+            let gk = -1;
+            if (expr_is_none(gv.init) == 0) { gk = gv.init.kind; }
+            if (gk == EXPR_STRING) { gty = mk_type(TYPE_STRING); }
+            else if (gk == EXPR_INT) { gty = mk_type(TYPE_INT); }
+            else if (gk == EXPR_LONG) { gty = mk_type(TYPE_LONG); }
+            else if (gk == EXPR_FLOAT) { gty = mk_type(TYPE_FLOAT); }
+            else if (gk == EXPR_BOOL) { gty = mk_type(TYPE_BOOL); }
+            else { gty = mk_type(TYPE_INFER); }
+        }
+        // 回写 AST 节点：codegen(cg_emit_globals) 直接读 gv.type_ref 取 kind，
+        // 仅更新 node.global_types 不够，否则全局存储类型虽对、引用类型仍退化 any → <ptr>。
+        gv.type_ref = gty;
         let gexempt = 0;
         if (str_starts_with(gv.name, "SHADOW_") == 1) { gexempt = 1; }
         if (str_starts_with(gv.name, "rt_") == 1) { gexempt = 1; }

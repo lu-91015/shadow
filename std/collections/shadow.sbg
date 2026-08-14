@@ -1,0 +1,4 @@
+# shadow.sbg — std/collections 标准库
+[package]
+name = "collections"
+version = "0.5.0"

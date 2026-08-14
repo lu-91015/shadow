@@ -43,6 +43,16 @@ let ps_macro_hyg_counter: int = 0;
 // defer 条目（0.4 具体类型，替代 0.3 的 [depth, body] any 元组）
 pub struct DeferEntry { depth: int; body: array<Stmt> }
 
+// @ 注解（通用）：解析期收集，末尾合成注册调用注入 main（见 parser_finalize_annos）。
+// 仅顶层函数上的 @Name / @Name("a","b") 进入此表；@extern 仍走特判（不进此表）。
+struct AnnoRec {
+    name: string;            // 注解名，如 "Route"
+    args: array<string>;     // 字符串参数（最多取前 2 个，缺失补 ""）
+    func: string;            // 被注解函数名（注册时作为函数值传入 shadow_anno_register__）
+}
+let parser_annos: array<AnnoRec> = [];          // 本文件全部注解（func 已填）
+let parser_pending_annos: array<AnnoRec> = [];  // 当前待 flush 到下一函数的注解
+
 // ============ 错误恢复基础设施 ============
 pub kimo ps_set_fatal_mode(m: int) -> void { ps_fatal_mode = m; }
 pub kimo ps_get_fatal_mode() -> int { return ps_fatal_mode; }
@@ -2635,6 +2645,85 @@ pub kimo parse_type_alias(is_pub: int) -> TypeAlias {
     return ta;
 }
 
+// ============ @ 注解辅助 ============
+// 把当前 pending 注解交给刚解析出的函数 fn_name（填入 func 名），转入本文件注解表。
+kimo parser_flush_annos(fn_name: string) -> void {
+    let i = 0;
+    while (i < len(parser_pending_annos)) {
+        let rec = parser_pending_annos[i] as AnnoRec;
+        rec.func = fn_name;
+        parser_annos = array_push(parser_annos, rec);
+        i = i + 1;
+    }
+    parser_pending_annos = [];
+}
+
+// 为一条注解生成语句：shadow_anno_register__(<func>, "Anno", arg0, arg1)
+// 参数最多取前 2 个字符串，缺失补 ""。注册器由业务框架实现（零硬编码）。
+kimo parser_make_anno_call(rec: AnnoRec) -> Stmt {
+    let loc = mk_loc(ps_file, 1, 1);
+    let fvar = mk_expr(EXPR_VAR, loc);
+    fvar.str1 = rec.func;
+    let anno_str = mk_expr(EXPR_STRING, loc);
+    anno_str.str1 = rec.name;
+    let a0 = mk_expr(EXPR_STRING, loc);
+    a0.str1 = "";
+    let a1 = mk_expr(EXPR_STRING, loc);
+    a1.str1 = "";
+    if (len(rec.args) >= 1) { a0.str1 = rec.args[0] as string; }
+    if (len(rec.args) >= 2) { a1.str1 = rec.args[1] as string; }
+    let args: array<Expr> = [];
+    args = array_push(args, fvar);
+    args = array_push(args, anno_str);
+    args = array_push(args, a0);
+    args = array_push(args, a1);
+    let call = mk_expr(EXPR_CALL, loc);
+    call.str1 = "shadow_anno_register__";
+    call.items = args;
+    call.str_items = [];
+    let st = mk_stmt(STMT_EXPR, loc);
+    st.expr1 = call;
+    return st;
+}
+
+// 按模块名生成唯一 init 函数名，避免多个带注解模块导出同名 __shadow_anno_init__
+// 造成符号/名字解析冲突（呼应 Go 多包 init 互不干扰）。module 为空时回退 "main"。
+kimo parser_anno_init_name(mod: string) -> string {
+    if (mod == "") {
+        return "__shadow_anno_init__main";
+    }
+    return "__shadow_anno_init__" + mod;
+}
+
+// 合成 __shadow_anno_init__<module>()：遍历本文件注解，为每个生成 shadow_anno_register__ 调用。
+// 该函数为 pub，供 main 所在模块调用（呼应 Go 的 init() 自登记风格）。
+kimo parser_make_anno_init(mod: string) -> FuncDef {
+    let loc = mk_loc(ps_file, 1, 1);
+    let body_items: array<Stmt> = [];
+    let i = 0;
+    while (i < len(parser_annos)) {
+        let st = parser_make_anno_call(parser_annos[i] as AnnoRec);
+        body_items = array_push(body_items, st);
+        i = i + 1;
+    }
+    let blk = mk_stmt(STMT_BLOCK, loc);
+    blk.items = body_items;
+    let fd = FuncDef {
+        name: parser_anno_init_name(mod),
+        params: [],
+        return_type: mk_type(TYPE_VOID),
+        body: blk,
+        loc: loc,
+        is_pub: 1,
+        is_extern: 0,
+        extern_name: "",
+        type_params: [],
+        is_async: 0,
+        is_macro: 0,
+    };
+    return fd;
+}
+
 // ============ 顶层解析 ============
 pub kimo parse(tokens: array<Token>, file: string) -> Program {
     ps_tokens = tokens;
@@ -2653,6 +2742,8 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
     ps_diag_ranges = [];
     ps_err_count = 0;
     reset_node_ids();
+    parser_annos = [];
+    parser_pending_annos = [];
 
     let functions: array<FuncDef> = [];
     let structs: array<StructDef> = [];
@@ -2686,15 +2777,39 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
         let is_pub = 0;
         if (ps_at(TOK_PUB) == 1) { ps_adv(); is_pub = 1; }
 
-        // @extern 注解：@extern("c_name")
+        // @ 注解：@extern("c_name") 走特判（设 extern_name）；其余 @Name / @Name("a","b")
+        // 收进 parser_pending_annos，待下一函数解析后 flush 进 parser_annos。
         let extern_name = "";
-        if (ps_at(TOK_AT) == 1) {
+        while (ps_at(TOK_AT) == 1) {
             ps_adv();
-            ps_expect(TOK_IDENT, "extern");
-            ps_expect(TOK_LPAREN, "(");
-            extern_name = ps_cur_text();
-            ps_expect(TOK_STRING_LIT, "string");
-            ps_expect(TOK_RPAREN, ")");
+            let anno_name = ps_cur_text();
+            ps_expect(TOK_IDENT, "annotation name");
+            if (anno_name == "extern") {
+                ps_expect(TOK_LPAREN, "(");
+                extern_name = ps_cur_text();
+                ps_expect(TOK_STRING_LIT, "string");
+                ps_expect(TOK_RPAREN, ")");
+            } else {
+                // 通用注解：可选 ("a","b") 参数（仅字符串字面量，逗号分隔）
+                let aargs: array<string> = [];
+                if (ps_at(TOK_LPAREN) == 1) {
+                    ps_adv();
+                    if (ps_at(TOK_RPAREN) != 1) {
+                        let a0 = ps_cur_text();
+                        ps_expect(TOK_STRING_LIT, "string");
+                        aargs = array_push(aargs, a0);
+                        while (ps_at(TOK_COMMA) == 1) {
+                            ps_adv();
+                            let ax = ps_cur_text();
+                            ps_expect(TOK_STRING_LIT, "string");
+                            aargs = array_push(aargs, ax);
+                        }
+                    }
+                    ps_expect(TOK_RPAREN, ")");
+                }
+                parser_pending_annos = array_push(parser_pending_annos,
+                    AnnoRec { name: anno_name, args: aargs, func: "" });
+            }
         }
 
         if (ps_at(TOK_IMPORT) == 1) {
@@ -2723,6 +2838,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
             let fd = parse_function(is_pub, extern_name);
             fd.is_async = 0;
             functions = array_push(functions, fd);
+            parser_flush_annos(fd.name);
             continue;
         }
 
@@ -2732,6 +2848,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
             let fd = parse_function(is_pub, extern_name);
             fd.is_async = 1;
             functions = array_push(functions, fd);
+            parser_flush_annos(fd.name);
             continue;
         }
 
@@ -2773,6 +2890,16 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 ginit = parse_expr();
                 g_has_init = 1;
             }
+            // 无注解全局：从初始化字面量推断类型（源头修正，2026-08-13 实测 ex_global_infer）。
+            // 否则 type_ref 恒为 type_none_inner()（kind=TYPE_INFER 的非空对象）→ 下游 TC/codegen
+            // 把未注解全局当 any 处理 → 字符串被当裸指针存 → println 打印 <ptr> / 拼接垃圾。
+            if (g_has_init == 1) {
+                if (ginit.kind == EXPR_STRING) { gty = mk_type(TYPE_STRING); }
+                else if (ginit.kind == EXPR_INT) { gty = mk_type(TYPE_INT); }
+                else if (ginit.kind == EXPR_LONG) { gty = mk_type(TYPE_LONG); }
+                else if (ginit.kind == EXPR_FLOAT) { gty = mk_type(TYPE_FLOAT); }
+                else if (ginit.kind == EXPR_BOOL) { gty = mk_type(TYPE_BOOL); }
+            }
             ps_expect(TOK_SEMICOLON, ";");
             let gv = GlobalVar { name: gname, type_ref: gty, init: ginit, loc: gloc, is_pub: is_pub, is_mut: 0 };
             if (g_has_init == 0) { gv.init = 0 as Expr; }
@@ -2797,6 +2924,13 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 ps_adv();
                 minit = parse_expr();
                 m_has_init = 1;
+            }
+            if (m_has_init == 1) {
+                if (minit.kind == EXPR_STRING) { mty = mk_type(TYPE_STRING); }
+                else if (minit.kind == EXPR_INT) { mty = mk_type(TYPE_INT); }
+                else if (minit.kind == EXPR_LONG) { mty = mk_type(TYPE_LONG); }
+                else if (minit.kind == EXPR_FLOAT) { mty = mk_type(TYPE_FLOAT); }
+                else if (minit.kind == EXPR_BOOL) { mty = mk_type(TYPE_BOOL); }
             }
             ps_expect(TOK_SEMICOLON, ";");
             let gv = GlobalVar { name: mname, type_ref: mty, init: minit, loc: mloc, is_pub: is_pub, is_mut: 1 };
@@ -2953,6 +3087,40 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
         if (ps_fatal_mode == 1) {
             rt_exit(1);
         }
+    }
+
+    // ---- @ 注解收尾：本文件有注解时，合成 __shadow_anno_init__<module>() 并注入 main ----
+    if (len(parser_annos) > 0) {
+        let init_fd = parser_make_anno_init(module_name);
+        functions = array_push(functions, init_fd);
+        // 若本文件含零参 main()，在其体首部前插 __shadow_anno_init__<module>() 调用。
+        // 注意：数组元素是值语义，故复制 main 改副体再整体重建 functions 数组。
+        let new_funcs: array<FuncDef> = [];
+        let mi = 0;
+        while (mi < len(functions)) {
+            if (functions[mi].name == "main" && len(functions[mi].params) == 0) {
+                let mfd = functions[mi];   // 值拷贝
+                let call = mk_expr(EXPR_CALL, mk_loc(ps_file, 1, 1));
+                call.str1 = parser_anno_init_name(module_name);
+                call.items = [];
+                call.str_items = [];
+                let cst = mk_stmt(STMT_EXPR, mk_loc(ps_file, 1, 1));
+                cst.expr1 = call;
+                let merged: array<Stmt> = [];
+                merged = array_push(merged, cst);
+                let bi = 0;
+                while (bi < len(mfd.body.items)) {
+                    merged = array_push(merged, mfd.body.items[bi] as Stmt);
+                    bi = bi + 1;
+                }
+                mfd.body.items = merged;
+                new_funcs = array_push(new_funcs, mfd);
+            } else {
+                new_funcs = array_push(new_funcs, functions[mi]);
+            }
+            mi = mi + 1;
+        }
+        functions = new_funcs;
     }
 
     let prog = Program {

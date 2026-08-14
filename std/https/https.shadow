@@ -1,0 +1,47 @@
+/* ============================================================
+ * Shadow 0.5 标准库 std/https — HTTPS（TLS）客户端
+ * 建立在 std/http 的响应解析之上；实际的 TLS 握手/加解密由
+ * native/https_bind.c 通过 WinHttp 动态加载完成（见该文件注释）。
+ * 为减少依赖层级，本模块内联了响应解析（status/body），
+ * 不 import 其他 std 包，消费方只需在 [deps] 声明 https 一个包。
+ * 能力：https_get / https_post（返回完整响应文本），
+ *       https_status / https_body（本地解析，不联网）。
+ * ============================================================ */
+dsb https;
+
+@extern("shadow_https_get")  kimo https_get_raw(url: string, n: int) -> string { return ""; }
+@extern("shadow_https_post") kimo https_post_raw(url: string, n: int, body: string, bn: int) -> string { return ""; }
+
+// https_get(url) -> 完整响应文本（空串表示连接/TLS 失败）
+pub kimo https_get(url: string) -> string {
+    return https_get_raw(url, shadow_string_len(url));
+}
+
+// https_post(url, body) -> 完整响应文本（空串表示连接/TLS 失败）
+pub kimo https_post(url: string, body: string) -> string {
+    return https_post_raw(url, shadow_string_len(url), body, shadow_string_len(body));
+}
+
+// 从响应文本解析 HTTP 状态码（首行 "HTTP/1.1 200 OK" 的第二个 token）
+pub kimo https_status(resp: string) -> int {
+    let nl = str_index_of(resp, "\n");
+    let line = resp;
+    if (nl > 0) { line = substr2(resp, 0, nl); }
+    let cr = str_index_of(line, "\r");
+    if (cr > 0) { line = substr2(line, 0, cr); }
+    let parts = str_split(line, " ");
+    if (len(parts) < 2) { return 0; }
+    return shadow_parse_int(parts[1] as string);
+}
+
+// 从响应文本提取 body（首个空行之后），兼容 \r\n\r\n 与 \n\n
+pub kimo https_body(resp: string) -> string {
+    let i = str_index_of(resp, "\r\n\r\n");
+    let sep = 4;
+    if (i < 0) {
+        i = str_index_of(resp, "\n\n");
+        sep = 2;
+        if (i < 0) { return ""; }
+    }
+    return substr2(resp, i + sep, len(resp));
+}

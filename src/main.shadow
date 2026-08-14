@@ -81,9 +81,20 @@ kimo main_read_or_empty(path: string) -> string {
 // 目录=包：<pkg>.shadow 文件缺失时，<pkg>/ 目录存在 → 加载目录下全部 .shadow
 //   （插入排序保证确定性，避免 FindFirstFile 顺序影响 fixed-point）。
 let main_sbg_name: string = "";              // [package] name（无 sbg = ""）
-let main_sbg_deps_names: array<string> = []; // [deps] 依赖名（import 首段）
-let main_sbg_deps_paths: array<string> = []; // [deps] 路径（相对主目录；目录或 .spk）
-let main_sbg_deps_versions: array<string> = []; // [deps] 版本约束（""=任意，semver）
+let main_sbg_deps_names: array<string> = []; // 主包直接依赖（shadow.lock 用）
+let main_sbg_deps_paths: array<string> = [];
+let main_sbg_deps_versions: array<string> = [];
+// 全局依赖注册表（传递闭包）：主包 + 所有被依赖包的 [deps]；base=声明该依赖的包目录
+let main_dep_reg_names: array<string> = [];
+let main_dep_reg_paths: array<string> = [];
+let main_dep_reg_versions: array<string> = [];
+let main_dep_reg_bases: array<string> = [];
+let main_dep_reg_expanded: array<int> = [];
+// 解析临时缓冲（expand 用，避免污染主包直接依赖）
+let main_scratch_names: array<string> = [];
+let main_scratch_paths: array<string> = [];
+let main_scratch_versions: array<string> = [];
+let main_parse_target: int = 0;   // main_parse_sbg 当前写入目标：0=主包直接依赖，1=临时缓冲
 // P0-2：库自带 native 文件 — 从 .spk 包内 shadow.sbg 的 [native] 节收集。
 // main_link_exe 把 sources 编译为 .o 并追加到 clang++ 链接命令。
 let main_native_sources: array<string> = [];    // .cpp/.c 绝对路径（解包缓存目录下）
@@ -239,11 +250,18 @@ kimo tc_mod_imp_record(owner: string, target: string) -> void {
 
 // 解析 shadow.sbg（TOML 微子集）：[package] name/version/abi_version + [deps] name="path"
 // 结果写入全局 main_sbg_*；sbg_src 为空则重置为无清单状态。
-kimo main_parse_sbg(sbg_src: string) -> void {
-    main_sbg_name = "";
-    main_sbg_deps_names = [];
-    main_sbg_deps_paths = [];
-    main_sbg_deps_versions = [];
+kimo main_parse_sbg(sbg_src: string, target: int) -> void {
+    main_parse_target = target;
+    if (target == 1) {
+        main_scratch_names = [];
+        main_scratch_paths = [];
+        main_scratch_versions = [];
+    } else {
+        main_sbg_name = "";
+        main_sbg_deps_names = [];
+        main_sbg_deps_paths = [];
+        main_sbg_deps_versions = [];
+    }
     if (len(sbg_src) == 0) { return; }
     let lines = str_split(sbg_src, "\n");
     let section = "";
@@ -270,29 +288,22 @@ kimo main_parse_sbg(sbg_src: string) -> void {
         if (str_eq(section, "package") == 1) {
             if (str_eq(key, "name") == 1) { main_sbg_name = val; }
         } else if (str_eq(section, "deps") == 1) {
-            // deps: name = "path"（目录或 .spk 文件）
+            // deps: name = "path" 或内联约束 name = "path@约束"
             if (len(key) > 0 && len(val) > 0) {
-                main_sbg_deps_names = array_push(main_sbg_deps_names, key);
-                main_sbg_deps_paths = array_push(main_sbg_deps_paths, val);
-                main_sbg_deps_versions = array_push(main_sbg_deps_versions, "");
+                let dpath = val;
+                let dver = "";
+                let at = str_index_of(val, "@");
+                if (at >= 0) {
+                    dpath = substr2(val, 0, at);
+                    dver = substr2(val, at + 1, len(val));
+                }
+                main_sbg_append(key, dpath, dver);
             }
         } else if (str_starts_with(section, "deps.") == 1) {
             // [deps.<name>] 表：path / version（semver 约束）
             let dep_name = substr2(section, 5, len(section));
-            let di = 0;
-            let didx = -1;
-            while (di < len(main_sbg_deps_names)) {
-                if (str_eq(main_sbg_deps_names[di] as string, dep_name) == 1) { didx = di; }
-                di = di + 1;
-            }
-            if (didx < 0) {
-                main_sbg_deps_names = array_push(main_sbg_deps_names, dep_name);
-                main_sbg_deps_paths = array_push(main_sbg_deps_paths, "");
-                main_sbg_deps_versions = array_push(main_sbg_deps_versions, "");
-                didx = len(main_sbg_deps_names) - 1;
-            }
-            if (str_eq(key, "path") == 1) { main_sbg_deps_paths[didx] = val; }
-            if (str_eq(key, "version") == 1) { main_sbg_deps_versions[didx] = val; }
+            if (str_eq(key, "path") == 1) { main_sbg_append(dep_name, val, ""); }
+            else if (str_eq(key, "version") == 1) { main_sbg_append(dep_name, "", val); }
         }
         i = i + 1;
     }
@@ -300,7 +311,9 @@ kimo main_parse_sbg(sbg_src: string) -> void {
 
 // 从主文件目录读 shadow.sbg 并解析（无则重置）
 kimo main_load_sbg(project_root: string) -> void {
-    main_parse_sbg(main_read_or_empty(main_path_join(project_root, "shadow.sbg")));
+    let sbg = main_read_or_empty(main_path_join(project_root, "shadow.sbg"));
+    main_parse_sbg(sbg, 0);
+    main_reg_seed_from_globals(project_root);
 }
 
 // dep 路径查表：import 首段 → 命中依赖则返回 dep 路径（相对主目录），否则 ""
@@ -440,13 +453,502 @@ kimo main_collect_native_from_sbg(sbg_src: string, base_dir: string) -> void {
     }
 }
 
-// 版本约束是否满足（""/* 任意；否则与 version 精确相等；^/>= 等 semver 约束
-// 随 Phase 12 完整 semver 集成，先支持精确与通配）
+// ===== Phase 12b：依赖注册表 + semver + 包管理 =====
+// 全局依赖注册表（传递闭包）：主包 [deps] + 所有被依赖包的 [deps]。
+// 每个条目记录声明该依赖的包目录（base），相对路径按此目录解析。
+
+// 单字符数字判定（返回 0-9 或 -1）
+kimo main_digit_val(c: string) -> int {
+    let digits = "0123456789";
+    return str_index_of(digits, c);
+}
+// 字符串→整数（仅解析前导数字）
+kimo main_atoi(s: string) -> int {
+    let r = 0;
+    let i = 0;
+    while (i < len(s)) {
+        let d = main_digit_val(s[i] as string);
+        if (d < 0) { break; }
+        r = r * 10 + d;
+        i = i + 1;
+    }
+    return r;
+}
+// 是否纯数字串
+kimo main_is_num(s: string) -> int {
+    if (len(s) == 0) { return 0; }
+    let i = 0;
+    while (i < len(s)) {
+        if (main_digit_val(s[i] as string) < 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// semver 解析缓冲（main_ver_decode 写入）
+let main_v_major: int = 0;
+let main_v_minor: int = 0;
+let main_v_patch: int = 0;
+let main_v_pre: string = "";
+
+// 解析版本串 → 写入 main_v_*（忽略 build 元数据；prerelease 单独存）
+kimo main_ver_decode(v: string) -> void {
+    let plus = str_index_of(v, "+");
+    let core = v;
+    if (plus >= 0) { core = substr2(v, 0, plus); }
+    let dash = str_index_of(core, "-");
+    let nums = core;
+    main_v_pre = "";
+    if (dash >= 0) {
+        nums = substr2(core, 0, dash);
+        main_v_pre = substr2(core, dash + 1, len(core));
+    }
+    let parts = str_split(nums, ".");
+    main_v_major = 0; main_v_minor = 0; main_v_patch = 0;
+    if (len(parts) > 0) { main_v_major = main_atoi(parts[0] as string); }
+    if (len(parts) > 1) { main_v_minor = main_atoi(parts[1] as string); }
+    if (len(parts) > 2) { main_v_patch = main_atoi(parts[2] as string); }
+}
+
+// 版本比较：<0 / 0 / >0（build 元数据忽略；prerelease 按 semver 规则）
+kimo main_ver_cmp(a: string, b: string) -> int {
+    main_ver_decode(a);
+    let am = main_v_major; let ani = main_v_minor; let ap = main_v_patch; let apre = main_v_pre;
+    main_ver_decode(b);
+    let bm = main_v_major; let bni = main_v_minor; let bp = main_v_patch; let bpre = main_v_pre;
+    if (am != bm) { if (am < bm) { return -1; } else { return 1; } }
+    if (ani != bni) { if (ani < bni) { return -1; } else { return 1; } }
+    if (ap != bp) { if (ap < bp) { return -1; } else { return 1; } }
+    if (len(apre) == 0 && len(bpre) == 0) { return 0; }
+    if (len(apre) == 0) { return 1; }
+    if (len(bpre) == 0) { return -1; }
+    return main_pre_cmp(apre, bpre);
+}
+
+// prerelease 标识符比较（数字 < 字母；同型按数值/字典）
+kimo main_pre_cmp(a: string, b: string) -> int {
+    let pa = str_split(a, ".");
+    let pb = str_split(b, ".");
+    let n = len(pa);
+    if (len(pb) < n) { n = len(pb); }
+    let i = 0;
+    while (i < n) {
+        let x = pa[i] as string;
+        let y = pb[i] as string;
+        let xn = main_is_num(x);
+        let yn = main_is_num(y);
+        if (xn == 1 && yn == 1) {
+            let xi = main_atoi(x); let yi = main_atoi(y);
+            if (xi != yi) { if (xi < yi) { return -1; } else { return 1; } }
+        } else if (xn == 1 && yn == 0) {
+            return -1;
+        } else if (xn == 0 && yn == 1) {
+            return 1;
+        } else {
+            let c = rt_str_cmp(x, y);
+            if (c != 0) { return c; }
+        }
+        i = i + 1;
+    }
+    if (len(pa) < len(pb)) { return -1; }
+    if (len(pa) > len(pb)) { return 1; }
+    return 0;
+}
+
+// prerelease 约束规则：version 有 prerelease 而 bound 无，且同 [major,minor,patch] → 不满足
+kimo main_pre_ok(version: string, bound: string) -> int {
+    main_ver_decode(version);
+    let vpre = main_v_pre; let vma = main_v_major; let vmi = main_v_minor; let vpa = main_v_patch;
+    main_ver_decode(bound);
+    let bpre = main_v_pre;
+    if (len(vpre) > 0 && len(bpre) == 0) {
+        if (vma == main_v_major && vmi == main_v_minor && vpa == main_v_patch) { return 0; }
+    }
+    return 1;
+}
+// 范围（^/~）的 prerelease 规则：low 为发行版时，同 core 的 prerelease 不允许
+kimo main_pre_ok_range(version: string, low: string) -> int {
+    main_ver_decode(version);
+    let vpre = main_v_pre; let vma = main_v_major; let vmi = main_v_minor; let vpa = main_v_patch;
+    main_ver_decode(low);
+    let lpre = main_v_pre;
+    if (len(vpre) > 0 && len(lpre) == 0) {
+        if (vma == main_v_major && vmi == main_v_minor && vpa == main_v_patch) { return 0; }
+    }
+    return 1;
+}
+
+// 比较算子：0 >=, 1 <=, 2 >, 3 <, 4 ==
+kimo main_cmp_op(version: string, bound: string, op: int) -> int {
+    let cv = main_ver_cmp(version, bound);
+    if (op == 0) { if (cv >= 0) { return main_pre_ok(version, bound); } return 0; }
+    if (op == 1) { if (cv <= 0) { return main_pre_ok(version, bound); } return 0; }
+    if (op == 2) { if (cv > 0) { return main_pre_ok(version, bound); } return 0; }
+    if (op == 3) { if (cv < 0) { return main_pre_ok(version, bound); } return 0; }
+    if (cv == 0) { return 1; }
+    return 0;
+}
+
+// ^X.Y.Z：>=X.Y.Z 且 <(X+1).0.0（X=0 时降维到次/修订号）
+kimo main_ver_caret(a: string, version: string) -> int {
+    let bound = str_trim(substr2(a, 1, len(a)));
+    main_ver_decode(bound);
+    let x = main_v_major; let y = main_v_minor; let z = main_v_patch;
+    let low = bound;
+    let up = "";
+    if (x > 0) { up = int_to_str(x + 1) + ".0.0"; }
+    else if (y > 0) { up = "0." + int_to_str(y + 1) + ".0"; }
+    else { up = "0.0." + int_to_str(z + 1); }
+    if (main_ver_cmp(version, low) < 0) { return 0; }
+    if (main_ver_cmp(version, up) >= 0) { return 0; }
+    return main_pre_ok_range(version, low);
+}
+// ~X.Y.Z：>=X.Y.Z 且 <X.(Y+1).0
+kimo main_ver_tilde(a: string, version: string) -> int {
+    let bound = str_trim(substr2(a, 1, len(a)));
+    main_ver_decode(bound);
+    let x = main_v_major; let y = main_v_minor;
+    let low = bound;
+    let up = int_to_str(x) + "." + int_to_str(y + 1) + ".0";
+    if (main_ver_cmp(version, low) < 0) { return 0; }
+    if (main_ver_cmp(version, up) >= 0) { return 0; }
+    return main_pre_ok_range(version, low);
+}
+
+// 单约束原子：^ ~ >= <= > < = 或裸版本（精确）；"," 为 AND，"||" 为 OR
+kimo main_ver_atom_match(atom: string, version: string) -> int {
+    let a = str_trim(atom);
+    if (len(a) == 0) { return 1; }
+    if (str_eq(a, "*") == 1) { return 1; }
+    if (str_starts_with(a, "^") == 1) { return main_ver_caret(a, version); }
+    if (str_starts_with(a, "~") == 1) { return main_ver_tilde(a, version); }
+    if (str_starts_with(a, ">=") == 1) { return main_cmp_op(version, str_trim(substr2(a, 2, len(a))), 0); }
+    if (str_starts_with(a, "<=") == 1) { return main_cmp_op(version, str_trim(substr2(a, 2, len(a))), 1); }
+    if (str_starts_with(a, ">") == 1) { return main_cmp_op(version, str_trim(substr2(a, 1, len(a))), 2); }
+    if (str_starts_with(a, "<") == 1) { return main_cmp_op(version, str_trim(substr2(a, 1, len(a))), 3); }
+    if (str_starts_with(a, "=") == 1) { return main_cmp_op(version, str_trim(substr2(a, 1, len(a))), 4); }
+    return main_cmp_op(version, a, 4);
+}
+kimo main_ver_alt_match(alt: string, version: string) -> int {
+    let atoms = str_split(alt, ",");
+    let i = 0;
+    while (i < len(atoms)) {
+        if (main_ver_atom_match(atoms[i] as string, version) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+// 版本约束是否满足（完整 semver）：""/* 任意；"||" 取或；"," 取与；^ ~ >= 等
 kimo main_ver_match(constraint: string, version: string) -> int {
     let c = str_trim(constraint);
     if (len(c) == 0) { return 1; }
     if (str_eq(c, "*") == 1) { return 1; }
-    if (str_eq(c, version) == 1) { return 1; }
+    let alts = str_split(c, "||");
+    let ai = 0;
+    while (ai < len(alts)) {
+        if (main_ver_alt_match(alts[ai] as string, version) == 1) { return 1; }
+        ai = ai + 1;
+    }
+    return 0;
+}
+
+// 数组线性查找（按名字）
+kimo main_arr_idx(arr: array<string>, s: string) -> int {
+    let i = 0;
+    while (i < len(arr)) {
+        if (str_eq(arr[i] as string, s) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+// 向「当前解析目标」(target) 的依赖表追加/合并一条 dep（按名字去重）
+kimo main_sbg_append(name: string, path: string, ver: string) -> void {
+    if (main_parse_target == 1) {
+        let idx = main_arr_idx(main_scratch_names, name);
+        if (idx >= 0) {
+            if (len(path) > 0) { main_scratch_paths[idx] = path; }
+            if (len(ver) > 0) { main_scratch_versions[idx] = ver; }
+            return;
+        }
+        main_scratch_names = array_push(main_scratch_names, name);
+        main_scratch_paths = array_push(main_scratch_paths, path);
+        main_scratch_versions = array_push(main_scratch_versions, ver);
+    } else {
+        let idx = main_arr_idx(main_sbg_deps_names, name);
+        if (idx >= 0) {
+            if (len(path) > 0) { main_sbg_deps_paths[idx] = path; }
+            if (len(ver) > 0) { main_sbg_deps_versions[idx] = ver; }
+            return;
+        }
+        main_sbg_deps_names = array_push(main_sbg_deps_names, name);
+        main_sbg_deps_paths = array_push(main_sbg_deps_paths, path);
+        main_sbg_deps_versions = array_push(main_sbg_deps_versions, ver);
+    }
+}
+
+// 注册表索引
+kimo main_reg_index(name: string) -> int {
+    return main_arr_idx(main_dep_reg_names, name);
+}
+// 从主包直接依赖表（main_sbg_deps_*）播种注册表
+kimo main_reg_seed_from_globals(base: string) -> void {
+    let i = 0;
+    while (i < len(main_sbg_deps_names)) {
+        let nm = main_sbg_deps_names[i] as string;
+        if (main_reg_index(nm) < 0) {
+            main_dep_reg_names = array_push(main_dep_reg_names, nm);
+            main_dep_reg_paths = array_push(main_dep_reg_paths, main_sbg_deps_paths[i] as string);
+            main_dep_reg_versions = array_push(main_dep_reg_versions, main_sbg_deps_versions[i] as string);
+            main_dep_reg_bases = array_push(main_dep_reg_bases, base);
+            main_dep_reg_expanded = array_push(main_dep_reg_expanded, 0);
+        }
+        i = i + 1;
+    }
+}
+// 从临时解析缓冲（scratch）播种注册表
+kimo main_reg_seed_from_scratch(base: string) -> void {
+    let i = 0;
+    while (i < len(main_scratch_names)) {
+        let nm = main_scratch_names[i] as string;
+        if (main_reg_index(nm) < 0) {
+            main_dep_reg_names = array_push(main_dep_reg_names, nm);
+            main_dep_reg_paths = array_push(main_dep_reg_paths, main_scratch_paths[i] as string);
+            main_dep_reg_versions = array_push(main_dep_reg_versions, main_scratch_versions[i] as string);
+            main_dep_reg_bases = array_push(main_dep_reg_bases, base);
+            main_dep_reg_expanded = array_push(main_dep_reg_expanded, 0);
+        }
+        i = i + 1;
+    }
+}
+// 依赖路径 → 绝对包目录（.spk 走缓存解包，目录走 base 拼接，裸包名回退已安装缓存）
+kimo main_resolve_dep_dir(path: string, base: string, ver: string, name: string) -> string {
+    let dl = len(path);
+    if (dl > 4) {
+        let dext = substr2(path, dl - 4, dl);
+        if (str_eq(dext, ".spk") == 1) {
+            return main_spk_ensure(base, name, path, ver);
+        }
+    }
+    // 本地目录优先：path 相对 base 存在即当作本地包（目录可读）
+    let local = main_path_join(base, main_bslash(path));
+    if (len(file_list_dir(local)) > 0) { return local; }
+    // 裸包名依赖回退到已安装缓存 $SHADOW_HOME/pkg/mod/<name>@<满足约束的最高版本>：
+    // 让 `pkg install` 装进缓存的远程包在编译期真正可被解析，避免"装好却用不上"的半成品。
+    let cached = main_mod_cache_dir(name, ver);
+    if (len(cached) > 0) { return cached; }
+    return local;  // 仍未命中：保留本地路径，便于报错信息指向项目内预期位置
+}
+// 在 $SHADOW_HOME/pkg/mod 中按 <name>@<version> 查找已安装且满足约束的最高版本包目录。
+// 命中（目录含 shadow.sbg）返回该目录绝对路径；否则返回 ""。
+kimo main_mod_cache_dir(name: string, ver_constraint: string) -> string {
+    let home = main_shadow_home();
+    if (len(home) == 0) {
+        home = env_get("USERPROFILE");
+        if (len(home) == 0) { return ""; }
+        home = home + "\\.shadow";
+    }
+    home = main_bslash(home);
+    let cache_root = home + "\\pkg\\mod";
+    let entries = file_list_dir(cache_root);
+    if (len(entries) == 0) { return ""; }
+    let names = str_split(entries, ";");
+    let best_dir = "";
+    let best_ver = "";
+    let i = 0;
+    while (i < len(names)) {
+        let e = names[i] as string;
+        let el = len(e);
+        let at = str_index_of(e, "@");
+        if (at < 0) { i = i + 1; continue; }
+        let ename = substr2(e, 0, at);
+        if (str_eq(ename, name) == 0) { i = i + 1; continue; }
+        let ever = substr2(e, at + 1, el);
+        if (main_ver_match(ver_constraint, ever) == 0) { i = i + 1; continue; }
+        let dir = cache_root + "\\" + e;
+        if (file_exists(dir + "\\shadow.sbg") == 0) { i = i + 1; continue; }
+        if (len(best_ver) == 0 || main_ver_cmp(ever, best_ver) > 0) {
+            best_ver = ever;
+            best_dir = dir;
+        }
+        i = i + 1;
+    }
+    return best_dir;
+}
+// 重置全局依赖注册表
+kimo main_dep_reg_reset() -> void {
+    main_dep_reg_names = [];
+    main_dep_reg_paths = [];
+    main_dep_reg_versions = [];
+    main_dep_reg_bases = [];
+    main_dep_reg_expanded = [];
+}
+// 展开依赖注册表（传递闭包）：反复解析每个未展开包的 [deps]，直到稳定
+kimo main_expand_all() -> void {
+    let guard = 0;
+    let remaining = 1;
+    while (remaining == 1 && guard < 8192) {
+        guard = guard + 1;
+        remaining = 0;
+        let i = 0;
+        while (i < len(main_dep_reg_names)) {
+            if (main_dep_reg_expanded[i] == 0) {
+                let nm = main_dep_reg_names[i] as string;
+                let pth = main_dep_reg_paths[i] as string;
+                let bse = main_dep_reg_bases[i] as string;
+                let vr = main_dep_reg_versions[i] as string;
+                let pkg_dir = main_resolve_dep_dir(pth, bse, vr, nm);
+                if (len(pkg_dir) > 0) {
+                    let sbg = main_read_or_empty(main_path_join(pkg_dir, "shadow.sbg"));
+                    if (len(sbg) > 0) {
+                        main_parse_sbg(sbg, 1);
+                        main_reg_seed_from_scratch(pkg_dir);
+                    }
+                }
+                main_dep_reg_expanded[i] = 1;
+                remaining = 1;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// SHADOW_HOME（缓存/下载根）
+kimo main_shadow_home() -> string {
+    let home = env_get("SHADOW_HOME");
+    if (len(home) == 0) {
+        home = env_get("USERPROFILE");
+        if (len(home) == 0) { return ""; }
+        home = home + "\\" + ".shadow";
+    }
+    return main_bslash(home);
+}
+
+// shadow pkg list：列出当前项目已解析的依赖树（或已安装缓存）
+kimo main_pkg_list() -> int {
+    let dir = ".";
+    let sbg = main_read_or_empty(main_path_join(dir, "shadow.sbg"));
+    if (len(sbg) > 0) {
+        main_dep_reg_reset();
+        main_parse_sbg(sbg, 0);
+        main_reg_seed_from_globals(dir);
+        main_expand_all();
+        println("# resolved dependencies for " + dir + "/shadow.sbg");
+        let i = 0;
+        while (i < len(main_dep_reg_names)) {
+            let nm = main_dep_reg_names[i] as string;
+            let pth = main_dep_reg_paths[i] as string;
+            let vr = main_dep_reg_versions[i] as string;
+            let bse = main_dep_reg_bases[i] as string;
+            let pkg_dir = main_resolve_dep_dir(pth, bse, vr, nm);
+            let ver = "";
+            if (len(pkg_dir) > 0) {
+                let sb2 = main_read_or_empty(main_path_join(pkg_dir, "shadow.sbg"));
+                ver = main_sbg_version_of(sb2);
+            }
+            println(nm + "  constraint=" + vr + "  resolved=" + pkg_dir + "  version=" + ver);
+            i = i + 1;
+        }
+        return 0;
+    }
+    let home = main_shadow_home();
+    if (len(home) == 0) { println("(no shadow.sbg and SHADOW_HOME unset)"); return 0; }
+    let moddir = home + "\\pkg\\mod";
+    let entries = file_list_dir(moddir);
+    if (len(entries) == 0) { println("(no installed packages in " + moddir + ")"); return 0; }
+    println("# installed packages (" + moddir + ")");
+    let names = str_split(entries, ";");
+    let j = 0;
+    while (j < len(names)) {
+        let nm = names[j] as string;
+        if (len(nm) > 0) { println(nm); }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// 从 $SHADOW_REGISTRY 下载并解包一个包到缓存
+kimo main_pkg_install(name: string, ver: string) -> int {
+    let reg = env_get("SHADOW_REGISTRY");
+    if (len(reg) == 0) {
+        main_eprint("pkg install: SHADOW_REGISTRY not set (registry download base URL, e.g. https://example.com/mod)\n");
+        return 1;
+    }
+    if (len(ver) == 0) {
+        main_eprint("pkg install: version required for '" + name + "' (use e.g. shadow pkg install " + name + "@1.2.3)\n");
+        return 1;
+    }
+    let url = reg + "/" + name + "/@v/" + ver + ".spk";
+    let home = main_shadow_home();
+    if (len(home) == 0) { main_eprint("pkg install: cannot determine SHADOW_HOME\n"); return 1; }
+    dir_create(home + "\\pkg");
+    dir_create(home + "\\pkg\\_dl");
+    let tmp = home + "\\pkg\\_dl\\" + name + "_" + ver + ".spk";
+    let dl = "curl.exe -sL \"" + url + "\" -o \"" + tmp + "\"";
+    let out = rt_sys_exec(dl);
+    if (file_exists(tmp) == 0) {
+        main_eprint("pkg install: download failed: " + url + "\n" + out + "\n");
+        return 1;
+    }
+    let cache_dir = home + "\\pkg\\mod\\" + name + "@" + ver;
+    dir_create(cache_dir);
+    let ok = zip_unpack(tmp, cache_dir);
+    if (ok != 0) { main_eprint("pkg install: unpack failed: " + cache_dir + "\n"); return 1; }
+    rt_delete_file(tmp);
+    println("installed " + name + "@" + ver + " -> " + cache_dir);
+    return 0;
+}
+
+// shadow pkg install [name@version]：安装指定包，或安装当前项目全部依赖
+kimo main_pkg_install_cmd(arg: string) -> int {
+    if (len(arg) > 0) {
+        let at = str_index_of(arg, "@");
+        let name = arg; let ver = "";
+        if (at >= 0) { name = substr2(arg, 0, at); ver = substr2(arg, at + 1, len(arg)); }
+        return main_pkg_install(name, ver);
+    }
+    let dir = ".";
+    let sbg = main_read_or_empty(main_path_join(dir, "shadow.sbg"));
+    if (len(sbg) == 0) { main_eprint("pkg install: no shadow.sbg in " + dir + "\n"); return 1; }
+    main_dep_reg_reset();
+    main_parse_sbg(sbg, 0);
+    main_reg_seed_from_globals(dir);
+    main_expand_all();
+    let i = 0;
+    while (i < len(main_dep_reg_names)) {
+        let nm = main_dep_reg_names[i] as string;
+        let pth = main_dep_reg_paths[i] as string;
+        let bse = main_dep_reg_bases[i] as string;
+        let vr = main_dep_reg_versions[i] as string;
+        // 统一用 main_resolve_dep_dir 判定本地可解析（目录 / 本地 .spk 均返回非空），
+        // 与 main_pkg_list 行为一致，避免 file_exists 对 ./ ../ 前缀路径的脆弱误判。
+        let dl = len(pth);
+        let is_spk = 0;
+        if (dl > 4 && str_eq(substr2(pth, dl - 4, dl), ".spk") == 1) { is_spk = 1; }
+        let is_local = 0;
+        if (is_spk == 1) {
+            // 本地 .spk：检查该文件存在即可（解包延迟到真正安装时）
+            if (file_exists(main_path_join(bse, main_bslash(pth))) == 1) { is_local = 1; }
+        } else {
+            // 普通目录依赖：用 main_resolve_dep_dir 解析并确认目录存在。
+            // 注意：内置 file_exists 走 fopen("r")，对 Windows 目录返回 0，
+            // 故必须用 file_list_dir 判定目录存在（非空即目录可读），否则本地依赖会被误判为远程。
+            let local_dir = main_resolve_dep_dir(pth, bse, vr, nm);
+            if (len(local_dir) > 0 && len(file_list_dir(local_dir)) > 0) { is_local = 1; }
+        }
+        if (is_local == 1) {
+            if (is_spk == 1) {
+                let cd = main_spk_ensure(bse, nm, pth, vr);
+                if (len(cd) > 0) { println("installed (local spk) " + nm + " -> " + cd); }
+                else { println("FAILED local spk " + nm); }
+            } else {
+                println("present (local) " + nm + " = " + pth);
+            }
+        } else {
+            let rc = main_pkg_install(nm, vr);
+            if (rc != 0) { return rc; }
+        }
+        i = i + 1;
+    }
     return 0;
 }
 
@@ -467,8 +969,11 @@ kimo main_spk_ensure(project_root: string, module: string, dep_path: string, ver
     // dep_path 相对 project_root；转绝对
     let spk_full = main_path_join(project_root, main_bslash(dep_path));
     if (file_exists(spk_full) == 0) { return ""; }
-    // 临时解包目录
-    let tmp_dir = cache_root + "\\" + module + "@_tmp";
+    // 临时解包目录：用 spk 内容 hash 作唯一后缀，避免并行（-j 8）下多用例解包
+    // 同一 module 的【不同版本】spk 时互相覆盖 tmp_dir → 读到错误 version → 约束误判。
+    // 不同版本 = 不同内容 = 不同 hash = 不同 tmp 目录，天然隔离。
+    let h0 = content_hash(spk_full);
+    let tmp_dir = cache_root + "\\" + module + "@" + h0;
     zip_unpack(spk_full, tmp_dir);
     // 读 version
     let sbg_src = main_read_or_empty(tmp_dir + "\\shadow.sbg");
@@ -483,7 +988,7 @@ kimo main_spk_ensure(project_root: string, module: string, dep_path: string, ver
     // （发布方改了代码但没升 version → 消费方永远编译旧源码）。
     // 用 spk 文件内容 hash 做戳，不一致则重新解包覆盖。
     let stamp = final_dir + "\\.spk_hash";
-    let h = content_hash(spk_full);
+    let h = h0;   // 复用上方 spk 内容 hash（同一 spk，内容戳与 tmp 后缀一致）
     if (file_exists(final_dir + "\\shadow.sbg") == 1) {
         if (str_eq(str_trim(main_read_or_empty(stamp)), h) == 1) {
             // P0-2：native 收集是编译期状态、不随缓存持久化，缓存命中也必须重新收集
@@ -514,7 +1019,7 @@ kimo main_lock_write(project_root: string) -> void {
 }
 
 // 目录=包：dir_key（相对主目录）下全部 .shadow 追加到 main_resolved（插入排序，确定性）
-kimo main_collect_dir(dir_key: string, project_root: string) -> int {
+kimo main_collect_dir(dir_key: string, project_root: string, child_root: string) -> int {
     let full = main_path_join(project_root, dir_key);
     let entries = file_list_dir(full);
     if (len(entries) == 0) { return 0; }
@@ -531,7 +1036,7 @@ kimo main_collect_dir(dir_key: string, project_root: string) -> int {
                 let mkey = nm;
                 if (len(dir_key) > 0) { mkey = dir_key + "\\" + nm; }
                 main_resolved = array_push(main_resolved, mkey);
-                main_resolved_roots = array_push(main_resolved_roots, project_root);
+                main_resolved_roots = array_push(main_resolved_roots, child_root);
             }
         }
         i = i + 1;
@@ -593,11 +1098,11 @@ kimo main_resolve_in_base(base: string, key_prefix: string, rest: string, projec
         let dkey = "";
         if (len(key_prefix) > 0) { dkey = key_prefix + "\\"; }
         dkey = dkey + rel;
-        hit = main_collect_dir(dkey, project_root);
+        hit = main_collect_dir(dkey, project_root, project_root);
         return hit;
     }
     // rest 空：base 自身作为包目录（目录=包）
-    hit = main_collect_dir(key_prefix, project_root);
+    hit = main_collect_dir(key_prefix, project_root, project_root);
     return hit;
 }
 
@@ -618,7 +1123,34 @@ kimo main_resolve_import(import_path: string, project_root: string) -> int {
         i = i + 1;
     }
     let hit = 0;
-    // ① 主模块自身：首段匹配主目录下的一级目录/文件
+    // ① 依赖注册表（传递闭包）：module 命中任一已加载包的 [deps] → 按声明包目录解析
+    let ridx = main_reg_index(module);
+    if (ridx >= 0) {
+        let dep_path = main_dep_reg_paths[ridx] as string;
+        let dep_base = main_dep_reg_bases[ridx] as string;
+        let dep_ver = main_dep_reg_versions[ridx] as string;
+        let pkg_dir = main_resolve_dep_dir(dep_path, dep_base, dep_ver, module);
+        if (len(pkg_dir) == 0) {
+            main_import_err = "module not found: \"" + module + "\" (dependency path \"" + dep_path + "\" from " + dep_base + " unresolvable)";
+            return 0;
+        }
+        if (len(rest) == 0) {
+            hit = main_collect_dir("", pkg_dir, pkg_dir);
+        } else {
+            let pre_n = len(main_resolved);
+            hit = main_resolve_in_base(pkg_dir, "", rest, pkg_dir);
+            let k = pre_n;
+            while (k < len(main_resolved)) {
+                main_resolved_ns = array_push(main_resolved_ns, module + "." + rest);
+                k = k + 1;
+            }
+        }
+        if (hit == 0) {
+            main_import_err = "module \"" + module + "\" resolved to " + pkg_dir + " but subpath \"" + rest + "\" not found";
+        }
+        return hit;
+    }
+    // ② 主模块自身：首段匹配主目录下的一级目录/文件
     let base = main_path_join(project_root, module);
     if (len(rest) == 0) {
         // 单段 import a：先试 a.shadow 文件，再试 a/ 目录（目录=包）
@@ -628,62 +1160,12 @@ kimo main_resolve_import(import_path: string, project_root: string) -> int {
             main_resolved_roots = array_push(main_resolved_roots, project_root);
             hit = 1;
         } else {
-            hit = main_collect_dir(module, project_root);
+            hit = main_collect_dir(module, project_root, project_root);
         }
     } else {
         hit = main_resolve_in_base(base, module, rest, project_root);
     }
-    // ② deps（主模块未命中）
-    if (hit == 0) {
-        let dep = main_dep_path_of(module);
-        if (len(dep) > 0) {
-            let is_spk = 0;
-            let dln = len(dep);
-            if (dln > 4) {
-                let dext = substr2(dep, dln - 4, dln);
-                if (str_eq(dext, ".spk") == 1) { is_spk = 1; }
-            }
-            if (is_spk == 1) {
-                // SPK 依赖（§3.8.4）：解包到全局版本化缓存，从缓存目录解析
-                let ver_constraint = main_dep_version_of(module);
-                let cache_dir = main_spk_ensure(project_root, module, dep, ver_constraint);
-                if (len(cache_dir) > 0) {
-                    if (len(rest) == 0) {
-                        // cache_dir 既是 project_root 也是包目录本身 → dir_key 必须为空，
-                        // 否则 full = cache_dir + "\" + cache_dir（路径双拼接，必然读不到）
-                        hit = main_collect_dir("", cache_dir);
-                    } else {
-                        // 0.5 严格态：文件读取用相对 cache_dir 的 key，命名空间覆盖为 import 路径
-                        let pre_n = len(main_resolved);
-                        hit = main_resolve_in_base(cache_dir, "", rest, cache_dir);
-                        let k = pre_n;
-                        while (k < len(main_resolved)) {
-                            main_resolved_ns = array_push(main_resolved_ns, module + "." + rest);
-                            k = k + 1;
-                        }
-                    }
-                } else {
-                    main_import_err = "SPK dependency unavailable: \"" + module + "\" (path " + dep + ")";
-                }
-            } else {
-                let dep_key = main_bslash(dep);
-                let base2 = main_path_join(project_root, dep_key);
-                // 0.5 严格态 dep：文件读取用相对 dep 路径的 key（读文件正确），
-                // 命名空间覆盖为 import 路径（mylib._helper）→ 与 import 记录一致（可见性）。
-                if (len(rest) == 0) {
-                    hit = main_collect_dir(dep_key, project_root);
-                } else {
-                    let pre_n = len(main_resolved);
-                    hit = main_resolve_in_base(base2, "", rest, base2);
-                    let k = pre_n;
-                    while (k < len(main_resolved)) {
-                        main_resolved_ns = array_push(main_resolved_ns, module + "." + rest);
-                        k = k + 1;
-                    }
-                }
-            }
-        }
-    }
+    // ② 依赖注册表已在函数开头（①）统一处理；此处不再重复解析主模块 [deps]
     // ②.5 内置标准库回退（0.3 main_std_dir 的等价物）：
     //     `import std.iter` 这类编译器自带模块不属于用户项目，也不在 [deps] 里，
     //     必须从编译器自身的 src/ 目录解析，否则任何用户项目都用不了 std.*。
@@ -691,7 +1173,7 @@ kimo main_resolve_import(import_path: string, project_root: string) -> int {
         if (len(main_std_root) > 0) {
             let sbase = main_path_join(main_std_root, module);
             if (len(rest) == 0) {
-                hit = main_collect_dir(module, main_std_root);
+                hit = main_collect_dir(module, main_std_root, main_std_root);
             } else {
                 hit = main_resolve_in_base(sbase, module, rest, main_std_root);
             }
@@ -926,6 +1408,7 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
     main_import_err = "";
     main_compiled = [];
     main_path_stack = [];
+    main_dep_reg_reset();
     // §3.8 兼容态命名空间：重置模块行范围
     tc_mod_ns = [];
     tc_mod_starts = [];
@@ -989,8 +1472,10 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
             stry = stry + 1;
         }
     }
-    // 1. shadow.sbg（主模块清单 + [deps]）
+    // 1. shadow.sbg（主模块清单 + [deps]）→ 注入全局依赖注册表
     main_load_sbg(dir);
+    // 1.5 展开依赖注册表（传递闭包：主包 + 所有被依赖包的 [deps]）
+    main_expand_all();
     // 2. 主文件（保留 dsb，递归 import 用 §3.8.3 模块解析）
     main_collect_module(dir, main_bslash(file_rel), 1, "");
     if (len(main_import_err) > 0) {
@@ -1775,7 +2260,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     while (ni < len(main_native_sources)) {
         let nsrc = main_native_sources[ni] as string;
         let nobj = obj_path + "_native_" + int_to_str(ni) + ".o";
-        let ncmd = clang + " -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS 2>&1";
+        let ncmd = clang + " -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
         let nrc = rt_sys_exec(ncmd);
         if (file_exists(nobj) == 0) {
             main_eprint("link failed: native compile failed: " + nsrc + "\n");
@@ -1807,7 +2292,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         cmd2 = cmd2 + " -l" + (main_native_links[lki] as string);
         lki = lki + 1;
     }
-    cmd2 = cmd2 + " -o \"" + exe_path + "\" -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\" 2>&1";
+    cmd2 = cmd2 + " -o \"" + exe_path + "\" -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\"";
     let r2 = rt_sys_exec(cmd2);
     // native .o 是中间产物，链接结束即可清理（成功/失败都清）
     let ci2 = 0;
@@ -1829,6 +2314,7 @@ kimo main() -> int {
     if (n_args < 2) {
         main_eprint("usage: shadow <file.shadow> [-o out.ll | --run] [--strict]\n");
         main_eprint("       shadow pack <dir> <out.spk> | unpack <spk> <out_dir> | list <spk> | -init <dir>\n");
+        main_eprint("       shadow pkg list | shadow pkg install [name@version]   (registry: $SHADOW_REGISTRY)\n");
         main_eprint("       shadow --lsp | --check <f> | --ranges <f> | --diag-json <f> | --at <f> <l> <c> | --type-at <f> <l> <c>\n");
         return 1;
     }
@@ -1891,6 +2377,22 @@ kimo main() -> int {
             main_eprint("shadow.sbg already exists: " + sbg_path + "\n");
             return 1;
         }
+        /* -init <dir>：目录不存在时逐层创建（dir_create 仅建单层、父目录缺失静默失败，
+           故按分隔符拆段逐层 mkdir；不改变 dir 原值，name 派生逻辑照旧） */
+        if (file_exists(dir) == 0) {
+            let nd = str_replace(dir, "/", "\\");
+            let segs = str_split(nd, "\\");
+            let acc = "";
+            let i2 = 0;
+            while (i2 < len(segs)) {
+                let seg = segs[i2] as string;
+                if (len(seg) > 0) {
+                    if (len(acc) == 0) { acc = seg; } else { acc = acc + "\\" + seg; }
+                    dir_create(acc);
+                }
+                i2 = i2 + 1;
+            }
+        }
         let name = "myapp";
         let i0 = len(dir) - 1;
         while (i0 >= 0) {
@@ -1907,6 +2409,22 @@ kimo main() -> int {
         if (wrc == 0) { main_eprint("cannot write: " + sbg_path + "\n"); return 1; }
         println("initialized " + sbg_path);
         return 0;
+    }
+    // ---- Phase 12b：包管理 CLI ----
+    if (str_eq(arg1, "pkg") == 1) {
+        if (n_args < 3) {
+            main_eprint("usage: shadow pkg list | shadow pkg install [name@version]\n");
+            return 1;
+        }
+        let sub = args[2] as string;
+        if (str_eq(sub, "list") == 1) { return main_pkg_list(); }
+        if (str_eq(sub, "install") == 1) {
+            let parg = "";
+            if (n_args >= 4) { parg = args[3] as string; }
+            return main_pkg_install_cmd(parg);
+        }
+        main_eprint("unknown pkg subcommand: " + sub + "\n");
+        return 1;
     }
     // --strict：唯一严格态触发方式（Phase 15）；dsb 行恢复纯 `dsb <name>;` 语义，不再承载 strict 关键字
     // （统一扫描已在查询分派前执行，此处保留向后兼容）

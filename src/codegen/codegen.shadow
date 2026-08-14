@@ -1729,9 +1729,18 @@ pub kimo cg_gen_spawn(mi: MirInst) -> void {
                 buf_push(thunk_args[ci]);
                 ci = ci + 1;
             }
-            let result_val = llvm_call(cg_builder, target_fn_ty, target_fn, n_args, "thunk_result");
-            let ret_as_ptr = cg_cast_val(result_val, ret_kind2, TYPE_ANY);
-            llvm_ret(cg_builder, ret_as_ptr);
+            // 目标返回 void 时：调用不能带名字（LLVM 规则：void 指令不可命名），
+            // thunk 自身仍须返回 i8*（签名固定）→ 返回 null 指针。
+            let call_name = "thunk_result";
+            if (ret_kind2 == TYPE_VOID || ret_kind2 == TYPE_UNIT) { call_name = ""; }
+            let result_val = llvm_call(cg_builder, target_fn_ty, target_fn, n_args, call_name);
+            if (ret_kind2 == TYPE_VOID || ret_kind2 == TYPE_UNIT) {
+                let void_ret = llvm_const_null(llvm_ptr_ty(llvm_i8(cg_ctx), 0));
+                llvm_ret(cg_builder, void_ret);
+            } else {
+                let ret_as_ptr = cg_cast_val(result_val, ret_kind2, TYPE_ANY);
+                llvm_ret(cg_builder, ret_as_ptr);
+            }
             cg_func = saved_func;
             llvm_pos_builder_end(cg_builder, saved_bb);
         }
@@ -2376,7 +2385,10 @@ pub kimo cg_emit_globals(globals: array<GlobalVar>) -> void {
         let gv = globals[i];
         let name = gv.name;
         let kind = TYPE_INT;
-        if ((gv.type_ref as any) != 0) {
+        // 无注解全局：parser 给 type_ref = type_none_inner()（kind=TYPE_INFER 的非空对象）。
+        // 必须排除 TYPE_INFER 再走 type_ref.kind，否则未注解全局一律被当 TYPE_INFER → 加载成 any →
+        // println(g) 打印 <ptr> / 拼接垃圾（2026-08-13 实测 ex_global_infer）。
+        if ((gv.type_ref as any) != 0 && gv.type_ref.kind != TYPE_INFER) {
             kind = gv.type_ref.kind;
         } else if (expr_is_none(gv.init) == 0) {
             let ie0 = gv.init;

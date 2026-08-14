@@ -49,3 +49,23 @@ pkg/*.exe.old
 # 载荷构建产物（stage_llvm.sh 收集的 LLVM 工具链 380MB + bin 二进制，不入库）
 pkg/shadow/bin/
 pkg/shadow/llvm/
+
+# Python 工具/打包脚本：0.5 源码保持 Shadow-only，.py 不入库。
+# 当前仓库内并无这些 .py 的对应 .shadow 移植版，故统一 git rm --cached 移出跟踪、本地保留，
+# 供打包（pkg/installer.py GUI）与 LSP/重构开发使用，但不进 0.5 源码 git。
+# build/ 下探针已被 build/* 覆盖，无需单列。
+tools/check_sig_extract.py
+tools/cmp_index.py
+tools/link_rt.py
+tools/lint_multiline_str.py
+tools/verify_fixed_point.py
+tools/verify_index_batch.py
+src/type_checker/_refactor.py
+test/run_tests.py
+test/tools/repack_spk.py
+test/test_lsp.py
+test/test_lsp_features.py
+test/lsp_selfhost_probe.py
+pkg/installer.py
+pkg/shadow/tools/link_rt.py
+pkg/shadow/tools/verify_fixed_point.py
