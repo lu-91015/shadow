@@ -1,8 +1,0 @@
-# std/base64 — Shadow 0.5 标准库包
-# base64 / hex 编解码，[native] C 实现见 native/base64_bind.c
-[package]
-name = "base64"
-version = "0.5.0"
-
-[native]
-sources = ["native/base64_bind.c"]

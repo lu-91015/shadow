@@ -1,9 +1,0 @@
-# std/net — Shadow 0.5 标准库包
-# TCP 网络原语（客户端/服务端），[native] C 实现见 native/net_bind.c（链接 ws2_32）
-[package]
-name = "net"
-version = "0.5.0"
-
-[native]
-sources = ["native/net_bind.c"]
-links = ["ws2_32"]

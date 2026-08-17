@@ -1,4 +1,0 @@
-# shadow.sbg — std/log 标准库
-[package]
-name = "logging"
-version = "0.5.0"
