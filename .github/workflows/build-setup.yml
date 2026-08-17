@@ -1,14 +1,14 @@
 name: build-setup
 
-# 触发：源码/构建链改动 push 自动构建；也可手动触发（workflow_dispatch）
+# 触发：自托管编译器源码/构建链改动 push 自动构建验证；也可手动触发（workflow_dispatch）
+# 说明：本工作流只验证「从冻结种子自举出 shadow 编译器」这一核心链路是否仍然可构建；
+#       Windows 安装器打包（pkg/make_setup.sh 等）为本地操作，打包脚本有意不入库，不在 CI 进行。
 on:
   push:
     paths:
       - 'src/**'
       - 'rt/**'
       - 'bootstrap/**'
-      - 'build_shadow.sh'
-      - 'pkg/**'
       - 'tools/**'
       - '.github/workflows/build-setup.yml'
   workflow_dispatch:
@@ -29,20 +29,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install pyinstaller
-        run: python -m pip install --quiet pyinstaller
-
-      # build_shadow.sh 内部用 python3 调 verify_fixed_point.py；Windows Git Bash 无 python3，
-      # 建一个包装脚本指向 python
-      - name: Ensure python3 alias
-        run: |
-          if ! command -v python3 >/dev/null 2>&1; then
-            mkdir -p "$HOME/bin"
-            printf '#!/bin/sh\nexec python "$@"\n' > "$HOME/bin/python3"
-            chmod +x "$HOME/bin/python3"
-            echo "$HOME/bin" >> "$GITHUB_PATH"
-          fi
-          python3 --version
+      # 注入 MSVC + Windows SDK 的 LIB/INCLUDE/PATH（CI 默认 bash 没有 VS 开发者环境）。
+      # LLVM-C 的导入库经 #pragma comment(lib,"winhttp.lib") 间接要求 Windows SDK 的 winhttp.lib，
+      # 自举链接阶段 lld-link 需经 LIB 找到它。
+      - name: Setup MSVC + Windows SDK
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Download LLVM 22.1.0
         run: |
@@ -50,24 +43,23 @@ jobs:
           curl -L --fail -o llvm.tar.xz \
             https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/clang+llvm-22.1.0-x86_64-pc-windows-msvc.tar.xz
           python - <<'EOF'
-          import lzma, tarfile
+          import tarfile
           with tarfile.open('llvm.tar.xz', 'r:xz') as t:
               t.extractall()
           EOF
-          echo "LLVM_HOME=$LLVM_DIR" >> "$GITHUB_ENV"
+          # 供 native 工具链（shadow 驱动 / clang / lld-link）使用：Windows 原生路径
+          LLVM_WIN="$(cygpath -w "$LLVM_DIR")"
+          echo "LLVM_HOME=$LLVM_WIN" >> "$GITHUB_ENV"
+          # 供 bash 侧工具（llc/clang/llvm-objcopy）使用：加入 PATH
+          echo "$LLVM_DIR/bin" >> "$GITHUB_PATH"
           "$LLVM_DIR/bin/llc.exe" --version | head -1
 
-      # 自举链：HOST=build/shadow.exe（种子已入库）→ stage1 → stage2 → stage3 → fixed-point
-      - name: Bootstrap shadow.exe
-        run: bash build_shadow.sh
+      # 自举链：冻结种子 build/shadow.exe（已入库）把 tools/build_shadow.shadow 编成驱动
+      # build/build_shadow.exe，再运行驱动执行 7 阶段自举，部署出 build/shadow.exe + rt/*.o。
+      - name: Bootstrap shadow.exe (self-host)
+        run: bash tools/bootstrap.sh
 
-      # 打包：刷新载荷 → pyinstaller --onefile --windowed
-      - name: Package setup exe
-        run: PYTHON=python bash pkg/make_setup.sh
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: shadow-0.5.0-setup
-          path: pkg/dist/shadow-0.5.0-setup.exe
-          if-no-files-found: error
+      - name: Verify self-hosted compiler
+        run: |
+          build/shadow.exe --version
+          echo "self-host OK"
