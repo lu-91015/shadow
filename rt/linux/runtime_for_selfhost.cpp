@@ -286,9 +286,12 @@ extern "C" int shadow_rename_file(const char* old_path, const char* new_path) {
 
 // List directory contents (semicolon-separated)
 extern "C" const char* shadow_list_dir(const char* path) {
+    // Normalize path separators first so backslash-joined paths produced by
+    // main_path_join (always '\') also work on POSIX opendir().
+    std::string np = shadow_path_to_slashes(path ? std::string(path) : std::string(""));
     std::string result;
 #ifdef _WIN32
-    std::string search_path = std::string(path) + "\\*";
+    std::string search_path = np + "/*";
     WIN32_FIND_DATA fd;
     HANDLE hFind = FindFirstFile(search_path.c_str(), &fd);
     if (hFind != INVALID_HANDLE_VALUE) {
@@ -301,7 +304,7 @@ extern "C" const char* shadow_list_dir(const char* path) {
         FindClose(hFind);
     }
 #else
-    DIR* dir = opendir(path);
+    DIR* dir = opendir(np.c_str());
     if (dir) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != nullptr) {
