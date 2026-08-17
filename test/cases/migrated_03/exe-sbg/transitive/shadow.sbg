@@ -1,7 +1,0 @@
-# shadow.sbg — 传递依赖测试主包
-[package]
-name = "transitive_test"
-version = "0.3.0"
-
-[deps]
-mylib = "./mylib"

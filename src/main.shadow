@@ -123,7 +123,7 @@ let main_g_lu_cache: int = 1;
 // 缓存基目录：默认 "build/lu_cache"，可被环境变量 SHADOW_LU_CACHE_DIR 覆盖。
 // 用途：run_tests.exe 的 -j 并行子进程各自拿到独立目录，互不再写同一份 .lu，
 // 彻底消除多个 shadow.exe 并发写 build/lu_cache 造成的缓存竞态损坏。
-let main_lu_base: string = "build\\lu_cache";
+let main_lu_base: string = "build/lu_cache";
 
 // L3+ 内置标准库根目录（编译器自带 src/），用于 `import std.iter` 等。
 // 0.3 有此回退（main_std_dir），0.4 重写模块解析时遗漏 → `import std.xxx`
@@ -894,7 +894,7 @@ kimo main_pkg_install(name: string, ver: string) -> int {
         main_eprint("pkg install: download failed: " + url + "\n" + out + "\n");
         return 1;
     }
-    let cache_dir = home + "\\pkg\\mod\\" + name + "@" + ver;
+    let cache_dir = home + "/pkg/mod/" + name + "@" + ver;
     dir_create(cache_dir);
     let ok = zip_unpack(tmp, cache_dir);
     if (ok != 0) { main_eprint("pkg install: unpack failed: " + cache_dir + "\n"); return 1; }
@@ -1801,7 +1801,7 @@ kimo main_mod_in_src(idx: int) -> int {
 //   0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
 //   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "\\v10_s1_" + main_hash_src(path);
+    return main_lu_base + "/v10_s1_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
@@ -2238,24 +2238,38 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     if (len(llvm_home) == 0) {
         main_eprint("LLVM_HOME not set: set LLVM_HOME to your LLVM installation (e.g. C:\\llvm\\...)\n");
         return 1;
-    } else {
-        // MSYS/Git Bash 可能把反斜杠路径转成正斜杠（C://llvm//...），
-        // 与下方 \\bin\\ 拼接混用会令 cmd 无法定位。统一转回反斜杠。
-        llvm_home = str_replace(llvm_home, "/", "\\");
     }
+    // 平台探测：LLVM_HOME/bin/llc（Linux，无 .exe 后缀）存在 → Linux；
+    // 否则按 Windows 处理（bin\\llc.exe）。
+    // 也可用环境变量 SHADOW_LLC / SHADOW_CLANG 直接指定 llc / 链接器（覆盖默认探测）。
+    let custom_llc = env_get("SHADOW_LLC");
+    let custom_clang = env_get("SHADOW_CLANG");
+    let is_win = 1;
     let llc = llvm_home + "\\bin\\llc.exe";
     let clang = llvm_home + "\\bin\\clang++.exe";
-    // 产物链接 0.5 自研 rt/ 系统调用层（纯 C，仅系统库），不再依赖 C++ runtime。
-    // 产物 .ll 已内嵌 Shadow runtime（main_load_combined 注入的 runtime_lib.shadow）。
     let rt_dir = self_dir + "\\rt\\";
     let rt_objs = "\"" + rt_dir + "rt_core.o\" \"" + rt_dir + "rt_fs.o\" \"" + rt_dir + "rt_proc.o\" \"" +
                   rt_dir + "rt_time.o\" \"" + rt_dir + "rt_err.o\" \"" + rt_dir + "rt_extra.o\" \"" +
                   rt_dir + "rt_gc.o\" \"" + rt_dir + "rt_thread.o\" \"" + rt_dir + "rt_io.o\"";
     let miniz_obj = self_dir + "\\bootstrap\\miniz.o";
+    let link_tail = " -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\"";
+    if (file_exists(llvm_home + "/bin/llc") == 1 || len(custom_llc) > 0) {
+        is_win = 0;
+        if (len(custom_llc) > 0) { llc = custom_llc; } else { llc = llvm_home + "/bin/llc"; }
+        if (len(custom_clang) > 0) { clang = custom_clang; } else { clang = llvm_home + "/bin/clang++"; }
+        // Linux 用户程序 runtime：跨平台 .o 集合（self_dir/rt/ 下）
+        rt_dir = self_dir + "/rt/";
+        rt_objs = "\"" + rt_dir + "runtime_for_selfhost.o\" \"" + rt_dir + "miniz.o\" \"" +
+                  rt_dir + "sys_exec_cpa.o\" \"" + rt_dir + "rt_proc_spawn.o\" \"" +
+                  rt_dir + "rt_zip.o\" \"" + rt_dir + "shadow_index.o\" \"" +
+                  rt_dir + "shadow_gc_supplement.o\"";
+        miniz_obj = "";
+        link_tail = " -lpthread -ldl";
+    }
     // llc -O0 -filetype=obj <ir> -o <obj>
     // cmd1：程序路径（llc）不带引号——LLVM_HOME 默认无空格；命令以引号开头会触发
     // cmd /c 的引号剥除陷阱（_popen 走 cmd.exe）。文件路径加引号（用户路径可能含空格）。
-    let cmd1 = llc + " -O0 -filetype=obj \"" + ir_path + "\" -o \"" + obj_path + "\"";
+    let cmd1 = "\"" + llc + "\" -O0 -filetype=obj \"" + ir_path + "\" -o \"" + obj_path + "\"";
     let r1 = rt_sys_exec(cmd1);
     if (file_exists(obj_path) == 0) {
         main_eprint("DBG cmd1: " + cmd1 + "\n");
@@ -2269,7 +2283,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     while (ni < len(main_native_sources)) {
         let nsrc = main_native_sources[ni] as string;
         let nobj = obj_path + "_native_" + int_to_str(ni) + ".o";
-        let ncmd = clang + " -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
+        let ncmd = "\"" + clang + "\" -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
         let nrc = rt_sys_exec(ncmd);
         if (file_exists(nobj) == 0) {
             main_eprint("link failed: native compile failed: " + nsrc + "\n");
@@ -2285,7 +2299,8 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         ni = ni + 1;
     }
     // cmd2：clang 不带引号（同 cmd1，避免 cmd /c 引号剥除陷阱）；文件/库路径加引号
-    let cmd2 = clang + " -std=c++17 \"" + obj_path + "\" " + rt_objs + " \"" + miniz_obj + "\"";
+    let cmd2 = "\"" + clang + "\" -std=c++17 \"" + obj_path + "\" " + rt_objs;
+    if (len(miniz_obj) > 0) { cmd2 = cmd2 + " \"" + miniz_obj + "\""; }
     let oi = 0;
     while (oi < len(native_objs)) {
         cmd2 = cmd2 + " \"" + (native_objs[oi] as string) + "\"";
@@ -2301,7 +2316,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         cmd2 = cmd2 + " -l" + (main_native_links[lki] as string);
         lki = lki + 1;
     }
-    cmd2 = cmd2 + " -o \"" + exe_path + "\" -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\"";
+    cmd2 = cmd2 + " -o \"" + exe_path + "\"" + link_tail;
     let r2 = rt_sys_exec(cmd2);
     // native .o 是中间产物，链接结束即可清理（成功/失败都清）
     let ci2 = 0;
@@ -2463,10 +2478,11 @@ kimo main() -> int {
         return 1;
     }
     // 解析参数：找 -o / --run / --exe
+    // 从 i=1 扫描所有参数（含 args[1]），使 `shadow --run file` 与 `shadow file --run` 都生效。
     let out_path = "";
     let do_run = 0;
     let do_exe = 0;
-    let i = 2;
+    let i = 1;
     while (i < n_args) {
         let a = args[i] as string;
         if (str_eq(a, "-o") == 1 && i + 1 < n_args) {

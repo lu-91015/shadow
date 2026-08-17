@@ -1,9 +1,0 @@
-# shadow.sbg — 版本不匹配测试
-# 约束 >=0.4.0，但 ver_pkg.spk 内 version=0.3.5
-# 编译器应拒绝并报错：does not satisfy required '>=0.4.0'
-[package]
-name = "ver_test_fail"
-version = "0.3.0"
-
-[deps]
-ver_pkg = "ver_pkg.spk@>=0.4.0"

@@ -1,7 +1,0 @@
-[package]
-name = "tc_mod_deps"
-version = "0.1.0"
-abi_version = 1
-
-[deps]
-mathlib = "mathlib"

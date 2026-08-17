@@ -1,6 +1,0 @@
-# ver_pkg.spk 内嵌的 shadow.sbg
-# 版本 0.3.0+build.5（带 build metadata）
-# 按约束 =0.3.0 应匹配（build 不参与比较）
-[package]
-name = "ver_pkg"
-version = "0.3.0+build.5"
