@@ -441,7 +441,15 @@ kimo main_collect_native_from_sbg(sbg_src: string, base_dir: string) -> void {
                         main_native_sources = array_push(main_native_sources, full);
                     }
                 } else if (str_eq(key, "links") == 1) {
-                    if (main_str_in(main_native_links, it) == 0) {
+                    // ws2_32 是 Windows-only 库：Linux/POSIX 下 -lws2_32 链接失败，
+                    // 且 POSIX 后端走 libc 不需要它。仅当 OS=Windows_NT 才追加。
+                    if (str_eq(it, "ws2_32") == 1) {
+                        if (str_eq(env_get("OS"), "Windows_NT") == 1) {
+                            if (main_str_in(main_native_links, it) == 0) {
+                                main_native_links = array_push(main_native_links, it);
+                            }
+                        }
+                    } else if (main_str_in(main_native_links, it) == 0) {
                         main_native_links = array_push(main_native_links, it);
                     }
                 } else if (str_eq(key, "link_dirs") == 1) {
@@ -1026,6 +1034,12 @@ kimo main_lock_write(project_root: string) -> void {
 // 目录=包：dir_key（相对主目录）下全部 .shadow 追加到 main_resolved（插入排序，确定性）
 kimo main_collect_dir(dir_key: string, project_root: string, child_root: string) -> int {
     let full = main_path_join(project_root, dir_key);
+    // §标准库/目录型包的 [native] 收集：任何被解析为「目录包」的目录都可能是含
+    // [native] C 实现的包（如 std/net 的 native/net_bind.c）。直接在解析点读
+    // <full>/shadow.sbg 收集，覆盖 std 包 / 项目目录包 / .spk 解包根，不再依赖
+    // main_spk_ensure 的 .spk 专属路径。去重由 main_collect_native_from_sbg 保证。
+    let p_sbg = main_read_or_empty(full + "\\shadow.sbg");
+    if (len(p_sbg) > 0) { main_collect_native_from_sbg(p_sbg, full); }
     let entries = file_list_dir(full);
     if (len(entries) == 0) { return 0; }
     let names = str_split(entries, ";");
@@ -2282,8 +2296,11 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     let ni = 0;
     while (ni < len(main_native_sources)) {
         let nsrc = main_native_sources[ni] as string;
+        // 原生源路径由 main_path_join 拼出反斜杠（如 src/std/net\native/net_bind.c），
+        // 在 Linux 上 clang 无法识别。统一转成正斜杠（Windows 下 clang 同样接受）。
+        let nsrc_fwd = str_replace(nsrc, "\\", "/");
         let nobj = obj_path + "_native_" + int_to_str(ni) + ".o";
-        let ncmd = "\"" + clang + "\" -std=c++20 -O0 -c \"" + nsrc + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
+        let ncmd = "\"" + clang + "\" -std=c++20 -O0 -c \"" + nsrc_fwd + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
         let nrc = rt_sys_exec(ncmd);
         if (file_exists(nobj) == 0) {
             main_eprint("link failed: native compile failed: " + nsrc + "\n");
@@ -2308,7 +2325,8 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     }
     let ldi = 0;
     while (ldi < len(main_native_link_dirs)) {
-        cmd2 = cmd2 + " -L\"" + (main_native_link_dirs[ldi] as string) + "\"";
+        let ldf = str_replace(main_native_link_dirs[ldi] as string, "\\", "/");
+        cmd2 = cmd2 + " -L\"" + ldf + "\"";
         ldi = ldi + 1;
     }
     let lki = 0;
