@@ -42,7 +42,21 @@
  *   ./build/cindex.exe src/lsp/lsp.shadow build/shadow.exe
  * ============================================================ */
 #define _CRT_SECURE_NO_WARNINGS
+#ifdef _WIN32
 #include <windows.h>
+#else
+/* Linux/POSIX：本文件只用到 3 个 Win32 面，逐一有等价物——
+ *   GetFileAttributesA         -> stat()
+ *   FindFirstFileA/NextFileA   -> opendir()/readdir()
+ *   QueryPerformanceCounter    -> clock_gettime(CLOCK_MONOTONIC)
+ * 注意：module key / sx_join 仍沿用 '\\' 分隔符（与 src/main.shadow 的
+ * main_path_join 对齐，保证索引器与编译器的 key 逐字节一致）；落到 syscall
+ * 之前才由 sx_fs() 归一化为 '/'，与 runtime 的 shadow_path_to_slashes 同策略。 */
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+#include <time.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,12 +166,30 @@ static int  g_depth_guard = 0;     /* 递归深度上限，防病态输入 */
 static int  g_inited = 0;
 
 /* ---------------- 基础工具 ---------------- */
+#ifndef _WIN32
+/* POSIX：把 '\\' 归一化为 '/'（结果写入调用方缓冲，无静态状态、线程安全） */
+static const char* sx_fs(const char* p, char* buf, int n) {
+    int i = 0;
+    if (!p) { buf[0] = 0; return buf; }
+    for (; p[i] && i < n - 1; i++) buf[i] = (p[i] == '\\') ? '/' : p[i];
+    buf[i] = 0;
+    return buf;
+}
+#endif
 static int sx_is_file(const char* path) {
+#ifdef _WIN32
     DWORD a;
     if (!path || !path[0]) return 0;
     a = GetFileAttributesA(path);
     if (a == INVALID_FILE_ATTRIBUTES) return 0;
     return (a & FILE_ATTRIBUTE_DIRECTORY) ? 0 : 1;
+#else
+    char nb[1400];
+    struct stat st;
+    if (!path || !path[0]) return 0;
+    if (stat(sx_fs(path, nb, (int)sizeof(nb)), &st) != 0) return 0;
+    return S_ISDIR(st.st_mode) ? 0 : 1;
+#endif
 }
 static char* sx_read_file(const char* path) {
     FILE* f;
@@ -165,7 +197,11 @@ static char* sx_read_file(const char* path) {
     char* buf;
     size_t rd;
     if (!path || !path[0]) return NULL;
+#ifdef _WIN32
     f = fopen(path, "rb");
+#else
+    { char nb[1400]; f = fopen(sx_fs(path, nb, (int)sizeof(nb)), "rb"); }
+#endif
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     sz = ftell(f);
@@ -978,29 +1014,54 @@ static void sx_scan_module(const char* src, const ModCtx* m) {
 /* 目录=包：收集 dir 下全部 .shadow，按 strcmp 升序（复刻 main_collect_dir 插入排序） */
 static int sx_collect_dir(const char* dir_key, const char* project_root,
                           SList* keys, SList* roots) {
-    char full[1024], search[1200];
-    WIN32_FIND_DATAA fd;
-    HANDLE h;
+    char full[1024];
     SList tmp;
     int i, j, found = 0;
 
     sx_join(project_root, dir_key, full, sizeof(full));
     if (!full[0]) return 0;
-    snprintf(search, sizeof(search), "%s\\*", full);
-    h = FindFirstFileA(search, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-
     sl_init(&tmp);
-    do {
-        int nl = (int)strlen(fd.cFileName);
-        if (nl > 7 && strcmp(fd.cFileName + nl - 7, ".shadow") == 0) {
-            char mkey[1024];
-            if (dir_key && dir_key[0]) snprintf(mkey, sizeof(mkey), "%s\\%s", dir_key, fd.cFileName);
-            else snprintf(mkey, sizeof(mkey), "%s", fd.cFileName);
-            if (!sl_push(&tmp, mkey)) { FindClose(h); sl_free(&tmp); return 0; }
+#ifdef _WIN32
+    {
+        char search[1200];
+        WIN32_FIND_DATAA fd;
+        HANDLE h;
+        snprintf(search, sizeof(search), "%s\\*", full);
+        h = FindFirstFileA(search, &fd);
+        if (h == INVALID_HANDLE_VALUE) { sl_free(&tmp); return 0; }
+        do {
+            const char* en = fd.cFileName;
+            int nl = (int)strlen(en);
+            if (nl > 7 && strcmp(en + nl - 7, ".shadow") == 0) {
+                char mkey[1024];
+                if (dir_key && dir_key[0]) snprintf(mkey, sizeof(mkey), "%s\\%s", dir_key, en);
+                else snprintf(mkey, sizeof(mkey), "%s", en);
+                if (!sl_push(&tmp, mkey)) { FindClose(h); sl_free(&tmp); return 0; }
+            }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    {
+        char nb[1400];
+        DIR* d;
+        struct dirent* de;
+        d = opendir(sx_fs(full, nb, (int)sizeof(nb)));
+        if (!d) { sl_free(&tmp); return 0; }
+        while ((de = readdir(d)) != NULL) {
+            const char* en = de->d_name;
+            int nl = (int)strlen(en);
+            if (nl > 7 && strcmp(en + nl - 7, ".shadow") == 0) {
+                char mkey[1024];
+                if (dir_key && dir_key[0]) snprintf(mkey, sizeof(mkey), "%s\\%s", dir_key, en);
+                else snprintf(mkey, sizeof(mkey), "%s", en);
+                if (!sl_push(&tmp, mkey)) { closedir(d); sl_free(&tmp); return 0; }
+            }
         }
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+        closedir(d);
+        /* readdir 顺序不保证，但下方插入排序会统一为 strcmp 升序 → 结果确定 */
+    }
+#endif
 
     if (tmp.n == 0) { sl_free(&tmp); return 0; }
     /* 插入排序（升序），与 main_collect_dir 的 rt_str_cmp 顺序一致 */
@@ -1852,8 +1913,10 @@ const char* shadow_index_hover(const char* src, int line, int col) {
 
 void shadow_index_reset(void) { sx_state_reset(); }
 
-/* 单调毫秒时钟：进程启动以来的毫秒数（QueryPerformanceCounter）。
-   供 LSP DBG 日志打时间戳、诊断防抖窗口判定。返回 int（进程存活期内不会溢出 32 位）。 */
+/* 单调毫秒时钟：进程启动以来的毫秒数（Win32: QueryPerformanceCounter；
+   POSIX: CLOCK_MONOTONIC）。供 LSP DBG 日志打时间戳、诊断防抖窗口判定。
+   返回 int（进程存活期内不会溢出 32 位）。 */
+#ifdef _WIN32
 static LARGE_INTEGER g_clock_freq;
 static LARGE_INTEGER g_clock_base;
 static int g_clock_inited = 0;
@@ -1868,6 +1931,21 @@ int shadow_now_ms(void) {
     LONGLONG ms = (now.QuadPart - g_clock_base.QuadPart) * 1000 / g_clock_freq.QuadPart;
     return (int)ms;
 }
+#else
+static struct timespec g_clock_base;
+static int g_clock_inited = 0;
+int shadow_now_ms(void) {
+    struct timespec now;
+    if (!g_clock_inited) {
+        clock_gettime(CLOCK_MONOTONIC, &g_clock_base);
+        g_clock_inited = 1;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long long ms = (now.tv_sec - g_clock_base.tv_sec) * 1000
+                 + (now.tv_nsec - g_clock_base.tv_nsec) / 1000000;
+    return (int)ms;
+}
+#endif
 
 /* ============ 工作区级精确符号表（真实坐标 JSON，供扩展侧 goto-def/hover） ============
  * 与 sx_scan_module 同源逻辑，但：① 对单文件扫描（Cur.li/col 即真实文件行/列）；
@@ -2124,23 +2202,41 @@ static void sx_scan_file_real(const char* path, const char* rel_key, const char*
 
 /* 递归遍历 root 下所有 .shadow，跳过无关目录；产出工作区级符号表 JSON */
 static void sx_walk(const char* root, const char* dir, Buf* out, int* first) {
+#ifdef _WIN32
     char search[1400];
     WIN32_FIND_DATAA fd; HANDLE h;
     snprintf(search, sizeof(search), "%s\\*", dir);
     h = FindFirstFileA(search, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
-        if (fd.cFileName[0] == '.') continue;   /* 隐藏/临时文件（.shadow_lsp_* 等） */
+        const char* en = fd.cFileName;
+        if (strcmp(en, ".") == 0 || strcmp(en, "..") == 0) continue;
+        if (en[0] == '.') continue;   /* 隐藏/临时文件（.shadow_lsp_* 等） */
         char full[1400];
-        snprintf(full, sizeof(full), "%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        snprintf(full, sizeof(full), "%s\\%s", dir, en);
+        int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+#else
+    char nb[1400];
+    DIR* d = opendir(sx_fs(dir, nb, (int)sizeof(nb)));
+    struct dirent* de;
+    if (!d) return;
+    while ((de = readdir(d)) != NULL) {
+        const char* en = de->d_name;
+        if (strcmp(en, ".") == 0 || strcmp(en, "..") == 0) continue;
+        if (en[0] == '.') continue;   /* 隐藏/临时文件（.shadow_lsp_* 等） */
+        char full[1400];
+        snprintf(full, sizeof(full), "%s\\%s", dir, en);
+        char nb2[1400];
+        struct stat st;
+        int is_dir = (stat(sx_fs(full, nb2, (int)sizeof(nb2)), &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+#endif
+        if (is_dir) {
             /* 外部/构建/工具链目录一律跳过 */
-            if (strcmp(fd.cFileName, "node_modules") == 0 ||
-                strcmp(fd.cFileName, "build") == 0 || strcmp(fd.cFileName, "target") == 0 ||
-                strcmp(fd.cFileName, "dist") == 0 || strcmp(fd.cFileName, "out") == 0 ||
-                strcmp(fd.cFileName, "vendor") == 0 ||
-                strcmp(fd.cFileName, ".workbuddy") == 0 || strcmp(fd.cFileName, ".vscode") == 0) continue;
+            if (strcmp(en, "node_modules") == 0 ||
+                strcmp(en, "build") == 0 || strcmp(en, "target") == 0 ||
+                strcmp(en, "dist") == 0 || strcmp(en, "out") == 0 ||
+                strcmp(en, "vendor") == 0 ||
+                strcmp(en, ".workbuddy") == 0 || strcmp(en, ".vscode") == 0) continue;
             /* 项目边界：含 shadow.sbg 的子目录 = 独立项目（shadow.exe -init 生成），
                递归扫描时跳过，避免把同目录树下的其他项目文件扫进本项目的符号表 */
             {
@@ -2150,8 +2246,8 @@ static void sx_walk(const char* root, const char* dir, Buf* out, int* first) {
             }
             sx_walk(root, full, out, first);
         } else {
-            int nl = (int)strlen(fd.cFileName);
-            if (nl > 7 && strcmp(fd.cFileName + nl - 7, ".shadow") == 0) {
+            int nl = (int)strlen(en);
+            if (nl > 7 && strcmp(en + nl - 7, ".shadow") == 0) {
                 char* src = sx_read_file(full);
                 if (src && src[0]) {
                     const char* rel = full;
@@ -2162,8 +2258,13 @@ static void sx_walk(const char* root, const char* dir, Buf* out, int* first) {
                 }
             }
         }
+#ifdef _WIN32
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+#else
+    }
+    closedir(d);
+#endif
 }
 
 static const char* sx_workspace_json(const char* root) {

@@ -4376,6 +4376,50 @@ extern "C" const char* rt_zip_list_files(const char* archive_path) {
     return dup_str(result);
 }
 
+// ── SPK 包管理符号（shadow 层 @extern 名称）──────────────────────────
+// Linux/POSIX 运行时只用 std::filesystem 实现（rt_zip_*），但 shadow 编译器
+// 通过 shadow_zip_unpack / shadow_zip_pack / shadow_zip_list / shadow_content_hash
+// 这几个名字调用。Windows 版 rt/rt_zip.c 无法在 Linux 编译，故在此补齐薄包装：
+// 先归一化路径分隔符（main.shadow 用 '\' 拼接），再转发到 POSIX 实现。
+// 返回语义必须对齐 Windows 版：成功 0，失败 -1（main_spk_ensure 按 ok != 0 判失败；
+// POSIX rt_zip_extract_to_dir/pack_dir 是「成功 1 失败 0」，故在此翻转）。
+extern "C" int32_t shadow_zip_unpack(const char* spk, const char* out_dir) {
+    std::string a = shadow_path_to_slashes(spk ? std::string(spk) : std::string(""));
+    std::string b = shadow_path_to_slashes(out_dir ? std::string(out_dir) : std::string(""));
+    int32_t rc = rt_zip_extract_to_dir(a.c_str(), b.c_str());
+    return rc == 1 ? 0 : -1;
+}
+extern "C" int32_t shadow_zip_pack(const char* src_dir, const char* out_spk) {
+    std::string a = shadow_path_to_slashes(src_dir ? std::string(src_dir) : std::string(""));
+    std::string b = shadow_path_to_slashes(out_spk ? std::string(out_spk) : std::string(""));
+    int32_t rc = rt_zip_pack_dir(a.c_str(), b.c_str());
+    return rc == 1 ? 0 : -1;
+}
+extern "C" const char* shadow_zip_list(const char* spk) {
+    std::string a = shadow_path_to_slashes(spk ? std::string(spk) : std::string(""));
+    return rt_zip_list_files(a.c_str());
+}
+// FNV-1a 64 文件内容哈希（hex 16 字符），与 Windows rt/rt_zip.c 的 shadow_content_hash 等价。
+extern "C" const char* shadow_content_hash(const char* path) {
+    std::string p = shadow_path_to_slashes(path ? std::string(path) : std::string(""));
+    FILE* f = fopen(p.c_str(), "rb");
+    if (!f) return NULL;
+    unsigned char buf[65536];
+    size_t rd;
+    uint64_t hsh = 0xcbf29ce484222325ULL;
+    while ((rd = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t j = 0; j < rd; j++) { hsh ^= (uint64_t)buf[j]; hsh *= 0x100000001b3ULL; }
+    }
+    fclose(f);
+    char* hex = (char*)malloc(17);
+    if (!hex) return NULL;
+    for (int i = 0; i < 8; i++) {
+        sprintf(hex + i * 2, "%02llx", (unsigned long long)((hsh >> (56 - i * 8)) & 0xff));
+    }
+    hex[16] = '\0';
+    return hex;
+}
+
 // Character classification helper used by the lexer.
 // Takes an `any` box (pointer to {tag: i32, value: ptr})
 // and checks if the boxed string is a valid identifier start char.

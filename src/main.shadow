@@ -826,14 +826,17 @@ kimo main_expand_all() -> void {
 }
 
 // SHADOW_HOME（缓存/下载根）
+// 解析顺序：SHADOW_HOME → USERPROFILE\.shadow → HOME/.shadow。
+// 注意：不能用 main_bslash 处理 Linux 的 HOME（会把 '/' 翻成 '\' 破坏路径），
+// 故按 OS 选择分隔符；SHADOW_HOME 视为用户已给正确分隔符，原样返回。
 kimo main_shadow_home() -> string {
     let home = env_get("SHADOW_HOME");
-    if (len(home) == 0) {
-        home = env_get("USERPROFILE");
-        if (len(home) == 0) { return ""; }
-        home = home + "\\" + ".shadow";
-    }
-    return main_bslash(home);
+    if (len(home) > 0) { return home; }
+    home = env_get("USERPROFILE");
+    if (len(home) == 0) { home = env_get("HOME"); }
+    if (len(home) == 0) { return ""; }
+    if (str_eq(env_get("OS"), "Windows_NT") == 1) { return home + "\\.shadow"; }
+    return home + "/.shadow";
 }
 
 // shadow pkg list：列出当前项目已解析的依赖树（或已安装缓存）
@@ -970,13 +973,8 @@ kimo main_pkg_install_cmd(arg: string) -> int {
 // 幂等：最终缓存目录存在（含 shadow.sbg）→ 复用；否则解包 + 校验 + 落位。
 // 返回缓存目录绝对路径；失败返回 ""。
 kimo main_spk_ensure(project_root: string, module: string, dep_path: string, ver_constraint: string) -> string {
-    let home = env_get("SHADOW_HOME");
-    if (len(home) == 0) {
-        home = env_get("USERPROFILE");
-        if (len(home) == 0) { return ""; }
-        home = home + "\\" + ".shadow";
-    }
-    home = main_bslash(home);
+    let home = main_shadow_home();
+    if (len(home) == 0) { return ""; }
     let cache_root = home + "\\pkg\\mod";
     dir_create(cache_root);
     // dep_path 相对 project_root；转绝对
