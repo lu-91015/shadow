@@ -7,7 +7,7 @@
  * ============================================================ */
 dsb http;
 
-import net.net;
+import std.net;
 
 // URL 解析结果（模块级全局暂存，因 Shadow 暂不支持多返回值语法）
 let H_HOST: string = "";
