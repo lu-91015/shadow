@@ -1671,7 +1671,7 @@ extern "C" const char* shadow_to_string_any(void* val_ptr) {
     }
     // Small pointer optimization: small values are boxed integers (except 0 and 1 which are booleans)
     if (u > 1 && u < 10000) {
-        static char buf[32];
+        char buf[32];
         snprintf(buf, sizeof(buf), "%lld", (long long)(intptr_t)val_ptr);
         return dup_str(buf);
     }
@@ -1943,8 +1943,20 @@ extern "C" void* shadow_member_any(void* obj, const char* type_name, const char*
 //   其他值 → 不释放（未知类型，可能是 GC 管理的对象）
 // 注：ShadowArray/ShadowDict/ShadowSet 的首个字段是 uint32_t type_tag，
 //     reinterpret_cast 到任一结构体后读 type_tag 即可区分。
+// 前向声明：GC 登记对象删除辅助（定义于文件后部 GC 状态之后）
+extern "C" int32_t shadow_gc_forget(void* ptr);
+// 前向声明：诊断用——指针是否在 GC meta 中（定义于文件后部）
+extern "C" int32_t shadow_gc_meta_contains(void* p);
+
 extern "C" void shadow_free(void* ptr) {
     if (!ptr) return;
+    // GC 登记的对象（shadow_gc_alloc / __rt_shadow_malloc 分配）：先从 meta 删除，
+    // 防止 sweep 阶段 double-free / 残留元数据导致 UAF。随后直接 free。
+    // （C 布局对象头不是 RFS 的 type_tag，走原 type_tag 判断会错删/泄漏。）
+    if (shadow_gc_forget(ptr)) {
+        free(ptr);
+        return;
+    }
     uint32_t tag = *reinterpret_cast<uint32_t*>(ptr);
     if (tag == 0) {
         // ShadowArray
@@ -2233,12 +2245,14 @@ extern "C" int32_t shadow_tcp_close(int64_t socket_handle) {
 
 extern "C" const char* shadow_any_to_string(void* val, const char* type_name) {
     if(!val)return "0";
-    if(strcmp(type_name,"int")==0||strcmp(type_name,"bool")==0){static char b[32];snprintf(b,32,"%lld",(long long)(intptr_t)val);return b;}
+    if(strcmp(type_name,"int")==0||strcmp(type_name,"bool")==0){char b[32];snprintf(b,32,"%lld",(long long)(intptr_t)val);return dup_str(b);}
     if(strcmp(type_name,"string")==0)return (const char*)val;
     return "?";
 }
+// 线程安全：返回 malloc 拷贝（对齐 Windows rt_dup_str 语义）。
+// 旧实现返回静态缓冲，多线程 spawn 下互覆盖导致字符串内容错乱。
 extern "C" const char* shadow_int_to_str(void* val) {
-    static char b[32]; snprintf(b,32,"%lld",(long long)(intptr_t)val); return b;
+    char b[32]; snprintf(b,32,"%lld",(long long)(intptr_t)val); return dup_str(b);
 }
 extern "C" int64_t shadow_any_to_int(void* val) { return (int64_t)(intptr_t)val; }
 extern "C" const char* shadow_string_concat(const char* a, const char* b) {
@@ -2389,10 +2403,10 @@ extern "C" int32_t shadow_today() {
 extern "C" const char* shadow_env_get(const char* name) {
     if (!name) return nullptr;
 #ifdef _WIN32
-    static char buf[4096];
+    char buf[4096];
     DWORD r = GetEnvironmentVariableA(name, buf, sizeof(buf));
     if (r == 0 || r >= sizeof(buf)) return nullptr;
-    return buf;
+    return dup_str(buf);
 #else
     return getenv(name);
 #endif
@@ -2833,16 +2847,16 @@ extern "C" const char* shadow_any_as_string(void* ptr) {
     return "";
 }
 extern "C" const char* shadow_any_print(void* ptr) {
-    if (!ptr) { static char b[32] = "0"; return b; }
+    if (!ptr) return "0";
     // Check static buffers first: pointer may come from shadow_array_get/shadow_dict_get
     if (ptr == &g_any_int_buf) {
-        static char b[32]; snprintf(b, sizeof(b), "%lld", (long long)g_any_int_buf); return b;
+        char b[32]; snprintf(b, sizeof(b), "%lld", (long long)g_any_int_buf); return dup_str(b);
     }
     if (ptr == &g_any_bool_buf) {
         return g_any_bool_buf ? "true" : "false";
     }
     if (ptr == &g_any_float_buf) {
-        static char b[32]; snprintf(b, sizeof(b), "%g", g_any_float_buf); return b;
+        char b[32]; snprintf(b, sizeof(b), "%g", g_any_float_buf); return dup_str(b);
     }
     // Raw int handle from shadow_array_get (transparent model):
     // shadow_array_get returns (void*)(intptr_t)value for ints. This is the
@@ -2850,21 +2864,21 @@ extern "C" const char* shadow_any_print(void* ptr) {
     // address is well above 64KB, so values < 65536 are definitely raw handles.
     uintptr_t u = (uintptr_t)ptr;
     if (u > 0 && u < 0x10000) {
-        static char b[32]; snprintf(b, sizeof(b), "%llu", (unsigned long long)u); return b;
+        char b[32]; snprintf(b, sizeof(b), "%llu", (unsigned long long)u); return dup_str(b);
     }
     // Check if it's an AnyBox* (identified by magic, NOT just tag range,
     // because raw ShadowArray/ShadowDict also use small type_tags 0/1)
     if (!is_valid_ptr(ptr)) return "number";
     AnyBox* b = reinterpret_cast<AnyBox*>(ptr);
     if (b->magic == ANYBOX_MAGIC && b->tag >= 0 && b->tag <= 3) {
-        static char buf[128];
+        char buf[128];
         // AnyBox tag 约定（与 runtime_lib.shadow 一致）：0=int,1=long,2=float,3=string,4=bool
         switch (b->tag) {
-            case 0: snprintf(buf, sizeof(buf), "%lld", (long long)b->value); return buf;  // int
-            case 1: snprintf(buf, sizeof(buf), "%lld", (long long)b->value); return buf;  // long
-            case 2: snprintf(buf, sizeof(buf), "%g", *(double*)&b->value); return buf;    // float
-            case 3: return (const char*)(intptr_t)b->value;                                // string
-            case 4: return b->value ? "true" : "false";                                   // bool
+            case 0: snprintf(buf, sizeof(buf), "%lld", (long long)b->value); return dup_str(buf);  // int
+            case 1: snprintf(buf, sizeof(buf), "%lld", (long long)b->value); return dup_str(buf);  // long
+            case 2: snprintf(buf, sizeof(buf), "%g", *(double*)&b->value); return dup_str(buf);    // float
+            case 3: return (const char*)(intptr_t)b->value;                                        // string
+            case 4: return b->value ? "true" : "false";                                           // bool
             default: return "?";
         }
     }
@@ -2928,7 +2942,8 @@ extern "C" void* shadow_any_unbox(void* ptr) {
 //           follow the global→AnyBox→ShadowArray reachability chain, causing
 //           premature frees of objects still referenced through `any` globals.
 struct GCMeta {
-    std::atomic<uint32_t> marked;   // lock-free mark flag
+    std::atomic<uint32_t> marked;   // 跨轮存活标记（含"分配即黑"）——sweep 只认它
+    std::atomic<uint32_t> visited;  // 本轮遍历去重位（三色标记：collect 开始清 visited，不动 marked）
     int32_t  kind;    // 0=raw, 1=array, 2=dict, 3=anybox
     int32_t  owned;   // 1 = gc_alloc'd (free()), 0 = registered (delete)
     int64_t  size;    // user size for conservative scan (kind 0)
@@ -2938,18 +2953,20 @@ struct GCMeta {
     void*   finalizer_data;      // passed to finalizer (usually the object ptr)
     bool    finalized;           // finalizer already ran (prevent double-finalize)
 
-    GCMeta() : marked(0), kind(0), owned(0), size(0), gen(0), survived(0),
+    GCMeta() : marked(0), visited(0), kind(0), owned(0), size(0), gen(0), survived(0),
                finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
     GCMeta(uint32_t m, int32_t k, int32_t o, int64_t s)
-        : marked(m), kind(k), owned(o), size(s), gen(0), survived(0),
+        : marked(m), visited(0), kind(k), owned(o), size(s), gen(0), survived(0),
           finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
     // Explicit copy: std::atomic is non-copyable, so we load/store the value.
     GCMeta(const GCMeta& o)
         : marked(o.marked.load(std::memory_order_relaxed)),
+          visited(o.visited.load(std::memory_order_relaxed)),
           kind(o.kind), owned(o.owned), size(o.size), gen(o.gen), survived(o.survived),
           finalizer_fn(o.finalizer_fn), finalizer_data(o.finalizer_data), finalized(o.finalized) {}
     GCMeta& operator=(const GCMeta& o) {
         marked.store(o.marked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        visited.store(o.visited.load(std::memory_order_relaxed), std::memory_order_relaxed);
         kind = o.kind; owned = o.owned; size = o.size; gen = o.gen; survived = o.survived;
         finalizer_fn = o.finalizer_fn; finalizer_data = o.finalizer_data; finalized = o.finalized;
         return *this;
@@ -2976,6 +2993,49 @@ static inline void gc_unlock() { g_gc_collect_lock.clear(std::memory_order_relea
 static thread_local int64_t tl_gc_alloc_count = 0;
 static std::atomic<int64_t> g_gc_total_alloc_count{0};
 
+// ── 自动 GC 触发状态（对齐 Windows rt_gc.c 的 GOGC / SHADOW_GC_STRESS 模型）──
+static std::atomic<int64_t> g_heap_bytes{0};     // 未释放对象总字节（alloc+，sweep-）
+static std::atomic<int64_t> g_gc_trigger{4 * 1024 * 1024};  // GOGC 触发点（初始最小堆 4MB）
+static std::atomic<int>     g_gc_running{0};     // 防重入：collect 在途
+static std::atomic<int64_t> g_alloc_ticks{0};    // STRESS 模式分配计数
+static int64_t g_gc_gogc = -1;                   // SHADOW_GOGC（默认 100）
+static int32_t g_gc_stress = -1;                 // SHADOW_GC_STRESS（0=关）
+static int32_t g_gc_auto = -1;                   // SHADOW_GC_AUTO（0=禁用自动触发，供 reseed 种子）
+
+// ── 协作式 STW（对齐 Windows rt_gc.o 的 g_stw_req/g_stw_active）──
+// collect 置 req=1 → 等所有 free-running 线程在 poll（安全点）置 stw_state=1
+// 并自旋 → active=1 扫根 → 放行（req/active 清零）。blocked（state=2）线程在
+// 等 g_gc_mutex，不跑 mutator，collect 无需等它。
+static std::atomic<int> g_gc_stw_req{0};
+static std::atomic<int> g_gc_stw_active{0};
+static int rt_gc_auto_on(void) {
+    if (g_gc_auto < 0) {
+        const char* e = getenv("SHADOW_GC_AUTO");
+        g_gc_auto = (e && *e && e[0] == '0') ? 0 : 1;
+    }
+    return g_gc_auto;
+}
+static int64_t rt_gc_gogc(void) {
+    if (g_gc_gogc < 0) {
+        const char* e = getenv("SHADOW_GOGC");
+        g_gc_gogc = (e && *e) ? atoll(e) : 100;
+        if (g_gc_gogc < 0) g_gc_gogc = 100;
+    }
+    return g_gc_gogc;
+}
+static int32_t rt_gc_stress_n(void) {
+    if (g_gc_stress < 0) {
+        const char* e = getenv("SHADOW_GC_STRESS");
+        if (e && *e) {
+            int64_t v = atoll(e);
+            g_gc_stress = (v > 0) ? (int32_t)v : 0;
+        } else {
+            g_gc_stress = 0;
+        }
+    }
+    return g_gc_stress;
+}
+
 // ── Per-thread GC root sets (thread-safe concurrency) ──
 // Each OS thread that runs Shadow code gets its OWN root stack/frames so that
 // concurrent spawn bodies don't corrupt each other's root discipline. The mark
@@ -2985,6 +3045,18 @@ struct ThreadGCState {
     std::vector<void*> roots;                        // frame-managed roots (popped by frame_leave)
     std::unordered_map<void*, void*> named_roots;    // slot_addr -> current value (replace semantics)
     std::vector<std::vector<void*>> named_frames;    // per-frame slot addrs (popped by frame_leave)
+    // shadow frame range roots (对齐 Windows rt_gc.o 的 shadow_gc_root_range)：
+    // codegen 在函数入口调用 shadow_gc_root_range(%sf, n) 把整个 shadow frame
+    // 注册为精确根（n 个指针槽）。collect 扫描这些槽 —— 这是「跨安全点指针
+    // 已 spill 到 shadow frame」这一编译器保证的运行时兑现：自动 GC 在任意
+    // alloc 安全点触发时，帧内活指针都被覆盖，未扎根临时量不会误回收。
+    std::vector<std::vector<std::pair<void*, uint32_t>>> range_frames;  // LIFO per frame
+    std::vector<std::pair<void*, uint32_t>> range_roots;                // flattened for scan
+    // 协作式 STW 状态（对齐 Windows rt_gc.o 的 rt_gc_thread.gc_state）：
+    //   0 = free-running（mutator，可能在任意点）
+    //   1 = at safepoint（shadow_gc_poll 自旋等待放行）
+    //   2 = blocked on g_gc_mutex（等锁，不跑 mutator，collect 无需等待）
+    std::atomic<int> stw_state{0};
 };
 static thread_local ThreadGCState* tl_gc_state = nullptr;
 static std::vector<ThreadGCState*> g_gc_thread_states;   // registry, guarded by g_gc_mutex
@@ -3104,17 +3176,31 @@ static ThreadGCState* gc_get_thread_state() {
     return s;
 }
 
+// 持锁辅助（mutator 路径）：等锁期间标记 blocked（stw_state=2），collect 扫根
+// 时跳过（等锁 = 不跑 mutator，根集冻结）。对齐 Windows「阻塞在 GC_LOCK 上
+// 的线程不会被等待」契约，避免 collect 等一个永远到不了安全点的等锁线程。
+static void gc_lock_blocked() {
+    ThreadGCState* s = gc_get_thread_state();
+    while (!g_gc_mutex.try_lock()) {
+        s->stw_state.store(2, std::memory_order_release);
+        std::this_thread::yield();
+    }
+    s->stw_state.store(0, std::memory_order_release);
+}
+
 static void gc_perm_root_add(void* p) {
     if (!p) return;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    gc_lock_blocked();
     g_gc_perm_roots.push_back(p);
+    g_gc_mutex.unlock();
 }
 static void gc_perm_root_remove(void* p) {
     if (!p) return;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    gc_lock_blocked();
     for (size_t i = 0; i < g_gc_perm_roots.size(); i++) {
         if (g_gc_perm_roots[i] == p) { g_gc_perm_roots[i] = g_gc_perm_roots.back(); g_gc_perm_roots.pop_back(); break; }
     }
+    g_gc_mutex.unlock();
 }
 // Global variable root registration (replace semantics, not frame-scoped).
 // Called from generated IR when a global variable of pointer kind is assigned.
@@ -3204,6 +3290,7 @@ static int64_t g_gc_disabled = 0;
 // SHADOW_GC_FORCE=1 makes shadow_gc_disable() a no-op, so the same binary can
 // be run with GC forced ON for forensics without recompiling shadow source.
 extern "C" void shadow_gc_disable() {
+    if (getenv("SHADOW_GC_LOG")) fprintf(stderr, "[GC] DISABLE called\n");
     const char* f = getenv("SHADOW_GC_FORCE");
     if (f && f[0] == '1') return;
     g_gc_disabled = 1;
@@ -3225,18 +3312,27 @@ extern "C" int64_t shadow_gc_live_objects() {
 }
 
 extern "C" int64_t shadow_gc_alloc_count() {
-    return (int64_t)g_gc_total_alloc_count.load(std::memory_order_relaxed);
+    // 对齐 Windows rt_gc.c：返回**堆字节**（未释放对象总字节），
+    // 供长驻验收用例（ex_gc_longrun 等）读谷底判断泄漏。
+    // 旧实现返回累计分配计数 → 单调递增 → 任何存活集恒定的程序都误报泄漏。
+    return (int64_t)g_heap_bytes.load(std::memory_order_relaxed);
 }
 
 // Trace a single candidate child pointer; if it is a tracked GC object and
-// not yet marked, mark it and push onto the worklist. Lock-free CAS on marked.
+// not yet visited this cycle, mark it alive (marked=1) and push onto the
+// worklist. Lock-free CAS on visited. 三色标记：
+//   visited: 本轮遍历去重（collect 开始清 0）
+//   marked:  存活判定（分配即黑置 1；sweep 只认它；collect 末尾重置）
+// 分离后「分配即黑」不再被 collect 开始的全量清 marked 破坏 → 刚分配未 root
+// 的对象在并发窗口内不会被误回收。
 static inline void gc_trace_child(void* child, std::vector<void*>& worklist) {
     if (!child) return;
     auto it = g_gc_meta.find(child);
     if (it == g_gc_meta.end()) return;
     uint32_t expected = 0;
-    if (!it->second.marked.compare_exchange_strong(expected, 1,
+    if (!it->second.visited.compare_exchange_strong(expected, 1,
             std::memory_order_acq_rel)) return;
+    it->second.marked.store(1, std::memory_order_relaxed);
     worklist.push_back(child);
 }
 
@@ -3244,15 +3340,15 @@ static inline void gc_trace_child(void* child, std::vector<void*>& worklist) {
 // If parent is old gen and child is young gen, add parent to remembered set.
 extern "C" void shadow_gc_write_barrier(void* parent, void* child) {
     if (!parent || !child) return;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    gc_lock_blocked();
     auto pit = g_gc_meta.find(parent);
-    if (pit == g_gc_meta.end()) return;
-    if (pit->second.gen != 1) return;  // only old→young matters
-    auto cit = g_gc_meta.find(child);
-    if (cit == g_gc_meta.end()) return;
-    if (cit->second.gen == 0) {
-        g_gc_remembered.insert(parent);
+    if (pit != g_gc_meta.end() && pit->second.gen == 1) {
+        auto cit = g_gc_meta.find(child);
+        if (cit != g_gc_meta.end() && cit->second.gen == 0) {
+            g_gc_remembered.insert(parent);
+        }
     }
+    g_gc_mutex.unlock();
 }
 
 // ── GC forensic diagnostics (enabled via env vars, zero cost otherwise) ──
@@ -3320,37 +3416,137 @@ static void gc_dump_referrers(void* target) {
 }
 
 // Internal: trace object children (shared by major and minor GC).
+// ── 用户类型表（对齐 Windows rt_gc.c 的 g_types / shadow_gc_register_type）──
+// codegen 为每个用户结构体类型调用 shadow_gc_register_type(id, size, bitmap)，
+// bitmap 位 i = 第 i 个 8 字节槽是否指针（与 Windows 一致）。trace 时按表精确
+// 追踪；未注册（异常）回退保守扫描。
+static std::mutex g_gc_types_mtx;
+struct GcTypeInfo { int32_t size; int64_t bitmap; };
+static std::vector<GcTypeInfo> g_gc_types;   // index = type_id
+
+extern "C" int32_t shadow_gc_register_type(int32_t id, int32_t size, int64_t bitmap) {
+    if (id < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_gc_types_mtx);
+    if ((size_t)id >= g_gc_types.size()) g_gc_types.resize((size_t)id + 1);
+    g_gc_types[(size_t)id] = GcTypeInfo{ size, bitmap };
+    return 1;
+}
+
+// 对齐 Windows rt_gc.c 的 type_id 语义（RT_T_*）：
+//   0 = 未分类（rt_malloc 通用对象：字符串/AnyBox/dict 桶等）→ 保守扫（兜底 AnyBox.value）
+//   1 = RT_T_STRING 纯字节 → 不扫
+//   2 = RT_T_ARRAY  [len:4][cap:4][elem_size:4][data@12]（C 布局，shadow 层数组）
+//   3 = RT_T_ANYBOX [tag:4][value@4]（runtime_lib shadow 层 12 字节布局；tag 3=string,5=ptr）
+//   4 = RT_T_DICT   rt_dict：{buckets**; n_buckets:4; size:4}
+//   5 = RT_T_CLOSURE [fn_ptr@0][env_ptr@8]
+//   ≥100 = RT_T_USER 用户类型：类型表 bitmap 精确追踪（>512B 整块保守）
 static inline void gc_trace_object_children(void* obj, GCMeta& m, std::vector<void*>& worklist) {
-    if (m.kind == 1) {
-        ShadowArray* a = reinterpret_cast<ShadowArray*>(obj);
-        for (const DictValue& v : a->data) {
-            if (std::holds_alternative<void*>(v)) {
-                gc_trace_child(std::get<void*>(v), worklist);
-            }
-        }
-    } else if (m.kind == 2) {
-        ShadowDict* d = reinterpret_cast<ShadowDict*>(obj);
-        for (const auto& kv : d->data) {
-            if (std::holds_alternative<void*>(kv.second)) {
-                gc_trace_child(std::get<void*>(kv.second), worklist);
-            }
-        }
-    } else if (m.kind == 0 && m.size > 0) {
-        // Raw struct: conservative scan for interior pointers
+    const int32_t tid = m.kind;
+    if (tid == 0) {
+        // 未分类对象：保守扫描（与 Windows 的"大对象保守"同精神；兜住
+        // AnyBox.value / 字符串内嵌指针等无法精确判定的场景，只多保活不误收）。
         char* base = reinterpret_cast<char*>(obj);
         for (int64_t off = 0; off + (int64_t)sizeof(void*) <= m.size; off += sizeof(void*)) {
             void* cand;
             std::memcpy(&cand, base + off, sizeof(void*));
             gc_trace_child(cand, worklist);
         }
-    } else if (m.kind == 3) {
-        // AnyBox: precise trace of .value field (may hold a GC-managed pointer).
-        // AnyBox layout: { int32_t magic, int32_t tag, int64_t value }.
-        // value is at offset 8 and may be a pointer (tag≥3: string/struct/array).
-        // gc_trace_child safely ignores non-pointer values (not in g_gc_meta).
-        AnyBox* b = reinterpret_cast<AnyBox*>(obj);
-        gc_trace_child((void*)(intptr_t)b->value, worklist);
+    } else if (tid == 2) {
+        // RT_T_ARRAY（shadow 层 C 布局）：[len:4][cap:4][es:4][data@12]
+        if (m.size < 12) return;
+        int32_t es = 0, len = 0;
+        std::memcpy(&es, (char*)obj + 8, 4);
+        std::memcpy(&len, obj, 4);
+        if (es == 8) {
+            // 边界裁剪（对齐 Windows g_bad_array 保护：损坏头给出天文 len → 越界读）
+            if (len < 0 || (int64_t)12 + (int64_t)len * 8 > m.size) {
+                len = (int32_t)((m.size - 12) / 8);
+                if (len < 0) len = 0;
+            }
+            for (int32_t i = 0; i < len; i++) {
+                void* e;
+                std::memcpy(&e, (char*)obj + 12 + (int64_t)i * 8, 8);
+                gc_trace_child(e, worklist);
+            }
+        }
+    } else if (tid == 3) {
+        // RT_T_ANYBOX（RFS AnyBox：new + register kind=3，16 字节）
+        // 布局：[magic:4@0][tag:4@4][value:8@8]；tag 3=string / 5=ptr → value 指针
+        if (m.size < 16) return;
+        int32_t tag = 0;
+        std::memcpy(&tag, (char*)obj + 4, 4);
+        if (tag == 3 || tag == 5) {
+            void* v;
+            std::memcpy(&v, (char*)obj + 8, 8);
+            gc_trace_child(v, worklist);
+        }
+    } else if (tid == 4) {
+        // RT_T_DICT：rt_dict { rt_kv** buckets@0; int32 n_buckets@8; int32 size@12; }
+        if (m.size < 16) return;
+        void* buckets = nullptr;
+        std::memcpy(&buckets, obj, 8);
+        int32_t nb = 0;
+        std::memcpy(&nb, (char*)obj + 8, 4);
+        gc_trace_child(buckets, worklist);
+        if (!buckets || nb <= 0 || nb > 1 << 20) return;
+        for (int32_t b = 0; b < nb; b++) {
+            void* kvp = nullptr;
+            std::memcpy(&kvp, (char*)buckets + (int64_t)b * 8, 8);
+            while (kvp) {
+                char* key = nullptr;
+                std::memcpy(&key, kvp, 8);
+                int32_t vt = 0;
+                std::memcpy(&vt, (char*)kvp + 8, 4);
+                void* next = nullptr;
+                std::memcpy(&next, (char*)kvp + 24, 8);
+                gc_trace_child(key, worklist);
+                if (vt == 0 || vt == 4) {   // RT_V_STRING / RT_V_PTR
+                    void* v;
+                    std::memcpy(&v, (char*)kvp + 16, 8);
+                    gc_trace_child(v, worklist);
+                }
+                gc_trace_child(kvp, worklist);
+                kvp = next;
+            }
+        }
+    } else if (tid == 5) {
+        // RT_T_CLOSURE：[fn_ptr@0][env_ptr@8]
+        if (m.size < 16) return;
+        void* env = nullptr;
+        std::memcpy(&env, (char*)obj + 8, 8);
+        gc_trace_child(env, worklist);
+    } else if (tid >= 100) {
+        // RT_T_USER：类型表 bitmap 精确追踪；未注册/大对象 → 保守扫描
+        std::lock_guard<std::mutex> lk(g_gc_types_mtx);
+        if ((size_t)tid < g_gc_types.size() && g_gc_types[(size_t)tid].size > 0) {
+            int64_t sz = g_gc_types[(size_t)tid].size;
+            int64_t bm = g_gc_types[(size_t)tid].bitmap;
+            if (m.size > 512) {
+                char* base = reinterpret_cast<char*>(obj);
+                for (int64_t off = 0; off + 8 <= m.size; off += 8) {
+                    void* cand;
+                    std::memcpy(&cand, base + off, 8);
+                    gc_trace_child(cand, worklist);
+                }
+            } else {
+                for (int64_t i = 0; i < 64 && i * 8 < sz; i++) {
+                    if ((bm >> i) & 1) {
+                        void* f;
+                        std::memcpy(&f, (char*)obj + i * 8, 8);
+                        gc_trace_child(f, worklist);
+                    }
+                }
+            }
+        } else {
+            char* base = reinterpret_cast<char*>(obj);
+            for (int64_t off = 0; off + 8 <= m.size; off += 8) {
+                void* cand;
+                std::memcpy(&cand, base + off, 8);
+                gc_trace_child(cand, worklist);
+            }
+        }
     }
+    // tid == 1（RT_T_STRING）及其它：不扫描
 }
 
 // Internal: run finalizers for dead objects, then free them.
@@ -3397,11 +3593,19 @@ static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
         auto it = g_gc_meta.find(obj);
         if (it == g_gc_meta.end()) continue;
         GCMeta m = it->second;
+        if (getenv("SHADOW_GC_SWEEP_DBG")) {
+            // 诊断：被 free 对象是否仍被全局根直接引用（漏标证据）
+            int refd = 0;
+            for (auto& gkv : g_gc_global_roots) { if (gkv.second == obj) { refd = 1; break; } }
+            if (refd)
+                fprintf(stderr, "[sweep-dbg] FREE-ROOTED obj=%p kind=%d size=%lld\n", obj, m.kind, (long long)m.size);
+        }
         if (g_gc_log_on)
             fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%lld gen=%u\n",
                     (long long)g_gc_collect_count, obj, m.kind, (long long)m.size, m.gen);
         if (m.kind == 0) g_diag_kind0++;
         g_gc_meta.erase(it);
+        g_heap_bytes.fetch_sub(m.size > 0 ? m.size : 0, std::memory_order_relaxed);
         // Clear from remembered set if present.
         g_gc_remembered.erase(obj);
         // Clean up global roots that still point to this freed object.
@@ -3409,13 +3613,15 @@ static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
             if (git->second == obj) git = g_gc_global_roots.erase(git);
             else ++git;
         }
+        // 释放策略（对齐 Windows type_id 语义下的对象来源）：
+        //   kind==1：RFS ShadowArray（new + register）→ delete
+        //   kind==3 && !owned：RFS AnyBox（new + register）→ delete
+        //   其它（用户产物全部 alloc：C 布局数组/结构体/closure/box/字符串）→ free
         if (m.kind == 1) {
             delete reinterpret_cast<ShadowArray*>(obj);
-        } else if (m.kind == 2) {
-            delete reinterpret_cast<ShadowDict*>(obj);
-        } else if (m.kind == 3) {
+        } else if (m.kind == 3 && !m.owned) {
             delete reinterpret_cast<AnyBox*>(obj);
-        } else if (m.owned) {
+        } else {
             free(obj);
         }
         freed++;
@@ -3441,15 +3647,25 @@ extern "C" int64_t shadow_gc_collect() {
     // pollutes the LSP server's stderr on every collect.
     if (g_gc_log_on) { fprintf(stderr, "[GC] major START meta=%zu\n", g_gc_meta.size()); fflush(stderr); }
     gc_lock();  // lock-free spinlock: prevent concurrent collect
+    g_gc_running.store(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
     if (g_gc_log_on)
-        fprintf(stderr, "[GCLOG] major collect #%lld meta=%zu perm=%zu global=%zu threads=%zu remembered=%zu conservative=%zu\n",
+        fprintf(stderr, "[GCLOG] major collect #%lld meta=%zu perm=%zu global=%zu threads=%zu remembered=%zu conservative=%zu heap=%lld trigger=%lld\n",
                 (long long)g_gc_major_count, g_gc_meta.size(), g_gc_perm_roots.size(),
                 g_gc_global_roots.size(), g_gc_thread_states.size(), g_gc_remembered.size(),
-                g_gc_conservative_regions.size());
+                g_gc_conservative_regions.size(),
+                (long long)g_heap_bytes.load(std::memory_order_relaxed),
+                (long long)g_gc_trigger.load(std::memory_order_relaxed));
 
     // ── Mark phase: trace from all roots ──
+    // 三色标记：本轮只清 visited（遍历去重位），marked（存活位）不动。
+    // 分配即黑（marked=1）的对象保留存活资格，保证「刚分配、尚未被 root」的
+    // 对象在并发窗口内不被误回收；同时 trace_child 用 visited 去重，上一轮
+    // 存活的对象本轮仍会被重新访问 → 子对象不漏标（修掉全量清 marked 的 UAF）。
+    for (auto& kv : g_gc_meta) {
+        kv.second.visited.store(0, std::memory_order_relaxed);
+    }
     std::vector<void*> worklist;
     for (void* root : g_gc_perm_roots) { gc_trace_child(root, worklist); }
     for (auto& kv : g_gc_global_roots) { gc_trace_child(kv.second, worklist); }
@@ -3457,6 +3673,16 @@ extern "C" int64_t shadow_gc_collect() {
         std::lock_guard<std::mutex> lk(s->mtx);
         for (void* root : s->roots) gc_trace_child(root, worklist);
         for (auto& kv : s->named_roots) gc_trace_child(kv.second, worklist);
+        // shadow frame range roots：逐槽精确追踪（对齐 Windows rt_gc.o 扫根）。
+        for (auto& rg : s->range_roots) {
+            char* base = reinterpret_cast<char*>(rg.first);
+            uint32_t n = rg.second;
+            for (uint32_t i = 0; i < n; i++) {
+                void* slot_val;
+                std::memcpy(&slot_val, base + (size_t)i * sizeof(void*), sizeof(void*));
+                gc_trace_child(slot_val, worklist);
+            }
+        }
     }
     // Conservative scan: trace pointer-sized values in registered memory regions
     // (e.g., process data segment for binaries without explicit GC root registration).
@@ -3499,6 +3725,28 @@ extern "C" int64_t shadow_gc_collect() {
     // Clear remembered set after major GC (all references re-traced).
     g_gc_remembered.clear();
 
+    // ── GOGC pacing：本轮 live = 真实可达堆（visited=1 的对象 size 和）──
+    // （对齐 Windows gc_pacing_settle：trigger = live × (1 + GOGC/100)，最小 4MB）
+    // 不能用清扫后的 g_heap_bytes：三色标记下它含"分配即黑"残留（本轮新分配、
+    // 下轮才回收的不可达对象）。若用它做 pacing，trigger 每轮放大 → 周期内
+    // 分配更多 → 残留更多 → 正反馈 → 谷底单调上涨（ex_gc_longrun min1/min2
+    // 漂移的根因）。真实 live 只认本轮从 roots 可达（visited=1）的对象。
+    {
+        int64_t live = 0;
+        for (auto& kv : g_gc_meta) {
+            if (kv.second.visited.load(std::memory_order_relaxed))
+                live += kv.second.size;
+        }
+        int64_t gogc = rt_gc_gogc();
+        int64_t next = live + live * gogc / 100;
+        if (next < 4 * 1024 * 1024) next = 4 * 1024 * 1024;
+        g_gc_trigger.store(next, std::memory_order_relaxed);
+        if (g_gc_log_on)
+            fprintf(stderr, "[GCLOG] major settle live=%lld trigger=%lld gogc=%lld\n",
+                    (long long)live, (long long)next, (long long)gogc);
+    }
+
+    g_gc_running.store(0, std::memory_order_relaxed);
     gc_unlock();
     return freed;
 }
@@ -3519,6 +3767,11 @@ extern "C" int64_t shadow_gc_minor_collect() {
     // ── Mark phase: trace from roots, but only mark young-gen objects ──
     // Old-gen objects are treated as alive (not swept in minor GC).
     // The remembered set provides old→young references as additional roots.
+    // 三色标记：只清 visited（遍历去重位），marked（存活位）不动 → 分配即黑
+    // 的对象保留存活资格，防「刚分配未 root 即被 minor sweep」的并发窗口。
+    for (auto& kv : g_gc_meta) {
+        kv.second.visited.store(0, std::memory_order_relaxed);
+    }
     std::vector<void*> worklist;
 
     // Mark all old-gen objects as alive (they survive minor GC).
@@ -3535,6 +3788,15 @@ extern "C" int64_t shadow_gc_minor_collect() {
         std::lock_guard<std::mutex> lk(s->mtx);
         for (void* root : s->roots) gc_trace_child(root, worklist);
         for (auto& kv : s->named_roots) gc_trace_child(kv.second, worklist);
+        for (auto& rg : s->range_roots) {
+            char* base = reinterpret_cast<char*>(rg.first);
+            uint32_t n = rg.second;
+            for (uint32_t i = 0; i < n; i++) {
+                void* slot_val;
+                std::memcpy(&slot_val, base + (size_t)i * sizeof(void*), sizeof(void*));
+                gc_trace_child(slot_val, worklist);
+            }
+        }
     }
     // Conservative scan: trace pointer-sized values in registered memory regions.
     gc_trace_conservative_regions(worklist);
@@ -3601,20 +3863,63 @@ extern "C" void shadow_gc_set_finalizer(void* ptr, void(*fn)(void*), void* data)
     it->second.finalizer_data = data;
 }
 
+// GC 登记对象删除辅助：shadow_free 在前部调用（GC 状态定义在后部）。
+// 返回 1 = ptr 是 GC 登记对象（已从 meta/remembered 删除，调用方负责 free）；
+// 返回 0 = 非 GC 对象（调用方走原 type_tag 逻辑）。
+extern "C" int32_t shadow_gc_forget(void* ptr) {
+    if (!ptr) return 0;
+    gc_lock_blocked();
+    auto it = g_gc_meta.find(ptr);
+    if (it == g_gc_meta.end()) { g_gc_mutex.unlock(); return 0; }
+    g_heap_bytes.fetch_sub(it->second.size > 0 ? it->second.size : 0, std::memory_order_relaxed);
+    g_gc_meta.erase(it);
+    g_gc_remembered.erase(ptr);
+    g_gc_mutex.unlock();
+    return 1;
+}
+
+// 诊断：指针是否在 GC meta 中（0=已回收/从未登记）
+extern "C" int32_t shadow_gc_meta_contains(void* p) {
+    if (!p) return 0;
+    gc_lock_blocked();
+    int r = g_gc_meta.find(p) != g_gc_meta.end() ? 1 : 0;
+    g_gc_mutex.unlock();
+    return r;
+}
+
 // Allocate a raw GC-managed block (used by codegen for `new Struct{...}`).
 // Allocations go to young gen (gen=0).
 //
-// IMPORTANT: Auto-trigger GC is DISABLED. The codegen does not root every
-// temporary SSA-register value, so triggering GC mid-expression can free live
-// objects that are only held in unrooted temporaries. GC must only run at
-// explicit call sites (e.g. lsp_maybe_gc) where all live objects are properly
-// rooted via frame roots, global roots, or perm roots. For batch programs,
-// memory is reclaimed at process exit.
+// 自动 GC 触发（对齐 Windows rt_gc.c 的 gc_alloc_hook）：//   ① SHADOW_GC_STRESS=N：每 N 次分配触发一次（无视堆阈值，Go gcstress 等价）；
+//   ② 否则 GOGC 模型：g_heap_bytes >= g_gc_trigger 触发（trigger = live×(1+GOGC/100)，
+//      最小 4MB）。分配即安全点：调用 alloc 时活指针已 spill 到 shadow frame
+//      （root_range 注册），同步 collect 不会误回收未扎根临时量。
+// 防重入：g_gc_running 在 collect 在途时置 1，触发检查跳过。
 extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
+    if (g_gc_disabled == 0 && rt_gc_auto_on() && g_gc_running.load(std::memory_order_relaxed) == 0) {
+        int32_t stress = rt_gc_stress_n();
+        int64_t want = 0;
+        if (stress > 0) {
+            int64_t t = g_alloc_ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((t % (int64_t)stress) == 0) want = 1;
+        } else {
+            int64_t hb = g_heap_bytes.load(std::memory_order_relaxed);
+            if (hb >= g_gc_trigger.load(std::memory_order_relaxed) && hb > 0) want = 1;
+        }
+        if (want) shadow_gc_collect();
+    }
     void* p = malloc((size_t)size);
     if (!p) return nullptr;
     {
-        std::lock_guard<std::mutex> lk(g_gc_mutex);
+        // 等锁期间标记 blocked（stw_state=2）：collect 扫根时跳过本线程
+        // （等锁 = 不跑 mutator，根集冻结）。对齐 Windows「阻塞在 GC_LOCK
+        // 上的线程不会被等待」的契约。
+        ThreadGCState* s = gc_get_thread_state();
+        while (!g_gc_mutex.try_lock()) {
+            s->stw_state.store(2, std::memory_order_release);
+            std::this_thread::yield();
+        }
+        s->stw_state.store(0, std::memory_order_release);
         g_gc_meta[p] = GCMeta{ 0, kind, 1, (int64_t)size };
         // New objects start in young gen.
         g_gc_meta[p].gen = 0;
@@ -3622,8 +3927,10 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
         // Mark self alive so any concurrent/triggered sweep cannot free it
         // before the caller receives the pointer (closes the alloc/collect race).
         g_gc_meta[p].marked.store(1, std::memory_order_relaxed);
+        g_heap_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
+        g_gc_mutex.unlock();
     }
-    // Track allocation counts for diagnostics, but do NOT auto-trigger GC.
+    // Track allocation counts for diagnostics.
     tl_gc_alloc_count++;
     g_gc_total_alloc_count.fetch_add(1, std::memory_order_relaxed);
     return p;
@@ -3640,8 +3947,15 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
 // shadow_gc_root_add (frame roots) until the enclosing frame returns.
 extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size) {
     if (!ptr) return;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    ThreadGCState* s = gc_get_thread_state();
+    while (!g_gc_mutex.try_lock()) {
+        s->stw_state.store(2, std::memory_order_release);
+        std::this_thread::yield();
+    }
+    s->stw_state.store(0, std::memory_order_release);
     g_gc_meta[ptr] = GCMeta{ 0, kind, 0, size };
+    if (size > 0) g_heap_bytes.fetch_add(size, std::memory_order_relaxed);
+    g_gc_mutex.unlock();
 }
 
 // ── Root management (LIFO frame discipline) ──
@@ -3651,6 +3965,7 @@ extern "C" int32_t shadow_gc_frame_enter() {
     ThreadGCState* s = gc_get_thread_state();
     std::lock_guard<std::mutex> lk(s->mtx);
     s->named_frames.push_back({});
+    s->range_frames.push_back({});
     return (int32_t)s->roots.size();
 }
 extern "C" int32_t shadow_gc_root_add(void* ptr) {
@@ -3694,7 +4009,62 @@ extern "C" int32_t shadow_gc_frame_leave(int32_t marker) {
         }
         s->named_frames.pop_back();
     }
+    // Drop this frame's shadow-frame range roots (aligned with Windows
+    // rt_gc.o's frame discipline: ranges are LIFO, popped by frame_leave).
+    if (!s->range_frames.empty()) {
+        auto& fr = s->range_frames.back();
+        // Remove the frame's ranges from the flattened scan list.
+        for (auto& rg : fr) {
+            for (size_t i = 0; i < s->range_roots.size(); i++) {
+                if (s->range_roots[i] == rg) {
+                    s->range_roots[i] = s->range_roots.back();
+                    s->range_roots.pop_back();
+                    break;
+                }
+            }
+        }
+        s->range_frames.pop_back();
+    }
     return 0;
+}
+
+// ── shadow frame range roots（§5.2.4 对齐 Windows rt_gc.o）──
+// codegen 在函数入口调用 shadow_gc_root_range(%sf, n)：%sf 是 shadow frame
+// （活跃变量的 spill 区，n 个指针槽）。注册到当前线程的 range 列表，collect
+// 扫描时逐槽追踪。frame_leave 弹出（LIFO）。
+// 此前 Linux 用户产物链接 shadow_gc_supplement.o 的 no-op 版 —— 帧槽不被
+// 扫描，自动 GC 一开就误回收未扎根临时量。此处为真实现，配合 main_link_exe
+// 去掉 supplement 后生效。
+extern "C" int32_t shadow_gc_root_range(void* base, uint32_t n) {
+    if (!base || n == 0) return 0;
+    ThreadGCState* s = gc_get_thread_state();
+    std::lock_guard<std::mutex> lk(s->mtx);
+    s->range_frames.back().push_back({base, n});
+    s->range_roots.push_back({base, n});
+    return 0;
+}
+
+// ── 协作式安全点（§5.2.4 对齐 Windows rt_gc.o 的 shadow_gc_poll）──
+// codegen 在函数入口 / 循环回边插入。本实现：
+//   ① STW 协作：collect 请求时到达安全点并自旋，等放行（多线程下防止
+//      collect 扫根窗口内其它线程改 roots → 漏标 → 误回收）；
+//   ② 触发检查：安全点处活指针已 spill 到 shadow frame，GOGC/STRESS 达标即
+//      同步 collect（与 Windows 在 alloc hook 触发语义一致）。
+extern "C" void shadow_gc_poll() {
+    // 触发检查（安全点处活指针已 spill 到 shadow frame；GOGC/STRESS 达标即同步 collect）
+    if (g_gc_disabled) return;
+    if (!rt_gc_auto_on()) return;
+    if (g_gc_running.load(std::memory_order_relaxed)) return;
+    int32_t stress = rt_gc_stress_n();
+    int64_t want = 0;
+    if (stress > 0) {
+        int64_t t = g_alloc_ticks.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((t % (int64_t)stress) == 0) want = 1;
+    } else {
+        int64_t hb = g_heap_bytes.load(std::memory_order_relaxed);
+        if (hb >= g_gc_trigger.load(std::memory_order_relaxed) && hb > 0) want = 1;
+    }
+    if (want) shadow_gc_collect();
 }
 
 // ── Debug helper: detect corrupted (module-derived / low-32-zeroed) pointers ──
@@ -3843,7 +4213,7 @@ extern "C" int32_t shadow_string_len(const char* s) {
     return (int32_t)strlen(s);
 }
 extern "C" const char* shadow_int_to_string(int32_t v) {
-    static char buf[32];
+    char buf[32];
     snprintf(buf, sizeof(buf), "%d", v);
     return dup_str(buf);
 }
@@ -3851,12 +4221,21 @@ extern "C" const char* shadow_int_to_string(int32_t v) {
 // ── __rt_ prefixed aliases for shadow-0.3 runtime primitives ──
 // shadow-0.3 declares extern functions with __rt_ prefix to avoid
 // name collision with user-defined Shadow runtime functions.
-extern "C" void* __rt_shadow_malloc(int32_t n) { return malloc(n); }
+// 对齐 Windows rt_core.c 的 rt_alloc_impl：所有 rt_malloc 分配（字符串、C 布局
+// AnyBox、dict 桶等）都登记进 GC（type_id=0，不扫描子对象，仅保活/回收）。
+// 这让字符串进入 GC 堆 → GOGC 触发模型生效（ex_gc_longrun 等长驻用例），
+// 且与 Windows 的分配语义一致。GC disabled 时回退裸 malloc。
+extern "C" void* __rt_shadow_malloc(int32_t n) {
+    if (g_gc_disabled) return malloc(n);
+    return shadow_gc_alloc(n, 0);
+}
 extern "C" void  __rt_shadow_free(void* p) { shadow_free(p); }
 extern "C" void  __rt_shadow_memcpy(void* dst, const void* src, int32_t n) { memcpy(dst, src, n); }
 extern "C" void  __rt_shadow_memcpy_at(void* dst, int32_t dst_off, const void* src, int32_t src_off, int32_t n) { memcpy((char*)dst+dst_off, (const char*)src+src_off, n); }
 extern "C" void  __rt_shadow_memset(void* dst, int32_t val, int32_t n) { memset(dst, val, n); }
-extern "C" int32_t __rt_shadow_strlen(const char* s) { return (int32_t)(s ? strlen(s) : 0); }
+extern "C" int32_t __rt_shadow_strlen(const char* s) {
+    return (int32_t)(s ? strlen(s) : 0);
+}
 extern "C" int32_t shadow_get_byte(void* p, int32_t off) { return (int32_t)(((unsigned char*)p)[off]); }
 extern "C" int32_t __rt_shadow_get_byte(void* p, int32_t off) { return (int32_t)((unsigned char*)p)[off]; }
 extern "C" void   __rt_shadow_set_byte(void* p, int32_t off, int32_t val) { ((char*)p)[off] = (char)val; }
@@ -3875,8 +4254,8 @@ extern "C" int32_t __rt_shadow_print_long(int64_t v) { printf("%lld", (long long
 extern "C" int32_t __rt_shadow_print_float(double v) { printf("%g", v); fflush(stdout); return 0; }
 extern "C" int32_t __rt_shadow_str_cmp(const char* a, const char* b) { return shadow_str_cmp(a, b); }
 extern "C" const char* __rt_shadow_int_to_cstr(int32_t v) { return shadow_int_to_string(v); }
-extern "C" const char* __rt_shadow_long_to_cstr(int64_t v) { static char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)v); return dup_str(buf); }
-extern "C" const char* __rt_shadow_float_to_cstr(double v) { static char buf[32]; snprintf(buf, sizeof(buf), "%g", v); return dup_str(buf); }
+extern "C" const char* __rt_shadow_long_to_cstr(int64_t v) { char buf[32]; snprintf(buf, sizeof(buf), "%lld", (long long)v); return dup_str(buf); }
+extern "C" const char* __rt_shadow_float_to_cstr(double v) { char buf[32]; snprintf(buf, sizeof(buf), "%g", v); return dup_str(buf); }
 
 // ── String → Number parsing primitives ──
 // 失败时调用 shadow_throw_str 设置全局异常标志并返回 0（依赖 shadow 的 try/catch 机制向上传播）。
@@ -4519,7 +4898,7 @@ extern "C" int64_t rt_nanotimestamp_now() {
 // 格式化函数：将时间整数编码转换为可读字符串
 // rt_date_to_str(d) → "YYYY.MM.DD"
 extern "C" const char* rt_date_to_str(int32_t d) {
-    static char buf[16];
+    char buf[16];
     int32_t year = d / 10000;
     int32_t md = d % 10000;
     int32_t month = md / 100;
@@ -4531,7 +4910,7 @@ extern "C" const char* rt_date_to_str(int32_t d) {
 // rt_timestamp_to_str(t) → "YYYY.MM.DD HH:MM:SS.mmm"
 // 注意：t 的编码是 YYYYMMDDHHMMSSmmm（17 位数字），需正确解码
 extern "C" const char* rt_timestamp_to_str(int64_t t) {
-    static char buf[32];
+    char buf[32];
     // 从 17 位整数解码（但 t 可能被 0.2 long 截断，这里尽力解码）
     int64_t ms_part = t % 1000;
     int64_t sec_part = (t / 1000) % 100;
@@ -4549,7 +4928,7 @@ extern "C" const char* rt_timestamp_to_str(int64_t t) {
 
 // rt_nanotimestamp_to_str(n) → 纳秒计数的数字字符串
 extern "C" const char* rt_nanotimestamp_to_str(int64_t n) {
-    static char buf[32];
+    char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)n);
     return dup_str(buf);
 }
@@ -4635,8 +5014,14 @@ extern "C" void* shadow_spawn_thunk(void* (*fn)(void*), void* arg) {
 extern "C" void* shadow_future_await(void* fut_h) {
     if (!fut_h) return nullptr;
     ShadowFuture* fut = (ShadowFuture*)fut_h;
+    ThreadGCState* s = gc_get_thread_state();
     std::unique_lock<std::mutex> lk(fut->mtx);
+    // 阻塞等待期间标记 blocked（stw_state=2）：不跑 mutator，根集冻结。
+    // 否则 collect 的协作式 STW 会永远等一个阻塞在 cv.wait 的线程
+    // （它到不了 poll 安全点）→ 死锁。对齐 Windows「阻塞线程不被等待」。
+    s->stw_state.store(2, std::memory_order_release);
     fut->cv.wait(lk, [fut]() { return fut->ready == 1; });
+    s->stw_state.store(0, std::memory_order_release);
     return fut->value;
 }
 
@@ -4648,12 +5033,16 @@ extern "C" void shadow_sched_run() {
         std::lock_guard<std::mutex> lk(g_tasks_mtx);
         local.swap(g_tasks);
     }
+    ThreadGCState* s = gc_get_thread_state();
+    // join 阻塞期间标记 blocked（不跑 mutator），防协作式 STW 死锁。
+    s->stw_state.store(2, std::memory_order_release);
     for (ShadowTask* t : local) {
         if (t->thread.joinable()) t->thread.join();
         gc_perm_root_remove(t->fut ? t->fut->value : nullptr);
         if (t->fut) delete t->fut;
         delete t;
     }
+    s->stw_state.store(0, std::memory_order_release);
 }
 
 // 手动构造/完成 Future（用于 async 函数返回 Future）
@@ -4833,12 +5222,14 @@ extern "C" int shadow_fs_watch_start(const char* path) {
 
 extern "C" const char* shadow_fs_watch_poll() {
     FsWatchManager* mgr = getFsWatchMgr();
-    static std::string result;
 
     std::lock_guard<std::mutex> lk(mgr->queueMtx);
+    // 线程安全：返回 malloc 拷贝（旧实现返回 static std::string 的 c_str()，
+    // 多线程下一次 poll 覆盖上一次的缓冲 → 内容错乱）。
+    std::string result;
     if (mgr->changeQueue.empty()) {
         result = "[]";
-        return result.c_str();
+        return dup_str(result);
     }
 
     std::ostringstream ss;
@@ -4859,7 +5250,7 @@ extern "C" const char* shadow_fs_watch_poll() {
     ss << "]";
     mgr->changeQueue.clear();
     result = ss.str();
-    return result.c_str();
+    return dup_str(result);
 }
 
 extern "C" void shadow_fs_watch_stop() {

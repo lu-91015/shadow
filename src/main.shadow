@@ -1,4 +1,4 @@
-// Shadow 0.5 — 编译器主入口
+// Shadow 0.5.1 — 编译器主入口
 // ============================================================
 // 完整管线：读文件 → tokenize → parse → TC → HIR → MIR → Codegen → .ll
 //   shadow <file.shadow> -o <out.ll>    只生成 .ll
@@ -26,6 +26,8 @@ import lsp.lsp;
 @extern("shadow_zip_unpack") kimo zip_unpack(spk: string, out: string) -> int { return 0; }
 @extern("shadow_zip_list") kimo zip_list(spk: string) -> string { return ""; }
 @extern("shadow_content_hash") kimo content_hash(path: string) -> string { return ""; }
+// 编译器本体禁用自动 GC（见 main() 入口注释）
+@extern("shadow_gc_disable") kimo shadow_disable_gc() -> void {}
 // TIMING-DBG-TEMP
 @extern("clock") kimo c_clock() -> long { return 0; }
 
@@ -2269,12 +2271,15 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         is_win = 0;
         if (len(custom_llc) > 0) { llc = custom_llc; } else { llc = llvm_home + "/bin/llc"; }
         if (len(custom_clang) > 0) { clang = custom_clang; } else { clang = llvm_home + "/bin/clang++"; }
-        // Linux 用户程序 runtime：跨平台 .o 集合（self_dir/rt/ 下）
+        // Linux 用户程序 runtime：跨平台 .o 集合（self_dir/rt/ 下）。
+        // 注意：不链接 shadow_gc_supplement.o（no-op GC 符号）——用户产物必须用
+        // runtime_for_selfhost.o 的真 GC（自动触发 + shadow frame range 根 +
+        // 协作安全点），与 Windows 用户产物链接 rt_gc.o 的真实现对齐。
+        // supplement 仅留给编译器本体（stage1）链接。
         rt_dir = self_dir + "/rt/";
         rt_objs = "\"" + rt_dir + "runtime_for_selfhost.o\" \"" + rt_dir + "miniz.o\" \"" +
                   rt_dir + "sys_exec_cpa.o\" \"" + rt_dir + "rt_proc_spawn.o\" \"" +
-                  rt_dir + "rt_zip.o\" \"" + rt_dir + "shadow_index.o\" \"" +
-                  rt_dir + "shadow_gc_supplement.o\"";
+                  rt_dir + "rt_zip.o\" \"" + rt_dir + "shadow_index.o\"";
         miniz_obj = "";
         link_tail = " -lpthread -ldl";
     }
@@ -2349,6 +2354,12 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
 
 // 主入口
 kimo main() -> int {
+    // 编译器本体禁用自动 GC：本二进制（shadow 编译器）是长驻批处理工具，
+    // 其对象图由编译流程显式管理，不依赖 GC 回收。runtime_for_selfhost.o 的
+    // shadow_gc_alloc 现在带自动触发（GOGC/STRESS），必须在这里关掉，否则
+    // 编译期分配驱动 GC → 扫描器元数据被回收 → 解析错乱/SIGSEGV。
+    // 用户产物（--run 编译出的程序）由 codegen 生成，不含本调用 → GC 正常启用。
+    shadow_disable_gc();
     let args = rt_sys_args();
     let n_args = len(args);
     if (n_args < 2) {
@@ -2360,7 +2371,7 @@ kimo main() -> int {
     }
     let arg1 = args[1] as string;
     if (str_eq(arg1, "--version") == 1) {
-        println("shadow 0.5");
+        println("shadow 0.5.1");
         return 0;
     }
     // ---- 统一扫描：--strict 任意位置生效（严格态唯一触发方式；查询/编译路径共用）----
