@@ -82,6 +82,7 @@ test/tools/repack_spk.py
 test/test_lsp.py
 test/test_lsp_features.py
 test/lsp_selfhost_probe.py
+tools/bootstrap.sh
 pkg/installer.py
 pkg/shadow/tools/link_rt.py
 pkg/shadow/tools/verify_fixed_point.py
