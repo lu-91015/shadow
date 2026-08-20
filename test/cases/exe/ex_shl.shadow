@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: 整型左移 << 增量能力。当前编译器对 << 无整型移位语义，需实现整数左移。
+//       1 << 3 = 8。仅作守门：实现后移除 //@xfail。
+//@xfail: 左移未实现：let y = x << 3 无整数左移语义。修复后应输出 8。
+//@expect: 8
+dsb ex_shl;
+
+kimo main() -> int {
+    let x = 1;
+    let y = x << 3; // 1 << 3 = 8
+    println(y);
+    return 0;
+}
