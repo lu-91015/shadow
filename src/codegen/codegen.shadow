@@ -1227,6 +1227,22 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
                 rhs = cg_cast_val(rhs_raw, rk, operand_k);
             }
         }
+        // 动态(ptr/any)操作数乘法：寄存器 SSA 型是 ptr，而 `mul ptr` 在 LLVM 中非法（Bug1 根因）。
+        if (is_f == 0 && is_str_eq == 0 && cg_is_ptr_kind(operand_k) == 1 && binop == BIN_MUL) {
+            // Bug1 修复：两个动态(ptr/any)值相乘在 LLVM 中 `mul ptr` 非法（llc 拒绝编译）。动态里存
+            // 的是裸整值，按 i64 乘法语义计算后 trunc 为 int 并登记为整型寄存器（TYPE_INT）：既避免
+            // 非法 IR，又避免把整型乘积当指针登记进 shadow frame——否则 GC 会视其为指针并解引用，
+            // 运行时 AV 崩溃（实测矩阵乘法 pre-fix 即如此）。回归用例 ex_mat_mult_dyn 现输出 134。
+            // 仅限 BIN_MUL：ADD/SUB/DIV/REM 若一并改写，会让自举阶段对自身源码的字节输出大面积改变
+            // （旧 stage1 中 add/sub ptr 均为 0 处），破坏 stage2==stage3 固定点且 stage2.exe 会在任何
+            // 输入上崩溃。故此守卫刻意收窄到乘法一处。
+            let pi_l = cg_cast_val(lhs_raw, lk, TYPE_LONG);
+            let pi_r = cg_cast_val(rhs_raw, rk, TYPE_LONG);
+            let res_v = llvm_mul(cg_builder, pi_l, pi_r, "multmp");
+            let res_int = llvm_trunc(cg_builder, res_v, cg_llvm_type_kind(TYPE_INT), "multmp");
+            cg_set_reg(mi.dst, res_int, TYPE_INT);
+            return;
+        }
 
         if (binop == BIN_ADD) {
             if (k == TYPE_STRING) {
