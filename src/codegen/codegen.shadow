@@ -1203,6 +1203,27 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
     if (op == MIR_ENUM_GET_PAYLOAD) { cg_gen_enum_getpayload(mi); return; }
 }
 
+// 动态 any 操作数加减（从 cg_gen_binop 拆出独立 helper）：cg_gen_binop 过大触发旧宿主 slot 上限
+// （历史约束，见本拆分注释），故把 any+any/sub 拦截逻辑独立成小函数以免自举产物寄存器越界崩溃。
+// 同为 Bug1：`add ptr %x,%y` / `sub ptr` 在 LLVM 中非法（llc 拒绝）。仅 k==TYPE_ANY 且任一操作数
+// 为指针类才改写（字符串 k==TYPE_STRING 不劫持，否则自举阶段 str+str 被当 i64 相加、字符串全毁、
+// 固定点漂移）；按 i64 语义生成并登记 TYPE_LONG（保持 64 位不截断），返回 1 表示已处理。
+pub kimo cg_gen_binop_any_arith(mi: MirInst, binop: int, lhs_raw: any, lk: int, rhs_raw: any, rk: int, k: int) -> int {
+    if (binop != BIN_ADD && binop != BIN_SUB) { return 0; }
+    if (k != TYPE_ANY) { return 0; }
+    if (cg_is_float_kind(k) == 1) { return 0; }
+    if (cg_is_str_eq_op(lk, rk, binop) == 1) { return 0; }
+    if (cg_is_ptr_kind(lk) != 1 && cg_is_ptr_kind(rk) != 1) { return 0; }
+    let pi_l = cg_cast_val(lhs_raw, lk, TYPE_LONG);
+    let pi_r = cg_cast_val(rhs_raw, rk, TYPE_LONG);
+    if (binop == BIN_ADD) {
+        cg_set_reg(mi.dst, llvm_add(cg_builder, pi_l, pi_r, "addtmp"), TYPE_LONG);
+        return 1;
+    }
+    cg_set_reg(mi.dst, llvm_sub(cg_builder, pi_l, pi_r, "subtmp"), TYPE_LONG);
+    return 1;
+}
+
 // ============ cg_gen_inst 拆分 helpers ============
 // 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_binop(mi: MirInst) -> void {
@@ -1233,9 +1254,6 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
             // 的是裸整值，按 i64 乘法语义计算后 trunc 为 int 并登记为整型寄存器（TYPE_INT）：既避免
             // 非法 IR，又避免把整型乘积当指针登记进 shadow frame——否则 GC 会视其为指针并解引用，
             // 运行时 AV 崩溃（实测矩阵乘法 pre-fix 即如此）。回归用例 ex_mat_mult_dyn 现输出 134。
-            // 仅限 BIN_MUL：ADD/SUB/DIV/REM 若一并改写，会让自举阶段对自身源码的字节输出大面积改变
-            // （旧 stage1 中 add/sub ptr 均为 0 处），破坏 stage2==stage3 固定点且 stage2.exe 会在任何
-            // 输入上崩溃。故此守卫刻意收窄到乘法一处。
             let pi_l = cg_cast_val(lhs_raw, lk, TYPE_LONG);
             let pi_r = cg_cast_val(rhs_raw, rk, TYPE_LONG);
             let res_v = llvm_mul(cg_builder, pi_l, pi_r, "multmp");
@@ -1243,6 +1261,14 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
             cg_set_reg(mi.dst, res_int, TYPE_INT);
             return;
         }
+        // 动态 any 操作数加减：同根 Bug1，`add ptr %x,%y` / `sub ptr` 在 LLVM 中非法（llc 拒绝）。
+        // 只有 k==TYPE_ANY（如 c[0][0]+c[0][1] 两个裸 any 元素相加，探查确认生成 add ptr）才需要改写。
+        // 反例：字符串拼接 k==TYPE_STRING 也是 ptr 类，若一并拦截会把 str+str 当 i64 相加，自举阶段
+        // 编译自身源码时字符串全毁、stage2.exe 崩溃/固定点漂移。且编译器自身源码里不存在 k==TYPE_ANY
+        // 的 ADD/SUB（否则旧 codegen 会早已生成非法 add ptr），故本分支在自举时不触发，固定点稳定。
+        // 按 i64 语义生成并登记 TYPE_LONG（保持 64 位不截断）：裸 any 整值 42+7+19=68 成立，
+        // 下游按 int 消费时自会截断；对含真实指针的 any 值保留地址位。
+        if (cg_gen_binop_any_arith(mi, binop, lhs_raw, lk, rhs_raw, rk, k) == 1) { return; }
 
         if (binop == BIN_ADD) {
             if (k == TYPE_STRING) {

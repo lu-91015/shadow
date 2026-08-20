@@ -1,0 +1,23 @@
+//@mode: exe
+//@desc: 修复回归 — 运行时构造的嵌套动态数组：内层数组复用(c[0]=array_push(c[0],v))后，裸 any 元素
+//       c[i][j] 参与「纯 any 合并」先前生成非法 `add ptr`（llc 拒绝，Bug1 mul-ptr 同根）。修复：
+//       cg_gen_binop 仅对 k==TYPE_ANY 的 ADD/SUB（如 c[0][0]+c[0][1]）按 i64 语义生成并登记
+//       TYPE_LONG（保持 64 位、不截断，故不破坏自举固定点；字符串拼接 k==TYPE_STRING 不被劫持）。
+//       此处 u=c[0][0]+c[0][1] 触发 add-ptr 守卫，再经 int 累加 t=42+7+19=68 输出。
+//@expect: 68
+dsb ex_nested_arr_readback;
+
+kimo main() -> int {
+    let c = [];
+    c = array_push(c, []);
+    c[0] = array_push(c[0], 42);
+    c[0] = array_push(c[0], 7);
+    c = array_push(c, []);
+    c[1] = array_push(c[1], 19);
+    let u = c[0][0] + c[0][1]; // any+any: 42+7=49，守卫 add-ptr
+    let t = 0;
+    t = t + u; // int+any → 49
+    t = t + c[1][0]; // int+any → +19
+    println(t); // 68
+    return 0;
+}
