@@ -3921,6 +3921,40 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         return bt;
     }
 
+    // 2.4 payload enum 限定构造：Color.Red(3) / Color.Green(4)。
+    // parse_member_chain 把头部类型名插入 args[0] 作为伪 receiver；若不提前剥离，
+    // 后续 trait 分发探测（3a）会把它当变量检查而误报「undefined variable <枚举名>」。
+    // Java 规则：同名局部变量遮蔽 —— env 已绑定该名时视为真实 receiver，不剥离。
+    if (len(args) > 1 && len(arg_names) == 0) {
+        let recv0 = args[0] as Expr;
+        if (recv0.kind == EXPR_VAR && len(recv0.str2) == 0) {
+            let qed = tc_enum_find_variant_global(ctx, name);
+            if (tc_enum_is_none(qed) == 0) {
+                // 剥离判定不依赖 qed.name（该字段是 mangle 后的注册名）：recev 是未解析的裸
+                // 标识（解析器只会在限定构造时插入类型名作为伪 receiver），且实参比载荷恰好多 1。
+                let do_strip = 0;
+                let sh = tc_env_get(env, recv0.str1);
+                if (type_is_none(sh) == 1) {
+                    let vi_tmp = tc_enum_variant_index(qed, name);
+                    if (vi_tmp >= 0) {
+                        let v_tmp = qed.variants[vi_tmp] as EnumVariant;
+                        let np_tmp = len(v_tmp.payloads);
+                        if (len(args) == np_tmp + 1) { do_strip = 1; }
+                    }
+                }
+                if (do_strip == 1) {
+                    let stripped0: array<Expr> = [];
+                    let qi0 = 1;
+                    while (qi0 < len(args)) {
+                        stripped0 = array_push(stripped0, args[qi0]);
+                        qi0 = qi0 + 1;
+                    }
+                    e.items = stripped0;
+                    args = stripped0;
+                }
+            }
+        }
+    }
     // 2. 模块限定调用：首实参为 bare IDENT 且是模块名 → 设 str2 移除 receiver
     let qmod = e.str2;
     if (len(qmod) > 0) {

@@ -1,12 +1,6 @@
 //@mode: exe
-//@desc: ADT — 带载荷枚举(payload enum) + match 绑定解构。当前语言能力缺口（parse 层即拒），守门后续实现。
+//@desc: ADT — 带载荷枚举(payload enum) + 限定构造 Color.Red(3) + match 绑定解构 Color.Red(x) =>。
 //@expect: 3\n11\n26
-//@xfail: shadow 当前 enum 仅支持 unit-tag（`enum Color { Red; Green; Blue }`，构造 Color.Red，比较 c==Color.Red，
-//        见 cg_enum_ref）；match 分支模式仅支持字面量 / `_` 值匹配（icmp eq，见 cg_match_simple/cg_match_expr/
-//        cg_match_wildcard），不允许成员访问形式与载荷绑定。
-//        本用例触发两个待实现点：1) payload 变体 Red(int) 的构造 2) match 绑定模式 Color.Red(x) =>。
-//        实测当前两个点分别报 SH-PARSE002 `expected => but got '.'`（match 分支）与 TC 层 `use 'Red(...)' constructor syntax`。
-//        实现 ADT（payload-enum + match 解构）后应输出 3、11、26 并移除 //@xfail。
 dsb ex_payload_enum_match;
 
 enum Color { Red(int); Green(int); Blue(int); }

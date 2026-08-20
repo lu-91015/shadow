@@ -528,6 +528,14 @@ pub kimo ps_parse_match_pattern() -> Expr {
             return pw;
         }
         ps_adv();
+        // 限定模式 Color.Variant / Color.Variant(b1, b2, ...)：吸收类型名前缀，
+        // 仅保留变体名（enum 变体按全局唯一名解析）。
+        if (ps_at(TOK_DOT) == 1) {
+            ps_adv();
+            let vn = ps_cur_text();
+            ps_expect(TOK_IDENT, "variant name");
+            name = vn;
+        }
         // Variant(b1, b2, ...) — 解构模式
         if (ps_at(TOK_LPAREN) == 1) {
             ps_adv();
