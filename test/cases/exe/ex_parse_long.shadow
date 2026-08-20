@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: parse_long 字符串→长整型（对照：Linux 产物运行时曾报 __rt_shadow_parse_long 函数指针 NULL → SIGSEGV，2026-08-20 报告）
+//@expect: 42
+// 覆盖数据转换 parse_long 正常路径。当前 Windows 自举（rt_core.c）输出 42；若在 Linux 运行时
+// （rt/linux/runtime_for_selfhost.cpp extern 绑定缺失复现时）本用例会 CRASH/FAIL，从而守住该回归。
+dsb ex_parse_long;
+
+kimo main() -> int {
+    let s = int_to_str(42);
+    let k = parse_long(s);
+    println(k);
+    return 0;
+}

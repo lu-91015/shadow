@@ -1,0 +1,42 @@
+//@mode: exe
+//@desc: BUG — 动态元素(nested-array any 值)作乘数时 codegen 生成 mul ptr ptr，LLVM 拒绝编译
+//@expect: 19\n22\n43\n50
+//@xfail: codegen/codegen.shadow 对 `a[i][k] * b[k][j]`（两个嵌套数组索引的动态值相乘）生成
+//        `mul ptr %x, %y` 非法 IR，llc 报 "invalid operand type for instruction"，RC!=0 编译失败
+//        （实测 root cause，2026-08-20 Windows 自举 shadow.exe / LLVM_HOME=D:/llvm/...）：两句索引
+//        结果类型为 any（指针），乘法 operator 未按实际 int 语义 unbox 生成 mul i32。修复后应
+//        正确输出以下矩阵结果并移除 //@xfail；此用例同时守护数组元素乘法不回归 mul ptr ptr。
+dsb ex_mat_mult_dyn;
+
+kimo mul(a: array, b: array) -> array {
+    let n = len(a);
+    let c = [];
+    let i = 0;
+    while (i < n) {
+        c = array_push(c, []);
+        let j = 0;
+        while (j < n) {
+            let s = 0;
+            let k = 0;
+            while (k < n) {
+                s = s + a[i][k] * b[k][j]; // trigger: mul ptr ptr
+                k = k + 1;
+            }
+            c[i] = array_push(c[i], s);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+kimo main() -> int {
+    let a = [[1, 2], [3, 4]];
+    let b = [[5, 6], [7, 8]];
+    let c = mul(a, b);
+    println(c[0][0]); // 1*5 + 2*7 = 19
+    println(c[0][1]); // 1*6 + 2*8 = 22
+    println(c[1][0]); // 3*5 + 4*7 = 43
+    println(c[1][1]); // 3*6 + 4*8 = 50
+    return 0;
+}

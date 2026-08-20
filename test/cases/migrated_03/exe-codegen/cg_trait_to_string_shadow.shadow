@@ -1,0 +1,30 @@
+//@mode: exe
+//@desc: BUG — trait 方法名 to_string 与 runtime 内建重名，obj.to_string() 被内建遮蔽、不走 trait 静态分发
+//@expect: Foo
+//@xfail: trait 方法 to_string 被 runtime 内建 to_string 遮蔽：f.to_string() 打印 0 而非 "Foo"（RC=0 无报错）。修复后应移除 //@xfail
+// 复现（2026-08-19 实证）：
+//   impl ToString for Foo { to_string(self:any)->string{ return "Foo"; } }
+//   println(f.to_string())  ->  实际输出 0（RC=0，无任何诊断）
+// 对照：方法名改为 describe 后，self:any 与 self:Self 两种写法均正确输出 "Foo"，
+//   证明根因是名字冲突（与 self 类型无关）。
+// 同类佐证：tc/tc_trait_parse.shadow 也用 to_string 但只测编译（@expect-ir: define），
+//   未覆盖运行分发，故未被发现。
+dsb cg_trait_to_string_shadow;
+
+trait ToString {
+    kimo to_string(self: any) -> string;
+}
+
+struct Foo { x: int; }
+
+impl ToString for Foo {
+    kimo to_string(self: any) -> string {
+        return "Foo";
+    }
+}
+
+kimo main() -> int {
+    let f = Foo { x: 42 };
+    println(f.to_string());
+    return 0;
+}
