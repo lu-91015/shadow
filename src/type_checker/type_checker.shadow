@@ -3035,6 +3035,10 @@ pub kimo tc_builtin_ret_type(name: string) -> Type {
         str_eq(name, "float_to_str") == 1 || str_eq(name, "double_to_str") == 1 ||
         str_eq(name, "bool_to_str") == 1 || str_eq(name, "char_to_str") == 1) { return mk_type(TYPE_STRING); }
     if (str_eq(name, "array_push") == 1) { return mk_type(TYPE_ARRAY); }
+    // array_pop：弹出末元素，返回透明 any（值语义，小整数直接为裸值）
+    if (str_eq(name, "array_pop") == 1) { return mk_type(TYPE_ANY); }
+    // typeof：运行时类型名（"number"/"string"/"array"/"dict"/"set"/"null"）
+    if (str_eq(name, "typeof") == 1) { return mk_type(TYPE_STRING); }
     if (str_eq(name, "substr2") == 1 || str_eq(name, "str_replace") == 1 ||
         str_eq(name, "str_trim") == 1 || str_eq(name, "str_to_upper") == 1 ||
         str_eq(name, "str_to_lower") == 1 || str_eq(name, "str_char_at") == 1 ||
@@ -3497,6 +3501,15 @@ pub kimo tc_check_unary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         let bt = mk_type(TYPE_BOOL);
         e.inferred_type = bt;
         return bt;
+    }
+    // 位非 ~x：要求整数操作数
+    if (op == UN_BITNOT) {
+        if (ik != TYPE_INT && ik != TYPE_LONG && ik != TYPE_SHORT && ik != TYPE_CHAR && ik != TYPE_ANY) {
+            let msg = "bitwise not requires integer operand, got '" + ty_display_name(inner) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        e.inferred_type = inner;
+        return inner;
     }
     // UN_NEG
     if (ik == TYPE_INT || ik == TYPE_LONG || ik == TYPE_FLOAT || ik == TYPE_DOUBLE ||

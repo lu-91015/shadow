@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: 嵌套块注释 /* /* */ */ 增量能力。深度计数法解析，外层注释正常闭合。正式回归用例。
+//@expect: 7
+dsb ex_nested_comment;
+
+/* 外层注释开始
+   /* 内层注释嵌套 */
+   仍然在外层注释内 */
+kimo main() -> int {
+    let v = 7; /* 行内注释 /* 嵌套 */ 结束 */
+    println(v);
+    return 0;
+}

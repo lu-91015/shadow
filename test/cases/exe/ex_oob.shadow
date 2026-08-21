@@ -1,0 +1,12 @@
+//@mode: exe
+//@desc: 数组越界访问 a[100] 边界测试。当前运行时无边界检查，越界值未定义，
+//       但访问不应崩溃；断言正常访问与 len 仍正确。正式回归用例。
+//@expect: 3
+dsb ex_oob;
+
+kimo main() -> int {
+    let a = [1, 2, 3];
+    let v = a[100]; // 越界读：值未定义，不应崩溃
+    println(len(a));
+    return 0;
+}

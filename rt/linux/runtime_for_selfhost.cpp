@@ -2688,6 +2688,29 @@ extern "C" void* shadow_array_push_ptr(void* array_ptr, void* val) {
     return array_ptr;
 }
 
+// ── array_pop: remove and return the last element (transparent-any value) ──
+// 返回裸值（小整数直接为 intptr 值；字符串/指针元素返回指针；double 装箱为 AnyBox）。
+extern "C" void* shadow_array_pop(void* array_ptr) {
+    if (!array_ptr) return nullptr;
+    ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
+    if (a->data.empty()) return nullptr;
+    DictValue v = a->data.back();
+    a->data.pop_back();
+    if (std::holds_alternative<int64_t>(v)) return (void*)(intptr_t)std::get<int64_t>(v);
+    if (std::holds_alternative<bool>(v)) return (void*)(intptr_t)(std::get<bool>(v) ? 1 : 0);
+    if (std::holds_alternative<double>(v)) {
+        AnyBox* b = new AnyBox;
+        b->magic = ANYBOX_MAGIC;
+        b->tag = 2;  // float
+        b->value = 0;
+        memcpy(&b->value, &std::get<double>(v), sizeof(double));
+        shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
+        return b;
+    }
+    if (std::holds_alternative<std::string>(v)) return (void*)strdup(std::get<std::string>(v).c_str());
+    return std::get<void*>(v);
+}
+
 // Ã¢ÂÂÃ¢ÂÂ shadow_dict_get_int Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
 extern "C" int64_t shadow_dict_get_int(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return 0;
@@ -4286,8 +4309,12 @@ extern "C" int64_t __rt_shadow_parse_long(const char* s) {
     }
     char* endp = nullptr;
     errno = 0;
-    long long v = strtoll(s, &endp, 10);
-    if (endp == s || (endp && *endp != '\0')) {
+    int base = 10;
+    const char* p = s;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
+    else if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) { base = 2; p += 2; }
+    long long v = strtoll(p, &endp, base);
+    if (endp == p || (endp && *endp != '\0')) {
         shadow_throw_str("parse_long: invalid integer format");
         return 0;
     }

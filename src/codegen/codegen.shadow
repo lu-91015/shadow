@@ -212,6 +212,7 @@ pub kimo cg_resolve_extern_name(name: string) -> string {
     if (str_eq(name, "print") == 1) { return "shadow_print_str"; }
     if (str_eq(name, "to_string") == 1) { return "shadow_any_to_string"; }
     if (str_eq(name, "array_push") == 1) { return "shadow_array_push_ptr"; }
+    if (str_eq(name, "array_pop") == 1) { return "shadow_array_pop"; }
     // 字符串处理全套 → 0.4 自研 runtime（shadow_* 0.4 命名，避免与 runtime_for_selfhost.o
     // 的 C++ shadow_string_* 符号重复定义；语义与 0.3 C++ 实现一致）
     if (str_eq(name, "str_join") == 1) { return "shadow_sjoin"; }
@@ -896,6 +897,10 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             cg_set_reg(mi.dst, llvm_not(cg_builder, operand, "nottmp"), TYPE_BOOL);
             return;
         }
+        if (unop == UN_BITNOT) {
+            cg_set_reg(mi.dst, llvm_not(cg_builder, operand, "bitnottmp"), k);
+            return;
+        }
         return;
     }
 
@@ -1443,6 +1448,23 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
             if (arg0_kind == TYPE_STRING) {
                 resolved_name = "shadow_string_len";
             }
+        }
+        // typeof：编译期类型内省——按参数静态类型发射字符串常量，不产生运行时调用。
+        // 避免与编译器自身 runtime_for_selfhost_wk.o 的 shadow_typeof 强符号重复定义。
+        if (str_eq(mi.strval, "typeof") == 1 && len(args) > 0) {
+            let a0k = cg_get_reg_kind(args[0] as int);
+            let tname = "unknown";
+            if (a0k == TYPE_INT || a0k == TYPE_LONG || a0k == TYPE_CHAR || a0k == TYPE_SHORT || a0k == TYPE_DATE) { tname = "number"; }
+            else if (a0k == TYPE_FLOAT || a0k == TYPE_DOUBLE) { tname = "float"; }
+            else if (a0k == TYPE_BOOL) { tname = "bool"; }
+            else if (a0k == TYPE_STRING) { tname = "string"; }
+            else if (a0k == TYPE_ARRAY) { tname = "array"; }
+            else if (a0k == TYPE_DICT) { tname = "dict"; }
+            else if (a0k == TYPE_SET) { tname = "set"; }
+            else if (a0k == TYPE_ANY) { tname = "any"; }
+            let sptr = cg_string_global(tname);
+            if (mi.dst >= 0) { cg_set_reg(mi.dst, sptr, TYPE_STRING); }
+            return;
         }
         if (len(args) > 0) {
             let a0k = cg_get_reg_kind(args[0] as int);

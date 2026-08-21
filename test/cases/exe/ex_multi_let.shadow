@@ -1,0 +1,12 @@
+//@mode: exe
+//@desc: 多变量声明 let a=1, b=2 增量能力。去糖为连续 let。正式回归用例。
+//@expect: 3
+//@expect: 4
+dsb ex_multi_let;
+
+kimo main() -> int {
+    let a = 3, b = 4;
+    println(a);
+    println(b);
+    return 0;
+}

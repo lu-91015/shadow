@@ -1,0 +1,11 @@
+//@mode: exe
+//@desc: 复合赋值 %= 增量能力。a %= 7 等价 a = a % 7。10 % 7 = 3。正式回归用例。
+//@expect: 3
+dsb ex_percenteq;
+
+kimo main() -> int {
+    let a = 10;
+    a %= 7;
+    println(a);
+    return 0;
+}

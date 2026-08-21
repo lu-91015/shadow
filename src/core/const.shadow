@@ -145,6 +145,8 @@ pub let TOK_SHL: int = 119;
 pub let TOK_SHR: int = 120;
 pub let TOK_INC: int = 121;
 pub let TOK_DEC: int = 122;
+pub let TOK_TILDE: int = 123;
+pub let TOK_PERCENTEQ: int = 124;
 
 // ============ 表达式种类 EXPR_* ============
 pub let EXPR_INT: int = 1;
@@ -229,6 +231,7 @@ pub let BIN_SHR: int = 17;
 // ============ 一元操作符 UN_* ============
 pub let UN_NEG: int = 0;
 pub let UN_NOT: int = 1;
+pub let UN_BITNOT: int = 2;
 
 // ============ 诊断（LSP-6） ============
 pub let DIAG_ERROR: int = 1;

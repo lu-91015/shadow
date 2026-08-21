@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: 十六进制 0xFF 与二进制 0b1010 字面量增量能力。0xFF=255，0b1010=10。正式回归用例。
+//@expect: 255
+//@expect: 10
+dsb ex_hex_bin;
+
+kimo main() -> int {
+    let h = 0xFF;
+    println(h);
+    let b = 0b1010;
+    println(b);
+    return 0;
+}

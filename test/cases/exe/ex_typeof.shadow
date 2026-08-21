@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: typeof 类型内省增量能力。编译期按静态类型返回类型名。正式回归用例。
+//@expect: array
+//@expect: number
+//@expect: string
+dsb ex_typeof;
+
+kimo main() -> int {
+    println(typeof([1, 2, 3]));
+    println(typeof(42));
+    println(typeof("hi"));
+    return 0;
+}

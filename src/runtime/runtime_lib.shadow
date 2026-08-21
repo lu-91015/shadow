@@ -233,6 +233,21 @@ pub kimo shadow_array_push_ptr(arr: any, val: any) -> any {
     return arr;
 }
 
+// array_pop：弹出末元素，返回透明 any（值语义，小整数直接为裸值）。
+// 与 shadow_array_get_ptr 同布局读取，仅把 len 减一。
+pub kimo shadow_array_pop(arr: any) -> any {
+    let len: int = shadow_array_len(arr);
+    if (len == 0) { return null; }
+    let es: int = shadow_array_elem_size(arr);
+    let idx: int = len - 1;
+    let off: int = 12 + idx * es;
+    let v: any = 0 as any;
+    if (es == 4) { v = rt_load_int(arr, off) as any; }
+    else { v = rt_load_ptr(arr, off); }
+    rt_store_int(arr, 0, idx);
+    return v;
+}
+
 pub kimo shadow_array_get_int(arr: any, idx: int) -> int {
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;

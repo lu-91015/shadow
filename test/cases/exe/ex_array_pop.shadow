@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: array_pop 内置函数增量能力。弹出末元素并缩短数组。正式回归用例。
+//@expect: 3
+//@expect: 2
+dsb ex_array_pop;
+
+kimo main() -> int {
+    let a = [1, 2, 3];
+    let popped = array_pop(a);
+    println(popped);
+    println(len(a));
+    return 0;
+}

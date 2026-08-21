@@ -1,0 +1,11 @@
+//@mode: exe
+//@desc: 嵌套数组下标参与算术 a[1][2] * a[1][1]。6 * 5 = 30。正式回归用例。
+//@expect: 30
+dsb ex_nested_arith;
+
+kimo main() -> int {
+    let a = [[1, 2, 3], [4, 5, 6]];
+    let v = a[1][2] * a[1][1]; // 6 * 5 = 30
+    println(v);
+    return 0;
+}

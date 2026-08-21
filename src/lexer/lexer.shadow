@@ -107,26 +107,66 @@ pub kimo lx_skip_ws() -> void {
         }
         else if (c == "/" && lx_peek(1) == "*") {
             lx_adv(); lx_adv();
+            let depth = 1;
             while (true) {
                 if (lx_cur() == "") { break; }
-                if (lx_cur() == "*" && lx_peek(1) == "/") {
+                if (lx_cur() == "/" && lx_peek(1) == "*") {
+                    depth = depth + 1;
                     lx_adv(); lx_adv();
-                    break;
                 }
-                lx_adv();
+                else if (lx_cur() == "*" && lx_peek(1) == "/") {
+                    lx_adv(); lx_adv();
+                    depth = depth - 1;
+                    if (depth == 0) { break; }
+                }
+                else { lx_adv(); }
             }
         }
         else { break; }
     }
 }
 
-// 数字字面量：十进制、float（.5、科学计数）、long 后缀 L/l
+// 数字字面量：十进制、float（.5、科学计数）、long 后缀 L/l、十六进制 0x、二进制 0b
 pub kimo lx_read_num() -> Token {
     let start_line = lx_line;
     let start_col = lx_col;
     let text = "";
     let is_float = 0;
     let is_long = 0;
+    // 十六进制 0xFF / 0Xff
+    if (lx_cur() == "0" && (lx_peek(1) == "x" || lx_peek(1) == "X")) {
+        text = "0x";
+        lx_adv(); lx_adv();
+        while (true) {
+            let h = lx_cur();
+            if ((h >= "0" && h <= "9") || (h >= "a" && h <= "f") || (h >= "A" && h <= "F")) {
+                text = text + h; lx_adv();
+            } else { break; }
+        }
+        let hl = lx_cur();
+        if (hl == "L" || hl == "l") { is_long = 1; lx_adv(); }
+        let hkind = TOK_INT_LIT;
+        if (is_long == 1) { hkind = TOK_LONG_LIT; }
+        return Token { kind: hkind, text: text, line: start_line, col: start_col,
+                       end_line: lx_line, end_col: lx_col };
+    }
+    // 二进制 0b1010 / 0B1010
+    if (lx_cur() == "0" && (lx_peek(1) == "b" || lx_peek(1) == "B")) {
+        text = "0b";
+        lx_adv(); lx_adv();
+        while (true) {
+            let b = lx_cur();
+            if (b == "0" || b == "1") {
+                text = text + b; lx_adv();
+            } else { break; }
+        }
+        let bl = lx_cur();
+        if (bl == "L" || bl == "l") { is_long = 1; lx_adv(); }
+        let bkind = TOK_INT_LIT;
+        if (is_long == 1) { bkind = TOK_LONG_LIT; }
+        return Token { kind: bkind, text: text, line: start_line, col: start_col,
+                       end_line: lx_line, end_col: lx_col };
+    }
     while (true) {
         let c = lx_cur();
         if (c >= "0" && c <= "9") { text = text + c; lx_adv(); }
@@ -379,7 +419,11 @@ pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) ->
             if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SLASHEQ, "/=")); }
             else { tokens = array_push(tokens, lx_make_tok(TOK_SLASH, "/")); }
         }
-        else if (c == "%") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PERCENT, "%")); }
+        else if (c == "%") {
+            lx_adv();
+            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PERCENTEQ, "%=")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_PERCENT, "%")); }
+        }
         else if (c == "=") {
             lx_adv();
             if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_EQEQ, "==")); }
@@ -414,6 +458,7 @@ pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) ->
             else { tokens = array_push(tokens, lx_make_tok(TOK_BITOR, "|")); }
         }
         else if (c == "^") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_BITXOR, "^")); }
+        else if (c == "~") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_TILDE, "~")); }
         else if (c == "(") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LPAREN, "(")); }
         else if (c == ")") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_RPAREN, ")")); }
         else if (c == "{") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LBRACE, "{")); }

@@ -1,0 +1,13 @@
+//@mode: exe
+//@desc: 位非 ~ 增量能力。整数按位取反。~42 = -43，~~0 = 0。正式回归用例。
+//@expect: -43
+//@expect: 0
+dsb ex_bitnot;
+
+kimo main() -> int {
+    let x = ~42;
+    println(x);
+    let y = ~~0;
+    println(y);
+    return 0;
+}

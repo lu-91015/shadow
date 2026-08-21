@@ -710,6 +710,42 @@ pub kimo ps_build_string_interp(txt: string, loc: Location) -> Expr {
 }
 
 // ============ primary 表达式（优先级 climbing 底层） ============
+// 十六进制 0xFF / 二进制 0b1010 字面量转换。C 层 strtoll（parser_rt_parse_long）
+// 只按十进制解析，0x/0b 前缀在此手动转换（编译器自身 runtime 为冻结旧版，不能依赖它）。
+pub kimo parser_parse_radix_lit(txt: string) -> long {
+    let n = len(txt);
+    if (n < 2) { return parser_rt_parse_long(txt); }
+    let c0 = txt[0];
+    let c1 = txt[1];
+    if (c0 == "0" && (c1 == "x" || c1 == "X")) {
+        let v: long = 0;
+        let i = 2;
+        while (i < n) {
+            let c = txt[i];
+            let d: long = 0;
+            if (c >= "0" && c <= "9") { d = char_to_int(c) - 48; }
+            else if (c >= "a" && c <= "f") { d = char_to_int(c) - 87; }
+            else if (c >= "A" && c <= "F") { d = char_to_int(c) - 55; }
+            v = v * 16 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+    if (c0 == "0" && (c1 == "b" || c1 == "B")) {
+        let v: long = 0;
+        let i = 2;
+        while (i < n) {
+            let c = txt[i];
+            let d: long = 0;
+            if (c == "1") { d = 1; }
+            v = v * 2 + d;
+            i = i + 1;
+        }
+        return v;
+    }
+    return parser_rt_parse_long(txt);
+}
+
 pub kimo parse_primary_inner() -> Expr {
     let k = ps_cur_kind();
     let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
@@ -718,7 +754,7 @@ pub kimo parse_primary_inner() -> Expr {
         let txt = ps_cur_text();
         ps_adv();
         // C 层 strtoll 解析（自举链 long 算术降级 i32 规避，见文件头注释）
-        let v = parser_rt_parse_long(txt);
+        let v = parser_parse_radix_lit(txt);
         let e = mk_expr(EXPR_INT, loc);
         e.intval = v;
         return e;
@@ -727,7 +763,7 @@ pub kimo parse_primary_inner() -> Expr {
     if (k == TOK_LONG_LIT) {
         let txt = ps_cur_text();
         ps_adv();
-        let v = parser_rt_parse_long(txt);
+        let v = parser_parse_radix_lit(txt);
         let e = mk_expr(EXPR_LONG, loc);
         e.intval = v;
         return e;
@@ -1166,6 +1202,15 @@ pub kimo parse_unary_inner() -> Expr {
         let e = parse_unary();
         let r = mk_expr(EXPR_UNARY, loc);
         r.intval = UN_NOT;
+        r.child1 = e;
+        return r;
+    }
+    // 位非 ~x
+    if (k == TOK_TILDE) {
+        ps_adv();
+        let e = parse_unary();
+        let r = mk_expr(EXPR_UNARY, loc);
+        r.intval = UN_BITNOT;
         r.child1 = e;
         return r;
     }
@@ -2173,7 +2218,6 @@ pub kimo parse_statement_inner() -> Stmt {
         if (has_init == 0) {
             injected_new = ps_inject_struct_new(ty, 0 as Expr, loc);
         }
-        ps_expect(TOK_SEMICOLON, ";");
         let s = mk_stmt(STMT_LET, loc);
         s.str1 = name;
         s.type1 = ty;
@@ -2182,6 +2226,46 @@ pub kimo parse_statement_inner() -> Stmt {
         } else if (has_init == 1) {
             s.expr1 = init;
         }
+        // 多变量声明 let a=1, b=2, c=3;（去糖为 STMT_BLOCK）
+        if (ps_at(TOK_COMMA) == 1) {
+            let stmts: array<Stmt> = [];
+            stmts = array_push(stmts, s);
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                let nm = ps_cur_text();
+                ps_expect(TOK_IDENT, "identifier");
+                let ty2 = type_none_inner();
+                if (ps_at(TOK_COLON) == 1) {
+                    ps_adv();
+                    ty2 = parse_type();
+                }
+                let init2 = mk_expr(EXPR_INT, loc);
+                let has_init2 = 0;
+                if (ps_at(TOK_EQ) == 1) {
+                    ps_adv();
+                    init2 = parse_expr();
+                    has_init2 = 1;
+                }
+                let inj2 = 0 as Expr;
+                if (has_init2 == 0) {
+                    inj2 = ps_inject_struct_new(ty2, 0 as Expr, loc);
+                }
+                let s2 = mk_stmt(STMT_LET, loc);
+                s2.str1 = nm;
+                s2.type1 = ty2;
+                if (expr_is_none(inj2) == 0) {
+                    s2.expr1 = inj2;
+                } else if (has_init2 == 1) {
+                    s2.expr1 = init2;
+                }
+                stmts = array_push(stmts, s2);
+            }
+            ps_expect(TOK_SEMICOLON, ";");
+            let blk = mk_stmt(STMT_BLOCK, loc);
+            blk.items = stmts;
+            return blk;
+        }
+        ps_expect(TOK_SEMICOLON, ";");
         return s;
     }
 
@@ -2378,8 +2462,8 @@ pub kimo parse_statement_inner() -> Stmt {
         s.expr2 = rhs;
         return s;
     }
-    // 复合赋值: +=, -=, *=, /=
-    if (ps_at(TOK_PLUSEQ) == 1 || ps_at(TOK_MINUSEQ) == 1 || ps_at(TOK_STAREQ) == 1 || ps_at(TOK_SLASHEQ) == 1) {
+    // 复合赋值: +=, -=, *=, /=, %=
+    if (ps_at(TOK_PLUSEQ) == 1 || ps_at(TOK_MINUSEQ) == 1 || ps_at(TOK_STAREQ) == 1 || ps_at(TOK_SLASHEQ) == 1 || ps_at(TOK_PERCENTEQ) == 1) {
         let op_kind = ps_cur_kind();
         ps_adv();
         let rhs = parse_expr();
@@ -2388,7 +2472,8 @@ pub kimo parse_statement_inner() -> Stmt {
         if (op_kind == TOK_PLUSEQ) { bin_op = BIN_ADD; }
         else if (op_kind == TOK_MINUSEQ) { bin_op = BIN_SUB; }
         else if (op_kind == TOK_STAREQ) { bin_op = BIN_MUL; }
-        else { bin_op = BIN_DIV; }
+        else if (op_kind == TOK_SLASHEQ) { bin_op = BIN_DIV; }
+        else { bin_op = BIN_REM; }
         let bin_e = mk_expr(EXPR_BINARY, loc);
         bin_e.intval = bin_op;
         bin_e.child1 = e;

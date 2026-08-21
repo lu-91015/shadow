@@ -553,8 +553,12 @@ extern int64_t __rt_shadow_parse_long(const char* s) {
     char* end = NULL;
     long long v;
     if (!s) { g_parse_err = 1; shadow_throw_str("parse_long: null input"); return 0; }
-    v = strtoll(s, &end, 10);
-    if (end == s || *end != '\0') {
+    int base = 10;
+    const char* p = s;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) { base = 16; p += 2; }
+    else if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) { base = 2; p += 2; }
+    v = strtoll(p, &end, base);
+    if (end == p || *end != '\0') {
         g_parse_err = 1;
         shadow_throw_str("parse_long: invalid number");
         return 0;
