@@ -123,16 +123,17 @@ kimo main() -> int {
 
     // [6/7] compile rt/ system-call layer
     println("[6/7] compile rt/ system-call layer");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_core.c -o build/rt/rt_core.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_fs.c -o build/rt/rt_fs.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc.c -o build/rt/rt_proc.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_time.c -o build/rt/rt_time.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_err.c -o build/rt/rt_err.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_extra.c -o build/rt/rt_extra.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_gc.c -o build/rt/rt_gc.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_thread.c -o build/rt/rt_thread.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_io.c -o build/rt/rt_io.o");
+    // 用户产物运行时对象用 -O2：分配器/字符串/数组原语加速所有用户程序。
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_core.c -o build/rt/rt_core.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_fs.c -o build/rt/rt_fs.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_proc.c -o build/rt/rt_proc.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_time.c -o build/rt/rt_time.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_err.c -o build/rt/rt_err.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_extra.c -o build/rt/rt_extra.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_gc.c -o build/rt/rt_gc.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_thread.c -o build/rt/rt_thread.o");
+    rt_sys_exec(clang_c + " -O2 -I " + boot + " -c rt/rt_io.c -o build/rt/rt_io.o");
 
     // [7/7] smoke --version
     println("[7/7] smoke --version");

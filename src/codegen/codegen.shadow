@@ -120,6 +120,7 @@ let cg_cur_ret_kind: int = 0;
 let cg_cur_ret_default: any = 0 as any;
 let cg_cur_ret_is_void: int = 0;
 let cg_gc_frame_marker: any = 0 as any;
+let cg_gc_frame_active: int = 0;            // 1 = 本函数需要 GC 帧（有活指针/指针参数）
 // GC 类型注册缓存（0.4 GC v1：按 名称+大小+位图 复用 type_id，首次生成 register_type 调用）
 let cg_gc_type_keys: array<string> = [];
 let cg_gc_type_ids: array<int> = [];
@@ -644,11 +645,16 @@ pub kimo cg_emit_ret_default() -> void {
 
 // GC root frame（0.4 GC v1/v2 完成前沿用 0.3 符号）
 pub kimo cg_gc_enter_frame() -> void {
+    if (cg_gc_frame_active == 0) {
+        cg_gc_frame_marker = 0 as any;
+        return;
+    }
     let no_args: array<any> = [];
     cg_gc_frame_marker = cg_call_named("rt_gc_frame_enter", TYPE_INT, no_args);
 }
 
 pub kimo cg_gc_leave_frame() -> void {
+    if (cg_gc_frame_active == 0) { return; }
     let args: array<any> = [];
     args = array_push(args, cg_gc_frame_marker);
     cg_call_named("rt_gc_frame_leave", TYPE_INT, args);
@@ -2277,6 +2283,17 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     if (str_eq(mf.name, "main") == 1) {
         is_main = 1;
         n_llvm_params = n_params + 2;
+    }
+    // §5.2.4 GC 帧跳过：无活指针（sf_n==0）且无指针参数（且非 main）的函数
+    // 不需要帧 enter/leave 与根集登记，仅保留入口/回边 poll（协作 STW 仍成立）。
+    cg_gc_frame_active = 0;
+    if (sf_n > 0) { cg_gc_frame_active = 1; }
+    if (is_main == 1) { cg_gc_frame_active = 1; }
+    let pi = 0;
+    while (pi < n_params) {
+        let pp = params[pi];
+        if (cg_is_ptr_kind(pp.type_kind) == 1) { cg_gc_frame_active = 1; }
+        pi = pi + 1;
     }
     let i = 0;
     while (i < n_params) {
