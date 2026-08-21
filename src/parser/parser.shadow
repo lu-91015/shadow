@@ -20,6 +20,9 @@ import lexer.lexer;
 let ps_tokens: array<Token> = [];
 let ps_idx: int = 0;
 let ps_file: string = "";
+// 类型上下文把 TOK_SHR（>>）拆为两个 >：ps_expect_gt 消费第一个后置 1，
+// ps_cur_kind 返回 TOK_GT（第二个 >），下一次 ps_adv 复位并前进到下一 token。
+let ps_gt_pending: int = 0;
 // 大整数/长整型字面量解析走 C 层 strtoll（rt/rt_parse_only.c 补符号，rt_parse_only.o 进 shadow.exe 链接）。
 // ⚠️ 不能在此用 Shadow long 算术（v = v*10 + d）：自举链旧宿主会把 long 运算降级 i32，
 // 10^12 级字面量解析会溢出（-1000000000000L → 全局 727379968 / 局部 3567587328）。
@@ -130,6 +133,7 @@ pub kimo ps_sync_toplevel() -> void {
 
 // ============ 位置访问 ============
 pub kimo ps_cur_kind() -> int {
+    if (ps_gt_pending == 1) { return TOK_GT; }
     let t = ps_tokens[ps_idx] as Token;
     return t.kind;
 }
@@ -150,6 +154,11 @@ pub kimo ps_cur_col() -> int {
 }
 
 pub kimo ps_adv() -> void {
+    if (ps_gt_pending == 1) {
+        ps_gt_pending = 0;
+        if (ps_idx < len(ps_tokens) - 1) { ps_idx = ps_idx + 1; }
+        return;
+    }
     if (ps_idx < len(ps_tokens) - 1) { ps_idx = ps_idx + 1; }
 }
 
@@ -204,8 +213,12 @@ pub kimo parse_primary() -> Expr { return ps_finish_expr(parse_primary_inner());
 pub kimo parse_unary() -> Expr { return ps_finish_expr(parse_unary_inner()); }
 pub kimo parse_mul() -> Expr { return ps_finish_expr(parse_mul_inner()); }
 pub kimo parse_add() -> Expr { return ps_finish_expr(parse_add_inner()); }
+pub kimo parse_shift() -> Expr { return ps_finish_expr(parse_shift_inner()); }
 pub kimo parse_cmp() -> Expr { return ps_finish_expr(parse_cmp_inner()); }
 pub kimo parse_eq() -> Expr { return ps_finish_expr(parse_eq_inner()); }
+pub kimo parse_bitand() -> Expr { return ps_finish_expr(parse_bitand_inner()); }
+pub kimo parse_bitxor() -> Expr { return ps_finish_expr(parse_bitxor_inner()); }
+pub kimo parse_bitor() -> Expr { return ps_finish_expr(parse_bitor_inner()); }
 pub kimo parse_and() -> Expr { return ps_finish_expr(parse_and_inner()); }
 pub kimo parse_or() -> Expr { return ps_finish_expr(parse_or_inner()); }
 pub kimo parse_expr() -> Expr { return ps_finish_expr(parse_expr_inner()); }
@@ -247,6 +260,15 @@ pub kimo ps_expect(kind: int, what: string) -> void {
 pub kimo ps_at(kind: int) -> int {
     if (ps_cur_kind() == kind) { return 1; }
     return 0;
+}
+
+// 类型上下文消费闭合 >：普通 TOK_GT 直接消费；TOK_SHR（>>）拆为两个 >，
+// 消费第一个并置 ps_gt_pending，由下一次 ps_adv 消费第二个（见 ps_cur_kind/ps_adv）。
+pub kimo ps_expect_gt(what: string) -> void {
+    if (ps_cur_kind() == TOK_GT) { ps_adv(); return; }
+    if (ps_cur_kind() == TOK_SHR) { ps_gt_pending = 1; return; }
+    let msg = "SH-PARSE002: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": expected " + what + " but got '" + ps_cur_text() + "'";
+    ps_err(msg);
 }
 
 // 前瞻：ps_idx + offset 处 token kind（越界返回 -1）
@@ -453,7 +475,7 @@ pub kimo parse_type() -> Type {
             if (ps_at(TOK_LT) == 1) {
                 ps_adv();
                 let elem_t = parse_type();
-                ps_expect(TOK_GT, ">");
+                ps_expect_gt(">");
                 t.elem_type = elem_t;
             }
         } else if (str_eq(ident, "dict") == 1 || str_eq(ident, "map") == 1 || str_eq(ident, "hashmap") == 1) {
@@ -463,7 +485,7 @@ pub kimo parse_type() -> Type {
                 let key_t = parse_type();
                 ps_expect(TOK_COMMA, ",");
                 let val_t = parse_type();
-                ps_expect(TOK_GT, ">");
+                ps_expect_gt(">");
                 t.key_type = key_t;
                 t.val_type = val_t;
             }
@@ -472,7 +494,7 @@ pub kimo parse_type() -> Type {
             if (ps_at(TOK_LT) == 1) {
                 ps_adv();
                 let elem_t = parse_type();
-                ps_expect(TOK_GT, ">");
+                ps_expect_gt(">");
                 t.elem_type = elem_t;
             }
         } else {
@@ -486,7 +508,7 @@ pub kimo parse_type() -> Type {
                     ps_adv();
                     targs = array_push(targs, parse_type());
                 }
-                ps_expect(TOK_GT, ">");
+                ps_expect_gt(">");
                 t.param_types = targs;
             }
         }
@@ -804,7 +826,7 @@ pub kimo parse_primary_inner() -> Expr {
                 ps_adv();
                 type_args = array_push(type_args, parse_type());
             }
-            ps_expect(TOK_GT, ">");
+            ps_expect_gt(">");
         }
         let e = mk_expr(EXPR_NEW, loc);
         e.str1 = name;
@@ -896,7 +918,7 @@ pub kimo parse_primary_inner() -> Expr {
                 ps_adv();
                 type_args = array_push(type_args, parse_type());
             }
-            ps_expect(TOK_GT, ">");
+            ps_expect_gt(">");
         }
         // 结构体字面量: Name { field: expr, ... }
         if (ps_at(TOK_LBRACE) == 1 && ps_no_struct_lit == 0) {
@@ -990,7 +1012,8 @@ pub kimo parse_primary_inner() -> Expr {
         }
         let e = mk_expr(EXPR_VAR, loc);
         e.str1 = name;
-        return e;
+        // 后缀自增/自减 x++ / x-- 也走成员链循环（非 `.`/`[`/`++`/`--` 时是安全的 no-op）
+        return parse_member_chain(e, loc);
     }
 
     if (k == TOK_LPAREN) {
@@ -1111,6 +1134,17 @@ pub kimo parse_member_chain(base: Expr, loc: Location) -> Expr {
             e.child1 = result;
             e.child2 = idx;
             result = e;
+        } else if (ps_at(TOK_INC) == 1 || ps_at(TOK_DEC) == 1) {
+            // 后缀自增/自减 x++ / x--
+            let is_inc = 0;
+            if (ps_cur_kind() == TOK_INC) { is_inc = 1; }
+            ps_adv();
+            let e = mk_expr(EXPR_INCDEC, loc);
+            e.intval = 0;
+            if (is_inc == 0) { e.intval = 1; }
+            e.str1 = "post";
+            e.child1 = result;
+            result = e;
         } else { break; }
     }
     return result;
@@ -1133,6 +1167,19 @@ pub kimo parse_unary_inner() -> Expr {
         let r = mk_expr(EXPR_UNARY, loc);
         r.intval = UN_NOT;
         r.child1 = e;
+        return r;
+    }
+    // 前缀自增/自减 ++x / --x
+    if (k == TOK_INC || k == TOK_DEC) {
+        let is_inc = 0;
+        if (k == TOK_INC) { is_inc = 1; }
+        ps_adv();
+        let target = parse_unary();
+        let r = mk_expr(EXPR_INCDEC, loc);
+        r.intval = 0;
+        if (is_inc == 0) { r.intval = 1; }
+        r.str1 = "pre";
+        r.child1 = target;
         return r;
     }
     // spawn <funcname> 或 spawn <funcname>(args)
@@ -1182,6 +1229,11 @@ pub kimo bin_op_from_tok(kind: int) -> int {
     if (kind == TOK_GE) { return BIN_GE; }
     if (kind == TOK_AND) { return BIN_AND; }
     if (kind == TOK_OR) { return BIN_OR; }
+    if (kind == TOK_BITAND) { return BIN_BITAND; }
+    if (kind == TOK_BITOR) { return BIN_BITOR; }
+    if (kind == TOK_BITXOR) { return BIN_BITXOR; }
+    if (kind == TOK_SHL) { return BIN_SHL; }
+    if (kind == TOK_SHR) { return BIN_SHR; }
     return -1;
 }
 
@@ -1223,12 +1275,31 @@ pub kimo parse_add_inner() -> Expr {
     return left;
 }
 
-pub kimo parse_cmp_inner() -> Expr {
+pub kimo parse_shift_inner() -> Expr {
     let left = parse_add();
-    while (ps_at(TOK_LT) == 1 || ps_at(TOK_GT) == 1 || ps_at(TOK_LE) == 1 || ps_at(TOK_GE) == 1) {
+    while (ps_at(TOK_SHL) == 1 || ps_at(TOK_SHR) == 1) {
         let op = bin_op_from_tok(ps_cur_kind());
         ps_adv();
         let right = parse_add();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = op;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_cmp_inner() -> Expr {
+    let left = parse_shift();
+    while (ps_at(TOK_LT) == 1 || ps_at(TOK_GT) == 1 || ps_at(TOK_LE) == 1 || ps_at(TOK_GE) == 1) {
+        let op = bin_op_from_tok(ps_cur_kind());
+        ps_adv();
+        let right = parse_shift();
         let e = mk_expr(EXPR_BINARY, left.loc);
         e.intval = op;
         e.child1 = left;
@@ -1261,11 +1332,65 @@ pub kimo parse_eq_inner() -> Expr {
     return left;
 }
 
-pub kimo parse_and_inner() -> Expr {
+pub kimo parse_bitor_inner() -> Expr {
+    let left = parse_bitxor();
+    while (ps_at(TOK_BITOR) == 1) {
+        ps_adv();
+        let right = parse_bitxor();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = BIN_BITOR;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_bitxor_inner() -> Expr {
+    let left = parse_bitand();
+    while (ps_at(TOK_BITXOR) == 1) {
+        ps_adv();
+        let right = parse_bitand();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = BIN_BITXOR;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_bitand_inner() -> Expr {
     let left = parse_eq();
-    while (ps_at(TOK_AND) == 1) {
+    while (ps_at(TOK_BITAND) == 1) {
         ps_adv();
         let right = parse_eq();
+        let e = mk_expr(EXPR_BINARY, left.loc);
+        e.intval = BIN_BITAND;
+        e.child1 = left;
+        e.child2 = right;
+        // loc 须覆盖整个中缀表达式（左操作数起点 → 右操作数终点），
+        // 否则 hover 在运算符/右操作数上落空（0.3 行为）。
+        e.loc.end_line = right.loc.end_line;
+        e.loc.end_col = right.loc.end_col;
+        left = e;
+    }
+    return left;
+}
+
+pub kimo parse_and_inner() -> Expr {
+    let left = parse_bitor();
+    while (ps_at(TOK_AND) == 1) {
+        ps_adv();
+        let right = parse_bitor();
         let e = mk_expr(EXPR_BINARY, left.loc);
         e.intval = BIN_AND;
         e.child1 = left;
@@ -2408,7 +2533,7 @@ pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
             ps_adv();
             let ct = parse_type();
             constraints = array_push(constraints, ps_type_const_name(ct));
-            while (ps_at(TOK_OR) == 1) {
+            while (ps_at(TOK_OR) == 1 || ps_at(TOK_BITOR) == 1) {
                 ps_adv();
                 let ct2 = parse_type();
                 constraints = array_push(constraints, ps_type_const_name(ct2));
@@ -2424,7 +2549,7 @@ pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
                 ps_adv();
                 let ct3 = parse_type();
                 constraints2 = array_push(constraints2, ps_type_const_name(ct3));
-                while (ps_at(TOK_OR) == 1) {
+                while (ps_at(TOK_OR) == 1 || ps_at(TOK_BITOR) == 1) {
                     ps_adv();
                     let ct4 = parse_type();
                     constraints2 = array_push(constraints2, ps_type_const_name(ct4));
@@ -2432,7 +2557,7 @@ pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
             }
             type_params = array_push(type_params, TypeParam { name: tp2, constraints: constraints2 });
         }
-        ps_expect(TOK_GT, ">");
+        ps_expect_gt(">");
     }
     ps_expect(TOK_LPAREN, "(");
     let params: array<Param> = [];
@@ -2494,7 +2619,7 @@ pub kimo parse_struct(is_pub: int) -> StructDef {
             ps_expect(TOK_IDENT, "identifier");
             type_params = array_push(type_params, TypeParam { name: tp2, constraints: [] });
         }
-        ps_expect(TOK_GT, ">");
+        ps_expect_gt(">");
     }
     ps_expect(TOK_LBRACE, "{");
     let fields: array<StructField> = [];
@@ -2536,7 +2661,7 @@ pub kimo parse_enum(is_pub: int) -> EnumDef {
             if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
             break;
         }
-        ps_expect(TOK_GT, ">");
+        ps_expect_gt(">");
     }
     ps_expect(TOK_LBRACE, "{");
     let variants: array<EnumVariant> = [];
@@ -2586,7 +2711,7 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
             if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
             break;
         }
-        ps_expect(TOK_GT, ">");
+        ps_expect_gt(">");
     }
     ps_expect(TOK_LBRACE, "{");
     let methods: array<FuncDef> = [];

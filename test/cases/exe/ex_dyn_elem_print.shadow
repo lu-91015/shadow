@@ -1,8 +1,6 @@
 //@mode: exe
 //@desc: 修复回归 — 嵌套动态数组裸 any 元素直接打印。动态数组元素为裸 any（未装箱，值语义），
-//       println(c[0][0]) 会把裸整值当作 AnyBox 指针解引用 → AV 静默崩溃（实测 fault=0x2a，即
-//       载入的元素值 42 被当地址访问）。修复后应直接输出元素值 42。仅作守门：实现后移除 //@xfail。
-//@xfail: 打印裸 any 数组元素：println(c[0][0]) 现为 AV 崩溃（0xC0000005，无 stdout）。修复后应输出 42。
+//       println(c[0][0]) 会把裸整值当作 AnyBox 指针解引用 → AV 静默崩溃。修复后直接输出元素值 42。正式回归用例。
 //@expect: 42
 dsb ex_dyn_elem_print;
 

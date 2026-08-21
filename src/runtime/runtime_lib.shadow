@@ -44,6 +44,7 @@ pub kimo rt_free(p: any) -> void {}
 @extern("__rt_shadow_long_to_cstr") kimo rt_long_to_cstr(v: long) -> any { return 0 as any; }
 @extern("__rt_shadow_float_to_cstr") kimo rt_float_to_cstr(v: double) -> any { return 0 as any; }
 @extern("shadow_exit") kimo rt_exit(code: int) -> void {}
+@extern("shadow_any_to_int") kimo shadow_any_to_int(v: any) -> long { return 0; }
 
 // === String operations ===
 pub kimo shadow_string_concat(s1: any, s2: any) -> any {
@@ -375,6 +376,12 @@ pub kimo shadow_any_unbox_ptr(v: any) -> any {
 }
 
 pub kimo shadow_any_to_string(v: any) -> any {
+    if (v == null) { return "0"; }
+    // 裸 any 小整值（动态数组元素，透明模型）：元素以 inttoptr 裸存，不是 AnyBox 指针。
+    // 直接走 shadow_any_tag 的 rt_load_int(v,4) 会把整值当地址解引用 → AV（实测 fault=0x2a）。
+    // 与 C++ shadow_any_print 的启发式一致：0 < 值 < 0x10000 视为裸整值，按整数打印。
+    let raw: long = shadow_any_to_int(v);
+    if (raw > 0 && raw < 65536) { return shadow_long_to_str(raw); }
     let tag: int = shadow_any_tag(v);
     if (tag == 0) { return shadow_int_to_str(shadow_any_unbox_int(v)); }
     if (tag == 1) { return shadow_long_to_str(shadow_any_unbox_long(v)); }

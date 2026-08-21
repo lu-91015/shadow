@@ -1,7 +1,5 @@
 //@mode: exe
-//@desc: 位与运算 & 增量能力。当前编译器把单个 & 一律当作逻辑与（要求 bool 操作数），
-//       需实现整数位与语义。6(110) & 3(011) = 2(010)。仅作守门：实现后移除 //@xfail。
-//@xfail: 位与未实现：let y = x & 3 编译报错（logical operator requires bool operands）。修复后应输出 2。
+//@desc: 位与运算 & 增量能力。整数位与语义。6(110) & 3(011) = 2(010)。正式回归用例。
 //@expect: 2
 dsb ex_bitand;
 

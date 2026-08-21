@@ -275,6 +275,100 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         return r;
     }
 
+    // 自增/自减 ++/--：load → ±1 → store → 返回（pre=新值 / post=旧值）
+    if (k == EXPR_INCDEC) {
+        let children = h.children;
+        let target = children[0];
+        let is_inc = (h.op as int) == 0;
+        let is_pre = str_eq(h.str1, "pre") == 1;
+        let tty = h.inferred_type;
+        let target_kind = target.kind;
+        // 目标组件只 lower 一次（load 与 store 复用，避免下标/对象重复求值）
+        let arr_reg = -1;
+        let idx_reg = -1;
+        let obj_reg = -1;
+        if (target_kind == EXPR_INDEX) {
+            let tchildren = target.children;
+            arr_reg = mir_lower_expr(tchildren[0]);
+            idx_reg = mir_lower_expr(tchildren[1]);
+        } else if (target_kind == EXPR_MEMBER) {
+            let tchildren = target.children;
+            obj_reg = mir_lower_expr(tchildren[0]);
+        }
+        let old_reg = -1;
+        if (target_kind == EXPR_VAR) {
+            let ld = mir_mk(MIR_LOAD_VAR);
+            ld.dst = mir_new_reg();
+            ld.arg1 = target.slot;
+            ld.strval = target.str1;
+            ld.ty = target.inferred_type;
+            mir_emit(ld);
+            old_reg = ld.dst;
+        } else if (target_kind == EXPR_INDEX) {
+            let ld = mir_mk(MIR_INDEX);
+            ld.dst = mir_new_reg();
+            ld.arg1 = arr_reg;
+            ld.arg2 = idx_reg;
+            ld.ty = target.inferred_type;
+            mir_emit(ld);
+            old_reg = ld.dst;
+        } else if (target_kind == EXPR_MEMBER) {
+            let ld = mir_mk(MIR_MEMBER);
+            ld.dst = mir_new_reg();
+            ld.arg1 = obj_reg;
+            ld.strval = target.str1;
+            ld.longval = target.intval as int;
+            ld.ty = target.inferred_type;
+            mir_emit(ld);
+            old_reg = ld.dst;
+        } else {
+            let r = mir_new_reg();
+            let inst = mir_mk(MIR_CONST_INT);
+            inst.dst = r;
+            inst.longval = 0;
+            inst.ty = mk_type(TYPE_INT);
+            mir_emit(inst);
+            return r;
+        }
+        let one_reg = mir_new_reg();
+        let onec = mir_mk(MIR_CONST_INT);
+        onec.dst = one_reg;
+        onec.longval = 1;
+        onec.ty = mk_type(TYPE_INT);
+        mir_emit(onec);
+        let new_reg = mir_new_reg();
+        let bin = mir_mk(MIR_BINOP);
+        bin.dst = new_reg;
+        bin.arg1 = old_reg;
+        bin.arg2 = one_reg;
+        if (is_inc) { bin.longval = BIN_ADD; } else { bin.longval = BIN_SUB; }
+        bin.ty = tty;
+        mir_emit(bin);
+        if (target_kind == EXPR_VAR) {
+            let st = mir_mk(MIR_STORE_VAR);
+            st.arg1 = new_reg;
+            st.arg2 = target.slot;
+            st.ty = target.inferred_type;
+            st.strval = target.str1;
+            mir_emit(st);
+        } else if (target_kind == EXPR_INDEX) {
+            let st = mir_mk(MIR_STORE_INDEX);
+            st.arg1 = arr_reg;
+            st.arg2 = idx_reg;
+            st.args = array_push([], new_reg);
+            mir_emit(st);
+        } else if (target_kind == EXPR_MEMBER) {
+            let st = mir_mk(MIR_STORE_MEMBER);
+            st.arg1 = obj_reg;
+            st.strval = target.str1;
+            st.longval = target.intval as int;
+            st.args = array_push([], new_reg);
+            mir_emit(st);
+        }
+        if (is_pre) { return new_reg; }
+        return old_reg;
+    }
+
     if (k == EXPR_CALL && h.op != -1) {
         // enum 变体构造（如 Some(42)）：调用名是 enum 变体，h.intval = 变体索引
         let callee_ty = h.inferred_type;

@@ -115,6 +115,14 @@ pub kimo hir_lower_expr(e: Expr, env: HirEnv) -> HirExpr {
         return h;
     }
 
+    // 自增/自减 ++/--：op=0 增 1 减；str1="pre"/"post"；children[0]=目标
+    if (k == EXPR_INCDEC) {
+        let children: array<HirExpr> = [];
+        if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
+        h.children = children;
+        return h;
+    }
+
     if (k == EXPR_CALL) {
         let children: array<HirExpr> = [];
         let args = e.items;

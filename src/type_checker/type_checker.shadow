@@ -3315,6 +3315,25 @@ pub kimo tc_check_binary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         e.inferred_type = bt;
         return bt;
     }
+    // 位运算 → 整型 LUB（& | ^ << >>）
+    if (op == BIN_BITAND || op == BIN_BITOR || op == BIN_BITXOR || op == BIN_SHL || op == BIN_SHR) {
+        let is_int_l = 0;
+        if (lk == TYPE_INT || lk == TYPE_LONG || lk == TYPE_SHORT || lk == TYPE_CHAR) { is_int_l = 1; }
+        let is_int_r = 0;
+        if (rk == TYPE_INT || rk == TYPE_LONG || rk == TYPE_SHORT || rk == TYPE_CHAR) { is_int_r = 1; }
+        if (is_int_l == 0 && lk != TYPE_ANY) {
+            let msg = "bitwise operator requires integer operands, got '" + ty_display_name(lhs) + "'";
+            tc_error_at(ctx, loc, msg);
+        }
+        if (is_int_r == 0 && rk != TYPE_ANY) {
+            let msg2 = "bitwise operator requires integer operands, got '" + ty_display_name(rhs) + "'";
+            tc_error_at(ctx, loc, msg2);
+        }
+        let bt = mk_type(TYPE_INT);
+        if (lk == TYPE_LONG || rk == TYPE_LONG) { bt = mk_type(TYPE_LONG); }
+        e.inferred_type = bt;
+        return bt;
+    }
     // 算术运算
     // opaque 参与报错
     if (lk == TYPE_OPAQUE || rk == TYPE_OPAQUE) {
@@ -3489,6 +3508,29 @@ pub kimo tc_check_unary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     tc_error_at(ctx, loc, msg2);
     e.inferred_type = mk_type(TYPE_ANY);
     return mk_type(TYPE_ANY);
+}
+
+// ============ EXPR_INCDEC（++/--） ============
+pub kimo tc_check_incdec(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let target = e.child1;
+    let tk = target.kind;
+    // 目标必须是可赋值位置：变量 / 下标 / 成员
+    if (tk != EXPR_VAR && tk != EXPR_INDEX && tk != EXPR_MEMBER) {
+        let msg = "++/-- requires an assignable target (variable, index, or member), got expression";
+        tc_error_at(ctx, e.loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    let tt = tc_check_expr(ctx, target, env);
+    let tkk = tt.kind;
+    if (tkk != TYPE_INT && tkk != TYPE_LONG && tkk != TYPE_SHORT && tkk != TYPE_CHAR && tkk != TYPE_ANY) {
+        let msg2 = "++/-- requires integer operand, got '" + ty_display_name(tt) + "'";
+        tc_error_at(ctx, e.loc, msg2);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    e.inferred_type = tt;
+    return tt;
 }
 
 // ============ EXPR_INDEX ============
@@ -4846,6 +4888,7 @@ pub kimo tc_check_expr(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     if (k == EXPR_SPAWN) { return tc_check_spawn(ctx, e, env); }
     if (k == EXPR_AWAIT) { return tc_check_await(ctx, e, env); }
     if (k == EXPR_CLOSURE) { return tc_check_closure(ctx, e, env); }
+    if (k == EXPR_INCDEC) { return tc_check_incdec(ctx, e, env); }
     // EXPR_ENUM_VARIANT 值位置 → any
     e.inferred_type = mk_type(TYPE_ANY);
     return mk_type(TYPE_ANY);

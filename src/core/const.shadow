@@ -137,6 +137,15 @@ pub let TOK_DSB: int = 113;
 pub let TOK_DEFER: int = 114;
 pub let TOK_COLONCOLON: int = 115;
 
+// ============ 位运算 / 自增自减 token（0.5 增量） ============
+pub let TOK_BITAND: int = 116;
+pub let TOK_BITOR: int = 117;
+pub let TOK_BITXOR: int = 118;
+pub let TOK_SHL: int = 119;
+pub let TOK_SHR: int = 120;
+pub let TOK_INC: int = 121;
+pub let TOK_DEC: int = 122;
+
 // ============ 表达式种类 EXPR_* ============
 pub let EXPR_INT: int = 1;
 pub let EXPR_LONG: int = 2;
@@ -171,6 +180,8 @@ pub let EXPR_RANGE: int = 24;
 pub let EXPR_SPAWN: int = 25;
 // await：child1=Future 表达式
 pub let EXPR_AWAIT: int = 26;
+// 自增/自减 ++/--：intval=0 增 1 减；str1="pre"/"post" 前缀/后缀；child1=目标
+pub let EXPR_INCDEC: int = 27;
 
 // ============ 语句种类 STMT_* ============
 pub let STMT_LET: int = 1;
@@ -207,6 +218,13 @@ pub let BIN_LE: int = 9;
 pub let BIN_GE: int = 10;
 pub let BIN_AND: int = 11;
 pub let BIN_OR: int = 12;
+
+// ============ 位运算二元操作符（0.5 增量） ============
+pub let BIN_BITAND: int = 13;
+pub let BIN_BITOR: int = 14;
+pub let BIN_BITXOR: int = 15;
+pub let BIN_SHL: int = 16;
+pub let BIN_SHR: int = 17;
 
 // ============ 一元操作符 UN_* ============
 pub let UN_NEG: int = 0;

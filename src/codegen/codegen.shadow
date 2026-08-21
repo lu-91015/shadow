@@ -56,6 +56,9 @@ import core.utils;
 @extern("LLVMBuildFCmp") kimo llvm_fcmp(b: any, op: int, l: any, r: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildAnd") kimo llvm_and(b: any, l: any, r: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildOr") kimo llvm_or(b: any, l: any, r: any, name: string) -> any { return 0 as any; }
+@extern("LLVMBuildXor") kimo llvm_xor(b: any, l: any, r: any, name: string) -> any { return 0 as any; }
+@extern("LLVMBuildShl") kimo llvm_shl(b: any, l: any, r: any, name: string) -> any { return 0 as any; }
+@extern("LLVMBuildAShr") kimo llvm_ashr(b: any, l: any, r: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildNeg") kimo llvm_neg(b: any, v: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildNot") kimo llvm_not(b: any, v: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildZExt") kimo llvm_zext(b: any, v: any, ty: any, name: string) -> any { return 0 as any; }
@@ -1397,6 +1400,26 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
         }
         if (binop == BIN_OR) {
             cg_set_reg(mi.dst, llvm_or(cg_builder, lhs, rhs, "ortmp"), TYPE_BOOL);
+            return;
+        }
+        if (binop == BIN_BITAND) {
+            cg_set_reg(mi.dst, llvm_and(cg_builder, lhs, rhs, "bandtmp"), k);
+            return;
+        }
+        if (binop == BIN_BITOR) {
+            cg_set_reg(mi.dst, llvm_or(cg_builder, lhs, rhs, "bortmp"), k);
+            return;
+        }
+        if (binop == BIN_BITXOR) {
+            cg_set_reg(mi.dst, llvm_xor(cg_builder, lhs, rhs, "xortmp"), k);
+            return;
+        }
+        if (binop == BIN_SHL) {
+            cg_set_reg(mi.dst, llvm_shl(cg_builder, lhs, rhs, "shltmp"), k);
+            return;
+        }
+        if (binop == BIN_SHR) {
+            cg_set_reg(mi.dst, llvm_ashr(cg_builder, lhs, rhs, "shrtmp"), k);
             return;
         }
         return;

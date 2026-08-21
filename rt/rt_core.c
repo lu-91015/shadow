@@ -458,6 +458,11 @@ extern void __rt_shadow_store_float(void* p, int32_t off, double val) {
 extern void* __rt_shadow_load_ptr(const void* p, int32_t off) {
     void* v; memcpy(&v, (const char*)p + off, sizeof(void*)); return v;
 }
+/* 裸 any 值的整数表示：动态数组元素以 inttoptr 裸存（透明模型），
+ * 直接按指针位模式取整，供 runtime_lib.shadow_any_to_string 判别裸小整值。 */
+extern int64_t shadow_any_to_int(void* val) {
+    return (int64_t)(intptr_t)val;
+}
 /* 堆指针写的**唯一咽喉**：
  *   - Shadow 层字段/数组赋值 → runtime_lib rt_store_ptr → 这里
  *   - codegen 的 MIR_STORE_MEMBER / MIR_STORE_INDEX（cg_store_fn）→ 同样到这里

@@ -358,12 +358,14 @@ pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) ->
         }
         else if (c == "+") {
             lx_adv();
-            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PLUSEQ, "+=")); }
+            if (lx_cur() == "+") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_INC, "++")); }
+            else if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_PLUSEQ, "+=")); }
             else { tokens = array_push(tokens, lx_make_tok(TOK_PLUS, "+")); }
         }
         else if (c == "-") {
             lx_adv();
             if (lx_cur() == ">") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_ARROW, "->")); }
+            else if (lx_cur() == "-") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_DEC, "--")); }
             else if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_MINUSEQ, "-=")); }
             else { tokens = array_push(tokens, lx_make_tok(TOK_MINUS, "-")); }
         }
@@ -391,24 +393,27 @@ pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) ->
         }
         else if (c == "<") {
             lx_adv();
-            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LE, "<=")); }
+            if (lx_cur() == "<") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SHL, "<<")); }
+            else if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LE, "<=")); }
             else { tokens = array_push(tokens, lx_make_tok(TOK_LT, "<")); }
         }
         else if (c == ">") {
             lx_adv();
-            if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_GE, ">=")); }
+            if (lx_cur() == ">") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SHR, ">>")); }
+            else if (lx_cur() == "=") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_GE, ">=")); }
             else { tokens = array_push(tokens, lx_make_tok(TOK_GT, ">")); }
         }
         else if (c == "&") {
             lx_adv();
             if (lx_cur() == "&") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_AND, "&&")); }
-            else { tokens = array_push(tokens, lx_make_tok(TOK_AND, "&")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_BITAND, "&")); }
         }
         else if (c == "|") {
             lx_adv();
             if (lx_cur() == "|") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_OR, "||")); }
-            else { tokens = array_push(tokens, lx_make_tok(TOK_OR, "|")); }
+            else { tokens = array_push(tokens, lx_make_tok(TOK_BITOR, "|")); }
         }
+        else if (c == "^") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_BITXOR, "^")); }
         else if (c == "(") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LPAREN, "(")); }
         else if (c == ")") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_RPAREN, ")")); }
         else if (c == "{") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_LBRACE, "{")); }

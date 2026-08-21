@@ -1,7 +1,5 @@
 //@mode: exe
-//@desc: 位或运算 | 增量能力。当前编译器把单个 | 一律当作逻辑或（要求 bool 操作数），
-//       需实现整数位或语义。6(110) | 3(011) = 7(111)。仅作守门：实现后移除 //@xfail。
-//@xfail: 位或未实现：let y = x | 3 编译报错（logical operator requires bool operands）。修复后应输出 7。
+//@desc: 位或运算 | 增量能力。整数位或语义。6(110) | 3(011) = 7(111)。正式回归用例。
 //@expect: 7
 dsb ex_bitor;
 
