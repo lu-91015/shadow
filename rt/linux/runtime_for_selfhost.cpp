@@ -4092,12 +4092,22 @@ extern "C" void shadow_gc_poll() {
 
 // ── Debug helper: detect corrupted (module-derived / low-32-zeroed) pointers ──
 // Used by the shadow-0.3 self-host debugging to localize bad AST child pointers.
+// Also called by runtime_lib.shadow_any_to_string to distinguish transparent raw
+// int handles (inttoptr, e.g. array elements) from real heap pointers before
+// dereferencing an AnyBox* — a raw int >= 65536 would otherwise be treated as a
+// pointer and crash. VirtualQuery-based check mirrors the static is_valid_ptr.
 extern "C" int32_t shadow_is_valid_ptr(void* p) {
     if (p == nullptr) return 0;
-    uintptr_t v = (uintptr_t)p;
-    if (v >= 0x700000000000ULL) return 0;       // module image range (code/rdata/static)
-    if ((v & 0xFFFFFFFFULL) == 0) return 0;      // low 32 bits zeroed => corrupted ptr
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
     return 1;
+#else
+    (void)p;
+    return 1; // conservative GC (off by default); safepoint GC doesn't call this
+#endif
 }
 
 extern "C" void shadow_bad_node_report(void* e) {

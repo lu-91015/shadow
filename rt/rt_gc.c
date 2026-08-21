@@ -398,6 +398,13 @@ static int32_t rt_gc_ptr_lookup(void* p) {
     return -1;
 }
 
+/* 透明 any 判别：值是否为真实 GC 堆对象。
+ * 动态数组元素以 inttoptr 裸存小整值（透明模型），打印时若把裸整值当 AnyBox*
+ * 解引用会 AV 崩溃。此处用对象表判定「是堆对象才解引用」，裸整值一律按整数打印。 */
+extern int32_t shadow_is_valid_ptr(void* p) {
+    return rt_gc_ptr_lookup(p) >= 0 ? 1 : 0;
+}
+
 static void rt_gc_ht_insert(void* p, uint32_t idx) {
     uint32_t j, i;
     if (g_ht_used * 4 >= g_ht_cap * 3) rt_gc_ht_grow();

@@ -1,0 +1,19 @@
+//@mode: exe
+//@desc: 动态数组裸 any 元素打印边界。透明整值模型下，元素以 inttoptr 裸存，
+//       打印时 shadow_any_to_string 需用 shadow_is_valid_ptr 判别非 GC 堆对象按整数打印，
+//       否则 ≥65536 的裸整值被误当 AnyBox* 解引用会 AV 崩溃。65535/65536/70000 均应正常输出。
+//@expect: 65535
+//@expect: 65536
+//@expect: 70000
+dsb ex_any_print_boundary;
+
+kimo main() -> int {
+    let a = [];
+    a = array_push(a, 65535);
+    a = array_push(a, 65536);
+    a = array_push(a, 70000);
+    println(a[0]);
+    println(a[1]);
+    println(a[2]);
+    return 0;
+}

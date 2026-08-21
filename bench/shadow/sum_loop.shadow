@@ -1,0 +1,14 @@
+// 基准测试：整数循环求和
+dsb sum_loop;
+
+kimo main() -> int {
+    let n = 100000000;
+    let s = 0;
+    let i = 0;
+    while (i < n) {
+        s = s + i;
+        i = i + 1;
+    }
+    println(s);
+    return 0;
+}

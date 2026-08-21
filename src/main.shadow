@@ -2283,15 +2283,41 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         miniz_obj = "";
         link_tail = " -lpthread -ldl";
     }
-    // llc -O0 -filetype=obj <ir> -o <obj>
+    // 优化级别：默认 -O2（用户 exe 产物），可用 SHADOW_OPT 覆盖（如 -O0/-O1/-O3）。
+    // llc -O2 -filetype=obj <ir> -o <obj>
     // cmd1：程序路径（llc）不带引号——LLVM_HOME 默认无空格；命令以引号开头会触发
     // cmd /c 的引号剥除陷阱（_popen 走 cmd.exe）。文件路径加引号（用户路径可能含空格）。
-    let cmd1 = "\"" + llc + "\" -O0 -filetype=obj \"" + ir_path + "\" -o \"" + obj_path + "\"";
+    let opt_level = env_get("SHADOW_OPT");
+    if (len(opt_level) == 0) { opt_level = "-O2"; }
+    // P0-3：-O1/-O2/-O3 时先跑 opt 全量优化管线，再 llc 生成目标码。
+    // llc -O2 只做 codegen 级优化（无内联/循环优化），opt -O2 才跑完整管线。
+    let opt_bin = llc;
+    if (is_win == 1) {
+        opt_bin = llvm_home + "\\bin\\opt.exe";
+    } else {
+        opt_bin = llvm_home + "/bin/opt";
+    }
+    let ir_src = ir_path;
+    if (str_eq(opt_level, "-O0") == 0) {
+        let bc_path = obj_path + ".bc";
+        let opt_cmd = "\"" + opt_bin + "\" " + opt_level + " \"" + ir_path + "\" -o \"" + bc_path + "\"";
+        let ro = rt_sys_exec(opt_cmd);
+        if (file_exists(bc_path) == 0) {
+            main_eprint("DBG opt: " + opt_cmd + "\n");
+            main_eprint("opt failed: " + ro + "\n");
+            return 1;
+        }
+        ir_src = bc_path;
+    }
+    let cmd1 = "\"" + llc + "\" " + opt_level + " -filetype=obj \"" + ir_src + "\" -o \"" + obj_path + "\"";
     let r1 = rt_sys_exec(cmd1);
     if (file_exists(obj_path) == 0) {
         main_eprint("DBG cmd1: " + cmd1 + "\n");
         main_eprint("llc failed: " + r1 + "\n");
         return 1;
+    }
+    if (str_eq(opt_level, "-O0") == 0) {
+        rt_delete_file(obj_path + ".bc");
     }
     // P0-2：先把 .spk 包 [native] sources 声明的 .cpp/.c 编译为 .o
     // 输出到 <obj_path>_native_<n>.o（与 .obj 同目录，必定可写；避免依赖 cwd 下的 build/）
@@ -2303,7 +2329,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         // 在 Linux 上 clang 无法识别。统一转成正斜杠（Windows 下 clang 同样接受）。
         let nsrc_fwd = str_replace(nsrc, "\\", "/");
         let nobj = obj_path + "_native_" + int_to_str(ni) + ".o";
-        let ncmd = "\"" + clang + "\" -std=c++20 -O0 -c \"" + nsrc_fwd + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
+        let ncmd = "\"" + clang + "\" -std=c++20 " + opt_level + " -c \"" + nsrc_fwd + "\" -o \"" + nobj + "\" -D_CRT_SECURE_NO_WARNINGS";
         let nrc = rt_sys_exec(ncmd);
         if (file_exists(nobj) == 0) {
             main_eprint("link failed: native compile failed: " + nsrc + "\n");
