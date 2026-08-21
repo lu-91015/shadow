@@ -1,0 +1,31 @@
+// 基准测试：埃拉托斯特尼筛法（整数数组批量操作）
+dsb prime_sieve;
+
+kimo main() -> int {
+    let n = 2000000;
+    let a = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, 1);
+        i = i + 1;
+    }
+    let p = 2;
+    while (p * p < n) {
+        if ((a[p] as int) == 1) {
+            let j = p * p;
+            while (j < n) {
+                a[j] = 0;
+                j = j + p;
+            }
+        }
+        p = p + 1;
+    }
+    let count = 0;
+    i = 2;
+    while (i < n) {
+        if ((a[i] as int) == 1) { count = count + 1; }
+        i = i + 1;
+    }
+    println(count);
+    return 0;
+}

@@ -6,7 +6,7 @@ $root = "d:\shadow\shadow-0.5"
 $env:LLVM_HOME = "D:\llvm\clang+llvm-22.1.0-x86_64-pc-windows-msvc"
 $runs = 3
 
-$benches = @("sum_loop", "fib", "matmul", "str_concat", "array_push")
+$benches = @("sum_loop", "fib", "matmul", "str_concat", "array_push", "quicksort", "float_pi", "string_find", "prime_sieve", "ackermann", "str_reverse")
 $rt_objs = @(
     "$root\build\rt\rt_core.o", "$root\build\rt\rt_fs.o", "$root\build\rt\rt_proc.o",
     "$root\build\rt\rt_time.o", "$root\build\rt\rt_err.o", "$root\build\rt\rt_extra.o",

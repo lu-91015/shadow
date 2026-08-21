@@ -1,0 +1,43 @@
+// 基准测试：快速排序（数组访问 + 递归 + 比较）
+dsb quicksort;
+
+kimo qs_partition(a: array<any>, lo: int, hi: int) -> int {
+    let pivot = a[hi] as int;
+    let i = lo - 1;
+    let j = lo;
+    while (j < hi) {
+        if ((a[j] as int) < pivot) {
+            i = i + 1;
+            let t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+        }
+        j = j + 1;
+    }
+    let t2 = a[i + 1];
+    a[i + 1] = a[hi];
+    a[hi] = t2;
+    return i + 1;
+}
+
+kimo qs(a: array<any>, lo: int, hi: int) -> void {
+    if (lo < hi) {
+        let p = qs_partition(a, lo, hi);
+        qs(a, lo, p - 1);
+        qs(a, p + 1, hi);
+    }
+}
+
+kimo main() -> int {
+    let n = 20000;
+    let a = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, (n - i) % 7919);
+        i = i + 1;
+    }
+    qs(a, 0, n - 1);
+    println(a[0] as int);
+    println(a[n - 1] as int);
+    return 0;
+}

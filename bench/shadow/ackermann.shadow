@@ -1,0 +1,14 @@
+// 基准测试：阿克曼函数（深度递归调用开销）
+dsb ackermann;
+
+kimo ack(m: int, n: int) -> int {
+    if (m == 0) { return n + 1; }
+    if (n == 0) { return ack(m - 1, 1); }
+    return ack(m - 1, ack(m, n - 1));
+}
+
+kimo main() -> int {
+    let r = ack(3, 10);
+    println(r);
+    return 0;
+}
