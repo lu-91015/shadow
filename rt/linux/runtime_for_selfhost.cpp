@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
@@ -3008,9 +3009,9 @@ struct GCMeta {
 static std::unordered_map<void*, GCMeta> g_gc_meta;
 
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
+// (gc_lock/gc_unlock defined after ThreadGCState — they mark stw_state while
+// spinning so a concurrent collector is treated as blocked by the STW wait.)
 static std::atomic_flag g_gc_collect_lock = ATOMIC_FLAG_INIT;
-static inline void gc_lock() { while (g_gc_collect_lock.test_and_set(std::memory_order_acquire)) { /* spin */ } }
-static inline void gc_unlock() { g_gc_collect_lock.clear(std::memory_order_release); }
 
 // Thread-local allocation counter for lock-free GC trigger.
 static thread_local int64_t tl_gc_alloc_count = 0;
@@ -3086,6 +3087,19 @@ static std::vector<ThreadGCState*> g_gc_thread_states;   // registry, guarded by
 static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_gc_remembered,
                                                         //   g_gc_perm_roots, g_gc_thread_states
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
+
+// Lock-free collect coordination: spinlock prevents concurrent collect cycles.
+// 等 collect 锁期间标记 blocked（stw_state=2）：并发触发 collect 的线程在等锁
+// 时不跑 mutator，collect 的 STW 等待无需等它（否则并发 collect 死锁）。
+static inline void gc_lock() {
+    ThreadGCState* s = tl_gc_state;
+    while (g_gc_collect_lock.test_and_set(std::memory_order_acquire)) {
+        if (s) s->stw_state.store(2, std::memory_order_release);
+        std::this_thread::yield();
+    }
+    if (s) s->stw_state.store(0, std::memory_order_release);
+}
+static inline void gc_unlock() { g_gc_collect_lock.clear(std::memory_order_release); }
 
 // Global variable roots: slot_addr → current value (replace semantics).
 // Unlike named_roots (frame-scoped), global roots persist across function
@@ -3176,11 +3190,18 @@ extern "C" void shadow_gc_init_conservative_globals() {
 struct GCTLSGuard {
     ~GCTLSGuard() {
         if (tl_gc_state) {
-            std::lock_guard<std::mutex> lk(g_gc_mutex);
-            auto& v = g_gc_thread_states;
-            for (size_t i = 0; i < v.size(); i++) {
-                if (v[i] == tl_gc_state) { v[i] = v.back(); v.pop_back(); break; }
+            ThreadGCState* s = tl_gc_state;
+            // 退出中：取 g_gc_mutex 前标记 blocked（stw_state=2），否则 collect
+            // 的 STW 等待循环会把本线程当 free-running 无限等待 → 死锁。
+            s->stw_state.store(2, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> lk(g_gc_mutex);
+                auto& v = g_gc_thread_states;
+                for (size_t i = 0; i < v.size(); i++) {
+                    if (v[i] == s) { v[i] = v.back(); v.pop_back(); break; }
+                }
             }
+            s->stw_state.store(0, std::memory_order_release);
             tl_gc_state = nullptr;
         }
     }
@@ -3209,6 +3230,31 @@ static void gc_lock_blocked() {
         std::this_thread::yield();
     }
     s->stw_state.store(0, std::memory_order_release);
+}
+
+// ── 协作式 STW（对齐 Windows rt_gc.o 的 gc_stw_begin/gc_stw_end）──
+// collect 持 g_gc_mutex 调用：置 req=1 → 等所有其它线程 stw_state!=0
+// （1=安全点自旋，2=等锁阻塞）→ active=1、清 req → 精确扫根/清扫 →
+// active=0 放行。等待循环只读原子 stw_state，不取 s->mtx（避免与 mutator
+// 的 root_set 死锁）；g_gc_thread_states 在 g_gc_mutex 保护下稳定（collect
+// 持锁期间无增删）。collect 自身（me）跳过 —— 它不跑 mutator，根集冻结。
+static void gc_stw_begin() {
+    g_gc_stw_req.store(1, std::memory_order_relaxed);
+    ThreadGCState* me = tl_gc_state;
+    for (;;) {
+        int all = 1;
+        for (ThreadGCState* s : g_gc_thread_states) {
+            if (s == me) continue;
+            if (s->stw_state.load(std::memory_order_relaxed) == 0) { all = 0; break; }
+        }
+        if (all) break;
+        std::this_thread::yield();
+    }
+    g_gc_stw_active.store(1, std::memory_order_relaxed);
+    g_gc_stw_req.store(0, std::memory_order_relaxed);
+}
+static void gc_stw_end() {
+    g_gc_stw_active.store(0, std::memory_order_relaxed);
 }
 
 static void gc_perm_root_add(void* p) {
@@ -3673,6 +3719,9 @@ extern "C" int64_t shadow_gc_collect() {
     g_gc_running.store(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
+    // ── STW：请求所有其它线程到达安全点，冻结根集（多线程并发下防止
+    //    扫根/清扫窗口内其它线程改 roots 或写刚分配对象 → 漏标 → 误回收）──
+    gc_stw_begin();
     if (g_gc_log_on)
         fprintf(stderr, "[GCLOG] major collect #%lld meta=%zu perm=%zu global=%zu threads=%zu remembered=%zu conservative=%zu heap=%lld trigger=%lld\n",
                 (long long)g_gc_major_count, g_gc_meta.size(), g_gc_perm_roots.size(),
@@ -3769,6 +3818,7 @@ extern "C" int64_t shadow_gc_collect() {
                     (long long)live, (long long)next, (long long)gogc);
     }
 
+    gc_stw_end();
     g_gc_running.store(0, std::memory_order_relaxed);
     gc_unlock();
     return freed;
@@ -3783,6 +3833,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     gc_lock();
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
+    gc_stw_begin();
     if (g_gc_log_on)
         fprintf(stderr, "[GCLOG] minor collect #%lld young=%zu remembered=%zu\n",
                 (long long)g_gc_minor_count, g_gc_meta.size(), g_gc_remembered.size());
@@ -3870,6 +3921,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
         kv.second.marked.store(0, std::memory_order_relaxed);
     }
 
+    gc_stw_end();
     gc_unlock();
     return freed;
 }
@@ -4074,7 +4126,24 @@ extern "C" int32_t shadow_gc_root_range(void* base, uint32_t n) {
 //   ② 触发检查：安全点处活指针已 spill 到 shadow frame，GOGC/STRESS 达标即
 //      同步 collect（与 Windows 在 alloc hook 触发语义一致）。
 extern "C" void shadow_gc_poll() {
-    // 触发检查（安全点处活指针已 spill 到 shadow frame；GOGC/STRESS 达标即同步 collect）
+    // ① STW 协作：collect 请求时到达安全点并自旋，等放行。
+    if (g_gc_stw_req.load(std::memory_order_relaxed) ||
+        g_gc_stw_active.load(std::memory_order_relaxed)) {
+        ThreadGCState* s = gc_get_thread_state();
+        s->stw_state.store(1, std::memory_order_release);   // 到达安全点（根集已冻结）
+        // 等本次 STW 完全结束（req 清 0 且 active 清 0）：
+        // ⚠️ 只等 active 不够 —— poll 可能在 GC 的"等待阶段"进入（req=1,
+        // active=0），只看 active 会立即通过并回到 mutator，而 GC 已把它
+        // 计入"到达"并开始扫根 —— 扫根窗口内该线程却在跑 mutator 代码
+        // （非安全点），精确根集漏标。必须等到 req 与 active 双双清零。
+        while (g_gc_stw_req.load(std::memory_order_relaxed) ||
+               g_gc_stw_active.load(std::memory_order_relaxed)) {
+            std::this_thread::yield();
+        }
+        s->stw_state.store(0, std::memory_order_release);
+        return;
+    }
+    // ② 触发检查（安全点处活指针已 spill 到 shadow frame；GOGC/STRESS 达标即同步 collect）
     if (g_gc_disabled) return;
     if (!rt_gc_auto_on()) return;
     if (g_gc_running.load(std::memory_order_relaxed)) return;
@@ -4105,8 +4174,13 @@ extern "C" int32_t shadow_is_valid_ptr(void* p) {
     if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
     return 1;
 #else
-    (void)p;
-    return 1; // conservative GC (off by default); safepoint GC doesn't call this
+    // 用 mincore 判别地址是否已映射：裸整值（inttoptr，如动态数组 any 元素）指向
+    // 未映射页 → mincore 返回 ENOMEM → 判定非堆指针，按整数打印，避免 AV。
+    long page = sysconf(_SC_PAGESIZE);
+    void* aligned = (void*)((uintptr_t)p & ~((uintptr_t)page - 1));
+    unsigned char vec = 0;
+    if (mincore(aligned, (size_t)page, &vec) != 0) return 0;
+    return 1;
 #endif
 }
 

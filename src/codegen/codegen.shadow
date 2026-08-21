@@ -537,6 +537,28 @@ pub kimo cg_call_named(name: string, ret_kind: int, arg_vals: array<any>) -> any
     return cg_emit_call(callee, ret_kind, arg_vals);
 }
 
+// §5.2.4 免 GC 帧的纯运行时函数：不分配、不触发 GC、无安全点，仅做内存读写。
+// 这些函数在 runtime_lib.shadow 中实现，编译进每个用户程序；给它们免帧后
+// 体积足够小，opt -O2 可内联进调用方，消除热循环里的帧 enter/leave/root 开销。
+pub kimo cg_is_nogc_fn(name: string) -> int {
+    if (str_eq(name, "shadow_array_get_ptr") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_get_int") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_get_long") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_get_float") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_set_int") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_set_long") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_set_float") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_set_ptr") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_len") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_cap") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_elem_size") == 1) { return 1; }
+    if (str_eq(name, "shadow_array_pop") == 1) { return 1; }
+    if (str_eq(name, "shadow_string_len") == 1) { return 1; }
+    if (str_eq(name, "shadow_string_eq") == 1) { return 1; }
+    if (str_eq(name, "shadow_string_ne") == 1) { return 1; }
+    return 0;
+}
+
 // 按元素 kind 选择数组/字典/存储函数
 pub kimo cg_array_get_fn(ek: int) -> string {
     if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return "shadow_array_get_int"; }
@@ -2286,15 +2308,18 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     }
     // §5.2.4 GC 帧跳过：无活指针（sf_n==0）且无指针参数（且非 main）的函数
     // 不需要帧 enter/leave 与根集登记，仅保留入口/回边 poll（协作 STW 仍成立）。
-    cg_gc_frame_active = 0;
-    if (sf_n > 0) { cg_gc_frame_active = 1; }
-    if (is_main == 1) { cg_gc_frame_active = 1; }
+    // 纯运行时函数（cg_is_nogc_fn）强制免帧：不分配不触发 GC，内联后消除热循环开销。
+    let frame_needed = 0;
+    if (sf_n > 0) { frame_needed = 1; }
+    if (is_main == 1) { frame_needed = 1; }
     let pi = 0;
     while (pi < n_params) {
         let pp = params[pi];
-        if (cg_is_ptr_kind(pp.type_kind) == 1) { cg_gc_frame_active = 1; }
+        if (cg_is_ptr_kind(pp.type_kind) == 1) { frame_needed = 1; }
         pi = pi + 1;
     }
+    if (cg_is_nogc_fn(mf.name) == 1) { frame_needed = 0; }
+    cg_gc_frame_active = frame_needed;
     let i = 0;
     while (i < n_params) {
         let p = params[i];
@@ -2374,7 +2399,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         i = i + 1;
     }
     // §5.2.4：shadow frame 数组 [sf_n x i64]，清零，entry 一次性登记为 range 根
-    if (sf_n > 0) {
+    if (frame_needed == 1 && sf_n > 0) {
         let i64_ty = llvm_i64(cg_ctx);
         let sf_ty = llvm_array_ty(i64_ty, sf_n);
         cg_sf_alloca = llvm_alloca(cg_builder, sf_ty, "sf");
@@ -2415,12 +2440,18 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         if (is_main == 1) { param_idx = i + 2; }
         let param_val = llvm_get_param(cg_func, param_idx);
         llvm_store(cg_builder, param_val, cg_slots[slot]);
-        cg_gc_root_set_if_ptr(cg_slots[slot], param_val, p.type_kind);
+        if (frame_needed == 1) {
+            cg_gc_root_set_if_ptr(cg_slots[slot], param_val, p.type_kind);
+        }
         i = i + 1;
     }
     // §5.2.4 协作式安全点：函数入口 poll（对标 Go 函数序言安全点）。
     // 入口处参数已在 slot / shadow frame，根集完整。
-    cg_emit_poll();
+    // 免 GC 帧函数（纯运行时）跳过入口 poll：内联后避免在热循环里注入多余 poll，
+    // 未内联时由调用方下一安全点覆盖（纯函数无分配无 GC，短小立即返回）。
+    if (frame_needed == 1) {
+        cg_emit_poll();
+    }
 
     i = 0;
     while (i < n_blocks) {

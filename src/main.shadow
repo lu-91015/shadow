@@ -2281,7 +2281,9 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
                   rt_dir + "sys_exec_cpa.o\" \"" + rt_dir + "rt_proc_spawn.o\" \"" +
                   rt_dir + "rt_zip.o\" \"" + rt_dir + "shadow_index.o\"";
         miniz_obj = "";
-        link_tail = " -lpthread -ldl";
+        // 用户产物 .o 由 llc 生成（非 PIC），PIE 链接会报 R_X86_64_32S relocation；
+        // 固定用 -no-pie 链接用户 exe。
+        link_tail = " -no-pie -lpthread -ldl";
     }
     // 优化级别：默认 -O2（用户 exe 产物），可用 SHADOW_OPT 覆盖（如 -O0/-O1/-O3）。
     // llc -O2 -filetype=obj <ir> -o <obj>
