@@ -598,12 +598,12 @@ pub kimo cg_array_set_fn(ek: int) -> string {
 }
 
 pub kimo cg_array_push_fn(ek: int) -> string {
-    if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return "shadow_array_push_int"; }
-    if (ek == TYPE_LONG) { return "shadow_array_push_long"; }
-    if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { return "shadow_array_push_float"; }
-    if (ek == TYPE_DATE) { return "shadow_array_push_int"; }
-    if (ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) { return "shadow_array_push_long"; }
-    return "shadow_array_push_ptr";
+    if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return "shadow_array_push_int_fast"; }
+    if (ek == TYPE_LONG) { return "shadow_array_push_long_fast"; }
+    if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { return "shadow_array_push_float_fast"; }
+    if (ek == TYPE_DATE) { return "shadow_array_push_int_fast"; }
+    if (ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) { return "shadow_array_push_long_fast"; }
+    return "shadow_array_push_ptr_fast";
 }
 
 // array_push 按数组静态元素类型分派 typed push（array<int>→shadow_array_push_int 等）。

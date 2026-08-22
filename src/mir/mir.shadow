@@ -1461,6 +1461,40 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                     let rl = rchildren[0];
                     let rr = rchildren[1];
                     if (rl.kind == EXPR_VAR && rl.slot == lhs.slot && mir_owned_is(lhs.slot) == 1) {
+                        // 单字符追加优化：a = a + s[i]（s 为 string）→
+                        // a = shadow_string_concat_char_fast(a, shadow_string_char_at(s, i))。
+                        // 消除 s[i] 每次分配 1 字符字符串（str_reverse 91% 分配来自此）；
+                        // fast 版本单次 C 调用完成 strlen+cap 判断+写字节（省 4 次 extern）。
+                        if (rr.kind == EXPR_INDEX && len(rr.children) == 2) {
+                            let rbase = rr.children[0];
+                            if ((rbase as any) != 0 && (rbase.inferred_type as any) != 0 &&
+                                rbase.inferred_type.kind == TYPE_STRING) {
+                                let ra = mir_lower_expr(rl);
+                                let rs = mir_lower_expr(rbase);
+                                let ri = mir_lower_expr(rr.children[1]);
+                                let rc1 = mir_new_reg();
+                                let call1 = mir_mk(MIR_CALL);
+                                call1.dst = rc1;
+                                call1.strval = "shadow_string_char_at";
+                                call1.args = [rs, ri];
+                                call1.ty = mk_type(TYPE_INT);
+                                mir_emit(call1);
+                                let rc2 = mir_new_reg();
+                                let call2 = mir_mk(MIR_CALL);
+                                call2.dst = rc2;
+                                call2.strval = "shadow_string_concat_char_fast";
+                                call2.args = [ra, rc1];
+                                call2.ty = lty;
+                                mir_emit(call2);
+                                let st = mir_mk(MIR_STORE_VAR);
+                                st.arg1 = rc2;
+                                st.arg2 = lhs.slot;
+                                st.ty = lty;
+                                st.strval = lhs.str1;
+                                mir_emit(st);
+                                return;
+                            }
+                        }
                         if (mir_dbg() == 1) {
                             println("DBG INPLACE slot=" + int_to_str(lhs.slot) + " owned=" + int_to_str(mir_owned_is(lhs.slot)));
                         }

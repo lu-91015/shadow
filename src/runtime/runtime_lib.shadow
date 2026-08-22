@@ -47,6 +47,8 @@ pub kimo rt_free(p: any) -> void {}
 @extern("shadow_any_to_int") kimo shadow_any_to_int(v: any) -> long { return 0; }
 @extern("shadow_is_valid_ptr") kimo shadow_is_valid_ptr(p: any) -> int { return 0; }
 @extern("rt_alloc_cap") kimo rt_alloc_cap(p: any) -> int { return 0; }
+@extern("shadow_string_char_at") kimo shadow_string_char_at(s: any, idx: int) -> int { return 0; }
+@extern("shadow_string_cache_set") kimo shadow_string_cache_set(p: any, len: int, cap: int) -> void {}
 
 // === String operations ===
 pub kimo shadow_string_concat(s1: any, s2: any) -> any {
@@ -73,6 +75,7 @@ pub kimo shadow_string_concat_inplace(s1: any, s2: any) -> any {
     if (cap >= need) {
         rt_memcpy_at(s1, l1, s2, 0, l2);
         rt_set_byte(s1, l1 + l2, 0);
+        shadow_string_cache_set(s1, l1 + l2, cap);
         return s1;
     }
     let newcap: int = cap * 2;
@@ -81,6 +84,30 @@ pub kimo shadow_string_concat_inplace(s1: any, s2: any) -> any {
     rt_memcpy_at(p, 0, s1, 0, l1);
     rt_memcpy_at(p, l1, s2, 0, l2);
     rt_set_byte(p, l1 + l2, 0);
+    shadow_string_cache_set(p, l1 + l2, newcap);
+    return p;
+}
+
+// 就地追加单字符（str_reverse 热循环核心）：s1 缓冲容量足够时直接写 1 字节，
+// 否则按 2x 倍增扩容。与 shadow_string_concat_inplace 同语义，但省去 s2 的
+// 1 字符字符串分配（s[i] 每次 rt_malloc(2) → 消除 str_reverse 91% 的分配）。
+pub kimo shadow_string_concat_char(s1: any, c: int) -> any {
+    let l1: int = rt_strlen(s1);
+    let cap: int = rt_alloc_cap(s1);
+    let need: int = l1 + 2;
+    if (cap >= need) {
+        rt_set_byte(s1, l1, c);
+        rt_set_byte(s1, l1 + 1, 0);
+        shadow_string_cache_set(s1, l1 + 1, cap);
+        return s1;
+    }
+    let newcap: int = cap * 2;
+    if (newcap < need) { newcap = need; }
+    let p: any = rt_malloc(newcap);
+    rt_memcpy_at(p, 0, s1, 0, l1);
+    rt_set_byte(p, l1, c);
+    rt_set_byte(p, l1 + 1, 0);
+    shadow_string_cache_set(p, l1 + 1, newcap);
     return p;
 }
 

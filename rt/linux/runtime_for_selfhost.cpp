@@ -1606,11 +1606,20 @@ extern "C" const char* shadow_string_subscript(const char* s, int32_t idx) {
 // 裸 malloc 永不释放，循环里 `src[i] == "\n"` 是纯泄漏（长驻 LSP 进程最严重）。
 // 此函数返回字符码（i32，0 = 越界/NUL），调用方与字面量字符码比较即可，
 // 不产生任何分配。shadow-lang 0.2 不识别它，需在 Shadow 侧 @extern 声明使用。
+static inline int tl_str_lookup(void* p, int32_t* len, int32_t* cap);  // defined later in TU
+static inline void tl_str_set(void* p, int32_t len, int32_t cap);      // defined later in TU
 extern "C" int32_t shadow_string_char_at(const char* s, int32_t idx) {
-    if (!s || idx < 0) return 0;
-    int32_t n = (int32_t)strlen(s);
-    if (idx >= n) return 0;
-    return (int32_t)(unsigned char)s[idx];
+    if (!s) return 0;
+    int32_t n = 0, cap = 0;
+    if (!tl_str_lookup((void*)s, &n, &cap)) {
+        n = (int32_t)strlen(s);
+        tl_str_set((void*)s, n, 0);  // 只缓存长度，容量未知（源串通常非拼接目标）
+    }
+    int32_t i = idx;
+    if (i < 0) i = i + n;            // 负索引回绕（与 shadow_schar 一致）
+    if (i < 0) return 0;
+    if (i >= n) return 0;
+    return (int32_t)(unsigned char)s[i];
 }
 
 // Absolute value
@@ -2670,6 +2679,141 @@ extern "C" void* shadow_array_push_int(void* array_ptr, int32_t val) {
     a->data.push_back((DictValue)(int64_t)val);
     return array_ptr;
 }
+
+// 快速路径 array_push（shadow 层 C 布局数组，kind=2）：
+//   [0]=len(int32) [4]=cap(int32) [8]=elem_size(int32) [12..]=data
+// 单次 C 调用完成 len/cap 读取 + 扩容 + 元素写入 + len 更新，
+// 消除 shadow 层每次 push 的多次 extern 调用（__rt_shadow_load_int×3 +
+// __rt_shadow_store_int×2 → 1 次调用）。语义与 runtime_lib.shadow 的
+// shadow_array_push_int 完全一致（含 null 首推、2x 倍增扩容、es 4/8 分派）。
+extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind);  // defined later in TU
+extern "C" int32_t shadow_gc_root_set(void* slot, void* val);  // defined later in TU
+extern "C" void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
+    if (!array_ptr) {
+        void* na = shadow_gc_alloc(12 + 4 * 4, 2);
+        *reinterpret_cast<int32_t*>(na) = 1;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = 4;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = 4;
+        *reinterpret_cast<int32_t*>((char*)na + 12) = val;
+        return na;
+    }
+    int32_t len = *reinterpret_cast<int32_t*>(array_ptr);
+    int32_t cap = *reinterpret_cast<int32_t*>((char*)array_ptr + 4);
+    int32_t es = *reinterpret_cast<int32_t*>((char*)array_ptr + 8);
+    void* na = nullptr;
+    if (len >= cap) {
+        int32_t nc = cap * 2;
+        if (nc == 0) nc = 4;
+        na = shadow_gc_alloc(12 + nc * es, 2);
+        // Linux 无保守栈扫描：grow 后新数组须显式扎根，防并发 GC 在拷贝/存储前回收。
+        shadow_gc_root_set(&na, na);
+        memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
+        *reinterpret_cast<int32_t*>(na) = len;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = nc;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = es;
+        array_ptr = na;
+    }
+    int32_t off = 12 + len * es;
+    if (es == 4) *reinterpret_cast<int32_t*>((char*)array_ptr + off) = val;
+    else *reinterpret_cast<int64_t*>((char*)array_ptr + off) = val;
+    *reinterpret_cast<int32_t*>(array_ptr) = len + 1;
+    if (na) shadow_gc_root_set(&na, 0);
+    return array_ptr;
+}
+// 同快速路径：long / float / ptr 元素（es=8），单次 C 调用完成 push。
+extern "C" void* shadow_array_push_long_fast(void* array_ptr, int64_t val) {
+    if (!array_ptr) {
+        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        *reinterpret_cast<int32_t*>(na) = 1;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = 4;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = 8;
+        *reinterpret_cast<int64_t*>((char*)na + 12) = val;
+        return na;
+    }
+    int32_t len = *reinterpret_cast<int32_t*>(array_ptr);
+    int32_t cap = *reinterpret_cast<int32_t*>((char*)array_ptr + 4);
+    int32_t es = *reinterpret_cast<int32_t*>((char*)array_ptr + 8);
+    void* na = nullptr;
+    if (len >= cap) {
+        int32_t nc = cap * 2;
+        if (nc == 0) nc = 4;
+        na = shadow_gc_alloc(12 + nc * es, 2);
+        shadow_gc_root_set(&na, na);
+        memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
+        *reinterpret_cast<int32_t*>(na) = len;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = nc;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = es;
+        array_ptr = na;
+    }
+    int32_t off = 12 + len * es;
+    if (es == 4) *reinterpret_cast<int32_t*>((char*)array_ptr + off) = (int32_t)val;
+    else *reinterpret_cast<int64_t*>((char*)array_ptr + off) = val;
+    *reinterpret_cast<int32_t*>(array_ptr) = len + 1;
+    if (na) shadow_gc_root_set(&na, 0);
+    return array_ptr;
+}
+extern "C" void* shadow_array_push_float_fast(void* array_ptr, double val) {
+    if (!array_ptr) {
+        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        *reinterpret_cast<int32_t*>(na) = 1;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = 4;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = 8;
+        *reinterpret_cast<double*>((char*)na + 12) = val;
+        return na;
+    }
+    int32_t len = *reinterpret_cast<int32_t*>(array_ptr);
+    int32_t cap = *reinterpret_cast<int32_t*>((char*)array_ptr + 4);
+    int32_t es = *reinterpret_cast<int32_t*>((char*)array_ptr + 8);
+    void* na = nullptr;
+    if (len >= cap) {
+        int32_t nc = cap * 2;
+        if (nc == 0) nc = 4;
+        na = shadow_gc_alloc(12 + nc * es, 2);
+        shadow_gc_root_set(&na, na);
+        memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
+        *reinterpret_cast<int32_t*>(na) = len;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = nc;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = es;
+        array_ptr = na;
+    }
+    int32_t off = 12 + len * es;
+    if (es == 4) *reinterpret_cast<float*>((char*)array_ptr + off) = (float)val;
+    else *reinterpret_cast<double*>((char*)array_ptr + off) = val;
+    *reinterpret_cast<int32_t*>(array_ptr) = len + 1;
+    if (na) shadow_gc_root_set(&na, 0);
+    return array_ptr;
+}
+extern "C" void* shadow_array_push_ptr_fast(void* array_ptr, void* val) {
+    if (!array_ptr) {
+        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        *reinterpret_cast<int32_t*>(na) = 1;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = 4;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = 8;
+        *reinterpret_cast<void**>((char*)na + 12) = val;
+        return na;
+    }
+    int32_t len = *reinterpret_cast<int32_t*>(array_ptr);
+    int32_t cap = *reinterpret_cast<int32_t*>((char*)array_ptr + 4);
+    int32_t es = *reinterpret_cast<int32_t*>((char*)array_ptr + 8);
+    void* na = nullptr;
+    if (len >= cap) {
+        int32_t nc = cap * 2;
+        if (nc == 0) nc = 4;
+        na = shadow_gc_alloc(12 + nc * es, 2);
+        shadow_gc_root_set(&na, na);
+        memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
+        *reinterpret_cast<int32_t*>(na) = len;
+        *reinterpret_cast<int32_t*>((char*)na + 4) = nc;
+        *reinterpret_cast<int32_t*>((char*)na + 8) = es;
+        array_ptr = na;
+    }
+    int32_t off = 12 + len * es;
+    if (es == 4) *reinterpret_cast<int32_t*>((char*)array_ptr + off) = (int32_t)(intptr_t)val;
+    else *reinterpret_cast<void**>((char*)array_ptr + off) = val;
+    *reinterpret_cast<int32_t*>(array_ptr) = len + 1;
+    if (na) shadow_gc_root_set(&na, 0);
+    return array_ptr;
+}
 extern "C" void* shadow_array_push_long(void* array_ptr, int64_t val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
@@ -3356,6 +3500,81 @@ static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_
                                                         //   g_gc_perm_roots, g_gc_thread_states
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
 
+// ── 线程局部字符串长度/容量缓存 ──
+// str_reverse 热循环里 shadow_string_concat_char_fast 每次 strlen(out)（out 0→43 增长）
+// 是 O(n²) 瓶颈，且每次都要 g_pend 扫描 + g_gc_meta 哈希查找（带互斥锁）。缓存
+// (ptr, len, cap) 三元组：命中即免 strlen 和哈希查找。
+// ABA 安全：字符串只会在 GC 清扫（collect）时被释放，collect 后 g_gc_epoch 递增；
+// 缓存条目记录 epoch，epoch 不匹配即视为失效（地址复用不会误用旧长度）。
+// cap=0 表示"未知容量"（非堆对象/未查表），调用方按"无余量"处理（分配新缓冲，
+// 输出仍正确，仅损失就地追加优化）。所有就地修改字符串的函数必须维护本缓存。
+struct TLStrCache { void* p; int32_t len; int32_t cap; uint32_t epoch; };
+static thread_local TLStrCache tl_str_cache[8];
+static thread_local int32_t tl_str_cache_n = 0;
+
+static inline int tl_str_lookup(void* p, int32_t* len, int32_t* cap) {
+    uint32_t ep = g_gc_epoch;
+    for (int32_t i = 0; i < tl_str_cache_n; i++) {
+        if (tl_str_cache[i].p == p) {
+            if (tl_str_cache[i].epoch != ep) {
+                for (int32_t j = i; j < tl_str_cache_n - 1; j++) tl_str_cache[j] = tl_str_cache[j + 1];
+                tl_str_cache_n--;
+                return 0;
+            }
+            *len = tl_str_cache[i].len;
+            *cap = tl_str_cache[i].cap;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline void tl_str_set(void* p, int32_t len, int32_t cap) {
+    uint32_t ep = g_gc_epoch;
+    for (int32_t i = 0; i < tl_str_cache_n; i++) {
+        if (tl_str_cache[i].p == p) {
+            tl_str_cache[i].len = len;
+            tl_str_cache[i].cap = cap;
+            tl_str_cache[i].epoch = ep;
+            return;
+        }
+    }
+    if (tl_str_cache_n < 8) {
+        tl_str_cache[tl_str_cache_n].p = p;
+        tl_str_cache[tl_str_cache_n].len = len;
+        tl_str_cache[tl_str_cache_n].cap = cap;
+        tl_str_cache[tl_str_cache_n].epoch = ep;
+        tl_str_cache_n++;
+    } else {
+        for (int32_t i = 0; i < 7; i++) tl_str_cache[i] = tl_str_cache[i + 1];
+        tl_str_cache[7].p = p;
+        tl_str_cache[7].len = len;
+        tl_str_cache[7].cap = cap;
+        tl_str_cache[7].epoch = ep;
+    }
+}
+
+// 取 (len, cap)：缓存命中直接返回；未命中计算 strlen + 查容量后入缓存。
+static inline void tl_str_get(void* p, int32_t* len, int32_t* cap) {
+    if (tl_str_lookup(p, len, cap)) return;
+    *len = (int32_t)strlen((const char*)p);
+    *cap = 0;
+    for (int i = 0; i < g_pend_n; i++) {
+        if (g_pend[i].p == p) { *cap = g_pend[i].asize; break; }
+    }
+    if (*cap == 0) {
+        std::lock_guard<std::mutex> lk(g_gc_mutex);
+        GCMeta* m = g_gc_meta.find(p);
+        if (m) *cap = (int32_t)m->size;
+    }
+    tl_str_set(p, *len, *cap);
+}
+
+// 供 shadow 层就地拼接函数（shadow_string_concat_inplace / _char）在修改后同步缓存。
+extern "C" void shadow_string_cache_set(void* p, int32_t len, int32_t cap) {
+    tl_str_set(p, len, cap);
+}
+
 // 查询 GC 堆对象的数据区容量（分配时记录的 size）；非堆对象（字面量/栈上）返回 0。
 // 供 shadow_string_concat_inplace 判断能否就地追加（与 Windows rt_gc.c 的 rt_alloc_cap 对齐）。
 // 注意：攒批快路径期间新对象只进 g_pend、尚未入哈希表，哈希查找 miss 时须线性扫
@@ -3369,6 +3588,32 @@ extern "C" int32_t rt_alloc_cap(void* p) {
     GCMeta* m = g_gc_meta.find(p);
     if (!m) return 0;
     return (int32_t)m->size;
+}
+
+// 快速路径单字符追加：单次 C 调用完成 strlen + alloc_cap 判断 + 就地写字节/扩容，
+// 消除 shadow 层 shadow_string_concat_char 的 4 次 extern 调用（str_reverse 热循环
+// 9M 次追加 × 4 = 36M 次 extern 调用 → 1 次）。语义与 runtime_lib.shadow 的
+// shadow_string_concat_char 完全一致（cap 足够就地写，否则 2x 倍增扩容）。
+extern "C" void* shadow_string_concat_char_fast(void* s1, int32_t c) {
+    int32_t l1, cap;
+    tl_str_get(s1, &l1, &cap);
+    int32_t need = l1 + 2;
+    if (cap >= need) {
+        ((char*)s1)[l1] = (char)c;
+        ((char*)s1)[l1 + 1] = 0;
+        tl_str_set(s1, l1 + 1, cap);
+        return s1;
+    }
+    int32_t newcap = cap * 2;
+    if (newcap < need) newcap = need;
+    void* p = shadow_gc_alloc(newcap, 0);
+    shadow_gc_root_set(&p, p);
+    memcpy(p, s1, (size_t)l1);
+    ((char*)p)[l1] = (char)c;
+    ((char*)p)[l1 + 1] = 0;
+    shadow_gc_root_set(&p, 0);
+    tl_str_set(p, l1 + 1, newcap);
+    return p;
 }
 
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
