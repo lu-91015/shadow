@@ -107,6 +107,45 @@ static rt_span** g_spans = NULL;
 static uint32_t g_spans_len = 0, g_spans_cap = 0;
 static CRITICAL_SECTION g_span_lock;
 
+/* ---- 惰性 scavenge（对标 Go mheap.scavenge） ----
+ * span 整块空闲时**不立即** MEM_DECOMMIT 归还 OS，而是留在 mcentral.empty 保持
+ * 已提交，供后续 refill 直接复用（零系统调用）。只有累计空闲字节超过阈值才批量
+ * 从 empty 链表尾部（最旧）归还。这消除了 str_reverse 类负载下 span 在
+ * decommit/commit 之间疯狂往返（66K 次系统调用 ≈ 155ms）。 */
+static uint64_t g_empty_bytes = 0;        /* empty 链表上已提交空闲字节（仅中央锁内改） */
+static uint64_t g_scav_threshold = 8u << 20;  /* 8MB：超过则触发 scavenge（SHADOW_SCAV_THRESH=MB 覆盖） */
+
+/* ---- 分配器统计（SHADOW_GC_STATS=1 时退出汇总，镜像 rt_gc.c §5.2.10） ---- */
+static uint64_t g_alloc_count = 0;    /* 小块分配总数 */
+static uint64_t g_alloc_refill = 0;   /* mcache 借 span（中央锁）次数 */
+static uint64_t g_free_count = 0;     /* 通用 free 路径次数 */
+static uint64_t g_free_flush = 0;     /* 攒批 flush 次数 */
+static uint64_t g_free_flush_obj = 0; /* 攒批 flush 归还对象数 */
+static uint64_t g_lock_us = 0;        /* 中央锁内累计耗时 us */
+static uint64_t g_decommit = 0;       /* span 归还 OS（MEM_DECOMMIT）次数 */
+static uint64_t g_commit = 0;         /* span 重新提交（MEM_COMMIT）次数 */
+static uint64_t g_decommit_us = 0;    /* MEM_DECOMMIT 系统调用累计耗时 us */
+static uint64_t g_commit_us = 0;      /* MEM_COMMIT 系统调用累计耗时 us */
+static uint64_t g_scavenge_passes = 0; /* 惰性 scavenge 触发次数 */
+static int32_t g_alloc_stats = -1;
+static int32_t rt_alloc_stats_on(void) {
+    if (g_alloc_stats < 0) {
+        const char* e = getenv("SHADOW_GC_STATS");
+        g_alloc_stats = (e && e[0] != '0' && e[0] != '\0') ? 1 : 0;
+    }
+    return g_alloc_stats;
+}
+/* 中央锁内耗时累计（仅统计开启时用 QPC，关闭时零开销） */
+static void rt_lock_tick(uint64_t us) { if (rt_alloc_stats_on()) g_lock_us += us; }
+static uint64_t rt_qpc_us(void) {
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart * 1000000ULL / freq.QuadPart);
+}
+extern void rt_alloc_stats_arm_once(void);
+
 static uint32_t g_pagesize = 4096;
 static LONG g_init_lock = 0;
 static int g_init = 0;
@@ -119,9 +158,15 @@ static void rt_alloc_init(void) {
         g_pagesize = si.dwPageSize ? si.dwPageSize : 4096;
         for (int i = 0; i < (int)RT_NCLASS; i++) InitializeCriticalSection(&g_central[i].lock);
         InitializeCriticalSection(&g_span_lock);
+        const char* st = getenv("SHADOW_SCAV_THRESH");
+        if (st && st[0]) {
+            long long mb = atoll(st);
+            if (mb > 0) g_scav_threshold = (uint64_t)mb << 20;
+        }
         g_init = 1;
     }
     g_init_lock = 0;
+    rt_alloc_stats_arm_once();
 }
 
 static int rt_class_index(uint32_t n) {
@@ -200,15 +245,19 @@ static rt_span* rt_central_cache_span(int ci, void** out_list) {
         sp = c->empty;
         if (sp) {
             c->empty = sp->next;
+            if (!sp->decommitted) g_empty_bytes -= (uint64_t)sp->npages * g_pagesize;
             if (sp->decommitted) {
+                uint64_t t0 = rt_alloc_stats_on() ? rt_qpc_us() : 0;
                 if (!VirtualAlloc(sp->base, (SIZE_T)sp->npages * g_pagesize,
                                   MEM_COMMIT, PAGE_READWRITE)) {
                     sp->next = c->empty; c->empty = sp;  /* 放回 */
                     LeaveCriticalSection(&c->lock);
                     return NULL;
                 }
+                if (rt_alloc_stats_on()) g_commit_us += rt_qpc_us() - t0;
                 rt_span_build_freelist(sp);   /* 重新提交后页已零化，重建空闲链表 */
                 sp->decommitted = 0;
+                if (rt_alloc_stats_on()) g_commit++;
             }
         } else {
             sp = rt_span_new(ci);
@@ -239,14 +288,11 @@ static void rt_central_unlink_partial(int ci, rt_span* sp) {
  * nfree 才重新等于 span 的全部空闲对象数，nfree==nobj 的 scavenge 判定才成立。 */
 static void rt_central_uncache_span_locked(int ci, rt_span* sp) {
     rt_central* c = &g_central[ci];
-    if (sp->nfree == sp->nobj) {          /* 整 span 空闲 → 归还 OS（scavenge） */
+    if (sp->nfree == sp->nobj) {          /* 整 span 空闲 → 挂 empty，惰性 scavenge */
         sp->next = c->empty;
         c->empty = sp;
         sp->state = 0;
-        if (!sp->decommitted) {
-            VirtualFree(sp->base, (SIZE_T)sp->npages * g_pagesize, MEM_DECOMMIT);
-            sp->decommitted = 1;
-        }
+        if (!sp->decommitted) g_empty_bytes += (uint64_t)sp->npages * g_pagesize;
     } else if (sp->nfree > 0) {           /* 还有空闲 → 回 partial，供任意线程复用 */
         sp->next = c->partial;
         c->partial = sp;
@@ -255,6 +301,43 @@ static void rt_central_uncache_span_locked(int ci, rt_span* sp) {
                                            * 等它的对象被 free 时自会回到 partial */
         sp->next = NULL;
         sp->state = 3;
+    }
+}
+
+/* 惰性 scavenge：从 empty 链表尾部（最旧，最不可能被复用）批量归还 OS，
+ * 直到 g_empty_bytes 降到阈值一半。调用方必须已持有 g_central[ci].lock。
+ * 单链表尾部摘除是 O(n)，但只在阈值超限时触发且链表很短，可接受。
+ * 不变式：empty 链表上的 span 均 decommitted==0（scavenge 摘除已归还的），
+ * 故扣减 g_empty_bytes 不会下溢；此处仍加保护以防未来路径破坏不变式。 */
+static void rt_central_scavenge_locked(int ci) {
+    rt_central* c = &g_central[ci];
+    uint64_t target = g_scav_threshold / 2;
+    while (g_empty_bytes > target) {
+        rt_span* prev = NULL;
+        rt_span* cur = c->empty;
+        if (!cur) break;
+        while (cur->next) { prev = cur; cur = cur->next; }
+        uint64_t bytes = (uint64_t)cur->npages * g_pagesize;
+        if (!cur->decommitted) {
+            uint64_t t0 = rt_alloc_stats_on() ? rt_qpc_us() : 0;
+            VirtualFree(cur->base, (SIZE_T)cur->npages * g_pagesize, MEM_DECOMMIT);
+            cur->decommitted = 1;
+            if (rt_alloc_stats_on()) { g_decommit++; g_decommit_us += rt_qpc_us() - t0; }
+        }
+        if (g_empty_bytes >= bytes) g_empty_bytes -= bytes; else g_empty_bytes = 0;
+        if (prev) prev->next = NULL; else c->empty = NULL;
+    }
+}
+
+/* 触发检查：g_empty_bytes 超阈值时对所有 class 做一次 scavenge。
+ * 调用方需在释放中央锁后调用（内部自行加锁，锁序固定 0..NCLASS-1）。 */
+static void rt_central_maybe_scavenge(void) {
+    if (g_empty_bytes <= g_scav_threshold) return;
+    if (rt_alloc_stats_on()) g_scavenge_passes++;
+    for (int ci = 0; ci < (int)RT_NCLASS; ci++) {
+        EnterCriticalSection(&g_central[ci].lock);
+        rt_central_scavenge_locked(ci);
+        LeaveCriticalSection(&g_central[ci].lock);
     }
 }
 
@@ -310,6 +393,7 @@ static void* rt_alloc_small(int ci, uint32_t rec) {
     if (!mc) { mc = rt_mcache_get(); if (!mc) return NULL; }
     if (!mc->alloc[ci]) {
         rt_span* old = mc->span[ci];
+        uint64_t t0 = rt_alloc_stats_on() ? rt_qpc_us() : 0;
         if (old) {                              /* 先交还用尽的旧 span */
             mc->span[ci] = NULL;
             EnterCriticalSection(&g_central[ci].lock);
@@ -317,9 +401,13 @@ static void* rt_alloc_small(int ci, uint32_t rec) {
             LeaveCriticalSection(&g_central[ci].lock);
         }
         rt_span* sp = rt_central_cache_span(ci, &mc->alloc[ci]);
+        if (sp) { if (rt_alloc_stats_on()) g_alloc_refill++; }
+        if (rt_alloc_stats_on()) rt_lock_tick(rt_qpc_us() - t0);
         if (!sp) return NULL;
         mc->span[ci] = sp;          /* 空闲链搬运与置 checked-out 已在锁内完成 */
+        rt_central_maybe_scavenge();
     }
+    if (rt_alloc_stats_on()) g_alloc_count++;
     void* data = mc->alloc[ci];
     mc->alloc[ci] = *(void**)((char*)data + 0);   /* pop（next 存于 data+0） */
     memset(data, 0, (size_t)rt_classes[ci]);       /* Go：分配即零化 */
@@ -387,8 +475,10 @@ void rt_mem_free_span(void* p) {
         VirtualFree((void*)blk, 0, MEM_RELEASE);
         return;
     }
+    if (rt_alloc_stats_on()) g_free_count++;
     rt_span* sp = g_spans[sid];
     int ci = sp->ci;
+    uint64_t t0 = rt_alloc_stats_on() ? rt_qpc_us() : 0;
     EnterCriticalSection(&g_central[ci].lock);
     if (sp->decommitted) {        /* 防御：页已归还 OS，再碰就是 double free，直接吞掉 */
         LeaveCriticalSection(&g_central[ci].lock);
@@ -407,16 +497,17 @@ void rt_mem_free_span(void* p) {
         sp->state = 1;
     }
     if (sp->state == 1 && sp->nfree == sp->nobj) {
-        /* 无主且整 span 空闲 → 归还 OS（scavenge）。state==2 不做此判定：
+        /* 无主且整 span 空闲 → 挂 empty，惰性 scavenge。state==2 不做此判定：
          * 那时 nfree 只统计"还回来的"，等于 nobj 也不代表没人用。 */
         rt_central_unlink_partial(ci, sp);
         sp->next = g_central[ci].empty;
         g_central[ci].empty = sp;
         sp->state = 0;
-        VirtualFree(sp->base, (SIZE_T)sp->npages * g_pagesize, MEM_DECOMMIT);
-        sp->decommitted = 1;
+        if (!sp->decommitted) g_empty_bytes += (uint64_t)sp->npages * g_pagesize;
     }
     LeaveCriticalSection(&g_central[ci].lock);
+    if (rt_alloc_stats_on()) rt_lock_tick(rt_qpc_us() - t0);
+    rt_central_maybe_scavenge();
 }
 
 /* 批量归还：把 sp->pend[0..pend_n) 一次性压回空闲链（中央锁一次）。
@@ -426,7 +517,9 @@ void rt_mem_free_span_flush(rt_span* sp) {
     uint32_t n = sp->pend_n, i;
     sp->pend_n = 0;
     if (!n) return;
+    if (rt_alloc_stats_on()) { g_free_flush++; g_free_flush_obj += n; }
     int ci = sp->ci;
+    uint64_t t0 = rt_alloc_stats_on() ? rt_qpc_us() : 0;
     EnterCriticalSection(&g_central[ci].lock);
     if (sp->decommitted) {        /* 防御：同 rt_mem_free_span */
         LeaveCriticalSection(&g_central[ci].lock);
@@ -449,10 +542,11 @@ void rt_mem_free_span_flush(rt_span* sp) {
         sp->next = g_central[ci].empty;
         g_central[ci].empty = sp;
         sp->state = 0;
-        VirtualFree(sp->base, (SIZE_T)sp->npages * g_pagesize, MEM_DECOMMIT);
-        sp->decommitted = 1;
+        if (!sp->decommitted) g_empty_bytes += (uint64_t)sp->npages * g_pagesize;
     }
     LeaveCriticalSection(&g_central[ci].lock);
+    if (rt_alloc_stats_on()) rt_lock_tick(rt_qpc_us() - t0);
+    rt_central_maybe_scavenge();
 }
 
 /* 清扫攒批入口：先入 span 缓冲，满则刷。大对象不走攒批（整块 VirtualFree）。 */
@@ -699,3 +793,31 @@ extern char* rt_bytes_to_str(void* buf, int32_t off, int32_t slen) {
     p[slen] = '\0';
     return p;
 }
+
+/* ---------------- 分配器统计（SHADOW_GC_STATS=1 退出汇总） ----------------
+ * 与 rt_gc.c 的 gc_stats_dump 各自独立挂 atexit；这里只报分配器视角：
+ * 中央锁（mcentral）在分配/释放路径上的调用次数与累计耗时。 */
+static void rt_alloc_stats_dump(void) {
+    if (!rt_alloc_stats_on()) return;
+    fprintf(stderr, "[ALLOC][stats] ---- shadow allocator summary ----\n");
+    fprintf(stderr, "[ALLOC][stats] alloc=%llu refill=%llu (%.1f%%)\n",
+            (unsigned long long)g_alloc_count, (unsigned long long)g_alloc_refill,
+            g_alloc_count ? (double)g_alloc_refill * 100.0 / (double)g_alloc_count : 0.0);
+    fprintf(stderr, "[ALLOC][stats] free=%llu flush=%llu flush_obj=%llu\n",
+            (unsigned long long)g_free_count, (unsigned long long)g_free_flush,
+            (unsigned long long)g_free_flush_obj);
+    fprintf(stderr, "[ALLOC][stats] lock_us=%llu (%.1fms)\n",
+            (unsigned long long)g_lock_us, (double)g_lock_us / 1000.0);
+    fprintf(stderr, "[ALLOC][stats] decommit=%llu commit=%llu\n",
+            (unsigned long long)g_decommit, (unsigned long long)g_commit);
+    fprintf(stderr, "[ALLOC][stats] decommit_us=%llu commit_us=%llu (%.1fms/%.1fms)\n",
+            (unsigned long long)g_decommit_us, (unsigned long long)g_commit_us,
+            (double)g_decommit_us / 1000.0, (double)g_commit_us / 1000.0);
+    fprintf(stderr, "[ALLOC][stats] scavenge_passes=%llu\n",
+            (unsigned long long)g_scavenge_passes);
+}
+static void rt_alloc_stats_arm(void) {
+    if (!rt_alloc_stats_on()) return;
+    atexit(rt_alloc_stats_dump);
+}
+extern void rt_alloc_stats_arm_once(void) { rt_alloc_stats_arm(); }

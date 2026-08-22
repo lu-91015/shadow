@@ -4,6 +4,7 @@ build/*
 *.obj
 *.exe
 *.ll
+*.bc
 *.pdb
 *.ilk
 *.lib
