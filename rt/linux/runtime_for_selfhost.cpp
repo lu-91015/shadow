@@ -2970,28 +2970,32 @@ struct GCMeta {
     std::atomic<uint32_t> visited;  // 本轮遍历去重位（三色标记：collect 开始清 visited，不动 marked）
     int32_t  kind;    // 0=raw, 1=array, 2=dict, 3=anybox
     int32_t  owned;   // 1 = gc_alloc'd (free()), 0 = registered (delete)
-    int64_t  size;    // user size for conservative scan (kind 0)
+    int64_t  size;    // 对齐后容量（rt_alloc_cap 返回、保守扫描范围）
+    int64_t  req;     // 实际请求大小（g_heap_bytes / GC pacing 记账，避免对齐放大触发）
     uint32_t gen;     // 0=young, 1=old (tenured)
     uint32_t survived;// minor GC survival count (for promotion)
     void(*finalizer_fn)(void*);  // finalizer callback (nullptr = none)
     void*   finalizer_data;      // passed to finalizer (usually the object ptr)
     bool    finalized;           // finalizer already ran (prevent double-finalize)
 
-    GCMeta() : marked(0), visited(0), kind(0), owned(0), size(0), gen(0), survived(0),
+    GCMeta() : marked(0), visited(0), kind(0), owned(0), size(0), req(0), gen(0), survived(0),
                finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
     GCMeta(uint32_t m, int32_t k, int32_t o, int64_t s)
-        : marked(m), visited(0), kind(k), owned(o), size(s), gen(0), survived(0),
+        : marked(m), visited(0), kind(k), owned(o), size(s), req(s), gen(0), survived(0),
+          finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
+    GCMeta(uint32_t m, int32_t k, int32_t o, int64_t s, int64_t r)
+        : marked(m), visited(0), kind(k), owned(o), size(s), req(r), gen(0), survived(0),
           finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
     // Explicit copy: std::atomic is non-copyable, so we load/store the value.
     GCMeta(const GCMeta& o)
         : marked(o.marked.load(std::memory_order_relaxed)),
           visited(o.visited.load(std::memory_order_relaxed)),
-          kind(o.kind), owned(o.owned), size(o.size), gen(o.gen), survived(o.survived),
+          kind(o.kind), owned(o.owned), size(o.size), req(o.req), gen(o.gen), survived(o.survived),
           finalizer_fn(o.finalizer_fn), finalizer_data(o.finalizer_data), finalized(o.finalized) {}
     GCMeta& operator=(const GCMeta& o) {
         marked.store(o.marked.load(std::memory_order_relaxed), std::memory_order_relaxed);
         visited.store(o.visited.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        kind = o.kind; owned = o.owned; size = o.size; gen = o.gen; survived = o.survived;
+        kind = o.kind; owned = o.owned; size = o.size; req = o.req; gen = o.gen; survived = o.survived;
         finalizer_fn = o.finalizer_fn; finalizer_data = o.finalizer_data; finalized = o.finalized;
         return *this;
     }
@@ -3684,7 +3688,7 @@ static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
                     (long long)g_gc_collect_count, obj, m.kind, (long long)m.size, m.gen);
         if (m.kind == 0) g_diag_kind0++;
         g_gc_meta.erase(it);
-        g_heap_bytes.fetch_sub(m.size > 0 ? m.size : 0, std::memory_order_relaxed);
+        g_heap_bytes.fetch_sub(m.req > 0 ? m.req : 0, std::memory_order_relaxed);
         // Clear from remembered set if present.
         g_gc_remembered.erase(obj);
         // Clean up global roots that still point to this freed object.
@@ -3817,7 +3821,7 @@ extern "C" int64_t shadow_gc_collect() {
         int64_t live = 0;
         for (auto& kv : g_gc_meta) {
             if (kv.second.visited.load(std::memory_order_relaxed))
-                live += kv.second.size;
+                live += kv.second.req;
         }
         int64_t gogc = rt_gc_gogc();
         int64_t next = live + live * gogc / 100;
@@ -3956,7 +3960,7 @@ extern "C" int32_t shadow_gc_forget(void* ptr) {
     gc_lock_blocked();
     auto it = g_gc_meta.find(ptr);
     if (it == g_gc_meta.end()) { g_gc_mutex.unlock(); return 0; }
-    g_heap_bytes.fetch_sub(it->second.size > 0 ? it->second.size : 0, std::memory_order_relaxed);
+    g_heap_bytes.fetch_sub(it->second.req > 0 ? it->second.req : 0, std::memory_order_relaxed);
     g_gc_meta.erase(it);
     g_gc_remembered.erase(ptr);
     g_gc_mutex.unlock();
@@ -3981,6 +3985,12 @@ extern "C" int32_t shadow_gc_meta_contains(void* p) {
 //      （root_range 注册），同步 collect 不会误回收未扎根临时量。
 // 防重入：g_gc_running 在 collect 在途时置 1，触发检查跳过。
 extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
+    // 对齐 Windows rt_alloc_impl：分配 8 字节对齐容量并记录对齐后大小，
+    // 使 rt_alloc_cap 返回真实可用容量（如 5 字节字符串 → 8），
+    // shadow_string_concat_inplace 可复用对齐余量就地追加（匹配 Windows 效率）。
+    if (size < 0) size = 0;
+    int32_t asize = (size + 7) & ~7;
+    if (asize < size) asize = size;   // overflow guard
     if (g_gc_disabled == 0 && rt_gc_auto_on() && g_gc_running.load(std::memory_order_relaxed) == 0) {
         int32_t stress = rt_gc_stress_n();
         int64_t want = 0;
@@ -3993,7 +4003,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
         }
         if (want) shadow_gc_collect();
     }
-    void* p = malloc((size_t)size);
+    void* p = malloc((size_t)asize);
     if (!p) return nullptr;
     {
         // 等锁期间标记 blocked（stw_state=2）：collect 扫根时跳过本线程
@@ -4005,7 +4015,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             std::this_thread::yield();
         }
         s->stw_state.store(0, std::memory_order_release);
-        g_gc_meta[p] = GCMeta{ 0, kind, 1, (int64_t)size };
+        g_gc_meta[p] = GCMeta{ 0, kind, 1, (int64_t)asize, (int64_t)size };
         // New objects start in young gen.
         g_gc_meta[p].gen = 0;
         g_gc_meta[p].survived = 0;

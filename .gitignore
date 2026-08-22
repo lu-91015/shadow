@@ -1,5 +1,7 @@
 # 构建产物（build/* 而非 build/：需例外跟踪 build/shadow.exe 种子宿主，见下）
 build/*
+# Linux 自举构建产物（WSL：stage1.ll/.o、shadow 二进制、rt/ 运行时对象）
+linux_build/
 *.o
 *.obj
 *.exe
