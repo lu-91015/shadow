@@ -56,6 +56,8 @@ pkg/build_tmp*/
 pkg/dist/
 pkg/*.spec
 pkg/*.exe.old
+# 模块缓存（包管理器按需重生，对标 Go pkg/mod）
+pkg/mod/
 # 打包脚本与卸载器（不入库）
 pkg/make_setup.sh
 pkg/stage_llvm.sh

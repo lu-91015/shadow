@@ -55,6 +55,8 @@ typedef struct rt_gc_obj {
     void* data;        /* NULL = 空闲槽 */
     uint32_t type_id;
     uint32_t size;
+    uint32_t ht_slot;  /* 本对象在哈希表中的槽位（登记时写入，重建时刷新）。
+                        * 清扫用它免全表查找 —— 每周期省 ~12 万次一致性校验探测。 */
 } rt_gc_obj;
 static rt_gc_obj* g_objs = NULL;
 static uint32_t g_objs_len = 0, g_objs_cap = 0;
@@ -65,6 +67,11 @@ static uint32_t* g_ht_vals = NULL;
 static uint32_t g_ht_cap = 0;        /* 2 的幂 */
 static uint32_t g_ht_mask = 0;
 static uint32_t g_ht_used = 0;
+/* 墓碑：地址 1 不可能是合法对象（分配 16 字节对齐），用作"已擦除"哨兵。
+ * 清扫每周期擦除 ~95% 条目，backshift 维护链完整要 O(簇长²) 总开销；墓碑把
+ * 擦除降为 O(1)，代价是查找需跳过墓碑、表会积攒墓碑 —— 清扫收尾重建压回。 */
+#define RT_HT_TOMBSTONE ((void*)1)
+static uint32_t g_ht_tomb = 0;       /* 墓碑计数 */
 
 /* ---------------- 根集（frame + global + perm） ---------------- */
 typedef struct rt_gc_root {
@@ -374,19 +381,22 @@ static uint32_t rt_gc_hash_ptr(void* p) {
     return (uint32_t)h;
 }
 
-static void rt_gc_ht_grow(void) {
-    uint32_t ncap = g_ht_cap ? g_ht_cap * 2 : 256;
+/* 重哈希到指定容量（丢弃墓碑）。调用方需持 GC 锁。
+ * 同时刷新每个存活对象表项的 ht_slot —— 重建后槽位全变，清扫依赖它。 */
+static void rt_gc_ht_rehash_to(uint32_t ncap) {
+    uint32_t nmask = ncap - 1;
     void** nk = (void**)gc_xcalloc(ncap, sizeof(void*));
     uint32_t* nv = (uint32_t*)gc_xcalloc(ncap, sizeof(uint32_t));
-    uint32_t nmask = ncap - 1;
     uint32_t i;
     if (!nk || !nv) return;
     for (i = 0; i < g_ht_cap; i++) {
-        if (!g_ht_keys[i]) continue;
-        uint32_t j = rt_gc_hash_ptr(g_ht_keys[i]) & nmask;
+        void* k = g_ht_keys[i];
+        if (!k || k == RT_HT_TOMBSTONE) continue;
+        uint32_t j = rt_gc_hash_ptr(k) & nmask;
         while (nk[j]) j = (j + 1) & nmask;
-        nk[j] = g_ht_keys[i];
+        nk[j] = k;
         nv[j] = g_ht_vals[i];
+        g_objs[g_ht_vals[i]].ht_slot = j;
     }
     gc_xfree(g_ht_keys);
     gc_xfree(g_ht_vals);
@@ -394,8 +404,19 @@ static void rt_gc_ht_grow(void) {
     g_ht_vals = nv;
     g_ht_cap = ncap;
     g_ht_mask = nmask;
+    g_ht_tomb = 0;
     g_ht_used = 0;  /* 重新计数 */
     for (i = 0; i < g_ht_cap; i++) if (g_ht_keys[i]) g_ht_used++;
+}
+
+static void rt_gc_ht_grow(void) {
+    uint32_t ncap = g_ht_cap ? g_ht_cap * 2 : 256;
+    rt_gc_ht_rehash_to(ncap);
+}
+
+/* 容量不变重建：清扫后墓碑可能占半张表，重建把有效负载压回 used/cap。 */
+static void rt_gc_ht_rebuild(void) {
+    rt_gc_ht_rehash_to(g_ht_cap);
 }
 
 /* 返回 obj index；-1 = 不在对象表 */
@@ -411,6 +432,20 @@ static int32_t rt_gc_ptr_lookup(void* p) {
     return -1;
 }
 
+/* 同 rt_gc_ptr_lookup，额外经 *out_pos 返回哈希表槽位 —— 清扫路径用它
+ * 把"一致性校验的查找"与"随后 ht_erase 的查找"合并成一次。 */
+static int32_t rt_gc_ptr_lookup_pos(void* p, uint32_t* out_pos) {
+    uint32_t j, i;
+    if (!p || g_ht_cap == 0) return -1;
+    j = rt_gc_hash_ptr(p) & g_ht_mask;
+    for (i = 0; i < g_ht_cap; i++) {
+        if (g_ht_keys[j] == p) { if (out_pos) *out_pos = j; return (int32_t)g_ht_vals[j]; }
+        if (!g_ht_keys[j]) return -1;
+        j = (j + 1) & g_ht_mask;
+    }
+    return -1;
+}
+
 /* 透明 any 判别：值是否为真实 GC 堆对象。
  * 动态数组元素以 inttoptr 裸存小整值（透明模型），打印时若把裸整值当 AnyBox*
  * 解引用会 AV 崩溃。此处用对象表判定「是堆对象才解引用」，裸整值一律按整数打印。 */
@@ -418,19 +453,36 @@ extern int32_t shadow_is_valid_ptr(void* p) {
     return rt_gc_ptr_lookup(p) >= 0 ? 1 : 0;
 }
 
-static void rt_gc_ht_insert(void* p, uint32_t idx) {
+/* 登记对象并返回哈希槽位（调用方存入 g_objs[idx].ht_slot，清扫免查找）。
+ * 复用探测链上第一个墓碑：新对象常复用死对象地址（freelist），其 hash 与
+ * 墓碑同链，复用使表保持 ~48% 负载，避免墓碑把有效负载顶到 90%+。 */
+static uint32_t rt_gc_ht_insert(void* p, uint32_t idx) {
     uint32_t j, i;
     if (g_ht_used * 4 >= g_ht_cap * 3) rt_gc_ht_grow();
+    else if (g_ht_tomb && (g_ht_used + g_ht_tomb) * 4 >= g_ht_cap * 3) rt_gc_ht_rebuild();
     j = rt_gc_hash_ptr(p) & g_ht_mask;
     for (i = 0; i < g_ht_cap; i++) {
-        if (!g_ht_keys[j]) {
+        if (!g_ht_keys[j] || g_ht_keys[j] == RT_HT_TOMBSTONE) {
+            /* 墓碑在 hash(p) 探测链上，命中即复用（立即停，不再向后探测）。
+             * 新对象复用死对象地址 → 首探即中墓碑，插入 O(1)。 */
+            if (g_ht_keys[j] == RT_HT_TOMBSTONE) g_ht_tomb--;
             g_ht_keys[j] = p;
             g_ht_vals[j] = idx;
             g_ht_used++;
-            return;
+            return j;
         }
         j = (j + 1) & g_ht_mask;
     }
+    return (uint32_t)-1;
+}
+
+/* 从已知槽位 k 擦除。墓碑方案：O(1) 标记，不做 backshift —— 查找/插入
+ * 会跳过墓碑，清扫收尾重建一次性清除。调用方保证 g_ht_keys[k] == p。 */
+static void rt_gc_ht_erase_at(void* p, uint32_t k) {
+    if (!p || g_ht_cap == 0) return;
+    g_ht_keys[k] = RT_HT_TOMBSTONE;
+    g_ht_tomb++;
+    g_ht_used--;
 }
 
 static void rt_gc_ht_erase(void* p) {
@@ -444,25 +496,7 @@ static void rt_gc_ht_erase(void* p) {
         j = (j + 1) & g_ht_mask;
     }
     if (k == (uint32_t)-1) return;
-    /* backshift：把后续连续项向前挪，保持开放寻址查找链完整 */
-    j = (k + 1) & g_ht_mask;
-    while (g_ht_keys[j]) {
-        uint32_t ideal = rt_gc_hash_ptr(g_ht_keys[j]) & g_ht_mask;
-        int move = 0;
-        if (k < j) {
-            if (ideal <= k || ideal > j) move = 1;
-        } else {
-            if (ideal > j && ideal <= k) move = 1;
-        }
-        if (move) {
-            g_ht_keys[k] = g_ht_keys[j];
-            g_ht_vals[k] = g_ht_vals[j];
-            k = j;
-        }
-        j = (j + 1) & g_ht_mask;
-    }
-    g_ht_keys[k] = NULL;
-    g_ht_used--;
+    rt_gc_ht_erase_at(p, k);
 }
 
 /* 分配一个对象表槽位（复用空闲链或扩容） */
@@ -502,7 +536,7 @@ static uint64_t rt_gc_flush_pending_locked(void) {
         g_objs[slot].data = data;
         g_objs[slot].type_id = h->type_id;
         g_objs[slot].size = h->size;
-        rt_gc_ht_insert(data, slot);
+        g_objs[slot].ht_slot = rt_gc_ht_insert(data, slot);
         bytes += (uint64_t)h->size + RT_GC_HEADER;
         g_heap_bytes += (uint64_t)h->size + RT_GC_HEADER;
         if (g_heap_bytes > g_heap_peak) g_heap_peak = g_heap_bytes;
@@ -564,7 +598,7 @@ static void rt_gc_register_slow(void* data, rt_gc_hdr* h) {
     g_objs[slot].data = data;
     g_objs[slot].type_id = h->type_id;
     g_objs[slot].size = h->size;
-    rt_gc_ht_insert(data, slot);
+    g_objs[slot].ht_slot = rt_gc_ht_insert(data, slot);
     /* §5.2.4 分配根：覆盖式记录"最近分配"，扫根时保活到 mutator 赋值 sf。
      * 在 GC 锁内写，扫根（STW 内线程停靠）读 —— x86 原子，无竞态。 */
     if (t_self) t_self->alloc_root = data;
@@ -600,6 +634,24 @@ void rt_gc_unregister(void* data) {
     g_objs[idx].size = (uint32_t)g_free_head;  /* 链到空闲链 */
     g_free_head = idx;
     GC_UNLOCK();
+}
+
+/* 清扫专用释放：调用者（gc_sweep_step）已持 GC 锁，且已通过一致性校验
+ * 确认对象表槽 slot 与哈希表指向一致（hj 即该校验的哈希槽位）。跳过
+ * rt_gc_unregister 的重复哈希查找与重入锁，直接摘表 + 归还 span ——
+ * 清扫每对象省一次查找 + 一次 Enter/LeaveCriticalSection。内存归还走
+ * rt_mem_free_span_pend（rt_core.c，每 span 攒批缓冲，满 32 才加一次
+ * 中央锁），与通用 free 路径一致。 */
+extern void rt_mem_free_span_pend(void* p);
+static void rt_gc_sweep_free(void* d, uint32_t slot, uint32_t hj) {
+    g_unreg_count++;
+    if (g_objs[slot].size > 0x7FFFFFFF) return;   /* 防御：同 rt_gc_unregister */
+    g_heap_bytes -= (uint64_t)g_objs[slot].size + RT_GC_HEADER;
+    rt_gc_ht_erase_at(d, hj);
+    g_objs[slot].data = NULL;
+    g_objs[slot].size = (uint32_t)g_free_head;
+    g_free_head = slot;
+    rt_mem_free_span_pend(d);
 }
 
 /* 覆盖对象类型（shadow_gc_alloc 用） */
@@ -2192,6 +2244,12 @@ static void gc_sweep_begin(void) {
 static void gc_sweep_complete(void) {
     gc_pacing_settle(g_live_bytes);   /* 重算 goal 与 trigger（Task #33） */
     g_gc_freed += g_sweep_dead;
+    /* 攒批收尾：把各 span 残留的待归还缓冲一次性刷掉（持 GC 锁，安全） */
+    extern void rt_mem_free_span_flush_all(void);
+    rt_mem_free_span_flush_all();
+    /* 墓碑不在此重建：新对象复用死对象地址（freelist），其插入会沿同链
+     * 消费墓碑，表保持 ~46% 负载；仅在插入时占用超阈值才按需重建
+     * （rt_gc_ht_insert），避免每周期一次 3MB 表分配/释放。 */
     /* 归档到进程级累计：周期变量马上要被下一轮清零（§5.2.10） */
     g_live_last = g_live_bytes;
     g_tot_assist_work += g_assist_work;
@@ -2248,8 +2306,8 @@ static uint32_t gc_sweep_step(uint64_t budget) {
     tus = gc_now_us();
     while (g_sweep_cursor < g_sweep_end) {
         uint32_t i;
+        uint32_t hj;
         void* d;
-        int32_t vidx;
         if (budget && work >= budget) break;
         work++;
         i = g_sweep_cursor++;
@@ -2257,19 +2315,23 @@ static uint32_t gc_sweep_step(uint64_t budget) {
         if (!d) continue;
         /* 一致性校验：对象表槽 i 必须与 hash 表指向的槽一致。
          * 不一致 = 同一地址被重复登记（hash 插入失败/erase 漏删），
-         * 若照常 free 会造成 double free → freelist 成环 → 两次分配返回同一块 → 堆损坏。 */
-        vidx = rt_gc_ptr_lookup(d);
-        if (vidx != (int32_t)i) {
-            g_bad_slot++;
-            if (rt_gc_debug_on())
-                fprintf(stderr, "[GC][BAD-SLOT] i=%u data=%p ht_idx=%d size=%u type=%u\n",
-                        i, d, vidx, g_objs[i].size, g_objs[i].type_id);
-            g_objs[i].data = NULL;     /* 摘除幽灵表项，绝不 free */
-            continue;
+         * 若照常 free 会造成 double free → freelist 成环 → 两次分配返回同一块 → 堆损坏。
+         * 登记时已把哈希槽位存进对象表（ht_slot），此处 O(1) 校验即可；
+         * 异常（重建遗漏/重复登记）才走慢路径全表查找，保持原坏槽检测语义。 */
+        hj = g_objs[i].ht_slot;
+        if (hj >= g_ht_cap || g_ht_keys[hj] != d) {
+            int32_t vidx = rt_gc_ptr_lookup_pos(d, &hj);
+            if (vidx != (int32_t)i) {
+                g_bad_slot++;
+                if (rt_gc_debug_on())
+                    fprintf(stderr, "[GC][BAD-SLOT] i=%u data=%p ht_idx=%d size=%u type=%u\n",
+                            i, d, vidx, g_objs[i].size, g_objs[i].type_id);
+                g_objs[i].data = NULL;     /* 摘除幽灵表项，绝不 free */
+                continue;
+            }
         }
         if (rt_gc_hdr_of(d)->mark != g_col_black) {
-            extern void __rt_shadow_free(void*);
-            __rt_shadow_free(d);       /* 触发 rt_gc_unregister → 槽 i 入 freelist */
+            rt_gc_sweep_free(d, i, hj);   /* 已知槽位：跳过查找与重入锁 */
             dead++;
         } else {
             /* 无需复位 mark：下一轮 epoch 自增后，本轮的黑自动变成白 */

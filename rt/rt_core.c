@@ -56,6 +56,7 @@ extern void shadow_gc_barrier_slot(void* old, void* val);
 extern void shadow_gc_barrier_bulk(void* addr, int32_t n);
 
 /* ---- mspan：一块连续 VirtualAlloc 内存切成的同 size-class 对象集 ---- */
+#define RT_SPAN_PEND 32   /* 清扫攒批：每 span 待归还对象缓冲容量 */
 typedef struct rt_span {
     struct rt_span* next;     /* mcentral 链表链接 */
     uint8_t* base;           /* span 内存基地址（VirtualAlloc 返回，页对齐） */
@@ -75,6 +76,11 @@ typedef struct rt_span {
     int32_t  state;
     int32_t  decommitted;    /* 1 = 页已被 MEM_DECOMMIT 归还 OS */
     uint32_t id;            /* 在 g_spans 注册表中的下标 */
+    /* 清扫攒批缓冲：GC 清扫把死对象先压进这里（仅 GC_LOCK 内访问），
+     * 满 RT_SPAN_PEND 或清扫收尾时一次性加锁归还 —— 把每对象一次的
+     * EnterCriticalSection 摊薄为每 32 对象一次。 */
+    void*    pend[RT_SPAN_PEND];
+    uint32_t pend_n;
 } rt_span;
 
 /* ---- mcentral：每 size class 一个 ---- */
@@ -174,6 +180,7 @@ static rt_span* rt_span_new(int ci) {
     sp->next = NULL; sp->base = base; sp->npages = npages; sp->ci = ci;
     sp->objsize = objsize; sp->nobj = nobj;
     sp->free = NULL; sp->state = 2; sp->decommitted = 0;
+    sp->pend_n = 0;
     sp->id = rt_span_register(sp);
     rt_span_build_freelist(sp);
     return sp;
@@ -357,11 +364,20 @@ static int rt_poison_on(void) {
     return rt_poison;
 }
 
+/* 把已从 GC 对象表注销的内存归还给 span 空闲链（中央锁内）。
+ * 供 GC 清扫在已知槽位时跳过对象表查找/重入锁直接调用（见 rt_gc.c
+ * rt_gc_sweep_free）。通用路径仍走 __rt_shadow_free。 */
+extern void rt_mem_free_span(void* p);
+
 extern void __rt_shadow_free(void* p) {
-    uintptr_t blk;
-    uint32_t sid;
     if (!p) return;
     rt_gc_unregister(p);          /* 先注销 GC 对象表（不持锁，不会触发 GC） */
+    rt_mem_free_span(p);
+}
+
+void rt_mem_free_span(void* p) {
+    uintptr_t blk;
+    uint32_t sid;
     rt_alloc_init();
     blk = (uintptr_t)p - RT_HEADER;
     sid = RT_HDR_SPAN(blk);
@@ -401,6 +417,66 @@ extern void __rt_shadow_free(void* p) {
         sp->decommitted = 1;
     }
     LeaveCriticalSection(&g_central[ci].lock);
+}
+
+/* 批量归还：把 sp->pend[0..pend_n) 一次性压回空闲链（中央锁一次）。
+ * 状态迁移与 rt_mem_free_span 逐对象版等价 —— 迁移只依赖当前 state 与
+ * nfree，批量后统一判定结果相同。调用方需保证 sp->pend 仅 GC_LOCK 内访问。 */
+void rt_mem_free_span_flush(rt_span* sp) {
+    uint32_t n = sp->pend_n, i;
+    sp->pend_n = 0;
+    if (!n) return;
+    int ci = sp->ci;
+    EnterCriticalSection(&g_central[ci].lock);
+    if (sp->decommitted) {        /* 防御：同 rt_mem_free_span */
+        LeaveCriticalSection(&g_central[ci].lock);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        void* p = sp->pend[i];
+        if (rt_poison_on()) memset(p, 0xDD, (size_t)rt_classes[ci]);
+        *(void**)((char*)p + 0) = sp->free;
+        sp->free = p;
+        sp->nfree++;
+    }
+    if (sp->state == 3) {
+        sp->next = g_central[ci].partial;
+        g_central[ci].partial = sp;
+        sp->state = 1;
+    }
+    if (sp->state == 1 && sp->nfree == sp->nobj) {
+        rt_central_unlink_partial(ci, sp);
+        sp->next = g_central[ci].empty;
+        g_central[ci].empty = sp;
+        sp->state = 0;
+        VirtualFree(sp->base, (SIZE_T)sp->npages * g_pagesize, MEM_DECOMMIT);
+        sp->decommitted = 1;
+    }
+    LeaveCriticalSection(&g_central[ci].lock);
+}
+
+/* 清扫攒批入口：先入 span 缓冲，满则刷。大对象不走攒批（整块 VirtualFree）。 */
+void rt_mem_free_span_pend(void* p) {
+    uintptr_t blk = (uintptr_t)p - RT_HEADER;
+    uint32_t sid = RT_HDR_SPAN(blk);
+    if (sid == RT_SPAN_LARGE) { rt_mem_free_span(p); return; }
+    if (sid >= g_spans_len || !g_spans[sid]) {
+        fprintf(stderr, "[PEND] BAD sid=%u p=%p len=%u\n", sid, p, g_spans_len);
+        return;
+    }
+    rt_span* sp = g_spans[sid];
+    sp->pend[sp->pend_n++] = p;
+    if (sp->pend_n == RT_SPAN_PEND) rt_mem_free_span_flush(sp);
+}
+
+/* 清扫收尾：把残留的 span 缓冲全部刷掉。调用方需持 GC_LOCK（清扫期间
+ * 分配被锁挡住，g_spans_len 稳定，无并发新增 span）。 */
+void rt_mem_free_span_flush_all(void) {
+    uint32_t i;
+    for (i = 0; i < g_spans_len; i++) {
+        rt_span* sp = g_spans[i];
+        if (sp && sp->pend_n) rt_mem_free_span_flush(sp);
+    }
 }
 
 /* ---------------- 基础字节原语 ---------------- */
