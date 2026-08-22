@@ -561,6 +561,7 @@ pub kimo cg_is_nogc_fn(name: string) -> int {
     // 字符串拼接/单字符：纯 rt_malloc（非 GC 堆）+ memcpy，输入由调用方帧 root，
     // 结果非 GC 对象无需 root；免帧后可被 opt -O2 内联进热循环（str_reverse/str_concat）。
     if (str_eq(name, "shadow_string_concat") == 1) { return 1; }
+    if (str_eq(name, "shadow_string_concat_inplace") == 1) { return 1; }
     if (str_eq(name, "shadow_subscript") == 1) { return 1; }
     if (str_eq(name, "shadow_schar") == 1) { return 1; }
     // 字符串查找：纯字节读取（rt_get_byte），无分配无 GC 交互（string_find 热循环）。

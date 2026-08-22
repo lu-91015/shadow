@@ -83,7 +83,42 @@ kimo main() -> int {
     // [0.4/7] patch runtime: CreateProcessA shadow_sys_exec
     println("[0.4/7] patch runtime: CreateProcessA shadow_sys_exec");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
-    rt_sys_exec(objcopy + " --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
+    // 运行时符号重命名：stage1.o 内含 shadow-lang 标准库实现（shadow_string_concat 等强符号），
+    // runtime_for_selfhost.o 的 C++ 同名实现必须加 __cpp_ 前缀避免重复符号；shadow_sys_exec 走
+    // CreateProcessA 补丁（sys_exec_cpa.o）。rt_alloc_cap 为新增原语，保留原名供编译器链接。
+    rt_sys_exec(objcopy
+        + " --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob"
+        + " --redefine-sym=shadow_any_box_ptr=__cpp_shadow_any_box_ptr"
+        + " --redefine-sym=shadow_any_box_string=__cpp_shadow_any_box_string"
+        + " --redefine-sym=shadow_any_print=__cpp_shadow_any_print"
+        + " --redefine-sym=shadow_any_to_string=__cpp_shadow_any_to_string"
+        + " --redefine-sym=shadow_any_unbox_ptr=__cpp_shadow_any_unbox_ptr"
+        + " --redefine-sym=shadow_array_get_int=__cpp_shadow_array_get_int"
+        + " --redefine-sym=shadow_array_get_ptr=__cpp_shadow_array_get_ptr"
+        + " --redefine-sym=shadow_array_len=__cpp_shadow_array_len"
+        + " --redefine-sym=shadow_array_pop=__cpp_shadow_array_pop"
+        + " --redefine-sym=shadow_array_push_float=__cpp_shadow_array_push_float"
+        + " --redefine-sym=shadow_array_push_int=__cpp_shadow_array_push_int"
+        + " --redefine-sym=shadow_array_push_long=__cpp_shadow_array_push_long"
+        + " --redefine-sym=shadow_array_push_ptr=__cpp_shadow_array_push_ptr"
+        + " --redefine-sym=shadow_array_set_int=__cpp_shadow_array_set_int"
+        + " --redefine-sym=shadow_array_set_ptr=__cpp_shadow_array_set_ptr"
+        + " --redefine-sym=shadow_content_hash=__cpp_shadow_content_hash"
+        + " --redefine-sym=shadow_gc_poll=__cpp_shadow_gc_poll"
+        + " --redefine-sym=shadow_gc_register_type=__cpp_shadow_gc_register_type"
+        + " --redefine-sym=shadow_gc_root_range=__cpp_shadow_gc_root_range"
+        + " --redefine-sym=shadow_int_to_str=__cpp_shadow_int_to_str"
+        + " --redefine-sym=shadow_llvm_set_alwaysinline=__cpp_shadow_llvm_set_alwaysinline"
+        + " --redefine-sym=shadow_println_int=__cpp_shadow_println_int"
+        + " --redefine-sym=shadow_println_str=__cpp_shadow_println_str"
+        + " --redefine-sym=shadow_set_cli_args=__cpp_shadow_set_cli_args"
+        + " --redefine-sym=shadow_string_concat=__cpp_shadow_string_concat"
+        + " --redefine-sym=shadow_string_len=__cpp_shadow_string_len"
+        + " --redefine-sym=shadow_sys_args=__cpp_shadow_sys_args"
+        + " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list"
+        + " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack"
+        + " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack"
+        + " " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
 
     // [1/7] stage1: HOST compile src/main.shadow
     println("[1/7] stage1: HOST(" + host + ") compile src/main.shadow");

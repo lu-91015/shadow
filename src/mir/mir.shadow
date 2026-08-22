@@ -15,6 +15,16 @@ import core.const;
 import core.utils;
 import type_checker.type_checker;
 
+@extern("shadow_env_get") kimo mir_env_get(name: string) -> string { return ""; }
+let mir_dbg_on: int = -1;
+pub kimo mir_dbg() -> int {
+    if (mir_dbg_on < 0) {
+        let v = mir_env_get("SHADOW_MIR_DBG");
+        if (len(v) > 0) { mir_dbg_on = 1; } else { mir_dbg_on = 0; }
+    }
+    return mir_dbg_on;
+}
+
 // MIR builder 全局状态（每次 mir_lower_func 重置）
 let mir_blocks: array<MirBlock> = [];
 let mir_cur_label: string = "";
@@ -25,6 +35,169 @@ let mir_label_counter: int = 0;
 let mir_loop_break_labels: array<string> = [];
 let mir_loop_continue_labels: array<string> = [];
 let mir_n_slots: int = 0;
+
+// 就地追加优化所有权跟踪：mir_owned[slot] = 1 表示该 slot 唯一持有其字符串缓冲
+// （无其他活引用），可安全就地追加。保守数据流（仅 1→0，不会误判安全）：
+//   - let x = 字面量/二元运算 → 新缓冲，owned=1
+//   - let x = y（变量复制）/存储/传参/闭包捕获 → 源与目标共享，owned 均清 0
+//   - let x = 调用/索引/成员 → 结果可能逃逸/共享，owned=0
+//   - 函数调用结果视为逃逸（callee 可能保留/返回全局），owned=0
+//   - 循环入口扫描体内别名操作，清除跨迭代共享（否则下一次迭代就地追加会污染别名）
+let mir_owned: array<int> = [];
+
+pub kimo mir_owned_clear(slot: int) -> void {
+    if (slot >= 0 && slot < len(mir_owned)) {
+        mir_owned[slot] = 0;
+    }
+}
+
+pub kimo mir_owned_is(slot: int) -> int {
+    if (slot >= 0 && slot < len(mir_owned)) { return mir_owned[slot]; }
+    return 0;
+}
+
+pub kimo mir_owned_set(slot: int, v: int) -> void {
+    if (slot >= 0 && slot < len(mir_owned)) {
+        mir_owned[slot] = v;
+    }
+}
+
+// 循环体别名扫描（只读，不改 mir_owned）：找出体内会被共享的 slot。
+// 表达式层别名仅来自函数调用实参（callee 可能保留）与闭包捕获。
+pub kimo mir_scan_aliases_expr(h: HirExpr, aliased: array<int>) -> void {
+    if ((h as any) == 0) { return; }
+    let k = h.kind;
+    if (k == EXPR_VAR) { return; }
+    if (k == EXPR_CALL) {
+        let args = h.children;
+        let i = 0;
+        while (i < len(args)) {
+            let a = args[i];
+            if (a.kind == EXPR_VAR) {
+                if (a.slot >= 0 && a.slot < len(aliased)) { aliased[a.slot] = 1; }
+            }
+            mir_scan_aliases_expr(a, aliased);
+            i = i + 1;
+        }
+        return;
+    }
+    if (k == EXPR_CLOSURE) {
+        let children = h.children;
+        let i = 0;
+        while (i < len(children)) {
+            let c = children[i];
+            if (c.kind == EXPR_VAR) {
+                if (c.slot >= 0 && c.slot < len(aliased)) { aliased[c.slot] = 1; }
+            }
+            mir_scan_aliases_expr(c, aliased);
+            i = i + 1;
+        }
+        return;
+    }
+    let children = h.children;
+    let i = 0;
+    while (i < len(children)) {
+        mir_scan_aliases_expr(children[i], aliased);
+        i = i + 1;
+    }
+}
+
+pub kimo mir_scan_aliases_stmt(h: HirStmt, aliased: array<int>) -> void {
+    if ((h as any) == 0) { return; }
+    let k = h.kind;
+    if (k == STMT_LET) {
+        if ((h.child as any) != 0) {
+            let c = h.child;
+            if (c.kind == EXPR_VAR) {
+                if (c.slot >= 0 && c.slot < len(aliased)) { aliased[c.slot] = 1; }
+            }
+            mir_scan_aliases_expr(c, aliased);
+        }
+        return;
+    }
+    if (k == STMT_ASSIGN) {
+        let lhs = h.child;
+        let rhs = h.rhs;
+        if (lhs.kind == EXPR_INDEX || lhs.kind == EXPR_MEMBER) {
+            if ((rhs as any) != 0 && rhs.kind == EXPR_VAR) {
+                if (rhs.slot >= 0 && rhs.slot < len(aliased)) { aliased[rhs.slot] = 1; }
+            }
+        }
+        if ((rhs as any) != 0) { mir_scan_aliases_expr(rhs, aliased); }
+        mir_scan_aliases_expr(lhs, aliased);
+        return;
+    }
+    if (k == STMT_EXPR) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        return;
+    }
+    if (k == STMT_RETURN) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        return;
+    }
+    if (k == STMT_IF) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        let tb = h.body;
+        let i = 0;
+        while (i < len(tb)) { mir_scan_aliases_stmt(tb[i], aliased); i = i + 1; }
+        let eb = h.else_body;
+        let j = 0;
+        while (j < len(eb)) { mir_scan_aliases_stmt(eb[j], aliased); j = j + 1; }
+        return;
+    }
+    if (k == STMT_WHILE) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        let wb = h.body;
+        let i = 0;
+        while (i < len(wb)) { mir_scan_aliases_stmt(wb[i], aliased); i = i + 1; }
+        return;
+    }
+    if (k == STMT_FOR) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        let fb = h.body;
+        let i = 0;
+        while (i < len(fb)) { mir_scan_aliases_stmt(fb[i], aliased); i = i + 1; }
+        return;
+    }
+    if (k == STMT_BLOCK) {
+        let bb = h.body;
+        let i = 0;
+        while (i < len(bb)) { mir_scan_aliases_stmt(bb[i], aliased); i = i + 1; }
+        return;
+    }
+    if (k == STMT_MATCH) {
+        if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
+        let blocks = h.arm_blocks;
+        let i = 0;
+        while (i < len(blocks)) {
+            let blk = blocks[i];
+            let j = 0;
+            while (j < len(blk.stmts)) { mir_scan_aliases_stmt(blk.stmts[j], aliased); j = j + 1; }
+            i = i + 1;
+        }
+        return;
+    }
+}
+
+// 循环入口：扫描体内别名操作，清除对应 slot 所有权（跨迭代共享）
+pub kimo mir_clear_loop_aliases(body: array<HirStmt>) -> void {
+    let aliased: array<int> = [];
+    let ai = 0;
+    while (ai < mir_n_slots) {
+        aliased = array_push(aliased, 0);
+        ai = ai + 1;
+    }
+    let i = 0;
+    while (i < len(body)) {
+        mir_scan_aliases_stmt(body[i], aliased);
+        i = i + 1;
+    }
+    let j = 0;
+    while (j < mir_n_slots) {
+        if (aliased[j] == 1) { mir_owned_clear(j); }
+        j = j + 1;
+    }
+}
 
 // 检查是否已有终止符
 pub kimo mir_has_terminator() -> int {
@@ -397,6 +570,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
             while (i < len(args)) {
                 let ar = mir_lower_expr(args[i]);
                 arg_regs = array_push(arg_regs, ar);
+                // 枚举负载持有实参引用：变量缓冲被枚举共享，清除所有权
+                if (args[i].kind == EXPR_VAR) { mir_owned_clear(args[i].slot); }
                 i = i + 1;
             }
             let r = mir_new_reg();
@@ -415,6 +590,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         while (i < len(args)) {
             let ar = mir_lower_expr(args[i]);
             arg_regs = array_push(arg_regs, ar);
+            // 传参：变量缓冲可能被 callee 保留/共享，清除所有权
+            if (args[i].kind == EXPR_VAR) { mir_owned_clear(args[i].slot); }
             i = i + 1;
         }
         let r = mir_new_reg();
@@ -449,6 +626,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         while (i < len(args)) {
             let ar = mir_lower_expr(args[i]);
             arg_regs = array_push(arg_regs, ar);
+            // 传参：变量缓冲可能被 callee 保留/共享，清除所有权
+            if (args[i].kind == EXPR_VAR) { mir_owned_clear(args[i].slot); }
             i = i + 1;
         }
         let r = mir_new_reg();
@@ -985,6 +1164,31 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             inst.arg2 = h.slot;
             inst.ty = h.inferred_type;
             mir_emit(inst);
+            // 所有权：let x = y（变量复制）→ 共享缓冲，源与目标均不唯一持有；
+            // let x = 字面量/二元运算 → 新缓冲，唯一持有；
+            // let x = 调用/索引/成员/闭包 → 结果可能逃逸/共享，不唯一持有。
+            let init_kind = h.child.kind;
+            if (mir_dbg() == 1) {
+                println("DBG LET slot=" + int_to_str(h.slot) + " initkind=" + int_to_str(init_kind) + " childslot=" + int_to_str(h.child.slot) + " owned=" + int_to_str(mir_owned_is(h.slot)));
+            }
+            if (init_kind == EXPR_VAR) {
+                mir_owned_clear(h.child.slot);
+                mir_owned_set(h.slot, 0);
+            } else if (init_kind == EXPR_CALL || init_kind == EXPR_INDEX ||
+                       init_kind == EXPR_MEMBER || init_kind == EXPR_CLOSURE) {
+                mir_owned_set(h.slot, 0);
+                if (init_kind == EXPR_CLOSURE) {
+                    // 闭包捕获的变量缓冲被闭包共享，清除所有权
+                    let cap_children = h.child.children;
+                    let ci = 0;
+                    while (ci < len(cap_children)) {
+                        if (cap_children[ci].kind == EXPR_VAR) { mir_owned_clear(cap_children[ci].slot); }
+                        ci = ci + 1;
+                    }
+                }
+            } else {
+                mir_owned_set(h.slot, 1);
+            }
         }
         return;
     }
@@ -1191,6 +1395,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
     }
 
     if (k == STMT_WHILE) {
+        // 循环入口：体内别名操作会让变量在下一次迭代被共享，清除所有权禁用就地追加
+        mir_clear_loop_aliases(h.body);
         let cond_label = mir_new_label();
         let body_label = mir_new_label();
         let exit_label = mir_new_label();
@@ -1243,6 +1449,40 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         let rhs_h = h.rhs;
 
         if (lhs.kind == EXPR_VAR) {
+            // 就地追加优化：a = a + b（静态 string 类型）→ shadow_string_concat_inplace(a, b)。
+            // 复用 a 的缓冲，避免热循环里每次拼接都分配新缓冲 + 全量复制（str_reverse 等）。
+            // 仅当 RHS 是 a + b 且 a 与 LHS 同变量、类型为 string、且 a 唯一持有其缓冲
+            // （mir_owned_is）时生效；字面量/非堆缓冲由运行时 rt_alloc_cap 检测并回退普通 concat。
+            let lty = lhs.inferred_type;
+            if ((rhs_h as any) != 0 && (lty as any) != 0 && lty.kind == TYPE_STRING &&
+                rhs_h.kind == EXPR_BINARY && rhs_h.op == BIN_ADD) {
+                let rchildren = rhs_h.children;
+                if (len(rchildren) == 2) {
+                    let rl = rchildren[0];
+                    let rr = rchildren[1];
+                    if (rl.kind == EXPR_VAR && rl.slot == lhs.slot && mir_owned_is(lhs.slot) == 1) {
+                        if (mir_dbg() == 1) {
+                            println("DBG INPLACE slot=" + int_to_str(lhs.slot) + " owned=" + int_to_str(mir_owned_is(lhs.slot)));
+                        }
+                        let ra = mir_lower_expr(rl);
+                        let rb = mir_lower_expr(rr);
+                        let rc = mir_new_reg();
+                        let call = mir_mk(MIR_CALL);
+                        call.dst = rc;
+                        call.strval = "shadow_string_concat_inplace";
+                        call.args = [ra, rb];
+                        call.ty = lty;
+                        mir_emit(call);
+                        let st = mir_mk(MIR_STORE_VAR);
+                        st.arg1 = rc;
+                        st.arg2 = lhs.slot;
+                        st.ty = lty;
+                        st.strval = lhs.str1;
+                        mir_emit(st);
+                        return;
+                    }
+                }
+            }
             let rhs_reg = -1;
             if ((rhs_h as any) != 0) { rhs_reg = mir_lower_expr(rhs_h); }
             let inst = mir_mk(MIR_STORE_VAR);
@@ -1251,6 +1491,20 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             inst.ty = lhs.inferred_type;  // slot 类型（如 double）：codegen 据此做 float→double fpext
             inst.strval = lhs.str1;  // 全局赋值（slot=-1）按名查找
             mir_emit(inst);
+            // 所有权更新（与 STMT_LET 同规则）：x = y → 共享；x = 字面量/二元 → 新缓冲；
+            // x = 调用/索引/成员/闭包 → 不唯一持有。
+            if ((rhs_h as any) != 0) {
+                let rk = rhs_h.kind;
+                if (rk == EXPR_VAR) {
+                    mir_owned_clear(rhs_h.slot);
+                    mir_owned_set(lhs.slot, 0);
+                } else if (rk == EXPR_CALL || rk == EXPR_INDEX ||
+                           rk == EXPR_MEMBER || rk == EXPR_CLOSURE) {
+                    mir_owned_set(lhs.slot, 0);
+                } else {
+                    mir_owned_set(lhs.slot, 1);
+                }
+            }
             return;
         }
 
@@ -1266,6 +1520,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             inst.ty = lhs.inferred_type;  // 数组元素类型：codegen 据此决定直接 GEP 还是运行时函数
             inst.args = array_push([], rhs_reg);
             mir_emit(inst);
+            // 存储到数组：RHS 变量缓冲被数组共享，不再唯一持有
+            if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_VAR) { mir_owned_clear(rhs_h.slot); }
             return;
         }
 
@@ -1280,6 +1536,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             inst.longval = lhs.intval;  // 字段索引
             inst.args = array_push([], rhs_reg);
             mir_emit(inst);
+            // 存储到成员：RHS 变量缓冲被对象共享，不再唯一持有
+            if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_VAR) { mir_owned_clear(rhs_h.slot); }
             return;
         }
         return;
@@ -1301,6 +1559,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         //   双变量 for (i, x in arr): i = idx, x = arr[idx]
         //   range for (i in a..b): idx = a; while (idx < b) { i = idx; body; idx++ }
         //   多变量解包 for (a, b in arr): a = arr[idx].0, b = arr[idx].1
+        // 循环入口：体内别名操作会让变量在下一次迭代被共享，清除所有权禁用就地追加
+        mir_clear_loop_aliases(h.body);
         let var_names = tc_split_commas(h.str1);
         let n_vars = len(var_names);
         let first_slot = h.slot;
@@ -1719,6 +1979,12 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
     mir_loop_break_labels = [];
     mir_loop_continue_labels = [];
     mir_n_slots = hf.n_slots;
+    mir_owned = [];
+    let oi = 0;
+    while (oi < mir_n_slots) {
+        mir_owned = array_push(mir_owned, 0);
+        oi = oi + 1;
+    }
 
     let body = hf.body;
     let i = 0;

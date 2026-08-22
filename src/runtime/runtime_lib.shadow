@@ -46,6 +46,7 @@ pub kimo rt_free(p: any) -> void {}
 @extern("shadow_exit") kimo rt_exit(code: int) -> void {}
 @extern("shadow_any_to_int") kimo shadow_any_to_int(v: any) -> long { return 0; }
 @extern("shadow_is_valid_ptr") kimo shadow_is_valid_ptr(p: any) -> int { return 0; }
+@extern("rt_alloc_cap") kimo rt_alloc_cap(p: any) -> int { return 0; }
 
 // === String operations ===
 pub kimo shadow_string_concat(s1: any, s2: any) -> any {
@@ -53,6 +54,30 @@ pub kimo shadow_string_concat(s1: any, s2: any) -> any {
     let l2: int = rt_strlen(s2);
     let total: int = l1 + l2 + 1;
     let p: any = rt_malloc(total);
+    rt_memcpy_at(p, 0, s1, 0, l1);
+    rt_memcpy_at(p, l1, s2, 0, l2);
+    rt_set_byte(p, l1 + l2, 0);
+    return p;
+}
+
+// 就地追加（StringBuilder 核心）：s1 缓冲容量足够时直接复用（a = a + b 热循环，
+// str_reverse 等），避免每次拼接都分配新缓冲 + 全量复制；容量不足时按 2x 倍增扩容
+// （摊销 O(1)），留出余量供后续就地追加。s1 非堆对象（字面量/栈上）时 rt_alloc_cap
+// 返回 0，从 need 起步。语义：cap 足够时 s1 缓冲被就地修改，调用方须保证 s1 无其他
+// 活引用（MIR 仅对 x = x + y 的局部变量触发）。
+pub kimo shadow_string_concat_inplace(s1: any, s2: any) -> any {
+    let l1: int = rt_strlen(s1);
+    let l2: int = rt_strlen(s2);
+    let cap: int = rt_alloc_cap(s1);
+    let need: int = l1 + l2 + 1;
+    if (cap >= need) {
+        rt_memcpy_at(s1, l1, s2, 0, l2);
+        rt_set_byte(s1, l1 + l2, 0);
+        return s1;
+    }
+    let newcap: int = cap * 2;
+    if (newcap < need) { newcap = need; }
+    let p: any = rt_malloc(newcap);
     rt_memcpy_at(p, 0, s1, 0, l1);
     rt_memcpy_at(p, l1, s2, 0, l2);
     rt_set_byte(p, l1 + l2, 0);

@@ -1,0 +1,14 @@
+dsb t_cap;
+kimo main() -> int {
+    let x = "";
+    x = x + "a";
+    println(rt_alloc_cap(x));
+    x = x + "b";
+    println(rt_alloc_cap(x));
+    x = x + "c";
+    println(rt_alloc_cap(x));
+    x = x + "d";
+    println(rt_alloc_cap(x));
+    println(x);
+    return 0;
+}

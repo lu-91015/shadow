@@ -3088,6 +3088,16 @@ static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_
                                                         //   g_gc_perm_roots, g_gc_thread_states
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
 
+// 查询 GC 堆对象的数据区容量（分配时记录的 size）；非堆对象（字面量/栈上）返回 0。
+// 供 shadow_string_concat_inplace 判断能否就地追加（与 Windows rt_gc.c 的 rt_alloc_cap 对齐）。
+extern "C" int32_t rt_alloc_cap(void* p) {
+    if (!p) return 0;
+    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    auto it = g_gc_meta.find(p);
+    if (it == g_gc_meta.end()) return 0;
+    return (int32_t)it->second.size;
+}
+
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
 // 等 collect 锁期间标记 blocked（stw_state=2）：并发触发 collect 的线程在等锁
 // 时不跑 mutator，collect 的 STW 等待无需等它（否则并发 collect 死锁）。

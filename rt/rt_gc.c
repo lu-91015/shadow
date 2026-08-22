@@ -453,6 +453,22 @@ extern int32_t shadow_is_valid_ptr(void* p) {
     return rt_gc_ptr_lookup(p) >= 0 ? 1 : 0;
 }
 
+/* 查询 GC 堆对象的数据区容量（分配时记录的 size）；非堆对象（字面量/栈上）返回 0。
+ * 供 shadow_string_concat_inplace 判断能否就地追加。
+ * 注意：单 mutator 攒批快路径（rt_gc_register）期间新对象只进 g_pend、尚未入哈希表，
+ * 哈希查找 miss 时须线性扫 g_pend（≤RT_PEND_CAP=64；热循环里 s1 刚分配几乎必在批内）。 */
+extern int32_t rt_alloc_cap(void* p) {
+    int32_t idx = rt_gc_ptr_lookup(p);
+    if (idx >= 0) return (int32_t)g_objs[idx].size;
+    if (g_pend_n) {
+        uint32_t i;
+        for (i = 0; i < g_pend_n; i++) {
+            if (g_pend[i] == p) return (int32_t)rt_gc_hdr_of(p)->size;
+        }
+    }
+    return 0;
+}
+
 /* 登记对象并返回哈希槽位（调用方存入 g_objs[idx].ht_slot，清扫免查找）。
  * 复用探测链上第一个墓碑：新对象常复用死对象地址（freelist），其 hash 与
  * 墓碑同链，复用使表保持 ~48% 负载，避免墓碑把有效负载顶到 90%+。 */
