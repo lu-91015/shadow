@@ -3009,8 +3009,240 @@ struct GCMeta {
 #include <condition_variable>
 #include <algorithm>
 
+// ── 自定义开放寻址哈希表（替代 std::unordered_map<void*, GCMeta>）──
+// 分配/清扫热点：unordered_map 每次插入分配节点、遍历缓存不友好（node-based
+// 分散内存）。开放寻址 + 线性探测 + 连续存储 → 插入无节点分配、遍历缓存友好。
+// 指针键本身分布良好；负载因子 0.7。
+// 删除用墓碑（TOMBSTONE 哨兵）而非回移：O(1) 删除且不搬动条目，配合
+// 活条目双向链表使 for_each 只遍历存活条目（表在峰值后不收缩，若遍历全部
+// 槽位，str_reverse 每轮 GC 要扫 128MB 空槽 → 100x 退化）。墓碑+存活数
+// 超 70% 时按需重建（清墓碑，必要时扩容）。
+class GCMetaMap {
+public:
+    struct Entry {
+        void* key;      // nullptr = 空槽, TOMBSTONE = 已删, 其它 = 活
+        GCMeta meta;
+        int32_t next;   // 活条目链表：下一索引，-1 = 尾
+        int32_t prev;   // 活条目链表：上一索引，-1 = 无
+    };
+
+    static void* const TOMBSTONE;
+
+    GCMetaMap() { slots.assign(64, Entry{}); mask = 63; }
+
+    size_t size() const { return count; }
+
+    GCMeta* find(void* key) {
+        size_t i = hash(key) & mask;
+        while (slots[i].key) {
+            if (slots[i].key == key) return &slots[i].meta;
+            i = (i + 1) & mask;
+        }
+        return nullptr;
+    }
+
+    GCMeta& operator[](void* key) {
+        size_t i = hash(key) & mask;
+        int32_t first_tomb = -1;
+        while (slots[i].key) {
+            if (slots[i].key == key) return slots[i].meta;
+            if (slots[i].key == TOMBSTONE && first_tomb < 0) first_tomb = (int32_t)i;
+            i = (i + 1) & mask;
+        }
+        if ((count + tombstones + 1) * 10 >= slots.size() * 7) {
+            rebuild();
+            return (*this)[key];
+        }
+        size_t ins = (first_tomb >= 0) ? (size_t)first_tomb : i;
+        if (first_tomb >= 0) tombstones--;
+        slots[ins].key = key;
+        slots[ins].meta = GCMeta();
+        slots[ins].prev = -1;
+        slots[ins].next = head;
+        if (head >= 0) slots[head].prev = (int32_t)ins;
+        head = (int32_t)ins;
+        count++;
+        return slots[ins].meta;
+    }
+
+    // 批量插入（攒批 flush 用）：一次探测 + 字段初始化，免默认构造再覆盖。
+    GCMeta* insert(void* key, int32_t kind, int32_t asize, int32_t req) {
+        size_t i = hash(key) & mask;
+        int32_t first_tomb = -1;
+        while (slots[i].key) {
+            if (slots[i].key == key) return &slots[i].meta;
+            if (slots[i].key == TOMBSTONE && first_tomb < 0) first_tomb = (int32_t)i;
+            i = (i + 1) & mask;
+        }
+        if ((count + tombstones + 1) * 10 >= slots.size() * 7) {
+            rebuild();
+            return insert(key, kind, asize, req);
+        }
+        size_t ins = (first_tomb >= 0) ? (size_t)first_tomb : i;
+        if (first_tomb >= 0) tombstones--;
+        slots[ins].key = key;
+        GCMeta& m = slots[ins].meta;
+        m.marked.store(1, std::memory_order_relaxed);
+        m.visited.store(0, std::memory_order_relaxed);
+        m.kind = kind;
+        m.owned = 1;
+        m.size = (int64_t)asize;
+        m.req = (int64_t)req;
+        m.gen = 0;
+        m.survived = 0;
+        m.finalizer_fn = nullptr;
+        m.finalizer_data = nullptr;
+        m.finalized = false;
+        slots[ins].prev = -1;
+        slots[ins].next = head;
+        if (head >= 0) slots[head].prev = (int32_t)ins;
+        head = (int32_t)ins;
+        count++;
+        return &slots[ins].meta;
+    }
+
+    bool erase(void* key) {
+        size_t i = hash(key) & mask;
+        while (slots[i].key) {
+            if (slots[i].key == key) {
+                int32_t idx = (int32_t)i;
+                if (slots[idx].prev >= 0) slots[slots[idx].prev].next = slots[idx].next;
+                else head = slots[idx].next;
+                if (slots[idx].next >= 0) slots[slots[idx].next].prev = slots[idx].prev;
+                slots[idx].key = TOMBSTONE;
+                slots[idx].meta = GCMeta();
+                slots[idx].prev = -1;
+                slots[idx].next = -1;
+                count--;
+                tombstones++;
+                return true;
+            }
+            i = (i + 1) & mask;
+        }
+        return false;
+    }
+
+    // 按元数据指针直接擦除（sweep 用，免二次哈希查找）。
+    // 指针由 for_each 回调提供，指向 slots 内条目；sweep 期间无插入 → 无 rebuild，
+    // 指针稳定；erase 只清当前槽，不影响其它条目。GCMeta 在 Entry 内偏移固定，
+    // 由指针差算出槽位索引。
+    bool erase_entry(GCMeta* m) {
+        if (!m) return false;
+        intptr_t off = (char*)m - (char*)&slots[0].meta;
+        if (off < 0) return false;
+        size_t idx = (size_t)off / sizeof(Entry);
+        if (idx >= slots.size()) return false;
+        if (slots[idx].key == nullptr || slots[idx].key == TOMBSTONE) return false;
+        if (slots[idx].prev >= 0) slots[slots[idx].prev].next = slots[idx].next;
+        else head = slots[idx].next;
+        if (slots[idx].next >= 0) slots[slots[idx].next].prev = slots[idx].prev;
+        slots[idx].key = TOMBSTONE;
+        slots[idx].meta = GCMeta();
+        slots[idx].prev = -1;
+        slots[idx].next = -1;
+        count--;
+        tombstones++;
+        return true;
+    }
+
+    // 遍历所有存活条目（回调签名：void(void* key, GCMeta& meta)）。
+    // 顺序扫槽位 ~5ns/槽（缓存友好，读 80B 槽的 key 字段），链表随机跳转
+    // ~100ns/条（缓存缺失）。交叉点约 5% 占用率：占用 ≥5% 顺序扫更快，
+    // 更低才走链表避免扫大量空槽。
+    template <typename F>
+    void for_each(F&& f) {
+        if ((int64_t)count * 20 >= (int64_t)slots.size()) {
+            for (size_t i = 0; i < slots.size(); i++) {
+                Entry& e = slots[i];
+                if (e.key && e.key != TOMBSTONE) f(e.key, e.meta);
+            }
+        } else {
+            int32_t idx = head;
+            while (idx >= 0) {
+                Entry& e = slots[idx];
+                int32_t nxt = e.next;
+                f(e.key, e.meta);
+                idx = nxt;
+            }
+        }
+    }
+
+private:
+    static size_t hash(void* p) {
+        uintptr_t h = (uintptr_t)p;
+        h ^= h >> 16;
+        h *= 0x7feb352dU;
+        h ^= h >> 15;
+        h *= 0x846ca68bU;
+        h ^= h >> 16;
+        return (size_t)h;
+    }
+
+    void rebuild() {
+        size_t live = count;
+        size_t new_cap = slots.size();
+        if ((live + 1) * 10 >= new_cap * 7) new_cap *= 2;
+        std::vector<Entry> old;
+        old.swap(slots);
+        slots.assign(new_cap, Entry{});
+        mask = new_cap - 1;
+        count = 0;
+        tombstones = 0;
+        head = -1;
+        for (auto& e : old) {
+            if (e.key && e.key != TOMBSTONE) {
+                size_t i = hash(e.key) & mask;
+                while (slots[i].key) i = (i + 1) & mask;
+                slots[i].key = e.key;
+                slots[i].meta = std::move(e.meta);
+                slots[i].prev = -1;
+                slots[i].next = head;
+                if (head >= 0) slots[head].prev = (int32_t)i;
+                head = (int32_t)i;
+                count++;
+            }
+        }
+    }
+
+    std::vector<Entry> slots;
+    size_t mask;
+    size_t count = 0;
+    size_t tombstones = 0;
+    int32_t head = -1;
+};
+
+void* const GCMetaMap::TOMBSTONE = reinterpret_cast<void*>(uintptr_t(1));
+
 // GC metadata table: void* → GCMeta (lock-free reads via atomic marked field)
-static std::unordered_map<void*, GCMeta> g_gc_meta;
+static GCMetaMap g_gc_meta;
+
+// ── 攒批登记快路径（对齐 Windows rt_gc.c 的 g_pend）──
+// 单 mutator + GC 关闭时，分配只追加到 pending 缓冲（无锁无哈希），
+// GC 启动 / 缓冲满 / 慢路径时统一 flush 进 g_gc_meta —— 分配密集热循环
+// （str_reverse 等）省掉每分配的全局锁 + 哈希插入。
+// 安全性：g_mutator_threads<=1 时 g_pend 只被本线程读写，无并发；
+// 第二个 mutator attach 后快路径关闭，慢路径/GC 持锁 flush 全部 pending。
+// 已知微小窗口（第二个 mutator attach 瞬间跨线程 free 本批对象）概率极低，
+// 与 Windows 注释留档一致。
+#define RT_PEND_CAP 64
+struct PendingAlloc { void* p; int32_t kind; int32_t asize; int32_t req; };
+static PendingAlloc g_pend[RT_PEND_CAP];
+static int g_pend_n = 0;
+static int64_t g_pend_bytes = 0;
+static std::atomic<int32_t> g_mutator_threads{0};
+// 前向声明：g_heap_bytes 定义在下方（GC 触发状态小节），flush 需要它记账。
+extern std::atomic<int64_t> g_heap_bytes;
+
+// 锁内：把攒批的 pending 全部登记进 g_gc_meta（调用者必须已持 g_gc_mutex）。
+static void gc_flush_pending_locked() {
+    for (int i = 0; i < g_pend_n; i++) {
+        PendingAlloc& e = g_pend[i];
+        g_gc_meta.insert(e.p, e.kind, e.asize, e.req);
+        g_heap_bytes.fetch_add((int64_t)e.req, std::memory_order_relaxed);
+    }
+    g_pend_n = 0;
+    g_pend_bytes = 0;
+}
 
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
 // (gc_lock/gc_unlock defined after ThreadGCState — they mark stw_state while
@@ -3021,14 +3253,46 @@ static std::atomic_flag g_gc_collect_lock = ATOMIC_FLAG_INIT;
 static thread_local int64_t tl_gc_alloc_count = 0;
 static std::atomic<int64_t> g_gc_total_alloc_count{0};
 
+// ── 阶段计时（SHADOW_GC_PROFILE=1 时 atexit 打印分配/标记/清扫耗时）──
+static int64_t g_prof_alloc_ns = 0;
+static int64_t g_prof_mark_ns = 0;
+static int64_t g_prof_sweep_ns = 0;
+static int64_t g_prof_gc_ns = 0;
+static int64_t g_prof_gc_count = 0;
+static int64_t g_prof_meta_peak = 0;
+static int64_t g_prof_meta_ops = 0;
+static int64_t g_prof_mark_reset_ns = 0;   // mark：清 visited 的 for_each
+static int64_t g_prof_mark_roots_ns = 0;   // mark：根追踪
+static int64_t g_prof_mark_wl_ns = 0;      // mark：worklist 展开
+static int g_prof_on = -1;
+static int prof_on(void) {
+    if (g_prof_on < 0) { const char* e = getenv("SHADOW_GC_PROFILE"); g_prof_on = (e && e[0] == '1') ? 1 : 0; }
+    return g_prof_on;
+}
+
 // ── 自动 GC 触发状态（对齐 Windows rt_gc.c 的 GOGC / SHADOW_GC_STRESS 模型）──
-static std::atomic<int64_t> g_heap_bytes{0};     // 未释放对象总字节（alloc+，sweep-）
+std::atomic<int64_t> g_heap_bytes{0};     // 未释放对象总字节（alloc+，sweep-；非 static 供 flush 前向声明）
 static std::atomic<int64_t> g_gc_trigger{4 * 1024 * 1024};  // GOGC 触发点（初始最小堆 4MB）
 static std::atomic<int>     g_gc_running{0};     // 防重入：collect 在途
 static std::atomic<int64_t> g_alloc_ticks{0};    // STRESS 模式分配计数
 static int64_t g_gc_gogc = -1;                   // SHADOW_GOGC（默认 100）
 static int32_t g_gc_stress = -1;                 // SHADOW_GC_STRESS（0=关）
 static int32_t g_gc_auto = -1;                   // SHADOW_GC_AUTO（0=禁用自动触发，供 reseed 种子）
+static uint32_t g_gc_epoch = 0;                  // 标记世代：visited 存 epoch，免每轮全量清 visited
+
+static void prof_atexit(void) {
+    if (!prof_on()) return;
+    fprintf(stderr, "[PROF] alloc_ns=%lld mark_ns=%lld sweep_ns=%lld gc_ns=%lld gc_count=%lld meta_peak=%lld meta_ops=%lld total_alloc=%lld heap=%lld trigger=%lld\n",
+            (long long)g_prof_alloc_ns, (long long)g_prof_mark_ns, (long long)g_prof_sweep_ns,
+            (long long)g_prof_gc_ns, (long long)g_prof_gc_count, (long long)g_prof_meta_peak,
+            (long long)g_prof_meta_ops, (long long)g_gc_total_alloc_count.load(std::memory_order_relaxed),
+            (long long)g_heap_bytes.load(std::memory_order_relaxed),
+            (long long)g_gc_trigger.load(std::memory_order_relaxed));
+    fprintf(stderr, "[PROF] mark_reset_ns=%lld mark_roots_ns=%lld mark_wl_ns=%lld\n",
+            (long long)g_prof_mark_reset_ns, (long long)g_prof_mark_roots_ns, (long long)g_prof_mark_wl_ns);
+}
+struct ProfAtexit { ~ProfAtexit() { prof_atexit(); } };
+static ProfAtexit _prof_atexit;
 
 // ── 协作式 STW（对齐 Windows rt_gc.o 的 g_stw_req/g_stw_active）──
 // collect 置 req=1 → 等所有 free-running 线程在 poll（安全点）置 stw_state=1
@@ -3094,12 +3358,17 @@ static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_
 
 // 查询 GC 堆对象的数据区容量（分配时记录的 size）；非堆对象（字面量/栈上）返回 0。
 // 供 shadow_string_concat_inplace 判断能否就地追加（与 Windows rt_gc.c 的 rt_alloc_cap 对齐）。
+// 注意：攒批快路径期间新对象只进 g_pend、尚未入哈希表，哈希查找 miss 时须线性扫
+// g_pend（≤RT_PEND_CAP=64；热循环里 s1 刚分配几乎必在批内）。
 extern "C" int32_t rt_alloc_cap(void* p) {
     if (!p) return 0;
+    for (int i = 0; i < g_pend_n; i++) {
+        if (g_pend[i].p == p) return g_pend[i].asize;
+    }
     std::lock_guard<std::mutex> lk(g_gc_mutex);
-    auto it = g_gc_meta.find(p);
-    if (it == g_gc_meta.end()) return 0;
-    return (int32_t)it->second.size;
+    GCMeta* m = g_gc_meta.find(p);
+    if (!m) return 0;
+    return (int32_t)m->size;
 }
 
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
@@ -3217,6 +3486,7 @@ struct GCTLSGuard {
             }
             s->stw_state.store(0, std::memory_order_release);
             tl_gc_state = nullptr;
+            g_mutator_threads.fetch_sub(1, std::memory_order_relaxed);
         }
     }
 };
@@ -3230,6 +3500,7 @@ static ThreadGCState* gc_get_thread_state() {
         std::lock_guard<std::mutex> lk(g_gc_mutex);
         g_gc_thread_states.push_back(s);
     }
+    g_mutator_threads.fetch_add(1, std::memory_order_relaxed);
     tl_gc_state = s;
     return s;
 }
@@ -3404,18 +3675,20 @@ extern "C" int64_t shadow_gc_alloc_count() {
 // Trace a single candidate child pointer; if it is a tracked GC object and
 // not yet visited this cycle, mark it alive (marked=1) and push onto the
 // worklist. Lock-free CAS on visited. 三色标记：
-//   visited: 本轮遍历去重（collect 开始清 0）
+//   visited: 本轮遍历去重（存 epoch 世代号，collect 开始只 ++epoch 不清全表）
 //   marked:  存活判定（分配即黑置 1；sweep 只认它；collect 末尾重置）
 // 分离后「分配即黑」不再被 collect 开始的全量清 marked 破坏 → 刚分配未 root
 // 的对象在并发窗口内不会被误回收。
 static inline void gc_trace_child(void* child, std::vector<void*>& worklist) {
     if (!child) return;
-    auto it = g_gc_meta.find(child);
-    if (it == g_gc_meta.end()) return;
-    uint32_t expected = 0;
-    if (!it->second.visited.compare_exchange_strong(expected, 1,
+    GCMeta* m = g_gc_meta.find(child);
+    if (!m) return;
+    uint32_t epoch = g_gc_epoch;
+    uint32_t v = m->visited.load(std::memory_order_relaxed);
+    if (v == epoch) return;
+    if (!m->visited.compare_exchange_strong(v, epoch,
             std::memory_order_acq_rel)) return;
-    it->second.marked.store(1, std::memory_order_relaxed);
+    m->marked.store(1, std::memory_order_relaxed);
     worklist.push_back(child);
 }
 
@@ -3424,10 +3697,10 @@ static inline void gc_trace_child(void* child, std::vector<void*>& worklist) {
 extern "C" void shadow_gc_write_barrier(void* parent, void* child) {
     if (!parent || !child) return;
     gc_lock_blocked();
-    auto pit = g_gc_meta.find(parent);
-    if (pit != g_gc_meta.end() && pit->second.gen == 1) {
-        auto cit = g_gc_meta.find(child);
-        if (cit != g_gc_meta.end() && cit->second.gen == 0) {
+    GCMeta* pm = g_gc_meta.find(parent);
+    if (pm && pm->gen == 1) {
+        GCMeta* cm = g_gc_meta.find(child);
+        if (cm && cm->gen == 0) {
             g_gc_remembered.insert(parent);
         }
     }
@@ -3459,9 +3732,7 @@ extern "C" void shadow_gc_watch(void* p) {
 // Report every tracked object that references `target`, with its mark state.
 static void gc_dump_referrers(void* target) {
     fprintf(stderr, "[GCWATCH] sweeping %p — searching referrers...\n", target);
-    for (auto& kv : g_gc_meta) {
-        void* obj = kv.first;
-        GCMeta& m = kv.second;
+    g_gc_meta.for_each([&](void* obj, GCMeta& m) {
         bool refs = false;
         if (m.kind == 1) {
             ShadowArray* a = reinterpret_cast<ShadowArray*>(obj);
@@ -3484,7 +3755,7 @@ static void gc_dump_referrers(void* target) {
         if (refs)
             fprintf(stderr, "[GCWATCH]   referrer %p kind=%d size=%lld marked=%u\n",
                     obj, m.kind, (long long)m.size, m.marked.load(std::memory_order_relaxed));
-    }
+    });
     // Also check root sets
     for (void* r : g_gc_perm_roots)  if (r == target) fprintf(stderr, "[GCWATCH]   in PERM roots\n");
     for (auto& kv : g_gc_global_roots) if (kv.second == target)
@@ -3634,63 +3905,67 @@ static inline void gc_trace_object_children(void* obj, GCMeta& m, std::vector<vo
 
 // Internal: run finalizers for dead objects, then free them.
 // Objects with finalizers that haven't run yet get one extra cycle (resurrection).
-static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
+// 单次 for_each 收集 to_free/resurrected（存 GCMeta* 免去 free 阶段二次哈希查找；
+// erase_entry 按指针擦除）。sweep 期间无插入 → 无 rebuild，指针稳定。
+static int64_t gc_sweep_dead(bool is_minor) {
     int64_t freed = 0;
 
     // ── Finalizer pass: run finalizers BEFORE freeing ──
-    std::vector<void*> to_free;
-    std::vector<void*> resurrected;  // objects waiting for finalizer, get one more cycle
+    struct ToFree { void* obj; GCMeta* m; };
+    std::vector<ToFree> to_free;
+    std::vector<ToFree> resurrected;  // objects waiting for finalizer, get one more cycle
 
-    for (void* obj : dead) {
-        auto it = g_gc_meta.find(obj);
-        if (it == g_gc_meta.end()) continue;
-        GCMeta& m = it->second;
+    g_gc_meta.for_each([&](void* key, GCMeta& m) {
+        if (is_minor && m.gen != 0) return;  // minor GC: only sweep young-gen
+        if (m.marked.load(std::memory_order_relaxed)) return;
 
         // Run finalizer if registered and not yet finalized.
         if (m.finalizer_fn && !m.finalized) {
             if (g_gc_log_on)
                 fprintf(stderr, "[GCLOG] finalize #%lld %p kind=%d\n",
-                        (long long)g_gc_collect_count, obj, m.kind);
+                        (long long)g_gc_collect_count, key, m.kind);
             m.finalized = true;
             // Call the finalizer. It may resurrect the object by re-rooting it.
-            m.finalizer_fn(m.finalizer_data ? m.finalizer_data : obj);
+            m.finalizer_fn(m.finalizer_data ? m.finalizer_data : key);
             // Give finalized objects one more cycle — they'll be freed next
             // collect if not resurrected by the finalizer.
-            resurrected.push_back(obj);
+            resurrected.push_back({key, &m});
         } else {
             // No finalizer (or already finalized) → free immediately.
-            to_free.push_back(obj);
+            to_free.push_back({key, &m});
         }
-    }
+    });
 
     // Forensics BEFORE resetting marks / freeing.
     if (g_gc_watch) {
-        for (void* obj : to_free) {
-            if (obj == g_gc_watch) gc_dump_referrers(obj);
+        for (auto& tf : to_free) {
+            if (tf.obj == g_gc_watch) gc_dump_referrers(tf.obj);
         }
     }
 
-    // Reset marks for surviving objects (will be done by caller for all).
     // Free dead objects.
-    for (void* obj : to_free) {
-        auto it = g_gc_meta.find(obj);
-        if (it == g_gc_meta.end()) continue;
-        GCMeta m = it->second;
+    for (auto& tf : to_free) {
+        void* obj = tf.obj;
+        GCMeta* m = tf.m;
         if (getenv("SHADOW_GC_SWEEP_DBG")) {
             // 诊断：被 free 对象是否仍被全局根直接引用（漏标证据）
             int refd = 0;
             for (auto& gkv : g_gc_global_roots) { if (gkv.second == obj) { refd = 1; break; } }
             if (refd)
-                fprintf(stderr, "[sweep-dbg] FREE-ROOTED obj=%p kind=%d size=%lld\n", obj, m.kind, (long long)m.size);
+                fprintf(stderr, "[sweep-dbg] FREE-ROOTED obj=%p kind=%d size=%lld\n", obj, m->kind, (long long)m->size);
         }
         if (g_gc_log_on)
             fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%lld gen=%u\n",
-                    (long long)g_gc_collect_count, obj, m.kind, (long long)m.size, m.gen);
-        if (m.kind == 0) g_diag_kind0++;
-        g_gc_meta.erase(it);
-        g_heap_bytes.fetch_sub(m.req > 0 ? m.req : 0, std::memory_order_relaxed);
-        // Clear from remembered set if present.
-        g_gc_remembered.erase(obj);
+                    (long long)g_gc_collect_count, obj, m->kind, (long long)m->size, m->gen);
+        if (m->kind == 0) g_diag_kind0++;
+        // 先读 req 再 erase：erase 会把 meta 清零，之后 m->req 恒为 0，
+        // 导致 g_heap_bytes 从不递减 → heap 永远 ≥ trigger → GC 每 poll 触发（GC 风暴）。
+        int64_t mreq = m->req > 0 ? m->req : 0;
+        g_gc_meta.erase_entry(m);
+        g_heap_bytes.fetch_sub(mreq, std::memory_order_relaxed);
+        // Clear from remembered set if present。major GC 结束时整体 clear（全量重标
+        // 不需要 remembered），这里跳过省 9M+ 次哈希擦除；minor GC 必须逐对象摘。
+        if (is_minor) g_gc_remembered.erase(obj);
         // Clean up global roots that still point to this freed object.
         for (auto git = g_gc_global_roots.begin(); git != g_gc_global_roots.end(); ) {
             if (git->second == obj) git = g_gc_global_roots.erase(git);
@@ -3700,9 +3975,9 @@ static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
         //   kind==1：RFS ShadowArray（new + register）→ delete
         //   kind==3 && !owned：RFS AnyBox（new + register）→ delete
         //   其它（用户产物全部 alloc：C 布局数组/结构体/closure/box/字符串）→ free
-        if (m.kind == 1) {
+        if (m->kind == 1) {
             delete reinterpret_cast<ShadowArray*>(obj);
-        } else if (m.kind == 3 && !m.owned) {
+        } else if (m->kind == 3 && !m->owned) {
             delete reinterpret_cast<AnyBox*>(obj);
         } else {
             free(obj);
@@ -3713,11 +3988,8 @@ static int64_t gc_sweep_dead(std::vector<void*>& dead, bool is_minor) {
     // Resurrected objects: clear finalized flag won't help — they'll be
     // re-checked next cycle. If still unrooted, they'll be freed then.
     // Mark them so they survive THIS sweep (they were already in `dead`).
-    for (void* obj : resurrected) {
-        auto it = g_gc_meta.find(obj);
-        if (it != g_gc_meta.end()) {
-            it->second.marked.store(1, std::memory_order_relaxed);
-        }
+    for (auto& rf : resurrected) {
+        rf.m->marked.store(1, std::memory_order_relaxed);
     }
 
     return freed;
@@ -3732,6 +4004,7 @@ extern "C" int64_t shadow_gc_collect() {
     gc_lock();  // lock-free spinlock: prevent concurrent collect
     g_gc_running.store(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
+    gc_flush_pending_locked();   // 攒批对象先入表，标记/清扫才能覆盖它们
     gc_diag_init();
     // ── STW：请求所有其它线程到达安全点，冻结根集（多线程并发下防止
     //    扫根/清扫窗口内其它线程改 roots 或写刚分配对象 → 漏标 → 误回收）──
@@ -3745,12 +4018,25 @@ extern "C" int64_t shadow_gc_collect() {
                 (long long)g_gc_trigger.load(std::memory_order_relaxed));
 
     // ── Mark phase: trace from all roots ──
-    // 三色标记：本轮只清 visited（遍历去重位），marked（存活位）不动。
-    // 分配即黑（marked=1）的对象保留存活资格，保证「刚分配、尚未被 root」的
-    // 对象在并发窗口内不被误回收；同时 trace_child 用 visited 去重，上一轮
-    // 存活的对象本轮仍会被重新访问 → 子对象不漏标（修掉全量清 marked 的 UAF）。
-    for (auto& kv : g_gc_meta) {
-        kv.second.visited.store(0, std::memory_order_relaxed);
+    // 三色标记：visited 存 epoch 世代号（collect 开始只 ++epoch，免全量清 visited），
+    // marked（存活位）不动。分配即黑（marked=1）的对象保留存活资格，保证「刚分配、
+    // 尚未被 root」的对象在并发窗口内不被误回收；同时 trace_child 用 visited 去重，
+    // 上一轮存活的对象本轮仍会被重新访问 → 子对象不漏标（修掉全量清 marked 的 UAF）。
+    auto _gc_t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto _gc_t0_mark = _gc_t0;
+    auto _gc_t1 = _gc_t0;
+    uint32_t epoch = g_gc_epoch + 1;
+    if (epoch == 0) {
+        // epoch 回绕（2^32 次 GC 一次）：全量清 visited 后从 1 重新开始。
+        g_gc_meta.for_each([](void*, GCMeta& m) {
+            m.visited.store(0, std::memory_order_relaxed);
+        });
+        epoch = 1;
+    }
+    g_gc_epoch = epoch;
+    if (prof_on()) {
+        g_prof_mark_reset_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t1).count();
+        _gc_t1 = std::chrono::steady_clock::now();
     }
     std::vector<void*> worklist;
     for (void* root : g_gc_perm_roots) { gc_trace_child(root, worklist); }
@@ -3775,54 +4061,61 @@ extern "C" int64_t shadow_gc_collect() {
     gc_trace_conservative_regions(worklist);
     gc_scan_stack(worklist);
     gc_scan_process_heap(worklist);
+    if (prof_on()) {
+        g_prof_mark_roots_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t1).count();
+        _gc_t1 = std::chrono::steady_clock::now();
+    }
 
     while (!worklist.empty()) {
         void* obj = worklist.back(); worklist.pop_back();
-        auto it = g_gc_meta.find(obj);
-        if (it == g_gc_meta.end()) continue;
-        gc_trace_object_children(obj, it->second, worklist);
+        GCMeta* m = g_gc_meta.find(obj);
+        if (!m) continue;
+        gc_trace_object_children(obj, *m, worklist);
+    }
+    if (prof_on()) {
+        g_prof_mark_wl_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t1).count();
+        g_prof_mark_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
+        _gc_t0_mark = _gc_t0;
+        _gc_t0 = std::chrono::steady_clock::now();
     }
 
     if (g_gc_log_on) { fprintf(stderr, "[GC] major MARK done sweeping...\n"); fflush(stderr); }
     // ── Sweep phase ──
     g_gc_collect_count++;
     g_gc_major_count++;
-    std::vector<void*> dead;
-    for (auto& kv : g_gc_meta) {
-        if (!kv.second.marked.load(std::memory_order_relaxed)) dead.push_back(kv.first);
+
+    // Run finalizers + free dead objects（单次 for_each 收集 + 免哈希擦除）。
+    int64_t freed = gc_sweep_dead(false);
+    if (prof_on()) {
+        g_prof_sweep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
+        g_prof_gc_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0_mark).count();
+        g_prof_gc_count++;
     }
 
-    // Run finalizers + free dead objects.
-    int64_t freed = gc_sweep_dead(dead, false);
-
-    // ── Promotion: surviving young-gen objects get promoted after threshold ──
-    for (auto& kv : g_gc_meta) {
-        if (kv.second.marked.load(std::memory_order_relaxed)) {
-            if (kv.second.gen == 0) {
-                kv.second.survived++;
-                if (kv.second.survived >= PROMOTION_THRESHOLD) {
-                    kv.second.gen = 1;  // promote to old gen
-                }
-            }
-        }
-        // Reset marks for next cycle.
-        kv.second.marked.store(0, std::memory_order_relaxed);
-    }
-    // Clear remembered set after major GC (all references re-traced).
-    g_gc_remembered.clear();
-
-    // ── GOGC pacing：本轮 live = 真实可达堆（visited=1 的对象 size 和）──
-    // （对齐 Windows gc_pacing_settle：trigger = live × (1 + GOGC/100)，最小 4MB）
+    // ── Promotion + GOGC pacing（合并两次 for_each 遍历）──
+    // Promotion: surviving young-gen objects get promoted after threshold。
+    // GOGC pacing：本轮 live = 真实可达堆（visited=1 的对象 size 和）。
     // 不能用清扫后的 g_heap_bytes：三色标记下它含"分配即黑"残留（本轮新分配、
     // 下轮才回收的不可达对象）。若用它做 pacing，trigger 每轮放大 → 周期内
     // 分配更多 → 残留更多 → 正反馈 → 谷底单调上涨（ex_gc_longrun min1/min2
     // 漂移的根因）。真实 live 只认本轮从 roots 可达（visited=1）的对象。
-    {
-        int64_t live = 0;
-        for (auto& kv : g_gc_meta) {
-            if (kv.second.visited.load(std::memory_order_relaxed))
-                live += kv.second.req;
+    int64_t live = 0;
+    g_gc_meta.for_each([&](void*, GCMeta& m) {
+        if (m.marked.load(std::memory_order_relaxed)) {
+            if (m.gen == 0) {
+                m.survived++;
+                if (m.survived >= PROMOTION_THRESHOLD) {
+                    m.gen = 1;  // promote to old gen
+                }
+            }
         }
+        if (m.visited.load(std::memory_order_relaxed) == g_gc_epoch) live += m.req;
+        // Reset marks for next cycle.
+        m.marked.store(0, std::memory_order_relaxed);
+    });
+    // Clear remembered set after major GC (all references re-traced).
+    g_gc_remembered.clear();
+    {
         int64_t gogc = rt_gc_gogc();
         int64_t next = live + live * gogc / 100;
         if (next < 4 * 1024 * 1024) next = 4 * 1024 * 1024;
@@ -3846,6 +4139,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     if (g_gc_log_on) { fprintf(stderr, "[GC] minor START meta=%zu\n", g_gc_meta.size()); fflush(stderr); }
     gc_lock();
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
+    gc_flush_pending_locked();   // 攒批对象先入表，标记/清扫才能覆盖它们
     gc_diag_init();
     gc_stw_begin();
     if (g_gc_log_on)
@@ -3855,19 +4149,26 @@ extern "C" int64_t shadow_gc_minor_collect() {
     // ── Mark phase: trace from roots, but only mark young-gen objects ──
     // Old-gen objects are treated as alive (not swept in minor GC).
     // The remembered set provides old→young references as additional roots.
-    // 三色标记：只清 visited（遍历去重位），marked（存活位）不动 → 分配即黑
-    // 的对象保留存活资格，防「刚分配未 root 即被 minor sweep」的并发窗口。
-    for (auto& kv : g_gc_meta) {
-        kv.second.visited.store(0, std::memory_order_relaxed);
+    // 三色标记：visited 存 epoch 世代号（只 ++epoch 不清全表），marked（存活位）
+    // 不动 → 分配即黑的对象保留存活资格，防「刚分配未 root 即被 minor sweep」。
+    auto _gc_t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto _gc_t0_mark = _gc_t0;
+    uint32_t epoch = g_gc_epoch + 1;
+    if (epoch == 0) {
+        g_gc_meta.for_each([](void*, GCMeta& m) {
+            m.visited.store(0, std::memory_order_relaxed);
+        });
+        epoch = 1;
     }
+    g_gc_epoch = epoch;
     std::vector<void*> worklist;
 
     // Mark all old-gen objects as alive (they survive minor GC).
-    for (auto& kv : g_gc_meta) {
-        if (kv.second.gen == 1) {
-            kv.second.marked.store(1, std::memory_order_relaxed);
+    g_gc_meta.for_each([](void*, GCMeta& m) {
+        if (m.gen == 1) {
+            m.marked.store(1, std::memory_order_relaxed);
         }
-    }
+    });
 
     // Trace from roots: only young-gen objects get newly marked.
     for (void* root : g_gc_perm_roots) { gc_trace_child(root, worklist); }
@@ -3893,47 +4194,50 @@ extern "C" int64_t shadow_gc_minor_collect() {
 
     // Trace from remembered set: old-gen objects referencing young-gen.
     for (void* parent : g_gc_remembered) {
-        auto it = g_gc_meta.find(parent);
-        if (it == g_gc_meta.end()) continue;
-        gc_trace_object_children(parent, it->second, worklist);
+        GCMeta* m = g_gc_meta.find(parent);
+        if (!m) continue;
+        gc_trace_object_children(parent, *m, worklist);
     }
 
     // Expand worklist: trace children of marked young-gen objects.
     while (!worklist.empty()) {
         void* obj = worklist.back(); worklist.pop_back();
-        auto it = g_gc_meta.find(obj);
-        if (it == g_gc_meta.end()) continue;
-        gc_trace_object_children(obj, it->second, worklist);
+        GCMeta* m = g_gc_meta.find(obj);
+        if (!m) continue;
+        gc_trace_object_children(obj, *m, worklist);
+    }
+    if (prof_on()) {
+        g_prof_mark_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
+        _gc_t0_mark = _gc_t0;
+        _gc_t0 = std::chrono::steady_clock::now();
     }
 
     // ── Sweep phase: only sweep young-gen objects that are unmarked ──
     g_gc_collect_count++;
     g_gc_minor_count++;
-    std::vector<void*> dead;
-    for (auto& kv : g_gc_meta) {
-        // Only young-gen objects can be swept in minor GC.
-        if (kv.second.gen == 0 && !kv.second.marked.load(std::memory_order_relaxed)) {
-            dead.push_back(kv.first);
-        }
+
+    // Run finalizers + free dead young-gen objects（单次 for_each 收集 + 免哈希擦除）。
+    int64_t freed = gc_sweep_dead(true);
+    if (prof_on()) {
+        g_prof_sweep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
+        g_prof_gc_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0_mark).count();
+        g_prof_gc_count++;
     }
 
-    // Run finalizers + free dead young-gen objects.
-    int64_t freed = gc_sweep_dead(dead, true);
-
     // ── Promotion: surviving young-gen objects get promoted after threshold ──
-    for (auto& kv : g_gc_meta) {
-        if (kv.second.gen == 0 && kv.second.marked.load(std::memory_order_relaxed)) {
-            kv.second.survived++;
-            if (kv.second.survived >= PROMOTION_THRESHOLD) {
-                kv.second.gen = 1;  // promote to old gen
+    g_gc_meta.for_each([](void* key, GCMeta& m) {
+        if (m.gen == 0 && m.marked.load(std::memory_order_relaxed)) {
+            m.survived++;
+            if (m.survived >= PROMOTION_THRESHOLD) {
+                m.gen = 1;  // promote to old gen
                 if (g_gc_log_on)
                     fprintf(stderr, "[GCLOG] promote %p to old gen (survived %u)\n",
-                            kv.first, kv.second.survived);
+                            key, m.survived);
             }
         }
         // Reset marks for next cycle.
-        kv.second.marked.store(0, std::memory_order_relaxed);
-    }
+        m.marked.store(0, std::memory_order_relaxed);
+    });
 
     gc_stw_end();
     gc_unlock();
@@ -3946,10 +4250,10 @@ extern "C" int64_t shadow_gc_minor_collect() {
 // the object survives this cycle (resurrection).
 extern "C" void shadow_gc_set_finalizer(void* ptr, void(*fn)(void*), void* data) {
     if (!ptr || !fn) return;
-    auto it = g_gc_meta.find(ptr);
-    if (it == g_gc_meta.end()) return;
-    it->second.finalizer_fn = fn;
-    it->second.finalizer_data = data;
+    GCMeta* m = g_gc_meta.find(ptr);
+    if (!m) return;
+    m->finalizer_fn = fn;
+    m->finalizer_data = data;
 }
 
 // GC 登记对象删除辅助：shadow_free 在前部调用（GC 状态定义在后部）。
@@ -3957,11 +4261,20 @@ extern "C" void shadow_gc_set_finalizer(void* ptr, void(*fn)(void*), void* data)
 // 返回 0 = 非 GC 对象（调用方走原 type_tag 逻辑）。
 extern "C" int32_t shadow_gc_forget(void* ptr) {
     if (!ptr) return 0;
+    // 攒批对象尚未入表：从 pending 摘除（调用方随后 free）。
+    for (int i = 0; i < g_pend_n; i++) {
+        if (g_pend[i].p == ptr) {
+            g_pend_bytes -= g_pend[i].req;
+            g_pend[i] = g_pend[g_pend_n - 1];
+            g_pend_n--;
+            return 1;
+        }
+    }
     gc_lock_blocked();
-    auto it = g_gc_meta.find(ptr);
-    if (it == g_gc_meta.end()) { g_gc_mutex.unlock(); return 0; }
-    g_heap_bytes.fetch_sub(it->second.req > 0 ? it->second.req : 0, std::memory_order_relaxed);
-    g_gc_meta.erase(it);
+    GCMeta* m = g_gc_meta.find(ptr);
+    if (!m) { g_gc_mutex.unlock(); return 0; }
+    g_heap_bytes.fetch_sub(m->req > 0 ? m->req : 0, std::memory_order_relaxed);
+    g_gc_meta.erase(ptr);
     g_gc_remembered.erase(ptr);
     g_gc_mutex.unlock();
     return 1;
@@ -3970,8 +4283,11 @@ extern "C" int32_t shadow_gc_forget(void* ptr) {
 // 诊断：指针是否在 GC meta 中（0=已回收/从未登记）
 extern "C" int32_t shadow_gc_meta_contains(void* p) {
     if (!p) return 0;
+    for (int i = 0; i < g_pend_n; i++) {
+        if (g_pend[i].p == p) return 1;
+    }
     gc_lock_blocked();
-    int r = g_gc_meta.find(p) != g_gc_meta.end() ? 1 : 0;
+    int r = g_gc_meta.find(p) ? 1 : 0;
     g_gc_mutex.unlock();
     return r;
 }
@@ -3991,6 +4307,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
     if (size < 0) size = 0;
     int32_t asize = (size + 7) & ~7;
     if (asize < size) asize = size;   // overflow guard
+    // 触发检查：heap 记账含 pending 字节（攒批对象尚未入表）。
     if (g_gc_disabled == 0 && rt_gc_auto_on() && g_gc_running.load(std::memory_order_relaxed) == 0) {
         int32_t stress = rt_gc_stress_n();
         int64_t want = 0;
@@ -3998,14 +4315,35 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             int64_t t = g_alloc_ticks.fetch_add(1, std::memory_order_relaxed) + 1;
             if ((t % (int64_t)stress) == 0) want = 1;
         } else {
-            int64_t hb = g_heap_bytes.load(std::memory_order_relaxed);
+            int64_t hb = g_heap_bytes.load(std::memory_order_relaxed) + g_pend_bytes;
             if (hb >= g_gc_trigger.load(std::memory_order_relaxed) && hb > 0) want = 1;
         }
-        if (want) shadow_gc_collect();
+        if (want) {
+            gc_lock_blocked();
+            gc_flush_pending_locked();
+            g_gc_mutex.unlock();
+            shadow_gc_collect();
+        }
     }
     void* p = malloc((size_t)asize);
     if (!p) return nullptr;
+    // 攒批快路径：单 mutator + GC 关闭 + 缓冲未满 → 无锁无哈希，登记推迟到 flush。
+    if (g_gc_disabled == 0 && rt_gc_auto_on() &&
+        g_mutator_threads.load(std::memory_order_relaxed) <= 1 &&
+        g_gc_running.load(std::memory_order_relaxed) == 0 &&
+        g_pend_n < RT_PEND_CAP) {
+        g_pend[g_pend_n].p = p;
+        g_pend[g_pend_n].kind = kind;
+        g_pend[g_pend_n].asize = asize;
+        g_pend[g_pend_n].req = size;
+        g_pend_n++;
+        g_pend_bytes += size;
+        tl_gc_alloc_count++;
+        g_gc_total_alloc_count.fetch_add(1, std::memory_order_relaxed);
+        return p;
+    }
     {
+        auto _t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // 等锁期间标记 blocked（stw_state=2）：collect 扫根时跳过本线程
         // （等锁 = 不跑 mutator，根集冻结）。对齐 Windows「阻塞在 GC_LOCK
         // 上的线程不会被等待」的契约。
@@ -4015,15 +4353,16 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             std::this_thread::yield();
         }
         s->stw_state.store(0, std::memory_order_release);
-        g_gc_meta[p] = GCMeta{ 0, kind, 1, (int64_t)asize, (int64_t)size };
-        // New objects start in young gen.
-        g_gc_meta[p].gen = 0;
-        g_gc_meta[p].survived = 0;
-        // Mark self alive so any concurrent/triggered sweep cannot free it
-        // before the caller receives the pointer (closes the alloc/collect race).
-        g_gc_meta[p].marked.store(1, std::memory_order_relaxed);
+        gc_flush_pending_locked();
+        g_gc_meta.insert(p, kind, asize, size);
         g_heap_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
         g_gc_mutex.unlock();
+        if (prof_on()) {
+            g_prof_alloc_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _t0).count();
+            g_prof_meta_ops++;
+            int64_t sz = (int64_t)g_gc_meta.size();
+            if (sz > g_prof_meta_peak) g_prof_meta_peak = sz;
+        }
     }
     // Track allocation counts for diagnostics.
     tl_gc_alloc_count++;
@@ -4048,7 +4387,11 @@ extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size) {
         std::this_thread::yield();
     }
     s->stw_state.store(0, std::memory_order_release);
-    g_gc_meta[ptr] = GCMeta{ 0, kind, 0, size };
+    GCMeta& m = g_gc_meta[ptr];
+    m.kind = kind;
+    m.owned = 0;
+    m.size = size;
+    m.req = size;
     if (size > 0) g_heap_bytes.fetch_add(size, std::memory_order_relaxed);
     g_gc_mutex.unlock();
 }
