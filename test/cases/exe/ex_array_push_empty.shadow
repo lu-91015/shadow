@@ -1,0 +1,14 @@
+//@mode: exe
+//@desc: 空数组字面量 array_push 类型回填 — [] 应从被 push 值推断为 array<int>，typed push 与直接 GEP 的 elem_size 一致。
+//@expect: 1\n2\n3
+dsb ex_array_push_empty;
+
+kimo main() -> int {
+    let a: array<int> = array_push([], 1);
+    a = array_push(a, 2);
+    a = array_push(a, 3);
+    println(a[0]);
+    println(a[1]);
+    println(a[2]);
+    return 0;
+}

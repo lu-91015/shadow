@@ -478,20 +478,13 @@ static void gc_alloc_hook(uint64_t bytes, void* protect);   /* GC 驱动钩子�
 void rt_gc_register(void* data) {
     rt_gc_hdr* h;
     uint32_t slot;
-    int32_t exist;
     if (!data) return;
     GC_LOCK();
     g_reg_count++;
-    /* 防重复登记：同一地址已在对象表则只更新类型（避免 hash 重复键 → sweep double free） */
-    exist = rt_gc_ptr_lookup(data);
-    if (exist >= 0) {
-        h = rt_gc_hdr_of(data);
-        g_objs[exist].type_id = h->type_id;
-        g_objs[exist].size = h->size;
-        if (g_gc_phase != GC_OFF) h->mark = g_col_black;
-        GC_UNLOCK();
-        return;
-    }
+    /* 快路径：rt_gc_register 仅由 rt_alloc_small / rt_alloc_impl 调用（rt_core.c），
+     * 两者都是全新分配（空闲链表对象已随 free 注销、VirtualAlloc 对象天然全新），
+     * 对象表里必然没有该地址，重复登记检查恒 miss —— 直接跳过省一次哈希探测。
+     * 若未来新增"对已登记地址再次登记"的调用方，需恢复该检查。 */
     h = rt_gc_hdr_of(data);
     /* 分配即黑（Go 的 allocate-black）：回收周期内新生对象直接置黑。
      *

@@ -1816,8 +1816,12 @@ kimo main_mod_in_src(idx: int) -> int {
 //   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
 // v10_s2：codegen 新增 typed push 分派（array<int>→shadow_array_push_int）与直接 GEP 优化，
 //   旧 v10_s1 缓存的 MIR 未携带数组元素类型 → 必须整体失效，否则新逻辑被旧缓存跳过。
+// v10_s3：codegen 免 GC 帧函数名单扩展（shadow_string_concat/subscript/schar），
+//   旧 v10_s2 缓存的 MIR 已生成带帧的字符串函数 → 必须整体失效。
+// v10_s4：免 GC 帧名单再扩展（shadow_index_of/contains），同上需整体失效。
+// v10_s5：codegen 给免 GC 帧热点函数加 alwaysinline 属性，旧缓存 IR 无该属性 → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s2_" + main_hash_src(path);
+    return main_lu_base + "/v10_s5_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。

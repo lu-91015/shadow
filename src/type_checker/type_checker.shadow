@@ -3977,6 +3977,29 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
             tc_check_expr(ctx, args[i], env);
             i = i + 1;
         }
+        // array_push：空数组字面量 [] 的 elem_type 是 TYPE_INFER（type_none_inner），
+        // 直接 GEP/typed push 需要真实元素类型才能确定 es（4/8）；从被 push 的值类型
+        // 回填，否则 [] 会以 es=8 创建 array<int>，与直接 GEP 假设的 es=4 错位 → 越界。
+        if (str_eq(name, "array_push") == 1 && len(args) >= 2) {
+            let a0 = args[0] as Expr;
+            let vt = args[1].inferred_type;
+            if ((vt as any) != 0 && vt.kind != TYPE_INFER) {
+                if (a0.kind == EXPR_ARRAY_LIT) {
+                    let a0t = a0.inferred_type;
+                    if ((a0t as any) != 0 && a0t.kind == TYPE_ARRAY) {
+                        let et = a0t.elem_type;
+                        if ((et as any) == 0 || et.kind == TYPE_INFER) {
+                            a0t.elem_type = vt;
+                        }
+                    }
+                }
+                // 调用结果类型也细化（无注解 let a = array_push([], 1) 时 a 为 array<int>）
+                let bt_et = bt.elem_type;
+                if ((bt_et as any) == 0 || bt_et.kind == TYPE_INFER) {
+                    bt.elem_type = vt;
+                }
+            }
+        }
         // array_push 返回 array（元素类型保持调用侧推断）
         e.inferred_type = bt;
         return bt;

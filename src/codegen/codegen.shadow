@@ -110,6 +110,8 @@ import core.utils;
 @extern("LLVMBuildMemSet") kimo llvm_memset(b: any, p: any, val: any, len: any, align: int) -> any { return 0 as any; }
 // IR 损坏诊断
 @extern("shadow_verify_module") kimo rt_verify_mod(m: any) -> int { return 0; }
+// 给函数加 alwaysinline 属性（热点运行时函数强制内联）
+@extern("shadow_llvm_set_alwaysinline") kimo llvm_set_alwaysinline(ctx: any, fn: any) -> void {}
 
 // ============ Codegen 全局状态 ============
 let cg_ctx: any = 0 as any;
@@ -556,7 +558,23 @@ pub kimo cg_is_nogc_fn(name: string) -> int {
     if (str_eq(name, "shadow_string_len") == 1) { return 1; }
     if (str_eq(name, "shadow_string_eq") == 1) { return 1; }
     if (str_eq(name, "shadow_string_ne") == 1) { return 1; }
+    // 字符串拼接/单字符：纯 rt_malloc（非 GC 堆）+ memcpy，输入由调用方帧 root，
+    // 结果非 GC 对象无需 root；免帧后可被 opt -O2 内联进热循环（str_reverse/str_concat）。
+    if (str_eq(name, "shadow_string_concat") == 1) { return 1; }
+    if (str_eq(name, "shadow_subscript") == 1) { return 1; }
+    if (str_eq(name, "shadow_schar") == 1) { return 1; }
+    // 字符串查找：纯字节读取（rt_get_byte），无分配无 GC 交互（string_find 热循环）。
+    if (str_eq(name, "shadow_index_of") == 1) { return 1; }
+    if (str_eq(name, "shadow_contains") == 1) { return 1; }
     return 0;
+}
+
+// 热点运行时函数加 alwaysinline：opt -O2 强制内联进热循环，消除调用开销。
+// 仅对免 GC 帧的小函数启用（体积小，内联不会显著膨胀代码）。
+pub kimo cg_maybe_alwaysinline(fn: any, name: string) -> void {
+    if (cg_is_nogc_fn(name) == 1) {
+        llvm_set_alwaysinline(cg_ctx, fn);
+    }
 }
 
 // 按元素 kind 选择数组/字典/存储函数
@@ -614,7 +632,11 @@ pub kimo cg_elem_size(ek: int) -> int {
 // 仅当元素类型为固定宽度标量（int/long/double 等）且索引为 int/long 时启用；
 // any/ptr/string/struct 元素仍走运行时函数（需动态 es 与写屏障）。
 pub kimo cg_array_direct_ok(ek: int) -> int {
-    // EXPERIMENT: disabled to isolate direct GEP regression
+    if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return 1; }
+    if (ek == TYPE_LONG) { return 1; }
+    if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { return 1; }
+    if (ek == TYPE_DATE) { return 1; }
+    if (ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) { return 1; }
     return 0;
 }
 
@@ -2463,6 +2485,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     } else {
         cg_func = llvm_add_fn(cg_mod, mf.name, fn_ty);
     }
+    cg_maybe_alwaysinline(cg_func, mf.name);
 
     cg_block_labels = [];
     cg_block_ptrs = [];

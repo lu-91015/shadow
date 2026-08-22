@@ -1,0 +1,19 @@
+//@mode: exe
+//@desc: 静态类型 array<int> 直接 GEP 优化 — typed push 建数组后按 4 字节偏移读写，含下标写入。
+//@expect: 10\n20\n30\n3
+dsb ex_array_direct_gep;
+
+kimo main() -> int {
+    let a: array<int> = [];
+    a = array_push(a, 10);
+    a = array_push(a, 20);
+    a = array_push(a, 30);
+    let x = a[0];
+    let y = a[1];
+    a[2] = x + y;
+    println(a[0]);
+    println(a[1]);
+    println(a[2]);
+    println(len(a));
+    return 0;
+}
