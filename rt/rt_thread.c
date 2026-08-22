@@ -34,7 +34,7 @@
 #include <stdint.h>
 
 /* ---- GC 侧接口（rt_gc.c）---- */
-extern void rt_gc_thread_attach(void);
+extern void rt_gc_thread_attach(int is_worker);
 extern void rt_gc_thread_detach(void);
 extern void shadow_gc_perm_root_add(void* p);
 extern void shadow_gc_perm_root_remove(void* p);
@@ -118,8 +118,10 @@ static DWORD WINAPI task_run(LPVOID p) {
     void* result;
 
     /* 先入 GC 线程表，再执行用户代码：线程体第一次分配就可能触发 GC，
-     * 那时本线程的栈必须已经对 GC 可见，否则栈上的活对象会被误回收。 */
-    rt_gc_thread_attach();
+     * 那时本线程的栈必须已经对 GC 可见，否则栈上的活对象会被误回收。
+     * spawn 线程是 mutator（is_worker=0），计入 g_mutator_threads ——
+     * 第二个 mutator 一出现，GC 登记攒批快路径即自动关闭。 */
+    rt_gc_thread_attach(0);
 
     if (t->fn_nullary) result = t->fn_nullary();
     else                result = t->fn_thunk(t->arg);

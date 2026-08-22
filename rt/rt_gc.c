@@ -104,6 +104,7 @@ typedef struct rt_gc_thread {
      * 已冻结，STW 可立即扫根。gc_lock_depth 跟踪 GC 锁嵌套（CRITICAL_SECTION 可重入）。 */
     volatile int32_t gc_state;
     int32_t          gc_lock_depth;
+    int32_t          is_worker;     /* 1 = GC mark/sweep worker（不分配，不计入 mutator 数） */
     /* §5.2.4 分配根（对标 Go allocate-black 的补强）：最近一次分配的对象。
      * 分配路径的 C 中间帧（rt_gc_register / shadow_gc_alloc / any_box 等）在
      * "malloc 登记完成 → mutator 把结果赋值到 shadow frame"之间持有新对象，
@@ -119,6 +120,18 @@ static rt_gc_thread     g_threads[RT_GC_MAX_THREADS];
 static uint32_t         g_threads_len = 0;
 static CRITICAL_SECTION g_thr_lock;
 __declspec(thread) static rt_gc_thread* t_self = NULL;
+
+/* 用户（mutator）线程计数：GC mark/sweep worker 不计入。
+ * 登记批缓冲（rt_gc_register 快路径）仅在 g_mutator_threads<=1 时启用 ——
+ * 此时 g_pend 只被唯一 mutator 读写，无并发；多 mutator 时快路径关闭，
+ * 行为与旧版一致（见 rt_gc_register 注释）。 */
+static volatile LONG g_mutator_threads = 0;
+
+/* 攒批登记缓冲：分配密集热循环把登记推迟到 flush，省掉每分配的全局锁+哈希。
+ * 仅单 mutator 时使用；flush 点在 rt_gc_register_slow 与 gc_cycle_start。 */
+#define RT_PEND_CAP 64
+static void*    g_pend[RT_PEND_CAP];
+static uint32_t g_pend_n = 0;
 
 /* 永久根：跨线程传递中的 GC 指针（spawn 的 env、future 的结果）在
  * "只被非 GC 内存持有"的窗口内没有任何栈能证明它活着，必须显式钉住。 */
@@ -472,20 +485,69 @@ static uint32_t rt_gc_alloc_slot(void) {
 /* 登记对象（rt_core __rt_shadow_malloc 调用；type_id 由头决定） */
 static void gc_alloc_hook(uint64_t bytes, void* protect);   /* GC 驱动钩子，定义在调度小节 */
 
+/* 锁内：把攒批的 pending 全部登记进对象表（调用者必须已持 g_gc_lock）。
+ * 返回本批累计字节（供 gc_alloc_hook 驱动 GC 用）。 */
+static uint64_t rt_gc_flush_pending_locked(void) {
+    uint32_t n = g_pend_n, i;
+    uint64_t bytes = 0;
+    g_pend_n = 0;
+    for (i = 0; i < n; i++) {
+        void* data = g_pend[i];
+        rt_gc_hdr* h = rt_gc_hdr_of(data);
+        uint32_t slot;
+        g_reg_count++;
+        if (g_gc_phase != GC_OFF) h->mark = g_col_black;
+        slot = rt_gc_alloc_slot();
+        if (slot == (uint32_t)-1) continue;
+        g_objs[slot].data = data;
+        g_objs[slot].type_id = h->type_id;
+        g_objs[slot].size = h->size;
+        rt_gc_ht_insert(data, slot);
+        bytes += (uint64_t)h->size + RT_GC_HEADER;
+        g_heap_bytes += (uint64_t)h->size + RT_GC_HEADER;
+        if (g_heap_bytes > g_heap_peak) g_heap_peak = g_heap_bytes;
+        if (g_heap_bytes > g_cycle_peak) g_cycle_peak = g_heap_bytes;
+    }
+    return bytes;
+}
+
+static void rt_gc_register_slow(void* data, rt_gc_hdr* h);
+
 /* ⚠️ 多线程（§5.2.7）：本函数全程持 g_gc_lock。锁内会调用 gc_alloc_hook，
  * 后者可能跑完整 GC 周期（含 STW）—— 这正是 STW 契约要求的「发起者已持锁」。
  * CRITICAL_SECTION 可重入，嵌套获取安全。 */
 void rt_gc_register(void* data) {
     rt_gc_hdr* h;
-    uint32_t slot;
     if (!data) return;
+    h = rt_gc_hdr_of(data);
+    /* 快路径（攒批）：仅单 mutator + GC_OFF 时启用。
+     * 无锁无哈希，把登记推迟到 flush —— 分配密集热循环（str_reverse 等）
+     * 省掉每分配的全局锁 + 哈希插入。安全性论证：
+     *   · 单 mutator 时 g_pend 只被本线程读写，无并发；
+     *   · GC 启动（gc_cycle_start）先 flush 全部 pending 再进 MARK，
+     *     攒批对象在 epoch 刷白前入表，标记/清扫照常覆盖它们；
+     *   · 多 mutator 时快路径关闭（恒走慢路径），行为与旧版一致。
+     * 已知微小窗口：单 mutator 攒批期间若恰好有第二个 mutator attach 且
+     * 立刻跨线程 free 了本批对象，可能漏摘 —— 概率极低，注释留档。 */
+    if (t_self && !t_self->is_worker && g_mutator_threads <= 1 &&
+        g_gc_phase == GC_OFF && g_pend_n < RT_PEND_CAP) {
+        g_pend[g_pend_n++] = data;
+        t_self->alloc_root = data;
+        return;
+    }
+    rt_gc_register_slow(data, h);
+}
+
+static void rt_gc_register_slow(void* data, rt_gc_hdr* h) {
+    uint32_t slot;
+    uint64_t batch;
     GC_LOCK();
+    batch = rt_gc_flush_pending_locked();
     g_reg_count++;
     /* 快路径：rt_gc_register 仅由 rt_alloc_small / rt_alloc_impl 调用（rt_core.c），
      * 两者都是全新分配（空闲链表对象已随 free 注销、VirtualAlloc 对象天然全新），
      * 对象表里必然没有该地址，重复登记检查恒 miss —— 直接跳过省一次哈希探测。
      * 若未来新增"对已登记地址再次登记"的调用方，需恢复该检查。 */
-    h = rt_gc_hdr_of(data);
     /* 分配即黑（Go 的 allocate-black）：回收周期内新生对象直接置黑。
      *
      * MARK 期的依据：新对象的**所有**字段都在其分配之后才写入，而所有堆指针
@@ -518,7 +580,7 @@ void rt_gc_register(void* data) {
      * （登记时 phase 尚为 OFF，置黑分支没走到）。把触发者交给 gc_alloc_hook
      * 保护 —— gc_cycle_start 会在本轮 epoch 下把它置灰，避免"分配即被自己
      * 触发的 GC 回收"（精确根集下它在分配调用栈上，任何根都看不见它）。 */
-    gc_alloc_hook((uint64_t)h->size + RT_GC_HEADER, data);
+    gc_alloc_hook((uint64_t)h->size + RT_GC_HEADER + batch, data);
     GC_UNLOCK();
 }
 
@@ -966,7 +1028,7 @@ static void gc_stw_end(void) {
  * 局部指针已出作用域；它不执行任何 shadow 代码（无 sf 也无需 sf）。
  * ============================================================ */
 #define SHADOW_MAX_MARK_WORKERS 16
-extern void rt_gc_thread_attach(void);   /* 定义见「线程表」小节 */
+extern void rt_gc_thread_attach(int is_worker);   /* 定义见「线程表」小节 */
 /* 后台清扫线程状态（gc_workers_shutdown 引用，声明提前） */
 static HANDLE g_sweep_thread = NULL;
 static volatile LONG g_sweep_go = 0;       /* 1 = 清扫激活 */
@@ -984,7 +1046,7 @@ static uint64_t rt_gc_sweep_budget(void);
 
 static DWORD WINAPI gc_mark_worker_main(LPVOID arg) {
     (void)arg;
-    rt_gc_thread_attach();
+    rt_gc_thread_attach(1);               /* GC worker：不分配，不计入 mutator 数 */
     t_self->gc_state = 1;                 /* 空闲 = 安全点 */
     for (;;) {
         while (!g_mark_go) { if (g_mark_shutdown) return 0; Sleep(1); }
@@ -1048,7 +1110,7 @@ static void gc_mark_workers_ensure(void) {
 
 static DWORD WINAPI gc_sweep_worker_main(LPVOID arg) {
     (void)arg;
-    rt_gc_thread_attach();
+    rt_gc_thread_attach(1);               /* GC worker：不分配，不计入 mutator 数 */
     t_self->gc_state = 1;
     for (;;) {
         while (!g_sweep_go) { if (g_sweep_shutdown) return 0; Sleep(1); }
@@ -1089,7 +1151,7 @@ static void gc_sweep_worker_ensure(void) {
  * 句柄用 DuplicateHandle 复制真句柄：GetCurrentThread() 返回的是伪句柄
  * (-2)，跨线程传给 SuspendThread 只会挂起调用者自己。
  * ============================================================ */
-extern void rt_gc_thread_attach(void) {
+extern void rt_gc_thread_attach(int is_worker) {
     rt_gc_thread* th = NULL;
     uint32_t i;
     if (t_self) return;
@@ -1118,7 +1180,10 @@ extern void rt_gc_thread_attach(void) {
         th->gc_state = 0;          /* 协作式安全点：初始为自由运行 */
         th->gc_lock_depth = 0;
         th->alloc_root = NULL;
+        th->is_worker = is_worker;
         t_self = th;
+        /* mutator 计数：GC worker 不计入。快路径（攒批）仅在计数<=1 时启用。 */
+        if (!is_worker) InterlockedIncrement(&g_mutator_threads);
     }
     LeaveCriticalSection(&g_thr_lock);
 }
@@ -1140,13 +1205,14 @@ extern void rt_gc_thread_detach(void) {
     th->gc_state = 0;
     th->gc_lock_depth = 0;
     th->alloc_root = NULL;             /* 分配根随线程消失 */
+    if (!th->is_worker) InterlockedDecrement(&g_mutator_threads);
     LeaveCriticalSection(&g_thr_lock);
     t_self = NULL;
 }
 
 /* 当前线程的 GC 记录；主线程走这里惰性登记。 */
 static rt_gc_thread* rt_gc_self(void) {
-    if (!t_self) rt_gc_thread_attach();
+    if (!t_self) rt_gc_thread_attach(0);   /* 主线程 = mutator */
     return t_self;
 }
 
@@ -1834,6 +1900,12 @@ static void gc_cycle_start(void) {
      * 正常情况下清扫早已被分配驱动跑完，这里只是兜底（例如清扫途中
      * 有人显式调用 gc()，或分配停滞后突然越过堆阈值）。 */
     if (g_gc_phase == GC_SWEEP) gc_sweep_step(0);
+    /* 攒批登记刷新：周期启动前把 g_pend 全部入表。必须在 epoch 刷白
+     * （gc_epoch_advance）之前 —— 攒批对象此刻已赋值到帧根，刷白后由
+     * 标记阶段照常扫根置黑；若拖到刷白之后才入表，它们会带着旧 mark
+     * 直接落入"待清扫区间"，存活对象会被误回收。持锁调用（本函数
+     * 的两个调用点 gc_alloc_hook / shadow_gc_collect 均持 g_gc_lock）。 */
+    rt_gc_flush_pending_locked();
     t = GetTickCount64();
     tus = gc_now_us();
     if (rt_gc_log_on())
