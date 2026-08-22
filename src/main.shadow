@@ -1808,14 +1808,16 @@ kimo main_mod_in_src(idx: int) -> int {
 // 键 = <缓存语义版本>_<源文件路径 djb2>（路径变 → 新键 → 首次 miss 全量一次）
 // ⚠️ main_cache_sem 是正确性关键：任何改变 TC/codegen 语义的修改（新增检查、改类型推断、
 // 修 bug 改变接受/拒绝集合）都必须 bump 它，否则旧缓存命中会跳过函数体检查 → 漏报类型错误。
-// 当前值 = "v10_s1"。
+// 当前值 = "v10_s2"。
 // ⚠️ 为什么从 v9_s6 跳到 v10_s1（必须跳，不是美观问题）：
 //   磁盘上遗留的 v9_s6_*.lu 是 **0.4 兼容态**写的——那时私有符号不按模块 mangle，
 //   MIR 里的函数名/调用名与 0.5 严格态（__mod_<ns>__<name>）完全不同族。
 //   0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
 //   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
+// v10_s2：codegen 新增 typed push 分派（array<int>→shadow_array_push_int）与直接 GEP 优化，
+//   旧 v10_s1 缓存的 MIR 未携带数组元素类型 → 必须整体失效，否则新逻辑被旧缓存跳过。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s1_" + main_hash_src(path);
+    return main_lu_base + "/v10_s2_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。

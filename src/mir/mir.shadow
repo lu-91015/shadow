@@ -54,6 +54,18 @@ pub kimo mir_type_of_hir_expr(h: HirExpr) -> Type {
     return h.inferred_type;
 }
 
+// array_push 调用：返回第一个实参的数组类型（保留 elem_type），供 codegen 分派 typed push。
+// 独立小函数：避免 mir_lower_expr 过大触发旧宿主 slot 上限致自举产物崩溃。
+// 注意：a0 是 HirExpr（HIR 已把 Expr 迁移为 HirExpr），绝不能按 Expr 布局读取——
+// 两结构体字段偏移不同，强转会读到垃圾内存致 typed push 分派失效。
+pub kimo mir_array_push_ty(a0: HirExpr, fallback: Type) -> Type {
+    let a0ty = a0.inferred_type;
+    if ((a0ty as any) != 0 && a0ty.kind == TYPE_ARRAY) {
+        return a0ty;
+    }
+    return fallback;
+}
+
 // 封存当前块，开始新块
 pub kimo mir_seal_and_begin(new_label: string) -> void {
     let blk = MirBlock { label: mir_cur_label, insts: mir_cur_insts, terminator: mir_cur_terminator };
@@ -355,6 +367,7 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
             let st = mir_mk(MIR_STORE_INDEX);
             st.arg1 = arr_reg;
             st.arg2 = idx_reg;
+            st.ty = target.inferred_type;  // 数组元素类型：codegen 据此决定直接 GEP 还是运行时函数
             st.args = array_push([], new_reg);
             mir_emit(st);
         } else if (target_kind == EXPR_MEMBER) {
@@ -409,7 +422,14 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         inst.dst = r;
         inst.strval = h.str1;
         inst.args = arg_regs;
-        inst.ty = callee_ty;
+        // array_push：携带第一个实参的数组类型（保留 elem_type），
+        // codegen 据此分派 typed push（array<int>→shadow_array_push_int），
+        // 使静态类型数组以 4/8 字节槽存储，与直接 GEP 优化一致。
+        if (str_eq(h.str1, "array_push") == 1 && len(args) > 0) {
+            inst.ty = mir_array_push_ty(args[0], callee_ty);
+        } else {
+            inst.ty = callee_ty;
+        }
         mir_emit(inst);
         return r;
     }
@@ -1243,6 +1263,7 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             let inst = mir_mk(MIR_STORE_INDEX);
             inst.arg1 = arr_reg;
             inst.arg2 = idx_reg;
+            inst.ty = lhs.inferred_type;  // 数组元素类型：codegen 据此决定直接 GEP 还是运行时函数
             inst.args = array_push([], rhs_reg);
             mir_emit(inst);
             return;

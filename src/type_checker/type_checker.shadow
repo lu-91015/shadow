@@ -3916,6 +3916,12 @@ pub kimo tc_check_struct_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         }
         if (provided == 1) {
             let vt = tc_check_expr(ctx, val, env);
+            // 回填数组字面量类型：空 [] 的 elem_type 是 TYPE_NONE，直接 GEP/typed push
+            // 需要真实元素类型才能确定 es（4/8）；否则 HirEnv{slots:[]} 这类 struct 字段
+            // 会以 es=8 创建 array<int>，与直接 GEP 假设的 es=4 错位 → 内存越界崩溃。
+            if (f.type_ref.kind == TYPE_ARRAY && val.kind == EXPR_ARRAY_LIT) {
+                val.inferred_type = f.type_ref;
+            }
             // 泛型 struct 字面量：字段类型为类型参数 T 时放行（类型擦除，T 由实参推断）
             let fk = f.type_ref.kind;
             let is_tp = 0;
@@ -4933,6 +4939,11 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
                     let msg2 = "type mismatch in let binding: variable '" + name + "' is '" + ty_display_name(dty) + "' but initializer is '" + ty_display_name(init_t) + "'";
                     tc_error_at(ctx, loc, msg2);
                 }
+                // 声明为 array<T> 时把元素类型回填到数组字面量：空 [] 的 elem_type 是
+                // TYPE_NONE，直接 GEP/typed push 需要真实元素类型才能确定 es（4/8）。
+                if (dty.kind == TYPE_ARRAY && init.kind == EXPR_ARRAY_LIT) {
+                    init.inferred_type = dty;
+                }
                 tc_env_set(env, name, dty);
             } else {
                 tc_env_set(env, name, init_t);
@@ -5077,6 +5088,10 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
     if (k == STMT_ASSIGN) {
         let lhs_t = tc_check_expr(ctx, s.expr1, env);
         let rhs_t = tc_check_expr(ctx, s.expr2, env);
+        // 赋值给 array<T> 时回填元素类型到数组字面量（空 [] 的 elem_type 是 TYPE_NONE）
+        if (lhs_t.kind == TYPE_ARRAY && s.expr2.kind == EXPR_ARRAY_LIT) {
+            s.expr2.inferred_type = lhs_t;
+        }
         if (lhs_t.kind != TYPE_INFER && rhs_t.kind != TYPE_INFER &&
             lhs_t.kind != TYPE_ANY && rhs_t.kind != TYPE_ANY) {
             if (tc_type_compat(ctx, lhs_t, rhs_t) == 0) {

@@ -179,7 +179,8 @@ pub kimo shadow_array_push_int(arr: any, val: int) -> any {
     if (len >= cap) {
         let nc: int = cap * 2;
         if (nc == 0) { nc = 4; }
-        arr = shadow_array_grow(arr, nc);
+        if (arr == null) { arr = shadow_array_new(4, nc); }
+        else { arr = shadow_array_grow(arr, nc); }
     }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + len * es;
@@ -195,7 +196,8 @@ pub kimo shadow_array_push_long(arr: any, val: long) -> any {
     if (len >= cap) {
         let nc: int = cap * 2;
         if (nc == 0) { nc = 4; }
-        arr = shadow_array_grow(arr, nc);
+        if (arr == null) { arr = shadow_array_new(8, nc); }
+        else { arr = shadow_array_grow(arr, nc); }
     }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + len * es;
@@ -211,7 +213,8 @@ pub kimo shadow_array_push_float(arr: any, val: double) -> any {
     if (len >= cap) {
         let nc: int = cap * 2;
         if (nc == 0) { nc = 4; }
-        arr = shadow_array_grow(arr, nc);
+        if (arr == null) { arr = shadow_array_new(8, nc); }
+        else { arr = shadow_array_grow(arr, nc); }
     }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + len * es;

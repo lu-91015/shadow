@@ -587,10 +587,84 @@ pub kimo cg_array_push_fn(ek: int) -> string {
     return "shadow_array_push_ptr";
 }
 
+// array_push 按数组静态元素类型分派 typed push（array<int>→shadow_array_push_int 等）。
+// 独立小函数：避免 cg_gen_call 过大触发旧宿主 slot 上限致自举产物崩溃。
+pub kimo cg_array_push_resolve(mi: MirInst, fallback: string) -> string {
+    let arr_ty = mi.ty;
+    if ((arr_ty as any) != 0 && arr_ty.kind == TYPE_ARRAY) {
+        let elem_ty = arr_ty.elem_type;
+        if ((elem_ty as any) != 0) {
+            let pfn = cg_array_push_fn(elem_ty.kind);
+            if (str_eq(pfn, "shadow_array_push_ptr") == 0) {
+                return pfn;
+            }
+        }
+    }
+    return fallback;
+}
+
 pub kimo cg_elem_size(ek: int) -> int {
     if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return 4; }
     if (ek == TYPE_DATE) { return 4; }
     return 8;
+}
+
+// 静态类型标量数组直接 GEP+load/store：绕过 shadow_array_get_*/set_* 运行时函数，
+// 消除热循环里每次访问的 elem_size 动态加载、es==4 分支与 __rt_shadow_load_int 调用。
+// 仅当元素类型为固定宽度标量（int/long/double 等）且索引为 int/long 时启用；
+// any/ptr/string/struct 元素仍走运行时函数（需动态 es 与写屏障）。
+pub kimo cg_array_direct_ok(ek: int) -> int {
+    // EXPERIMENT: disabled to isolate direct GEP regression
+    return 0;
+}
+
+// 计算数组元素地址（i64）：base + 12 + idx*es
+pub kimo cg_array_elem_addr(arr_val: any, idx_val: any, ik: int, es: int) -> any {
+    let i64_ty = llvm_i64(cg_ctx);
+    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "arrbase");
+    let idx64 = idx_val;
+    if (ik != TYPE_LONG) { idx64 = llvm_sext(cg_builder, idx_val, i64_ty, "idx64"); }
+    let scaled = llvm_mul(cg_builder, idx64, llvm_const_int(i64_ty, es, 1), "idxscaled");
+    let addr = llvm_add(cg_builder, llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, 12, 1), "arrhdr"), scaled, "arraddr");
+    return addr;
+}
+
+// 直接 GEP+load 数组元素（char/short/bool 以 4 字节槽存储，读后截断到实际宽度）
+pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int, ek: int) -> void {
+    let es = cg_elem_size(ek);
+    let addr = cg_array_elem_addr(arr_val, idx_val, ik, es);
+    let slot_ty = llvm_i32(cg_ctx);
+    if (es == 8) {
+        if (cg_is_float_kind(ek) == 1) { slot_ty = llvm_double_ty(cg_ctx); }
+        else { slot_ty = llvm_i64(cg_ctx); }
+    }
+    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(slot_ty, 0), "arrptr");
+    let val = llvm_load(cg_builder, slot_ty, ptr, "arrval");
+    if (ek == TYPE_CHAR) { val = llvm_trunc(cg_builder, val, llvm_i8(cg_ctx), "chtrunc"); }
+    else if (ek == TYPE_SHORT) { val = llvm_trunc(cg_builder, val, llvm_i16(cg_ctx), "shtrunc"); }
+    else if (ek == TYPE_BOOL) { val = llvm_trunc(cg_builder, val, llvm_i1(cg_ctx), "booltrunc"); }
+    else if (ek == TYPE_FLOAT) { val = llvm_fptrunc(cg_builder, val, llvm_float_ty(cg_ctx), "fltrunc"); }
+    cg_set_reg(dst, val, ek);
+    return;
+}
+
+// 直接 GEP+store 数组元素（标量无需写屏障；char/short/bool 扩展回 4 字节槽）
+pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int, val_val: any, vk: int) -> void {
+    let es = cg_elem_size(ek);
+    let addr = cg_array_elem_addr(arr_val, idx_val, ik, es);
+    let slot_ty = llvm_i32(cg_ctx);
+    if (es == 8) {
+        if (cg_is_float_kind(ek) == 1) { slot_ty = llvm_double_ty(cg_ctx); }
+        else { slot_ty = llvm_i64(cg_ctx); }
+    }
+    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(slot_ty, 0), "arrptr");
+    let sv = cg_cast_val(val_val, vk, ek);
+    if (ek == TYPE_CHAR) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "chzext"); }
+    else if (ek == TYPE_SHORT) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "shzext"); }
+    else if (ek == TYPE_BOOL) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "boolzext"); }
+    else if (ek == TYPE_FLOAT) { sv = llvm_fpext(cg_builder, sv, llvm_double_ty(cg_ctx), "flzext"); }
+    llvm_store(cg_builder, sv, ptr);
+    return;
 }
 
 pub kimo cg_store_fn(vk: int) -> string {
@@ -1036,6 +1110,12 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         if (base_kind == TYPE_STRING) {
             fn_name = "shadow_subscript";
         }
+        // 静态类型标量数组 → 直接 GEP+load，绕过运行时函数
+        let ik = cg_get_reg_kind(mi.arg2);
+        if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
+            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek);
+            return;
+        }
         let arg_vals: array<any> = [];
         arg_vals = array_push(arg_vals, arr_val);
         arg_vals = array_push(arg_vals, idx_val);
@@ -1191,6 +1271,13 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             return;
         }
         let set_fn = cg_array_set_fn(vk);
+        // 静态类型标量数组 → 直接 GEP+store（标量无需写屏障），绕过运行时函数
+        let ek = cg_type_kind(mi.ty);
+        let ik = cg_get_reg_kind(mi.arg2);
+        if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
+            cg_gen_array_store_direct(arr_val, idx_val, ik, ek, val_val, vk);
+            return;
+        }
         let arg_vals: array<any> = [];
         arg_vals = array_push(arg_vals, arr_val);
         arg_vals = array_push(arg_vals, idx_val);
@@ -1461,6 +1548,12 @@ pub kimo cg_gen_binop(mi: MirInst) -> void {
 // 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
 pub kimo cg_gen_call(mi: MirInst) -> void {
         let resolved_name = cg_resolve_extern_name(mi.strval);
+        // array_push：按数组静态元素类型分派 typed push（array<int>→shadow_array_push_int 等）。
+        // mi.ty 由 mir 侧携带第一个实参的数组类型；typed push 使静态类型数组以
+        // 4/8 字节槽存储（es 与直接 GEP 优化一致），并消除 push 的 es 动态分支。
+        if (str_eq(mi.strval, "array_push") == 1) {
+            resolved_name = cg_array_push_resolve(mi, resolved_name);
+        }
         let k = cg_type_kind(mi.ty);
         let arg_vals: array<any> = [];
         let args = mi.args;
@@ -1470,6 +1563,23 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
             let reg_val = cg_get_reg(reg);
             arg_vals = array_push(arg_vals, reg_val);
             i = i + 1;
+        }
+        // typed push 形参宽度固定（push_long=long、push_float=double），
+        // 值类型不匹配时需显式转换，否则 call 以窄类型喂宽形参 → LLVM 类型不匹配。
+        if (len(args) >= 2) {
+            let vk = cg_get_reg_kind(args[1] as int);
+            if (str_eq(resolved_name, "shadow_array_push_long") == 1 && cg_is_int_kind(vk) == 1 && vk != TYPE_LONG) {
+                let ext_val = cg_cast_val(arg_vals[1], vk, TYPE_LONG);
+                let new_args: array<any> = [arg_vals[0]];
+                new_args = array_push(new_args, ext_val);
+                arg_vals = new_args;
+            }
+            else if (str_eq(resolved_name, "shadow_array_push_float") == 1 && vk == TYPE_FLOAT) {
+                let ext_val = cg_cast_val(arg_vals[1], TYPE_FLOAT, TYPE_DOUBLE);
+                let new_args: array<any> = [arg_vals[0]];
+                new_args = array_push(new_args, ext_val);
+                arg_vals = new_args;
+            }
         }
         if (str_eq(mi.strval, "len") == 1 && len(args) > 0) {
             let arg0_kind = cg_get_reg_kind(args[0] as int);
