@@ -1,14 +1,8 @@
 // 基准测试：埃拉托斯特尼筛法（静态类型整数数组批量操作）
+// sieve/count_primes 不分配、不触发 GC：@nogc 免 GC 帧/根集/安全点，消除循环 poll。
 dsb prime_sieve;
 
-kimo main() -> int {
-    let n = 2000000;
-    let a: array<int> = [];
-    let i = 0;
-    while (i < n) {
-        a = array_push(a, 1);
-        i = i + 1;
-    }
+@nogc kimo sieve(a: array<int>, n: int) -> void {
     let p = 2;
     while (p * p < n) {
         if (a[p] == 1) {
@@ -20,12 +14,27 @@ kimo main() -> int {
         }
         p = p + 1;
     }
+}
+
+@nogc kimo count_primes(a: array<int>, n: int) -> int {
     let count = 0;
-    i = 2;
+    let i = 2;
     while (i < n) {
         if (a[i] == 1) { count = count + 1; }
         i = i + 1;
     }
-    println(count);
+    return count;
+}
+
+kimo main() -> int {
+    let n = 2000000;
+    let a: array<int> = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, 1);
+        i = i + 1;
+    }
+    sieve(a, n);
+    println(count_primes(a, n));
     return 0;
 }

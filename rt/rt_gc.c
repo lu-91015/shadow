@@ -2683,6 +2683,25 @@ static int tl_str_lookup(void* p, int32_t* len, int32_t* cap) {
     return 0;
 }
 
+/* 返回缓存条目下标（-1 = 未命中）。热路径（char_at 就地追加）用它把
+ * 「查找 len/cap」与「追加后更新 len」合并成一次扫描，省一次线性遍历。 */
+static int32_t tl_str_find(void* p) {
+    uint32_t ep = g_gc_epoch;
+    int32_t i;
+    for (i = 0; i < tl_str_cache_n; i++) {
+        if (tl_str_cache[i].p == p) {
+            if (tl_str_cache[i].epoch != ep) {
+                int32_t j;
+                for (j = i; j < tl_str_cache_n - 1; j++) tl_str_cache[j] = tl_str_cache[j + 1];
+                tl_str_cache_n--;
+                return -1;
+            }
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void tl_str_set(void* p, int32_t len, int32_t cap) {
     uint32_t ep = g_gc_epoch;
     int32_t i;
@@ -2771,30 +2790,52 @@ extern void* shadow_string_concat_char_fast(void* s1, int32_t c) {
  * （与 shadow_schar 一致），越界返回 0 字符；追加语义与 shadow_string_concat_char_fast
  * 完全一致（cap 足够就地写，否则 2x 倍增扩容）。 */
 extern void* shadow_string_concat_char_at(void* s1, const char* s, int32_t idx) {
-    int32_t l1, cap, c = 0, n = 0, scap = 0, i;
-    tl_str_get(s1, &l1, &cap);
+    int32_t i1 = tl_str_find(s1);
+    int32_t l1, cap;
+    if (i1 >= 0) {
+        l1 = tl_str_cache[i1].len;
+        cap = tl_str_cache[i1].cap;
+    } else {
+        tl_str_get(s1, &l1, &cap);
+        i1 = tl_str_find(s1);  /* slow 路径已入缓存，必命中 */
+    }
+    int32_t c = 0, n = 0, scap = 0;
+    int32_t i = idx;
+    int32_t need = l1 + 2;
+    int32_t s_miss = 0;  /* s 查找未命中会 tl_str_set 左移缓存 → i1 下标失效，须回退 tl_str_set */
     if (tl_str_lookup((void*)s, &n, &scap)) {
-        i = idx;
         if (i < 0) i = i + n;
         if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
     } else {
+        s_miss = 1;
         n = (int32_t)strlen(s);
         tl_str_set((void*)s, n, 0);
-        i = idx;
         if (i < 0) i = i + n;
         if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
     }
-    if (l1 + 2 <= cap) {
+    if (cap >= need) {
         ((char*)s1)[l1] = (char)c;
         ((char*)s1)[l1 + 1] = 0;
-        tl_str_set(s1, l1 + 1, cap);
+        if (i1 >= 0 && s_miss == 0) {
+            tl_str_cache[i1].len = l1 + 1;
+            tl_str_cache[i1].epoch = g_gc_epoch;
+        } else {
+            tl_str_set(s1, l1 + 1, cap);
+        }
         return s1;
     }
     {
-        int32_t need = l1 + 2, newcap = cap * 2;
+        int32_t newcap = cap * 2;
         void* p;
         if (newcap < need) newcap = need;
-        if (newcap < 16) newcap = 16;
+        if (newcap < 16) newcap = 16;  /* 最小增长 16B：短串首段扩容一步到位 */
+        /* 反向逐字符构建启发：追加 s[i] 时结果至少 l1+i+1 长（反向构建中 l1+i 为不变量，
+         * 恒等于源长-1），一步到位预分配——str_reverse 每轮 3 次扩容分配 → 1 次，
+         * 直接削减分配/GC 清扫成本。仅 i 越界内才生效，越界 hint=0 不放大。 */
+        if (i >= 0 && i < n) {
+            int32_t hint = l1 + i + 2;
+            if (newcap < hint) newcap = hint;
+        }
         p = shadow_gc_alloc(newcap, 0);
         shadow_gc_root_set(&p, p);
         memcpy(p, s1, (size_t)l1);

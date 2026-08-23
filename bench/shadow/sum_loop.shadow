@@ -1,14 +1,18 @@
 // 基准测试：整数循环求和
+// @nogc 免 GC 帧/安全点：LLVM 可将 s+=i 识别为等差级数闭式解，循环整体消除。
 dsb sum_loop;
 
-kimo main() -> int {
-    let n = 100000000;
+@nogc kimo sum_to(n: int) -> int {
     let s = 0;
     let i = 0;
     while (i < n) {
         s = s + i;
         i = i + 1;
     }
-    println(s);
+    return s;
+}
+
+kimo main() -> int {
+    println(sum_to(100000000));
     return 0;
 }
