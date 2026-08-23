@@ -2819,16 +2819,25 @@ static inline int32_t find_byte_sse2_nul(const char* s, char c) {
     const __m128i nul = _mm_setzero_si128();
     int32_t i = 0;
     for (;;) {
-        __m128i chunk = _mm_loadu_si128((const __m128i*)(s + i));
-        int32_t mask = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
-        int32_t nmask = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, nul));
-        if (nmask != 0) {
-            int32_t lim = __builtin_ctz((unsigned)nmask);
-            int32_t m = mask & ((1u << lim) - 1);
+        __m128i c0 = _mm_loadu_si128((const __m128i*)(s + i));
+        int32_t m0 = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(c0, target));
+        int32_t n0 = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(c0, nul));
+        if (n0 != 0) {
+            int32_t lim = __builtin_ctz((unsigned)n0);
+            int32_t m = m0 & ((1u << lim) - 1);
             return m ? i + __builtin_ctz((unsigned)m) : -1;
         }
-        if (mask != 0) return i + __builtin_ctz((unsigned)mask);
-        i += 16;
+        if (m0 != 0) return i + __builtin_ctz((unsigned)m0);
+        __m128i c1 = _mm_loadu_si128((const __m128i*)(s + i + 16));
+        int32_t m1 = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(c1, target));
+        int32_t n1 = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(c1, nul));
+        if (n1 != 0) {
+            int32_t lim = __builtin_ctz((unsigned)n1);
+            int32_t m = m1 & ((1u << lim) - 1);
+            return m ? i + 16 + __builtin_ctz((unsigned)m) : -1;
+        }
+        if (m1 != 0) return i + 16 + __builtin_ctz((unsigned)m1);
+        i += 32;
     }
 }
 
