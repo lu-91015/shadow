@@ -2748,6 +2748,7 @@ extern void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     }
     newcap = cap * 2;
     if (newcap < need) newcap = need;
+    if (newcap < 16) newcap = 16;  /* 最小增长 16B：短串首段扩容一步到位，str_reverse 分配 6→3 次 */
     p = shadow_gc_alloc(newcap, 0);
     shadow_gc_root_set(&p, p);
     memcpy(p, s1, (size_t)l1);
@@ -2756,6 +2757,24 @@ extern void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     shadow_gc_root_set(&p, 0);
     tl_str_set(p, l1 + 1, newcap);
     return p;
+}
+
+/* 快速路径字符串查找：单次 C 调用完成朴素匹配，消除 shadow 层 shadow_index_of
+ * 逐字节 rt_get_byte 的 extern 调用开销。语义与 runtime_lib.shadow 的
+ * shadow_index_of 完全一致（返回首次出现位置，无则 -1）。 */
+extern int32_t shadow_index_of_fast(void* s, void* needle) {
+    const char* sp = (const char*)s;
+    const char* np = (const char*)needle;
+    int32_t sl = (int32_t)strlen(sp);
+    int32_t nl = (int32_t)strlen(np);
+    if (nl == 0) return 0;
+    int32_t limit = sl - nl;
+    for (int32_t i = 0; i <= limit; i++) {
+        int32_t j = 0;
+        while (j < nl && sp[i + j] == np[j]) j++;
+        if (j == nl) return i;
+    }
+    return -1;
 }
 
 /* 快速路径 array_push（shadow 层 C 布局数组，kind=2）：

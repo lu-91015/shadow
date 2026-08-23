@@ -221,7 +221,7 @@ pub kimo cg_resolve_extern_name(name: string) -> string {
     if (str_eq(name, "str_join") == 1) { return "shadow_sjoin"; }
     if (str_eq(name, "str_format") == 1) { return "shadow_format"; }
     if (str_eq(name, "str_contains") == 1) { return "shadow_contains"; }
-    if (str_eq(name, "str_index_of") == 1) { return "shadow_index_of"; }
+    if (str_eq(name, "str_index_of") == 1) { return "shadow_index_of_fast"; }
     if (str_eq(name, "str_replace") == 1) { return "shadow_str_replace"; }
     if (str_eq(name, "str_trim") == 1) { return "shadow_trim"; }
     if (str_eq(name, "str_to_upper") == 1) { return "shadow_supper"; }

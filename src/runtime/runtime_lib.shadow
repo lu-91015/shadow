@@ -103,6 +103,7 @@ pub kimo shadow_string_concat_char(s1: any, c: int) -> any {
     }
     let newcap: int = cap * 2;
     if (newcap < need) { newcap = need; }
+    if (newcap < 16) { newcap = 16; }  // 最小增长 16B：短串首段扩容一步到位，str_reverse 分配 6→3 次
     let p: any = rt_malloc(newcap);
     rt_memcpy_at(p, 0, s1, 0, l1);
     rt_set_byte(p, l1, c);

@@ -3175,6 +3175,13 @@ public:
     GCMetaMap() { slots.assign(64, Entry{}); mask = 63; }
 
     size_t size() const { return count; }
+    size_t rebuilds() const { return rebuild_count; }
+    size_t capacity() const { return slots.size(); }
+    size_t tombstones_n() const { return tombstones; }
+    size_t total_probes = 0;
+    size_t insert_count = 0;
+    size_t max_probe = 0;
+    size_t max_occ = 0;
 
     GCMeta* find(void* key) {
         size_t i = hash(key) & mask;
@@ -3213,11 +3220,18 @@ public:
     GCMeta* insert(void* key, int32_t kind, int32_t asize, int32_t req) {
         size_t i = hash(key) & mask;
         int32_t first_tomb = -1;
+        size_t probes = 0;
         while (slots[i].key) {
+            probes++;
             if (slots[i].key == key) return &slots[i].meta;
             if (slots[i].key == TOMBSTONE && first_tomb < 0) first_tomb = (int32_t)i;
             i = (i + 1) & mask;
         }
+        total_probes += probes + 1;
+        insert_count++;
+        if (probes + 1 > max_probe) max_probe = probes + 1;
+        size_t occ = count + tombstones;
+        if (occ > max_occ) max_occ = occ;
         if ((count + tombstones + 1) * 10 >= slots.size() * 7) {
             rebuild();
             return insert(key, kind, asize, req);
@@ -3311,6 +3325,12 @@ public:
         }
     }
 
+    // 清扫后活条目远小于容量时收缩表，保持缓存驻留（524288 槽 × 80B = 42MB
+    // 远超 L3；收缩后 str_reverse 每轮 GC 后表回到 ~1K 槽，插入/擦除免缓存缺失）。
+    void shrink_if_sparse() {
+        if (count * 4 < slots.size() && slots.size() > 64) shrink();
+    }
+
 private:
     static size_t hash(void* p) {
         uintptr_t h = (uintptr_t)p;
@@ -3326,6 +3346,19 @@ private:
         size_t live = count;
         size_t new_cap = slots.size();
         if ((live + 1) * 10 >= new_cap * 7) new_cap *= 2;
+        rehash(new_cap);
+    }
+
+    void shrink() {
+        size_t live = count;
+        size_t new_cap = 64;
+        while (new_cap < live * 2) new_cap *= 2;
+        if (new_cap >= slots.size()) return;
+        rehash(new_cap);
+    }
+
+private:
+    void rehash(size_t new_cap) {
         std::vector<Entry> old;
         old.swap(slots);
         slots.assign(new_cap, Entry{});
@@ -3346,7 +3379,11 @@ private:
                 count++;
             }
         }
+        rebuild_count++;
     }
+
+    size_t rebuild_count = 0;
+    size_t slots_size() const { return slots.size(); }
 
     std::vector<Entry> slots;
     size_t mask;
@@ -3373,6 +3410,8 @@ struct PendingAlloc { void* p; int32_t kind; int32_t asize; int32_t req; };
 static PendingAlloc g_pend[RT_PEND_CAP];
 static int g_pend_n = 0;
 static int64_t g_pend_bytes = 0;
+static int64_t g_dbg_fast = 0;   // 攒批快路径命中次数（诊断）
+static int64_t g_dbg_slow = 0;   // 慢路径次数（诊断）
 static std::atomic<int32_t> g_mutator_threads{0};
 // 前向声明：g_heap_bytes 定义在下方（GC 触发状态小节），flush 需要它记账。
 extern std::atomic<int64_t> g_heap_bytes;
@@ -3422,7 +3461,17 @@ static std::atomic<int64_t> g_alloc_ticks{0};    // STRESS 模式分配计数
 static int64_t g_gc_gogc = -1;                   // SHADOW_GOGC（默认 100）
 static int32_t g_gc_stress = -1;                 // SHADOW_GC_STRESS（0=关）
 static int32_t g_gc_auto = -1;                   // SHADOW_GC_AUTO（0=禁用自动触发，供 reseed 种子）
+static int64_t g_gc_min_heap = -1;               // SHADOW_GC_MIN_HEAP（最小触发堆字节，默认 4MB）
 static uint32_t g_gc_epoch = 0;                  // 标记世代：visited 存 epoch，免每轮全量清 visited
+
+static int64_t rt_gc_min_heap(void) {
+    if (g_gc_min_heap < 0) {
+        const char* e = getenv("SHADOW_GC_MIN_HEAP");
+        g_gc_min_heap = (e && *e) ? atoll(e) : 4 * 1024 * 1024;
+        if (g_gc_min_heap < 64 * 1024) g_gc_min_heap = 64 * 1024;
+    }
+    return g_gc_min_heap;
+}
 
 static void prof_atexit(void) {
     if (!prof_on()) return;
@@ -3434,6 +3483,10 @@ static void prof_atexit(void) {
             (long long)g_gc_trigger.load(std::memory_order_relaxed));
     fprintf(stderr, "[PROF] mark_reset_ns=%lld mark_roots_ns=%lld mark_wl_ns=%lld\n",
             (long long)g_prof_mark_reset_ns, (long long)g_prof_mark_roots_ns, (long long)g_prof_mark_wl_ns);
+    fprintf(stderr, "[PROF] meta slots=%zu live=%zu tombs=%zu rebuilds=%zu avgprobe=%.1f maxprobe=%zu maxocc=%zu fast=%lld slow=%lld\n",
+            g_gc_meta.capacity(), g_gc_meta.size(), g_gc_meta.tombstones_n(), g_gc_meta.rebuilds(),
+            g_gc_meta.insert_count > 0 ? (double)g_gc_meta.total_probes / (double)g_gc_meta.insert_count : 0.0,
+            g_gc_meta.max_probe, g_gc_meta.max_occ, (long long)g_dbg_fast, (long long)g_dbg_slow);
 }
 struct ProfAtexit { ~ProfAtexit() { prof_atexit(); } };
 static ProfAtexit _prof_atexit;
@@ -3444,6 +3497,9 @@ static ProfAtexit _prof_atexit;
 // 等 g_gc_mutex，不跑 mutator，collect 无需等它。
 static std::atomic<int> g_gc_stw_req{0};
 static std::atomic<int> g_gc_stw_active{0};
+// 单 poll 标志：STW 请求或 alloc 触发时置 1，poll 快路径只查它（sum_loop 等
+// 无分配热循环免去每次 6+ 次原子/普通加载）。慢路径清 0 后做完整 STW/触发检查。
+static std::atomic<int> g_gc_poll_flag{0};
 static int rt_gc_auto_on(void) {
     if (g_gc_auto < 0) {
         const char* e = getenv("SHADOW_GC_AUTO");
@@ -3606,6 +3662,7 @@ extern "C" void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     }
     int32_t newcap = cap * 2;
     if (newcap < need) newcap = need;
+    if (newcap < 16) newcap = 16;  // 最小增长 16B：短串首段扩容一步到位，str_reverse 分配 6→3 次
     void* p = shadow_gc_alloc(newcap, 0);
     shadow_gc_root_set(&p, p);
     memcpy(p, s1, (size_t)l1);
@@ -3614,6 +3671,24 @@ extern "C" void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     shadow_gc_root_set(&p, 0);
     tl_str_set(p, l1 + 1, newcap);
     return p;
+}
+
+// 快速路径字符串查找：单次 C 调用完成朴素匹配，消除 shadow 层 shadow_index_of
+// 逐字节 rt_get_byte 的 extern 调用开销（string_find 热循环 48M 次调用 → 300K 次）。
+// 语义与 runtime_lib.shadow 的 shadow_index_of 完全一致（返回首次出现位置，无则 -1）。
+extern "C" int32_t shadow_index_of_fast(void* s, void* needle) {
+    const char* sp = (const char*)s;
+    const char* np = (const char*)needle;
+    int32_t sl = (int32_t)strlen(sp);
+    int32_t nl = (int32_t)strlen(np);
+    if (nl == 0) return 0;
+    int32_t limit = sl - nl;
+    for (int32_t i = 0; i <= limit; i++) {
+        int32_t j = 0;
+        while (j < nl && sp[i + j] == np[j]) j++;
+        if (j == nl) return i;
+    }
+    return -1;
 }
 
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
@@ -3770,6 +3845,7 @@ static void gc_lock_blocked() {
 // 持锁期间无增删）。collect 自身（me）跳过 —— 它不跑 mutator，根集冻结。
 static void gc_stw_begin() {
     g_gc_stw_req.store(1, std::memory_order_relaxed);
+    g_gc_poll_flag.store(1, std::memory_order_relaxed);
     ThreadGCState* me = tl_gc_state;
     for (;;) {
         int all = 1;
@@ -3785,6 +3861,7 @@ static void gc_stw_begin() {
 }
 static void gc_stw_end() {
     g_gc_stw_active.store(0, std::memory_order_relaxed);
+    g_gc_poll_flag.store(0, std::memory_order_relaxed);
 }
 
 static void gc_perm_root_add(void* p) {
@@ -4237,6 +4314,10 @@ static int64_t gc_sweep_dead(bool is_minor) {
         rf.m->marked.store(1, std::memory_order_relaxed);
     }
 
+    // 清扫后活条目远小于容量时收缩表（缓存驻留优化，见 GCMetaMap::shrink_if_sparse）。
+    // 此时 to_free 的 GCMeta* 已不再使用，rehash 安全。
+    g_gc_meta.shrink_if_sparse();
+
     return freed;
 }
 
@@ -4363,7 +4444,8 @@ extern "C" int64_t shadow_gc_collect() {
     {
         int64_t gogc = rt_gc_gogc();
         int64_t next = live + live * gogc / 100;
-        if (next < 4 * 1024 * 1024) next = 4 * 1024 * 1024;
+        int64_t minheap = rt_gc_min_heap();
+        if (next < minheap) next = minheap;
         g_gc_trigger.store(next, std::memory_order_relaxed);
         if (g_gc_log_on)
             fprintf(stderr, "[GCLOG] major settle live=%lld trigger=%lld gogc=%lld\n",
@@ -4564,6 +4646,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             if (hb >= g_gc_trigger.load(std::memory_order_relaxed) && hb > 0) want = 1;
         }
         if (want) {
+            g_gc_poll_flag.store(1, std::memory_order_relaxed);  // 提示 poll 兜底复查
             gc_lock_blocked();
             gc_flush_pending_locked();
             g_gc_mutex.unlock();
@@ -4585,8 +4668,10 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
         g_pend_bytes += size;
         tl_gc_alloc_count++;
         g_gc_total_alloc_count.fetch_add(1, std::memory_order_relaxed);
+        g_dbg_fast++;
         return p;
     }
+    g_dbg_slow++;
     {
         auto _t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // 等锁期间标记 blocked（stw_state=2）：collect 扫根时跳过本线程
@@ -4734,6 +4819,10 @@ extern "C" int32_t shadow_gc_root_range(void* base, uint32_t n) {
 //   ② 触发检查：安全点处活指针已 spill 到 shadow frame，GOGC/STRESS 达标即
 //      同步 collect（与 Windows 在 alloc hook 触发语义一致）。
 extern "C" void shadow_gc_poll() {
+    // 快路径：单原子加载。STW 请求或 alloc 触发时标志置 1，否则无分配热循环
+    // （sum_loop 等）直接返回，免去每次 6+ 次加载 + rt_gc_auto_on 调用。
+    if (g_gc_poll_flag.load(std::memory_order_relaxed) == 0) return;
+    g_gc_poll_flag.store(0, std::memory_order_relaxed);
     // ① STW 协作：collect 请求时到达安全点并自旋，等放行。
     if (g_gc_stw_req.load(std::memory_order_relaxed) ||
         g_gc_stw_active.load(std::memory_order_relaxed)) {
