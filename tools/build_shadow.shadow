@@ -125,7 +125,7 @@ kimo main() -> int {
     rt_sys_exec(host + " src/main.shadow -o build/stage1.ll");
     if (file_ok("build/stage1.ll") == 0) { println("[X] stage1.ll empty"); return 1; }
     rt_sys_exec(llc + " -O0 -filetype=obj build/stage1.ll -o build/stage1.o");
-    rt_sys_exec(clang + " -std=c++17 build/stage1.o build/rt/runtime_for_selfhost_wk.o " + boot + "/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage1.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
+    rt_sys_exec(clang + " -std=c++17 build/stage1.o build/rt/runtime_for_selfhost_wk.o " + boot + "/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage1.exe -Wl,/subsystem:console -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
     println("    wrote build/shadow-stage1.exe");
 
     // [2/7] stage2: shadow-stage1 compile src/main.shadow
@@ -133,7 +133,7 @@ kimo main() -> int {
     rt_sys_exec("build/shadow-stage1.exe src/main.shadow -o build/stage2.ll");
     if (file_ok("build/stage2.ll") == 0) { println("[X] stage2.ll empty"); return 1; }
     rt_sys_exec(llc + " -O0 -filetype=obj build/stage2.ll -o build/stage2.o");
-    rt_sys_exec(clang + " -std=c++17 build/stage2.o build/rt/runtime_for_selfhost_wk.o " + boot + "/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage2.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
+    rt_sys_exec(clang + " -std=c++17 build/stage2.o build/rt/runtime_for_selfhost_wk.o " + boot + "/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage2.exe -Wl,/subsystem:console -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
     println("    wrote build/shadow-stage2.exe");
 
     // [3/7] stage3: shadow-stage2 compile src/main.shadow

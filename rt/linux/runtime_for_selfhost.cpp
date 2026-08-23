@@ -3613,8 +3613,12 @@ static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_
 // cap=0 表示"未知容量"（非堆对象/未查表），调用方按"无余量"处理（分配新缓冲，
 // 输出仍正确，仅损失就地追加优化）。所有就地修改字符串的函数必须维护本缓存。
 struct TLStrCache { void* p; int32_t len; int32_t cap; uint32_t epoch; };
-static thread_local TLStrCache tl_str_cache[8];
-static thread_local int32_t tl_str_cache_n = 0;
+// 用 __thread 而非 thread_local：thread_local 的动态初始化守卫（std::string g_str_buf
+// 等）会把 __cxa_thread_atexit 初始化代码内嵌进首个访问函数（tl_str_lookup），
+// 膨胀到 800+ 字节导致 -O2 拒绝内联，热循环每轮多 2 次函数调用。
+// __thread 仅支持 POD 常量初始化 → 无守卫 → 访问退化为 %fs:offset，可正常内联。
+static __thread TLStrCache tl_str_cache[8];
+static __thread int32_t tl_str_cache_n = 0;
 
 static inline int tl_str_lookup(void* p, int32_t* len, int32_t* cap) {
     uint32_t ep = g_gc_epoch;
@@ -3659,8 +3663,10 @@ static inline void tl_str_set(void* p, int32_t len, int32_t cap) {
 }
 
 // 取 (len, cap)：缓存命中直接返回；未命中计算 strlen + 查容量后入缓存。
-static inline void tl_str_get(void* p, int32_t* len, int32_t* cap) {
-    if (tl_str_lookup(p, len, cap)) return;
+// 慢路径拆成独立函数：tl_str_get 只剩「lookup + 慢路径调用」→ 体积小可内联，
+// 否则 strlen/g_pend 扫描/mutex 哈希查找的慢路径会让 -O2 拒绝内联整个函数，
+// 热循环每轮多 1 次函数调用。
+static void tl_str_get_slow(void* p, int32_t* len, int32_t* cap) {
     *len = (int32_t)strlen((const char*)p);
     *cap = 0;
     for (int i = 0; i < g_pend_n; i++) {
@@ -3672,6 +3678,10 @@ static inline void tl_str_get(void* p, int32_t* len, int32_t* cap) {
         if (m) *cap = (int32_t)m->size;
     }
     tl_str_set(p, *len, *cap);
+}
+static inline void tl_str_get(void* p, int32_t* len, int32_t* cap) {
+    if (tl_str_lookup(p, len, cap)) return;
+    tl_str_get_slow(p, len, cap);
 }
 
 // 供 shadow 层就地拼接函数（shadow_string_concat_inplace / _char）在修改后同步缓存。
@@ -3711,6 +3721,47 @@ extern "C" void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     int32_t newcap = cap * 2;
     if (newcap < need) newcap = need;
     if (newcap < 16) newcap = 16;  // 最小增长 16B：短串首段扩容一步到位，str_reverse 分配 6→3 次
+    void* p = shadow_gc_alloc(newcap, 0);
+    shadow_gc_root_set(&p, p);
+    memcpy(p, s1, (size_t)l1);
+    ((char*)p)[l1] = (char)c;
+    ((char*)p)[l1 + 1] = 0;
+    shadow_gc_root_set(&p, 0);
+    tl_str_set(p, l1 + 1, newcap);
+    return p;
+}
+
+// 单字符追加（源串下标版）：读取 s[idx] 并追加到 s1。等价于
+// shadow_string_concat_char_fast(s1, shadow_string_char_at(s, idx))，但单次 C 调用
+// 完成，消除 str_reverse 热循环每轮 2 次调用 → 1 次（8.6M 次追加省 8.6M 次调用）。
+// 语义：s[idx] 负索引回绕（与 shadow_schar 一致），越界返回 0 字符；追加语义与
+// shadow_string_concat_char_fast 完全一致（cap 足够就地写，否则 2x 倍增扩容）。
+extern "C" void* shadow_string_concat_char_at(void* s1, const char* s, int32_t idx) {
+    int32_t l1, cap;
+    if (!tl_str_lookup(s1, &l1, &cap)) tl_str_get_slow(s1, &l1, &cap);
+    int32_t c = 0;
+    int32_t n = 0, scap = 0;
+    if (tl_str_lookup((void*)s, &n, &scap)) {
+        int32_t i = idx;
+        if (i < 0) i = i + n;
+        if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
+    } else {
+        n = (int32_t)strlen(s);
+        tl_str_set((void*)s, n, 0);
+        int32_t i = idx;
+        if (i < 0) i = i + n;
+        if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
+    }
+    int32_t need = l1 + 2;
+    if (cap >= need) {
+        ((char*)s1)[l1] = (char)c;
+        ((char*)s1)[l1 + 1] = 0;
+        tl_str_set(s1, l1 + 1, cap);
+        return s1;
+    }
+    int32_t newcap = cap * 2;
+    if (newcap < need) newcap = need;
+    if (newcap < 16) newcap = 16;  // 最小增长 16B：短串首段扩容一步到位
     void* p = shadow_gc_alloc(newcap, 0);
     shadow_gc_root_set(&p, p);
     memcpy(p, s1, (size_t)l1);

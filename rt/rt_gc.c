@@ -2764,6 +2764,47 @@ extern void* shadow_string_concat_char_fast(void* s1, int32_t c) {
     return p;
 }
 
+/* 单字符追加（源串下标版）：读取 s[idx] 并追加到 s1。等价于
+ * shadow_string_concat_char_fast(s1, shadow_string_char_at(s, idx))，但单次 C 调用
+ * 完成，消除 str_reverse 热循环每轮 2 次调用 → 1 次。语义：s[idx] 负索引回绕
+ * （与 shadow_schar 一致），越界返回 0 字符；追加语义与 shadow_string_concat_char_fast
+ * 完全一致（cap 足够就地写，否则 2x 倍增扩容）。 */
+extern void* shadow_string_concat_char_at(void* s1, const char* s, int32_t idx) {
+    int32_t l1, cap, c = 0, n = 0, scap = 0, i;
+    tl_str_get(s1, &l1, &cap);
+    if (tl_str_lookup((void*)s, &n, &scap)) {
+        i = idx;
+        if (i < 0) i = i + n;
+        if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
+    } else {
+        n = (int32_t)strlen(s);
+        tl_str_set((void*)s, n, 0);
+        i = idx;
+        if (i < 0) i = i + n;
+        if (i >= 0 && i < n) c = (int32_t)(unsigned char)s[i];
+    }
+    if (l1 + 2 <= cap) {
+        ((char*)s1)[l1] = (char)c;
+        ((char*)s1)[l1 + 1] = 0;
+        tl_str_set(s1, l1 + 1, cap);
+        return s1;
+    }
+    {
+        int32_t need = l1 + 2, newcap = cap * 2;
+        void* p;
+        if (newcap < need) newcap = need;
+        if (newcap < 16) newcap = 16;
+        p = shadow_gc_alloc(newcap, 0);
+        shadow_gc_root_set(&p, p);
+        memcpy(p, s1, (size_t)l1);
+        ((char*)p)[l1] = (char)c;
+        ((char*)p)[l1 + 1] = 0;
+        shadow_gc_root_set(&p, 0);
+        tl_str_set(p, l1 + 1, newcap);
+        return p;
+    }
+}
+
 /* 快速路径字符串查找：单次 C 调用完成朴素匹配，消除 shadow 层 shadow_index_of
  * 逐字节 rt_get_byte 的 extern 调用开销。语义与 runtime_lib.shadow 的
  * shadow_index_of 完全一致（返回首次出现位置，无则 -1）。 */

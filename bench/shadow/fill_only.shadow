@@ -1,0 +1,14 @@
+// 隔离测试：仅填充循环（2M 次 array_push），无筛法
+dsb fill_only;
+
+kimo main() -> int {
+    let n = 2000000;
+    let a: array<int> = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, 1);
+        i = i + 1;
+    }
+    println(shadow_array_len(a));
+    return 0;
+}

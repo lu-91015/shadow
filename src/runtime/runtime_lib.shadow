@@ -151,6 +151,14 @@ pub kimo shadow_array_new(elem_size: int, cap: int) -> any {
     return p;
 }
 
+// 填充循环预分配（类似 Go 的 make）：编译器在 while (i < n) { a = array_push(a, v); }
+// 前调用，一次性分配 cap 容量，避免 2M 次 push 的倍增扩容 + memcpy。cap 负值按 0 处理
+// （循环条件 i<n 在 n<0 时不执行，预分配空数组保持语义）。
+pub kimo shadow_array_prealloc(elem_size: int, cap: int) -> any {
+    if (cap < 0) { cap = 0; }
+    return shadow_array_new(elem_size, cap);
+}
+
 pub kimo shadow_array_len(arr: any) -> int {
     if (arr == null) { return 0; }
     return rt_load_int(arr, 0);

@@ -144,6 +144,7 @@ let cg_cur_blk_idx: int = 0;         // 当前基本块在 cg_block_labels 中�
 let cg_poll_flag_g: any = 0 as any;  // g_gc_poll_flag 外部全局（懒创建，内联轮询 volatile 加载）
 let cg_poll_counter: int = 0;        // 内联 poll 块命名计数器（每函数重置，保证 IR 确定性）
 let cg_poll_skip_bb: any = 0 as any; // 最近一次内联 poll 的 skip 块（入口 poll 时 block 0 续接）
+let cg_push_counter: int = 0;        // 内联 array_push 块命名计数器（每函数重置）
 let cg_str_keys: array<string> = [];
 let cg_str_vals: array<any> = [];
 let cg_extern_names: array<string> = [];
@@ -649,6 +650,139 @@ pub kimo cg_array_push_resolve(mi: MirInst, fallback: string) -> string {
         }
     }
     return fallback;
+}
+
+// 内联 array_push 快速路径是否可用：静态类型数组且元素类型 es 已知（非 any）。
+// any 元素可能因协变赋值导致 es 与静态类型不一致，仍走运行时函数。
+pub kimo cg_array_push_inline_ok(mi: MirInst) -> int {
+    let arr_ty = mi.ty;
+    if ((arr_ty as any) == 0) { return 0; }
+    if (arr_ty.kind != TYPE_ARRAY) { return 0; }
+    let elem_ty = arr_ty.elem_type;
+    if ((elem_ty as any) == 0) { return 0; }
+    return cg_array_direct_ok(elem_ty.kind);
+}
+
+// 数组头字段 i32 加载（offset 字节处）：base + offset（模拟 GEP）
+pub kimo cg_array_hdr_load_i32(arr_val: any, offset: int, name: string) -> any {
+    let i64_ty = llvm_i64(cg_ctx);
+    let i32_ty = llvm_i32(cg_ctx);
+    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "hdrbase");
+    let addr = llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, offset, 1), "hdraddr");
+    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i32_ty, 0), "hdrptr");
+    return llvm_load(cg_builder, i32_ty, ptr, name);
+}
+
+// 数组头字段 i32 存储（offset 字节处）
+pub kimo cg_array_hdr_store_i32(arr_val: any, offset: int, v: any) -> void {
+    let i64_ty = llvm_i64(cg_ctx);
+    let i32_ty = llvm_i32(cg_ctx);
+    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "hdrbase");
+    let addr = llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, offset, 1), "hdraddr");
+    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i32_ty, 0), "hdrptr");
+    llvm_store(cg_builder, v, ptr);
+}
+
+// 内联 array_push：静态类型数组（es 已知）→ 生成无调用 push 快速路径，
+// 仅首推（null）/扩容（len>=cap）走慢路径调用运行时 push_fast。
+// 消除热循环里每轮 1 次函数调用（prime_sieve 2M 次 push = 2M 次调用）。
+// 结果经 alloca 合并（LLVM SROA 提升为 phi）；慢路径调用前 arr 已在 shadow frame
+// root（MIR_LOAD_VAR 的 cg_set_reg），GC 安全。
+pub kimo cg_gen_array_push_inline(mi: MirInst) -> void {
+    let args = mi.args;
+    if (len(args) < 2) { return; }
+    let arr_val = cg_get_reg(args[0] as int);
+    let val_val = cg_get_reg(args[1] as int);
+    let vk = cg_get_reg_kind(args[1] as int);
+    let arr_ty = mi.ty;
+    let ek = TYPE_ANY;
+    if ((arr_ty as any) != 0 && (arr_ty.elem_type as any) != 0) { ek = arr_ty.elem_type.kind; }
+    let es = cg_elem_size(ek);
+    let push_fn = cg_array_push_fn(ek);
+    let i32_ty = llvm_i32(cg_ctx);
+    let i64_ty = llvm_i64(cg_ctx);
+    let i8p_ty = llvm_ptr_ty(llvm_i8(cg_ctx), 0);
+    let null_v = llvm_const_null(i8p_ty);
+
+    cg_push_counter = cg_push_counter + 1;
+    let cn = int_to_str(cg_push_counter);
+
+    // 结果合并槽（LLVM SROA 提升为 phi；未提升时退化为栈读写，仍优于函数调用）
+    let result_slot = llvm_alloca(cg_builder, i8p_ty, "pushres" + cn);
+
+    // --- null 检查 → slow ---
+    let isnull = llvm_icmp(cg_builder, LLVM_INT_EQ, arr_val, null_v, "pushnull" + cn);
+    let check_bb = llvm_append_bb(cg_func, "pushcheck" + cn);
+    let slow_bb = llvm_append_bb(cg_func, "pushslow" + cn);
+    llvm_cond_br(cg_builder, isnull, slow_bb, check_bb);
+
+    // --- check：len >= cap 或运行时 es 与静态 es 不一致 → slow ---
+    // 裸 any 值（动态数组 es=8）可能被静态推断为 array<int>（es=4），硬编码 es 直接写
+    // 会破坏 8 字节槽 → 读运行时 es（offset 8），不一致走慢路径（运行时函数读 es 处理）。
+    // es=8 静态类型（long/string/嵌套数组等）运行时 es 恒为 8（typed 与 any 数组一致），无需检查。
+    llvm_pos_builder_end(cg_builder, check_bb);
+    let len_v = cg_array_hdr_load_i32(arr_val, 0, "pushlen" + cn);
+    let cap_v = cg_array_hdr_load_i32(arr_val, 4, "pushcap" + cn);
+    let grow = llvm_icmp(cg_builder, LLVM_INT_SGE, len_v, cap_v, "pushgrow" + cn);
+    let fast_bb = llvm_append_bb(cg_func, "pushfast" + cn);
+    if (es == 4) {
+        let es_v = cg_array_hdr_load_i32(arr_val, 8, "pushes" + cn);
+        let es_ok = llvm_icmp(cg_builder, LLVM_INT_EQ, es_v, llvm_const_int(i32_ty, 4, 1), "pushesok" + cn);
+        let bad = llvm_or(cg_builder, grow, llvm_not(cg_builder, es_ok, "pushesnot" + cn), "pushbad" + cn);
+        llvm_cond_br(cg_builder, bad, slow_bb, fast_bb);
+    } else {
+        llvm_cond_br(cg_builder, grow, slow_bb, fast_bb);
+    }
+
+    // --- fast：直接写缓冲（无调用） ---
+    llvm_pos_builder_end(cg_builder, fast_bb);
+    let len64 = llvm_sext(cg_builder, len_v, i64_ty, "pushlen64" + cn);
+    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "pushbase" + cn);
+    let off = llvm_add(cg_builder, llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, 12, 1), "pushhdr" + cn), llvm_mul(cg_builder, len64, llvm_const_int(i64_ty, es, 1), "pushscaled" + cn), "pushoff" + cn);
+    let slot_ty = i32_ty;
+    if (es == 8) {
+        if (cg_is_float_kind(ek) == 1) { slot_ty = llvm_double_ty(cg_ctx); }
+        else if (cg_is_ptr_kind(ek) == 1) { slot_ty = i8p_ty; }
+        else { slot_ty = llvm_i64(cg_ctx); }
+    }
+    let elem_ptr = llvm_inttoptr(cg_builder, off, llvm_ptr_ty(slot_ty, 0), "pushelem" + cn);
+    let sv = val_val;
+    if (es == 4) {
+        sv = cg_cast_val(val_val, vk, TYPE_INT);
+    } else {
+        sv = cg_cast_val(val_val, vk, ek);
+        if (cg_is_float_kind(ek) == 1) { sv = cg_cast_val(sv, ek, TYPE_DOUBLE); }
+    }
+    llvm_store(cg_builder, sv, elem_ptr);
+    let len1 = llvm_add(cg_builder, len_v, llvm_const_int(i32_ty, 1, 1), "pushlen1" + cn);
+    cg_array_hdr_store_i32(arr_val, 0, len1);
+    llvm_store(cg_builder, arr_val, result_slot);
+    let done_bb = llvm_append_bb(cg_func, "pushdone" + cn);
+    llvm_br(cg_builder, done_bb);
+
+    // --- slow：调用运行时 push_fast（首推/扩容） ---
+    llvm_pos_builder_end(cg_builder, slow_bb);
+    let slow_val = val_val;
+    if (str_eq(push_fn, "shadow_array_push_long_fast") == 1 && cg_is_int_kind(vk) == 1 && vk != TYPE_LONG) {
+        slow_val = cg_cast_val(val_val, vk, TYPE_LONG);
+    } else if (str_eq(push_fn, "shadow_array_push_float_fast") == 1 && vk == TYPE_FLOAT) {
+        slow_val = cg_cast_val(val_val, TYPE_FLOAT, TYPE_DOUBLE);
+    } else if (str_eq(push_fn, "shadow_array_push_int_fast") == 1 && (vk == TYPE_CHAR || vk == TYPE_SHORT || vk == TYPE_BOOL)) {
+        slow_val = cg_cast_val(val_val, vk, TYPE_INT);
+    }
+    let slow_args: array<any> = [];
+    slow_args = array_push(slow_args, arr_val);
+    slow_args = array_push(slow_args, slow_val);
+    let r = cg_call_named(push_fn, TYPE_ANY, slow_args);
+    llvm_store(cg_builder, r, result_slot);
+    llvm_br(cg_builder, done_bb);
+
+    // --- done：合并结果，续接后续指令 ---
+    llvm_pos_builder_end(cg_builder, done_bb);
+    let result = llvm_load(cg_builder, i8p_ty, result_slot, "pushresv" + cn);
+    if (mi.dst >= 0) { cg_set_reg(mi.dst, result, TYPE_ARRAY); }
+    cg_cur_bb = done_bb;
+    return;
 }
 
 pub kimo cg_elem_size(ek: int) -> int {
@@ -1627,7 +1761,12 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
         // array_push：按数组静态元素类型分派 typed push（array<int>→shadow_array_push_int 等）。
         // mi.ty 由 mir 侧携带第一个实参的数组类型；typed push 使静态类型数组以
         // 4/8 字节槽存储（es 与直接 GEP 优化一致），并消除 push 的 es 动态分支。
+        // 静态类型数组（es 已知）进一步内联为无调用 push，仅首推/扩容走慢路径。
         if (str_eq(mi.strval, "array_push") == 1) {
+            if (cg_array_push_inline_ok(mi) == 1) {
+                cg_gen_array_push_inline(mi);
+                return;
+            }
             resolved_name = cg_array_push_resolve(mi, resolved_name);
         }
         let k = cg_type_kind(mi.ty);
@@ -2509,6 +2648,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     // 内联轮询状态：每函数重置（入口 poll 的 skip 块供 block 0 续接；计数器保证块名确定性）
     cg_poll_skip_bb = 0 as any;
     cg_poll_counter = 0;
+    cg_push_counter = 0;
     let i = 0;
     while (i < n_params) {
         let p = params[i];

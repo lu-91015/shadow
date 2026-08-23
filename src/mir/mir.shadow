@@ -62,6 +62,22 @@ pub kimo mir_owned_set(slot: int, v: int) -> void {
     }
 }
 
+// 填充循环预分配跟踪：mir_slot_empty[slot]=1 表示该 slot 已知持有空数组（len=0）。
+// 仅 let a=[] / a=[] 时置 1，任何其他写入清 0（保守）。供 STMT_WHILE 检测
+// while (i < n) { a = array_push(a, v); i = i + 1; } 模式时确认 a 为空可安全预分配。
+let mir_slot_empty: array<int> = [];
+
+pub kimo mir_empty_is(slot: int) -> int {
+    if (slot >= 0 && slot < len(mir_slot_empty)) { return mir_slot_empty[slot]; }
+    return 0;
+}
+
+pub kimo mir_empty_set(slot: int, v: int) -> void {
+    if (slot >= 0 && slot < len(mir_slot_empty)) {
+        mir_slot_empty[slot] = v;
+    }
+}
+
 // 循环体别名扫描（只读，不改 mir_owned）：找出体内会被共享的 slot。
 // 表达式层别名仅来自函数调用实参（callee 可能保留）与闭包捕获。
 pub kimo mir_scan_aliases_expr(h: HirExpr, aliased: array<int>) -> void {
@@ -1171,6 +1187,12 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             if (mir_dbg() == 1) {
                 println("DBG LET slot=" + int_to_str(h.slot) + " initkind=" + int_to_str(init_kind) + " childslot=" + int_to_str(h.child.slot) + " owned=" + int_to_str(mir_owned_is(h.slot)));
             }
+            // 空数组字面量 [] → 标记空（供填充循环预分配检测）；其他初始化清 0
+            if (init_kind == EXPR_ARRAY_LIT && len(h.child.children) == 0) {
+                mir_empty_set(h.slot, 1);
+            } else {
+                mir_empty_set(h.slot, 0);
+            }
             if (init_kind == EXPR_VAR) {
                 mir_owned_clear(h.child.slot);
                 mir_owned_set(h.slot, 0);
@@ -1395,6 +1417,86 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
     }
 
     if (k == STMT_WHILE) {
+        // 填充循环预分配：识别 while (i < n) { a = array_push(a, v); i = i + 1; }
+        // 且 a 已知为空（let a=[]）→ 循环前一次性分配 cap=n（类似 Go 的 make），
+        // 消除 2M 次 push 的倍增扩容 + memcpy（prime_sieve 等）。bound 仅限变量/字面量
+        // （无副作用，可安全在循环前求值一次）；a 非空或模式不符则不触发（保守）。
+        let pre_a_slot = -1;
+        let pre_a_ty: Type = 0 as Type;
+        let pre_bound: HirExpr = 0 as HirExpr;
+        let cond = h.child;
+        if ((cond as any) != 0 && cond.kind == EXPR_BINARY &&
+            (cond.op == BIN_LT || cond.op == BIN_LE)) {
+            let cchildren = cond.children;
+            if (len(cchildren) == 2 && cchildren[0].kind == EXPR_VAR) {
+                let c1 = cchildren[1];
+                if (c1.kind == EXPR_VAR || c1.kind == EXPR_INT) {
+                    let i_slot = cchildren[0].slot;
+                    let body = h.body;
+                    let found_inc = 0;
+                    let bi = 0;
+                    while (bi < len(body)) {
+                        let st = body[bi];
+                        if (st.kind == STMT_ASSIGN && (st.child as any) != 0 &&
+                            (st.rhs as any) != 0) {
+                            let slhs = st.child;
+                            let srhs = st.rhs;
+                            if (slhs.kind == EXPR_VAR) {
+                                if (srhs.kind == EXPR_CALL && str_eq(srhs.str1, "array_push") == 1) {
+                                    let args = srhs.children;
+                                    if (len(args) > 0 && args[0].kind == EXPR_VAR &&
+                                        args[0].slot == slhs.slot && mir_empty_is(slhs.slot) == 1) {
+                                        pre_a_slot = slhs.slot;
+                                        pre_a_ty = slhs.inferred_type;
+                                    }
+                                }
+                                if (srhs.kind == EXPR_BINARY && srhs.op == BIN_ADD) {
+                                    let rchildren = srhs.children;
+                                    if (len(rchildren) == 2 && rchildren[0].kind == EXPR_VAR &&
+                                        rchildren[0].slot == slhs.slot && slhs.slot == i_slot &&
+                                        rchildren[1].kind == EXPR_INT && rchildren[1].intval == 1) {
+                                        found_inc = 1;
+                                    }
+                                }
+                            }
+                        }
+                        bi = bi + 1;
+                    }
+                    if (pre_a_slot >= 0 && found_inc == 1) {
+                        pre_bound = c1;
+                    }
+                }
+            }
+        }
+        if (pre_a_slot >= 0 && (pre_bound as any) != 0) {
+            // 预分配：a = shadow_array_prealloc(elem_size, n)
+            let es = 8;
+            if ((pre_a_ty as any) != 0 && (pre_a_ty.elem_type as any) != 0) {
+                let ek = pre_a_ty.elem_type.kind;
+                if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT ||
+                    ek == TYPE_BOOL || ek == TYPE_ENUM || ek == TYPE_DATE) { es = 4; }
+            }
+            let es_reg = mir_new_reg();
+            let es_inst = mir_mk(MIR_CONST_INT);
+            es_inst.dst = es_reg;
+            es_inst.longval = es;
+            es_inst.ty = mk_type(TYPE_INT);
+            mir_emit(es_inst);
+            let n_reg = mir_lower_expr(pre_bound);
+            let r = mir_new_reg();
+            let call = mir_mk(MIR_CALL);
+            call.dst = r;
+            call.strval = "shadow_array_prealloc";
+            call.args = [es_reg, n_reg];
+            call.ty = pre_a_ty;
+            mir_emit(call);
+            let st = mir_mk(MIR_STORE_VAR);
+            st.arg1 = r;
+            st.arg2 = pre_a_slot;
+            st.ty = pre_a_ty;
+            mir_emit(st);
+            mir_empty_set(pre_a_slot, 0);
+        }
         // 循环入口：体内别名操作会让变量在下一次迭代被共享，清除所有权禁用就地追加
         mir_clear_loop_aliases(h.body);
         let cond_label = mir_new_label();
@@ -1449,6 +1551,12 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         let rhs_h = h.rhs;
 
         if (lhs.kind == EXPR_VAR) {
+            // 空数组字面量 [] → 标记空（供填充循环预分配检测）；其他写入清 0
+            if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_ARRAY_LIT && len(rhs_h.children) == 0) {
+                mir_empty_set(lhs.slot, 1);
+            } else {
+                mir_empty_set(lhs.slot, 0);
+            }
             // 就地追加优化：a = a + b（静态 string 类型）→ shadow_string_concat_inplace(a, b)。
             // 复用 a 的缓冲，避免热循环里每次拼接都分配新缓冲 + 全量复制（str_reverse 等）。
             // 仅当 RHS 是 a + b 且 a 与 LHS 同变量、类型为 string、且 a 唯一持有其缓冲
@@ -1462,9 +1570,10 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                     let rr = rchildren[1];
                     if (rl.kind == EXPR_VAR && rl.slot == lhs.slot && mir_owned_is(lhs.slot) == 1) {
                         // 单字符追加优化：a = a + s[i]（s 为 string）→
-                        // a = shadow_string_concat_char_fast(a, shadow_string_char_at(s, i))。
+                        // a = shadow_string_concat_char_at(a, s, i)。
                         // 消除 s[i] 每次分配 1 字符字符串（str_reverse 91% 分配来自此）；
-                        // fast 版本单次 C 调用完成 strlen+cap 判断+写字节（省 4 次 extern）。
+                        // 单次 C 调用完成"读源字符 + strlen/cap 判断 + 写字节"，
+                        // 消除原 char_at + concat_char_fast 每轮 2 次调用 → 1 次。
                         if (rr.kind == EXPR_INDEX && len(rr.children) == 2) {
                             let rbase = rr.children[0];
                             if ((rbase as any) != 0 && (rbase.inferred_type as any) != 0 &&
@@ -1472,22 +1581,15 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                                 let ra = mir_lower_expr(rl);
                                 let rs = mir_lower_expr(rbase);
                                 let ri = mir_lower_expr(rr.children[1]);
-                                let rc1 = mir_new_reg();
-                                let call1 = mir_mk(MIR_CALL);
-                                call1.dst = rc1;
-                                call1.strval = "shadow_string_char_at";
-                                call1.args = [rs, ri];
-                                call1.ty = mk_type(TYPE_INT);
-                                mir_emit(call1);
-                                let rc2 = mir_new_reg();
-                                let call2 = mir_mk(MIR_CALL);
-                                call2.dst = rc2;
-                                call2.strval = "shadow_string_concat_char_fast";
-                                call2.args = [ra, rc1];
-                                call2.ty = lty;
-                                mir_emit(call2);
+                                let rc = mir_new_reg();
+                                let call = mir_mk(MIR_CALL);
+                                call.dst = rc;
+                                call.strval = "shadow_string_concat_char_at";
+                                call.args = [ra, rs, ri];
+                                call.ty = lty;
+                                mir_emit(call);
                                 let st = mir_mk(MIR_STORE_VAR);
-                                st.arg1 = rc2;
+                                st.arg1 = rc;
                                 st.arg2 = lhs.slot;
                                 st.ty = lty;
                                 st.strval = lhs.str1;
@@ -1544,6 +1646,10 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
 
         if (lhs.kind == EXPR_INDEX) {
             let lhs_children = lhs.children;
+            // a[i] = v 写入数组缓冲：清空 a 的空标记（保守，防预分配误判）
+            if (len(lhs_children) > 0 && lhs_children[0].kind == EXPR_VAR) {
+                mir_empty_set(lhs_children[0].slot, 0);
+            }
             let arr_reg = mir_lower_expr(lhs_children[0]);
             let idx_reg = mir_lower_expr(lhs_children[1]);
             let rhs_reg = -1;
@@ -2018,6 +2124,12 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
     while (oi < mir_n_slots) {
         mir_owned = array_push(mir_owned, 0);
         oi = oi + 1;
+    }
+    mir_slot_empty = [];
+    let ei = 0;
+    while (ei < mir_n_slots) {
+        mir_slot_empty = array_push(mir_slot_empty, 0);
+        ei = ei + 1;
     }
 
     let body = hf.body;
