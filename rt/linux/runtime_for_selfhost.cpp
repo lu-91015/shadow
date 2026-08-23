@@ -3587,7 +3587,10 @@ struct ThreadGCState {
     // 注册为精确根（n 个指针槽）。collect 扫描这些槽 —— 这是「跨安全点指针
     // 已 spill 到 shadow frame」这一编译器保证的运行时兑现：自动 GC 在任意
     // alloc 安全点触发时，帧内活指针都被覆盖，未扎根临时量不会误回收。
-    std::vector<std::vector<std::pair<void*, uint32_t>>> range_frames;  // LIFO per frame
+    // range_markers 记录每帧入口时 range_roots 的长度快照：帧严格 LIFO 且每帧
+    // 恰好一个 range（函数入口注册 shadow frame），frame_leave 直接 resize 回退，
+    // 免去旧实现的 O(n) 线性扫描删除（深递归 quicksort 的 O(n²) 开销来源）。
+    std::vector<size_t> range_markers;               // per-frame range_roots length snapshot
     std::vector<std::pair<void*, uint32_t>> range_roots;                // flattened for scan
     // 协作式 STW 状态（对齐 Windows rt_gc.o 的 rt_gc_thread.gc_state）：
     //   0 = free-running（mutator，可能在任意点）
@@ -3896,7 +3899,10 @@ static void gc_stw_begin() {
         int all = 1;
         for (ThreadGCState* s : g_gc_thread_states) {
             if (s == me) continue;
-            if (s->stw_state.load(std::memory_order_relaxed) == 0) { all = 0; break; }
+            // acquire：与 mutator 在 poll 的 stw_state=1 release store 配对，
+            // 建立「mutator 快路径根修改 → collect 扫根」的 happens-before 链
+            // （无锁快路径依赖此序，见 shadow_gc_frame_enter 注释）。
+            if (s->stw_state.load(std::memory_order_acquire) == 0) { all = 0; break; }
         }
         if (all) break;
         std::this_thread::yield();
@@ -4789,15 +4795,36 @@ extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size) {
 // ── Root management (LIFO frame discipline) ──
 // These are called from generated IR; signatures use int32_t to match the
 // codegen's i32 convention. The frame marker is a root-count snapshot.
+//
+// 无锁快路径：GC 收集只在安全点（poll/alloc）同步发生，STW 协议（gc_stw_begin）
+// 保证 collect 扫根前所有其它线程已到达安全点（stw_state!=0）且不再改根——因此
+// g_gc_running==0（无收集在途）时根容器只被本线程访问，可跳过 s->mtx 互斥锁；
+// collect 在途时回退持锁慢路径。可见性由 stw_state 的 release/acquire 对保证：
+// mutator 的根修改 → poll 置 stw_state=1（release）→ gc_stw_begin 读 1（acquire）
+// → collect 扫根。基准（quicksort 等）GC 收集次数为 0，此快路径消除每函数
+// 4 次互斥锁（frame_enter/root_range/root_set/frame_leave）的纯开销。
+static inline bool gc_root_lock_free() {
+    return g_gc_running.load(std::memory_order_relaxed) == 0;
+}
+
 extern "C" int32_t shadow_gc_frame_enter() {
     ThreadGCState* s = gc_get_thread_state();
+    if (gc_root_lock_free()) {
+        s->named_frames.push_back({});
+        s->range_markers.push_back(s->range_roots.size());
+        return (int32_t)s->roots.size();
+    }
     std::lock_guard<std::mutex> lk(s->mtx);
     s->named_frames.push_back({});
-    s->range_frames.push_back({});
+    s->range_markers.push_back(s->range_roots.size());
     return (int32_t)s->roots.size();
 }
 extern "C" int32_t shadow_gc_root_add(void* ptr) {
     ThreadGCState* s = gc_get_thread_state();
+    if (gc_root_lock_free()) {
+        s->roots.push_back(ptr);
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(s->mtx);
     s->roots.push_back(ptr);
     return 0;
@@ -4809,6 +4836,18 @@ extern "C" int32_t shadow_gc_root_add(void* ptr) {
 extern "C" int32_t shadow_gc_root_set(void* slot, void* val) {
     if (!slot) return 0;
     ThreadGCState* s = gc_get_thread_state();
+    if (gc_root_lock_free()) {
+        auto it = s->named_roots.find(slot);
+        if (it == s->named_roots.end() && !s->named_frames.empty()) {
+            s->named_frames.back().push_back(slot);
+        }
+        if (val) {
+            s->named_roots[slot] = val;
+        } else {
+            s->named_roots.erase(slot);
+        }
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(s->mtx);
     auto it = s->named_roots.find(slot);
     if (it == s->named_roots.end() && !s->named_frames.empty()) {
@@ -4824,6 +4863,28 @@ extern "C" int32_t shadow_gc_root_set(void* slot, void* val) {
 extern "C" int32_t shadow_gc_frame_leave(int32_t marker) {
     if (marker < 0) return 0;
     ThreadGCState* s = gc_get_thread_state();
+    if (gc_root_lock_free()) {
+        size_t m = (size_t)marker;
+        if (m <= s->roots.size()) {
+            s->roots.resize(m);
+        }
+        // Drop every replace-semantics root registered in this frame; the slot
+        // addresses are about to become invalid as the frame's stack unwinds.
+        if (!s->named_frames.empty()) {
+            for (void* slot : s->named_frames.back()) {
+                s->named_roots.erase(slot);
+            }
+            s->named_frames.pop_back();
+        }
+        // Drop this frame's shadow-frame range root：帧 LIFO，直接 resize 回退到
+        // 帧入口快照（range_markers），免线性扫描（对齐 Windows rt_gc.o 的
+        // frame discipline：ranges 是 LIFO，由 frame_leave 弹出）。
+        if (!s->range_markers.empty()) {
+            s->range_roots.resize(s->range_markers.back());
+            s->range_markers.pop_back();
+        }
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(s->mtx);
     size_t m = (size_t)marker;
     if (m <= s->roots.size()) {
@@ -4839,19 +4900,9 @@ extern "C" int32_t shadow_gc_frame_leave(int32_t marker) {
     }
     // Drop this frame's shadow-frame range roots (aligned with Windows
     // rt_gc.o's frame discipline: ranges are LIFO, popped by frame_leave).
-    if (!s->range_frames.empty()) {
-        auto& fr = s->range_frames.back();
-        // Remove the frame's ranges from the flattened scan list.
-        for (auto& rg : fr) {
-            for (size_t i = 0; i < s->range_roots.size(); i++) {
-                if (s->range_roots[i] == rg) {
-                    s->range_roots[i] = s->range_roots.back();
-                    s->range_roots.pop_back();
-                    break;
-                }
-            }
-        }
-        s->range_frames.pop_back();
+    if (!s->range_markers.empty()) {
+        s->range_roots.resize(s->range_markers.back());
+        s->range_markers.pop_back();
     }
     return 0;
 }
@@ -4866,8 +4917,11 @@ extern "C" int32_t shadow_gc_frame_leave(int32_t marker) {
 extern "C" int32_t shadow_gc_root_range(void* base, uint32_t n) {
     if (!base || n == 0) return 0;
     ThreadGCState* s = gc_get_thread_state();
+    if (gc_root_lock_free()) {
+        s->range_roots.push_back({base, n});
+        return 0;
+    }
     std::lock_guard<std::mutex> lk(s->mtx);
-    s->range_frames.back().push_back({base, n});
     s->range_roots.push_back({base, n});
     return 0;
 }
