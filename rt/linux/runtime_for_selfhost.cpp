@@ -3541,7 +3541,10 @@ static std::atomic<int> g_gc_stw_req{0};
 static std::atomic<int> g_gc_stw_active{0};
 // 单 poll 标志：STW 请求或 alloc 触发时置 1，poll 快路径只查它（sum_loop 等
 // 无分配热循环免去每次 6+ 次原子/普通加载）。慢路径清 0 后做完整 STW/触发检查。
-static std::atomic<int> g_gc_poll_flag{0};
+// 非 static + extern "C"：codegen 内联轮询以 volatile i32 直接加载本全局（快路径零函数调用）。
+// extern "C" 保证 MSVC ABI 下符号不 mangle（Linux 全局变量本就不 mangle），
+// 否则 lld-link 找不到未修饰的 g_gc_poll_flag 引用。
+extern "C" std::atomic<int> g_gc_poll_flag{0};
 static int rt_gc_auto_on(void) {
     if (g_gc_auto < 0) {
         const char* e = getenv("SHADOW_GC_AUTO");

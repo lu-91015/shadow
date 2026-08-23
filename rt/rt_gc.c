@@ -1010,6 +1010,9 @@ static void gc_scan_thread_suspended(rt_gc_thread* th) {
  * ============================================================ */
 static volatile LONG g_stw_req = 0;     /* 1 = 请求各线程到达安全点 */
 static volatile LONG g_stw_active = 0;  /* 1 = 扫根窗口进行中 */
+/* 内联轮询标志：codegen 在安全点以 volatile i32 直接加载本全局（快路径零函数调用），
+ * 置位时才调用 shadow_gc_poll 慢路径。STW 期间置 1，放行后清 0（对齐 Linux g_gc_poll_flag）。 */
+volatile LONG g_gc_poll_flag = 0;
 
 /* 编译器在每个安全点插入的协作检查（对标 Go preemptible 的栈增长检查点） */
 extern void shadow_gc_poll(void) {
@@ -1047,6 +1050,7 @@ static void gc_stw_begin(void) {
      * 本函数在 g_gc_lock 内被调用，reserve 无并发。 */
     gc_wl_reserve(g_objs_len + 64);
     InterlockedExchange(&g_stw_req, 1);
+    InterlockedExchange(&g_gc_poll_flag, 1);  /* 通知各线程内联 poll 进入慢路径 */
     /* 等待循环用**无锁快速扫描**（性能：STRESS 高频周期下每次等 8 个线程到
      * poll，持锁遍历会成为热点）。安全性论证：
      *   · g_threads_len 单调不减（attach 只增槽、detach 复用空槽不缩减），
@@ -1073,6 +1077,7 @@ static void gc_stw_begin(void) {
 
 static void gc_stw_end(void) {
     InterlockedExchange(&g_stw_active, 0);
+    InterlockedExchange(&g_gc_poll_flag, 0);  /* 放行：内联 poll 恢复快路径 */
 }
 
 /* ============================================================
