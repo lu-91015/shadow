@@ -1,0 +1,22 @@
+//@mode: exe
+//@desc: 嵌套未注解空数组回填 — let a=[] 后 a=array_push(a, rowa)（rowa 已回填为 array<int>）
+//       应推断为 array<array<int>>，a[i][j] 走直接 GEP。
+//@expect: 10\n20\n10\n20
+dsb ex_array_push_infer_nested;
+
+kimo main() -> int {
+    let a = [];
+    let i = 0;
+    while (i < 2) {
+        let rowa = [];
+        rowa = array_push(rowa, 10);
+        rowa = array_push(rowa, 20);
+        a = array_push(a, rowa);
+        i = i + 1;
+    }
+    println(a[0][0]);
+    println(a[0][1]);
+    println(a[1][0]);
+    println(a[1][1]);
+    return 0;
+}

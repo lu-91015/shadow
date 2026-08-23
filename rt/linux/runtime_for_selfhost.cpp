@@ -3416,6 +3416,48 @@ static std::atomic<int32_t> g_mutator_threads{0};
 // 前向声明：g_heap_bytes 定义在下方（GC 触发状态小节），flush 需要它记账。
 extern std::atomic<int64_t> g_heap_bytes;
 
+// ── 大小类空闲链表分配器（Linux 单 mutator 优化）──
+// 清扫把死对象按大小类压入空闲链表（免 free()），分配从链表弹出（免 malloc）。
+// 对象数据前 16 字节存 FLNode（next + size）：size 用于弹出时校验 ≥ 请求，
+// 避免同类的较小对象被较大请求复用（类区间是 2 的幂开区间，同类可含多个
+// 8 对齐尺寸）。仅 16B..64KB 的对象走链表（<16B 无节点空间、>64KB 大对象
+// 直接 free/malloc），且仅 g_mutator_threads<=1 时启用（与攒批快路径同门控）。
+#define FL_NUM_CLASS 14           // 8,16,...,65536
+struct FLNode { FLNode* next; int32_t size; };
+static void* g_fl_head[FL_NUM_CLASS] = {0};
+
+static int fl_class_of(int32_t asize) {
+    int c = 0;
+    int32_t s = 8;
+    while (s < asize && c < FL_NUM_CLASS - 1) { s <<= 1; c++; }
+    return c;
+}
+
+static bool fl_enabled() {
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("SHADOW_GC_NO_FL") ? 1 : 0;
+    return disabled == 0;
+}
+
+static void fl_push(void* p, int32_t msize) {
+    FLNode* n = (FLNode*)p;
+    int c = fl_class_of(msize);
+    n->next = (FLNode*)g_fl_head[c];
+    n->size = msize;
+    g_fl_head[c] = n;
+}
+
+static void* fl_pop(int32_t asize) {
+    int c = fl_class_of(asize);
+    FLNode** pp = (FLNode**)&g_fl_head[c];
+    while (*pp) {
+        FLNode* n = *pp;
+        if (n->size >= asize) { *pp = n->next; return n; }
+        pp = &n->next;
+    }
+    return nullptr;
+}
+
 // 锁内：把攒批的 pending 全部登记进 g_gc_meta（调用者必须已持 g_gc_mutex）。
 static void gc_flush_pending_locked() {
     for (int i = 0; i < g_pend_n; i++) {
@@ -4280,9 +4322,13 @@ static int64_t gc_sweep_dead(bool is_minor) {
             fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%lld gen=%u\n",
                     (long long)g_gc_collect_count, obj, m->kind, (long long)m->size, m->gen);
         if (m->kind == 0) g_diag_kind0++;
-        // 先读 req 再 erase：erase 会把 meta 清零，之后 m->req 恒为 0，
-        // 导致 g_heap_bytes 从不递减 → heap 永远 ≥ trigger → GC 每 poll 触发（GC 风暴）。
+        // 先读 req/size/kind/owned 再 erase：erase 会把 meta 清零，之后
+        // m->req 恒为 0 → g_heap_bytes 从不递减 → GC 风暴；m->size 恒为 0
+        // → 空闲链表永不压入（fl_push=0）。
         int64_t mreq = m->req > 0 ? m->req : 0;
+        int64_t msize = m->size;
+        int32_t mkind = m->kind;
+        int32_t mowned = m->owned;
         g_gc_meta.erase_entry(m);
         g_heap_bytes.fetch_sub(mreq, std::memory_order_relaxed);
         // Clear from remembered set if present。major GC 结束时整体 clear（全量重标
@@ -4297,10 +4343,13 @@ static int64_t gc_sweep_dead(bool is_minor) {
         //   kind==1：RFS ShadowArray（new + register）→ delete
         //   kind==3 && !owned：RFS AnyBox（new + register）→ delete
         //   其它（用户产物全部 alloc：C 布局数组/结构体/closure/box/字符串）→ free
-        if (m->kind == 1) {
+        //   单 mutator 时后者改走空闲链表复用（免 free/malloc 往返）。
+        if (mkind == 1) {
             delete reinterpret_cast<ShadowArray*>(obj);
-        } else if (m->kind == 3 && !m->owned) {
+        } else if (mkind == 3 && !mowned) {
             delete reinterpret_cast<AnyBox*>(obj);
+        } else if (msize >= 16 && msize <= 65536 && fl_enabled() && g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
+            fl_push(obj, (int32_t)msize);
         } else {
             free(obj);
         }
@@ -4653,8 +4702,16 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             shadow_gc_collect();
         }
     }
-    void* p = malloc((size_t)asize);
-    if (!p) return nullptr;
+    // 空闲链表快路径：单 mutator 时优先复用已死对象（免 malloc）。
+    void* p = nullptr;
+    if (fl_enabled() && asize >= 16 && asize <= 65536 &&
+        g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
+        p = fl_pop(asize);
+    }
+    if (!p) {
+        p = malloc((size_t)asize);
+        if (!p) return nullptr;
+    }
     // 攒批快路径：单 mutator + GC 关闭 + 缓冲未满 → 无锁无哈希，登记推迟到 flush。
     if (g_gc_disabled == 0 && rt_gc_auto_on() &&
         g_mutator_threads.load(std::memory_order_relaxed) <= 1 &&

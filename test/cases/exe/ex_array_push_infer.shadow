@@ -1,0 +1,16 @@
+//@mode: exe
+//@desc: 未注解空数组 array_push 类型回填 — let x = [] 后 x = array_push(x, v) 应推断为 array<int>，
+//       typed push 与直接 GEP 的 elem_size 一致（否则保持 array<TYPE_INFER> → 动态分派）。
+//@expect: 1\n2\n3
+dsb ex_array_push_infer;
+
+kimo main() -> int {
+    let a = [];
+    a = array_push(a, 1);
+    a = array_push(a, 2);
+    a = array_push(a, 3);
+    println(a[0]);
+    println(a[1]);
+    println(a[2]);
+    return 0;
+}

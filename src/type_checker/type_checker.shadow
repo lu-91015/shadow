@@ -3984,12 +3984,32 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
             let a0 = args[0] as Expr;
             let vt = args[1].inferred_type;
             if ((vt as any) != 0 && vt.kind != TYPE_INFER) {
-                if (a0.kind == EXPR_ARRAY_LIT) {
-                    let a0t = a0.inferred_type;
-                    if ((a0t as any) != 0 && a0t.kind == TYPE_ARRAY) {
-                        let et = a0t.elem_type;
-                        if ((et as any) == 0 || et.kind == TYPE_INFER) {
-                            a0t.elem_type = vt;
+                // 数组值须元素类型已具体（array<int>）才回填；array<TYPE_INFER>（如 [] 嵌套）
+                // 跳过，保持动态数组语义（ex_dyn_elem_print / ex_nested_arr_readback）。
+                let vt_ok = 1;
+                if (vt.kind == TYPE_ARRAY) {
+                    let vte = vt.elem_type;
+                    if ((vte as any) != 0 && vte.kind == TYPE_INFER) { vt_ok = 0; }
+                }
+                if (vt_ok == 1) {
+                    if (a0.kind == EXPR_ARRAY_LIT) {
+                        let a0t = a0.inferred_type;
+                        if ((a0t as any) != 0 && a0t.kind == TYPE_ARRAY) {
+                            let et = a0t.elem_type;
+                            if ((et as any) == 0 || et.kind == TYPE_INFER) {
+                                a0t.elem_type = vt;
+                            }
+                        }
+                    } else if (a0.kind == EXPR_VAR) {
+                        // let x = [] 后 x = array_push(x, v)：回填变量数组元素类型（原地改
+                        // 引用，env 与 a0.inferred_type 同对象），使后续 x[i] 走直接 GEP /
+                        // typed push（否则保持 array<TYPE_INFER> → 动态分派，matmul 慢 2x）。
+                        let vty = tc_env_get(env, a0.str1);
+                        if ((vty as any) != 0 && vty.kind == TYPE_ARRAY) {
+                            let vet = vty.elem_type;
+                            if ((vet as any) == 0 || vet.kind == TYPE_INFER) {
+                                vty.elem_type = vt;
+                            }
                         }
                     }
                 }
