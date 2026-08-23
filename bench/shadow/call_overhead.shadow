@@ -1,0 +1,14 @@
+// 隔离测试：同一循环结构调用简单 C 函数 rt_strlen，测量 shadow 侧调用开销
+dsb call_overhead;
+
+kimo main() -> int {
+    let s = "the quick brown fox jumps over the lazy dog";
+    let total = 0;
+    let i = 0;
+    while (i < 300000) {
+        total = total + rt_strlen(s);
+        i = i + 1;
+    }
+    println(total);
+    return 0;
+}

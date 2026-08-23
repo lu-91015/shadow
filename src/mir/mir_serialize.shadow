@@ -24,7 +24,7 @@ import core.utils;
 
 let MIR_SER_MAGIC0: int = 76;   // 'L'
 let MIR_SER_MAGIC1: int = 85;   // 'U'
-let MIR_SER_VERSION: int = 9;   // v9：函数级增量缓存（Phase 11）——拒绝旧 v8 缓存（格式有细微差异，避免错读）
+let MIR_SER_VERSION: int = 10;   // v10：MirFunc 序列化增加 is_nogc 字段（@nogc 免 GC 帧）——拒绝旧 v9 缓存
 let MIR_SER_BUF_SIZE: int = 4194304;  // 4MB 初始 buffer（不足时自动按精确尺寸重分配）
 
 let mir_ser_buf: any = 0 as any;
@@ -398,6 +398,7 @@ pub kimo mir_ser_write_func(buf: any, off: int, mf: MirFunc) -> int {
     off = leb_enc_uint(buf, off, mf.return_type_kind);
     off = leb_enc_uint(buf, off, mf.n_regs);
     off = leb_enc_uint(buf, off, mf.n_slots);
+    mir_ser_put(buf, off, mf.is_nogc); off = off + 1;
     let params = mf.params;
     let n_params = len(params);
     off = leb_enc_uint(buf, off, n_params);
@@ -449,6 +450,8 @@ pub kimo mir_ser_read_func(buf: any, off: int) -> MirFunc {
     let n_regs = mir_ser_val;
     leb_dec_uint(buf, off); off = mir_ser_off;
     let n_slots = mir_ser_val;
+    let is_nogc = rt_get_byte(buf, off);
+    off = off + 1;
     leb_dec_uint(buf, off); off = mir_ser_off;
     let n_params = mir_ser_val;
     let params: array<MirParam> = [];
@@ -491,7 +494,7 @@ pub kimo mir_ser_read_func(buf: any, off: int) -> MirFunc {
     mir_ser_off = off;
     let mf = MirFunc { name: name, params: params, return_type_kind: return_type_kind,
                        blocks: blocks, n_regs: n_regs, n_slots: n_slots,
-                       extern_name: extern_name };
+                       extern_name: extern_name, is_nogc: is_nogc };
     return mf;
 }
 

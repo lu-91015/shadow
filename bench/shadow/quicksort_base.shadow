@@ -1,8 +1,7 @@
-// 基准测试：快速排序（静态类型数组访问 + 递归 + 比较）
-// qs/qs_partition 不分配、不触发 GC：@nogc 免 GC 帧/根集/安全点，消除递归帧开销。
-dsb quicksort;
+// 基准测试：快速排序（静态类型数组访问 + 递归 + 比较）— 无 @nogc 基线
+dsb quicksort_base;
 
-@nogc kimo qs_partition(a: array<int>, lo: int, hi: int) -> int {
+kimo qs_partition(a: array<int>, lo: int, hi: int) -> int {
     let pivot = a[hi];
     let i = lo - 1;
     let j = lo;
@@ -21,7 +20,7 @@ dsb quicksort;
     return i + 1;
 }
 
-@nogc kimo qs(a: array<int>, lo: int, hi: int) -> void {
+kimo qs(a: array<int>, lo: int, hi: int) -> void {
     if (lo < hi) {
         let p = qs_partition(a, lo, hi);
         qs(a, lo, p - 1);

@@ -1,0 +1,11 @@
+// 最小 @nogc 测试
+dsb t_nogc_min;
+
+@nogc kimo add(a: int, b: int) -> int {
+    return a + b;
+}
+
+kimo main() -> int {
+    println(add(3, 4));
+    return 0;
+}

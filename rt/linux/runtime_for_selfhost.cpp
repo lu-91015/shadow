@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <emmintrin.h>
 #include <atomic>
 #include <cstdarg>
 #include <variant>
@@ -3775,17 +3776,48 @@ extern "C" void* shadow_string_concat_char_at(void* s1, const char* s, int32_t i
 // 快速路径字符串查找：单次 C 调用完成朴素匹配，消除 shadow 层 shadow_index_of
 // 逐字节 rt_get_byte 的 extern 调用开销（string_find 热循环 48M 次调用 → 300K 次）。
 // 语义与 runtime_lib.shadow 的 shadow_index_of 完全一致（返回首次出现位置，无则 -1）。
+// 优化：SSE2 16 字节并行定位首字节（对标 Go strings.Index 的 SIMD 首字节扫描），
+// 同一遍同时检测空终止符——首字节扫描与 strlen 合并为单遍，消除独立 strlen(sp)
+// 的第二次全串扫描；命中后再逐字节验证剩余 needle。
+// 空终止符充当天然边界：末字节检查读到的 0 永不等于非空 needle 末字节，
+// 中间逐字节检查也会在越界处被 0 截断，故不会产生越界假匹配。
+static inline int32_t find_byte_sse2_nul(const char* s, char c) {
+    const __m128i target = _mm_set1_epi8(c);
+    const __m128i nul = _mm_setzero_si128();
+    int32_t i = 0;
+    for (;;) {
+        __m128i chunk = _mm_loadu_si128((const __m128i*)(s + i));
+        int32_t mask = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, target));
+        int32_t nmask = (int32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, nul));
+        if (nmask != 0) {
+            int32_t lim = __builtin_ctz((unsigned)nmask);
+            int32_t m = mask & ((1u << lim) - 1);
+            return m ? i + __builtin_ctz((unsigned)m) : -1;
+        }
+        if (mask != 0) return i + __builtin_ctz((unsigned)mask);
+        i += 16;
+    }
+}
+
 extern "C" int32_t shadow_index_of_fast(void* s, void* needle) {
     const char* sp = (const char*)s;
     const char* np = (const char*)needle;
-    int32_t sl = (int32_t)strlen(sp);
     int32_t nl = (int32_t)strlen(np);
     if (nl == 0) return 0;
-    int32_t limit = sl - nl;
-    for (int32_t i = 0; i <= limit; i++) {
-        int32_t j = 0;
-        while (j < nl && sp[i + j] == np[j]) j++;
-        if (j == nl) return i;
+    if (nl == 1) return find_byte_sse2_nul(sp, np[0]);
+    char first = np[0];
+    char last = np[nl - 1];
+    int32_t i = 0;
+    for (;;) {
+        int32_t pos = find_byte_sse2_nul(sp + i, first);
+        if (pos < 0) return -1;
+        pos += i;
+        if (sp[pos + nl - 1] == last) {
+            int32_t j = 1;
+            while (j < nl - 1 && sp[pos + j] == np[j]) j++;
+            if (j == nl - 1) return pos;
+        }
+        i = pos + 1;
     }
     return -1;
 }

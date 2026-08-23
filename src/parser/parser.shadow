@@ -225,8 +225,8 @@ pub kimo parse_expr() -> Expr { return ps_finish_expr(parse_expr_inner()); }
 pub kimo parse_statement() -> Stmt { return ps_finish_stmt(parse_statement_inner()); }
 
 // 函数定义区间覆盖 `kimo name(...) -> T { ... }` 整体
-pub kimo parse_function(is_pub: int, extern_name: string) -> FuncDef {
-    let fd = parse_function_inner(is_pub, extern_name);
+pub kimo parse_function(is_pub: int, extern_name: string, is_nogc: int) -> FuncDef {
+    let fd = parse_function_inner(is_pub, extern_name, is_nogc);
     if (loc_is_point(fd.loc) == 1) {
         let el = ps_prev_end_line();
         let ec = ps_prev_end_col();
@@ -2573,6 +2573,7 @@ pub kimo parse_closure_expr(loc: Location) -> Expr {
         type_params: [],
         is_async: 0,
         is_macro: 0,
+        is_nogc: 0,
     };
     // 闭包 body 是语句块，包装为 STMT_BLOCK 存入
     let blk = mk_stmt(STMT_BLOCK, loc);
@@ -2602,7 +2603,7 @@ pub kimo ps_type_const_name(t: Type) -> string {
 }
 
 // ============ 函数解析 ============
-pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
+pub kimo parse_function_inner(is_pub: int, extern_name: string, is_nogc: int) -> FuncDef {
     let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
     ps_expect(TOK_KIMO, "kimo");
     let name = ps_cur_text();
@@ -2682,6 +2683,7 @@ pub kimo parse_function_inner(is_pub: int, extern_name: string) -> FuncDef {
         type_params: type_params,
         is_async: 0,
         is_macro: 0,
+        is_nogc: is_nogc,
     };
     return fd;
 }
@@ -2839,6 +2841,7 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
                 type_params: [],
                 is_async: 0,
                 is_macro: 0,
+                is_nogc: 0,
             };
             methods = array_push(methods, m);
         } else {
@@ -2938,6 +2941,7 @@ kimo parser_make_anno_init(mod: string) -> FuncDef {
         type_params: [],
         is_async: 0,
         is_macro: 0,
+        is_nogc: 0,
     };
     return fd;
 }
@@ -2995,9 +2999,10 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
         let is_pub = 0;
         if (ps_at(TOK_PUB) == 1) { ps_adv(); is_pub = 1; }
 
-        // @ 注解：@extern("c_name") 走特判（设 extern_name）；其余 @Name / @Name("a","b")
-        // 收进 parser_pending_annos，待下一函数解析后 flush 进 parser_annos。
+        // @ 注解：@extern("c_name") 走特判（设 extern_name）；@nogc 走特判（设 is_nogc）；
+        // 其余 @Name / @Name("a","b") 收进 parser_pending_annos，待下一函数解析后 flush 进 parser_annos。
         let extern_name = "";
+        let is_nogc = 0;
         while (ps_at(TOK_AT) == 1) {
             ps_adv();
             let anno_name = ps_cur_text();
@@ -3007,6 +3012,10 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 extern_name = ps_cur_text();
                 ps_expect(TOK_STRING_LIT, "string");
                 ps_expect(TOK_RPAREN, ")");
+            } else if (anno_name == "nogc") {
+                // @nogc：函数免 GC 帧 + 免安全点（不分配、指针由调用方保活）。编译期属性，
+                // 不进 parser_annos（无运行时注册），由 FuncDef.is_nogc 传给 codegen。
+                is_nogc = 1;
             } else {
                 // 通用注解：可选 ("a","b") 参数（仅字符串字面量，逗号分隔）
                 let aargs: array<string> = [];
@@ -3053,7 +3062,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
         }
 
         if (ps_at(TOK_KIMO) == 1) {
-            let fd = parse_function(is_pub, extern_name);
+            let fd = parse_function(is_pub, extern_name, is_nogc);
             fd.is_async = 0;
             functions = array_push(functions, fd);
             parser_flush_annos(fd.name);
@@ -3063,7 +3072,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
         // async kimo foo(...)
         if (ps_at(TOK_ASYNC) == 1) {
             ps_adv();
-            let fd = parse_function(is_pub, extern_name);
+            let fd = parse_function(is_pub, extern_name, is_nogc);
             fd.is_async = 1;
             functions = array_push(functions, fd);
             parser_flush_annos(fd.name);
@@ -3176,7 +3185,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                     let impl_pub = 0;
                     if (ps_at(TOK_PUB) == 1) { ps_adv(); impl_pub = 1; }
                     if (ps_at(TOK_KIMO) == 1) {
-                        let m = parse_function(impl_pub, "");
+                        let m = parse_function(impl_pub, "", 0);
                         // mangle 副本进 functions
                         let mc = FuncDef {
                             name: mangle_prefix + m.name,
@@ -3190,6 +3199,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                             type_params: m.type_params,
                             is_async: 0,
                             is_macro: 0,
+                            is_nogc: m.is_nogc,
                         };
                         functions = array_push(functions, mc);
                         impl_methods = array_push(impl_methods, m);
@@ -3209,7 +3219,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 let impl_pub = 0;
                 if (ps_at(TOK_PUB) == 1) { ps_adv(); impl_pub = 1; }
                 if (ps_at(TOK_KIMO) == 1) {
-                    let m = parse_function(impl_pub, "");
+                    let m = parse_function(impl_pub, "", 0);
                     functions = array_push(functions, m);
                     inh_methods = array_push(inh_methods, m);
                 } else {
@@ -3284,6 +3294,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 type_params: [],
                 is_async: 0,
                 is_macro: 1,
+                is_nogc: 0,
             };
             let mblk = mk_stmt(STMT_BLOCK, mfunc.loc);
             mblk.items = mbody_arr;

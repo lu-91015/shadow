@@ -2164,7 +2164,8 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
         blocks: mir_blocks,
         n_regs: mir_n_regs,
         n_slots: hf.n_slots,
-        extern_name: hf.extern_name
+        extern_name: hf.extern_name,
+        is_nogc: hf.is_nogc
     };
     return mf;
 }

@@ -1257,9 +1257,10 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
     }
 
     if (op == MIR_BR) {
-        // §5.2.4 协作式安全点：循环回边插 poll（目标块序 < 当前块序 = 回跳）
+        // §5.2.4 协作式安全点：循环回边插 poll（目标块序 < 当前块序 = 回跳）。
+        // 免帧函数（@nogc 或无可保活指针）无根可保护，跳过回边 poll 消除热循环开销。
         let tidx = cg_blk_index(mi.strval);
-        if (tidx >= 0 && tidx < cg_cur_blk_idx) { cg_emit_poll(); }
+        if (cg_gc_frame_active == 1 && tidx >= 0 && tidx < cg_cur_blk_idx) { cg_emit_poll(); }
         let target = cg_find_block(mi.strval);
         llvm_br(cg_builder, target);
         return;
@@ -1269,7 +1270,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         // §5.2.4 协作式安全点：条件回边（then 或 else 任一回跳）插 poll
         let tidx1 = cg_blk_index(mi.strval);
         let tidx2 = cg_blk_index(mi.strval2);
-        if ((tidx1 >= 0 && tidx1 < cg_cur_blk_idx) || (tidx2 >= 0 && tidx2 < cg_cur_blk_idx)) {
+        if (cg_gc_frame_active == 1 && ((tidx1 >= 0 && tidx1 < cg_cur_blk_idx) || (tidx2 >= 0 && tidx2 < cg_cur_blk_idx))) {
             cg_emit_poll();
         }
         let cond = cg_get_reg(mi.arg1);
@@ -2643,7 +2644,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         if (cg_is_ptr_kind(pp.type_kind) == 1) { frame_needed = 1; }
         pi = pi + 1;
     }
-    if (cg_is_nogc_fn(mf.name) == 1) { frame_needed = 0; }
+    if (mf.is_nogc == 1 || cg_is_nogc_fn(mf.name) == 1) { frame_needed = 0; }
     cg_gc_frame_active = frame_needed;
     // 内联轮询状态：每函数重置（入口 poll 的 skip 块供 block 0 续接；计数器保证块名确定性）
     cg_poll_skip_bb = 0 as any;

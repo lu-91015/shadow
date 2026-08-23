@@ -1,0 +1,7 @@
+// 空程序：测量 shadow exe 启动开销
+dsb empty_startup;
+
+kimo main() -> int {
+    println(42);
+    return 0;
+}

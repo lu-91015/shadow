@@ -1,0 +1,18 @@
+// 隔离测试2：@nogc 主循环调用 rt_strlen，无 poll/帧存储
+dsb call_overhead_nogc;
+
+@nogc kimo loop(s: string) -> int {
+    let total = 0;
+    let i = 0;
+    while (i < 300000) {
+        total = total + rt_strlen(s);
+        i = i + 1;
+    }
+    return total;
+}
+
+kimo main() -> int {
+    let s = "the quick brown fox jumps over the lazy dog";
+    println(loop(s));
+    return 0;
+}

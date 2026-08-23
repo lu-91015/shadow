@@ -2766,6 +2766,7 @@ pub kimo tc_mono_clone_funcdef(ctx: CompileContext, fd: FuncDef, tparams: array<
         type_params: [],
         is_async: fd.is_async,
         is_macro: fd.is_macro,
+        is_nogc: fd.is_nogc,
     };
     // 返回类型替换后 resolve（泛型 struct 实例 → 特化名）
     let nf_rt = tc_resolve_type(ctx, nf.return_type);

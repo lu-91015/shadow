@@ -102,6 +102,7 @@ pub struct FuncDef {
     type_params: array<TypeParam>;
     is_async: int;
     is_macro: int;
+    is_nogc: int;
 }
 
 // 结构体字段
@@ -332,6 +333,7 @@ pub struct HirFunc {
     body: array<HirStmt>;
     n_slots: int;
     extern_name: string;
+    is_nogc: int;
 }
 
 // ============ MIR（线性指令 + 显式基本块） ============
@@ -361,4 +363,5 @@ pub struct MirFunc {
     n_regs: int;
     n_slots: int;
     extern_name: string;
+    is_nogc: int;
 }

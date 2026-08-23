@@ -1,0 +1,19 @@
+// 基准测试：字符串查找（@nogc 主循环：免帧存储/免 poll，隔离 C 调用成本）
+dsb string_find_nogc;
+
+@nogc kimo loop(s: string, needle: string) -> int {
+    let total = 0;
+    let i = 0;
+    while (i < 300000) {
+        total = total + str_index_of(s, needle);
+        i = i + 1;
+    }
+    return total;
+}
+
+kimo main() -> int {
+    let s = "the quick brown fox jumps over the lazy dog";
+    let needle = "lazy";
+    println(loop(s, needle));
+    return 0;
+}

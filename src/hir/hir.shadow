@@ -545,7 +545,8 @@ pub kimo hir_lower_func(fd: FuncDef) -> HirFunc {
         return_type: fd.return_type,
         body: body_h,
         n_slots: env.counter,
-        extern_name: fd.extern_name
+        extern_name: fd.extern_name,
+        is_nogc: fd.is_nogc
     };
     return hf;
 }
