@@ -657,16 +657,22 @@ pub kimo cg_elem_size(ek: int) -> int {
     return 8;
 }
 
-// 静态类型标量数组直接 GEP+load/store：绕过 shadow_array_get_*/set_* 运行时函数，
+// 静态类型数组直接 GEP+load/store：绕过 shadow_array_get_*/set_* 运行时函数，
 // 消除热循环里每次访问的 elem_size 动态加载、es==4 分支与 __rt_shadow_load_int 调用。
-// 仅当元素类型为固定宽度标量（int/long/double 等）且索引为 int/long 时启用；
-// any/ptr/string/struct 元素仍走运行时函数（需动态 es 与写屏障）。
+// 标量元素（int/long/double 等）与固定 8 字节指针元素（嵌套数组/字符串/结构体等）
+// 均启用；any 元素仍走运行时函数（裸句柄 + 协变赋值可能造成 es 与静态类型不一致）。
+// 仅当索引为 int/long 时启用。指针元素直接 store 需写屏障（由 cg_gen_array_store_direct 补发）。
 pub kimo cg_array_direct_ok(ek: int) -> int {
     if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL || ek == TYPE_ENUM) { return 1; }
     if (ek == TYPE_LONG) { return 1; }
     if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { return 1; }
     if (ek == TYPE_DATE) { return 1; }
     if (ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) { return 1; }
+    // 固定 8 字节指针元素：嵌套数组（array<array<int>>）、字符串、结构体、函数
+    if (ek == TYPE_ARRAY) { return 1; }
+    if (ek == TYPE_STRING) { return 1; }
+    if (ek == TYPE_STRUCT) { return 1; }
+    if (ek == TYPE_FUNCTION) { return 1; }
     return 0;
 }
 
@@ -688,6 +694,7 @@ pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int,
     let slot_ty = llvm_i32(cg_ctx);
     if (es == 8) {
         if (cg_is_float_kind(ek) == 1) { slot_ty = llvm_double_ty(cg_ctx); }
+        else if (cg_is_ptr_kind(ek) == 1) { slot_ty = llvm_ptr_ty(llvm_i8(cg_ctx), 0); }
         else { slot_ty = llvm_i64(cg_ctx); }
     }
     let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(slot_ty, 0), "arrptr");
@@ -700,13 +707,15 @@ pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int,
     return;
 }
 
-// 直接 GEP+store 数组元素（标量无需写屏障；char/short/bool 扩展回 4 字节槽）
+// 直接 GEP+store 数组元素（标量无需写屏障；char/short/bool 扩展回 4 字节槽；
+// 指针元素补发 rt_gc_write_barrier——分代 GC 需把 old→young 引用记入 remembered set）
 pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int, val_val: any, vk: int) -> void {
     let es = cg_elem_size(ek);
     let addr = cg_array_elem_addr(arr_val, idx_val, ik, es);
     let slot_ty = llvm_i32(cg_ctx);
     if (es == 8) {
         if (cg_is_float_kind(ek) == 1) { slot_ty = llvm_double_ty(cg_ctx); }
+        else if (cg_is_ptr_kind(ek) == 1) { slot_ty = llvm_ptr_ty(llvm_i8(cg_ctx), 0); }
         else { slot_ty = llvm_i64(cg_ctx); }
     }
     let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(slot_ty, 0), "arrptr");
@@ -716,6 +725,12 @@ pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int,
     else if (ek == TYPE_BOOL) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "boolzext"); }
     else if (ek == TYPE_FLOAT) { sv = llvm_fpext(cg_builder, sv, llvm_double_ty(cg_ctx), "flzext"); }
     llvm_store(cg_builder, sv, ptr);
+    if (cg_is_ptr_kind(vk) == 1) {
+        let wb_args: array<any> = [];
+        wb_args = array_push(wb_args, arr_val);
+        wb_args = array_push(wb_args, val_val);
+        cg_call_named("rt_gc_write_barrier", TYPE_VOID, wb_args);
+    }
     return;
 }
 
@@ -1028,7 +1043,16 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         }
         let slot_ptr = cg_slots[mi.arg2];
         llvm_store(cg_builder, val, slot_ptr);
-        cg_gc_root_set_if_ptr(slot_ptr, val, gc_kind);
+        // §5.2.4：源寄存器已有 shadow frame 槽（值已随 cg_set_reg 写入 range-root 帧）时，
+        // 跳过带互斥锁的 shadow_gc_root_set——frame 已保证跨安全点保活，消除每次赋值锁开销
+        // （array_push 热循环 2M 次 push = 2M 次锁操作）。frame_active==1 守卫排除 nogc 免帧函数。
+        let skip_root = 0;
+        if (cg_gc_frame_active == 1 && mi.arg1 >= 0 && mi.arg1 < len(cg_sf_reg_slot)) {
+            if (cg_sf_reg_slot[mi.arg1] >= 0) { skip_root = 1; }
+        }
+        if (skip_root == 0) {
+            cg_gc_root_set_if_ptr(slot_ptr, val, gc_kind);
+        }
         return;
     }
 

@@ -1,0 +1,55 @@
+//@mode: exe
+//@desc: 类型化嵌套数组直接 GEP 访问回归 — array<array<int>> 的 a[i][k] 读、a[i][j]=v 标量写、
+//       a[i]=row 指针写（触发 rt_gc_write_barrier）均走 codegen 直接路径（绕过 shadow_array_get_ptr）。
+//       构造 3x3 矩阵并累加 a[i][k]*b[k][j]，再整体替换一行验证指针写。a[i][j]=i*3+j+1,
+//       b[i][j]=(j+1)*2+i → b=[[2,4,6],[3,5,7],[4,6,8]]，正确矩阵乘 s=96+231+366=693；
+//       替换 c[1]=row 后 c[1][0]=99。
+//@expect: 693
+//         99
+dsb ex_nested_typed_direct;
+
+kimo main() -> int {
+    let n = 3;
+    let a: array<array<int>> = [];
+    let b: array<array<int>> = [];
+    let c: array<array<int>> = [];
+    let i = 0;
+    while (i < n) {
+        let rowa: array<int> = [];
+        let rowb: array<int> = [];
+        let rowc: array<int> = [];
+        let j = 0;
+        while (j < n) {
+            rowa = array_push(rowa, i * n + j + 1);
+            rowb = array_push(rowb, (j + 1) * 2 + i);
+            rowc = array_push(rowc, 0);
+            j = j + 1;
+        }
+        a = array_push(a, rowa);
+        b = array_push(b, rowb);
+        c = array_push(c, rowc);
+        i = i + 1;
+    }
+    let s = 0;
+    i = 0;
+    while (i < n) {
+        let j = 0;
+        while (j < n) {
+            let k = 0;
+            while (k < n) {
+                s = s + a[i][k] * b[k][j];
+                k = k + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let row: array<int> = [];
+    row = array_push(row, 99);
+    row = array_push(row, 98);
+    row = array_push(row, 97);
+    c[1] = row;
+    println(s);
+    println(c[1][0]);
+    return 0;
+}
