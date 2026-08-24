@@ -153,6 +153,11 @@ let cg_all_blocks: array<array<MirBlock>> = [];
 let cg_global_names: array<string> = [];
 let cg_global_ptrs: array<any> = [];
 let cg_global_kinds: array<int> = [];
+// 用户函数形参类型表（name -> array<int> param kinds），供 MIR_CALL 调用点对 float 实参做 fpext->double 拓宽。
+// 函数已在 cg_gen_module 预声明循环用自身签名声明（double 形参），但 float 字面量/表达式在寄存器是 float32，
+// 直接喂 double 形参会留高 32 位垃圾（4.98503e-315 类病态值）。
+let cg_user_func_param_kinds_keys: array<string> = [];
+let cg_user_func_param_kinds_vals: array<any> = [];
 
 // LLVM 比较/实数谓词常量
 pub let LLVM_INT_EQ: int = 32;
@@ -567,6 +572,19 @@ pub kimo cg_call_named(name: string, ret_kind: int, arg_vals: array<any>) -> any
     let resolved_name = cg_resolve_extern_name(name);
     let callee = cg_get_or_declare_fn(resolved_name, ret_kind, arg_vals);
     return cg_emit_call(callee, ret_kind, arg_vals);
+}
+
+// 查用户函数形参类型表（name -> array<int>）。仅匹配 mfuncs 中的用户函数；运行时/extern 函数返回 0。
+pub kimo cg_user_func_param_kinds(name: string) -> any {
+    let i = 0;
+    while (i < len(cg_user_func_param_kinds_keys)) {
+        let kn = cg_user_func_param_kinds_keys[i] as string;
+        if (str_eq(kn, name) == 1) {
+            return cg_user_func_param_kinds_vals[i];
+        }
+        i = i + 1;
+    }
+    return 0 as any;
 }
 
 // §5.2.4 免 GC 帧的纯运行时函数：不分配、不触发 GC、无安全点，仅做内存读写。
@@ -1154,8 +1172,13 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             gc_kind = src_k;
         }
         if (src_k != dst_k) {
-            if (cg_is_float_kind(src_k) == 1 && cg_is_float_kind(dst_k) == 1) {
-                val = cg_cast_val(val, src_k, dst_k);
+            if (cg_is_float_kind(src_k) == 1) {
+                // 目标为 double，或 mi.ty 未设置（局部/结构体槽统一 8 字节 double）时，
+                // float32 寄存器值必须 fpext 成 double 再存，否则高 32 位留垃圾（4.98503e-315 类病态值）。
+                // dst_k==TYPE_FLOAT（显式 float 槽）时 float->float 无需转换，保留原行为。
+                if (dst_k == TYPE_DOUBLE || dst_k == 0) {
+                    val = cg_cast_val(val, src_k, TYPE_DOUBLE);
+                }
             } else if (cg_is_int_kind(src_k) == 1 && cg_is_int_kind(dst_k) == 1) {
                 val = cg_cast_val(val, src_k, dst_k);
             }
@@ -1509,9 +1532,11 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         let val_reg = mi.args[0] as int;
         let val_val = cg_get_reg(val_reg);
         let vk = cg_get_reg_kind(val_reg);
-        let dst_k = cg_type_kind(mi.ty);
-        if (cg_is_float_kind(vk) == 1 && cg_is_float_kind(dst_k) == 1) {
-            val_val = cg_cast_val(val_val, vk, dst_k);
+        // rt_store_float 形参恒为 double（结构体字段统一 8 字节槽），float32 寄存器值
+        // 必须 fpext 成 double 再传，否则高 32 位留垃圾（5.53553e-315 类病态值）。
+        // MIR_STORE_MEMBER 的 mi.ty 在 mir 侧未设置，故不依赖 dst_k，直接按“值为 float 即 fpext”处理。
+        if (cg_is_float_kind(vk) == 1) {
+            val_val = cg_cast_val(val_val, vk, TYPE_DOUBLE);
         }
         let field_idx = mi.longval as int;
         let offset = field_idx * 8;
@@ -1779,6 +1804,43 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
             let reg_val = cg_get_reg(reg);
             arg_vals = array_push(arg_vals, reg_val);
             i = i + 1;
+        }
+        // 调用实参 float->double 拓宽：float 字面量/表达式在寄存器是 float32，
+        // 直接喂 double 形参会留高 32 位垃圾（4.98503e-315 类病态值）。
+        // - 用户函数：命中形参类型表，按形参类型精确拓宽（double 形参才 fpext）。
+        // - 运行时/extern 函数：设计上数值形参均为 double，float 实参统一 fpext 到 double。
+        let callee_pk = cg_user_func_param_kinds(mi.strval);
+        if ((callee_pk as any) != 0) {
+            let wn = len(args);
+            let new_args: array<any> = [];
+            let wi = 0;
+            while (wi < wn) {
+                let wreg = args[wi] as int;
+                let wvk = cg_get_reg_kind(wreg);
+                let wpk = TYPE_INT;
+                if (wi < len(callee_pk as array<int>)) { wpk = (callee_pk as array<int>)[wi]; }
+                let wval = arg_vals[wi];
+                if (cg_is_float_kind(wvk) == 1 && wpk == TYPE_DOUBLE) {
+                    wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
+                }
+                new_args = array_push(new_args, wval);
+                wi = wi + 1;
+            }
+            arg_vals = new_args;
+        } else {
+            let wn = len(args);
+            let new_args: array<any> = [];
+            let wi = 0;
+            while (wi < wn) {
+                let wvk = cg_get_reg_kind(args[wi] as int);
+                let wval = arg_vals[wi];
+                if (cg_is_float_kind(wvk) == 1) {
+                    wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
+                }
+                new_args = array_push(new_args, wval);
+                wi = wi + 1;
+            }
+            arg_vals = new_args;
         }
         // typed push 形参宽度固定（push_long=long、push_float=double），
         // 值类型不匹配时需显式转换，否则 call 以窄类型喂宽形参 → LLVM 类型不匹配。
@@ -2955,9 +3017,20 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
     }
 
     // 预声明所有非 extern 函数（用自身签名），避免 call site 懒声明错误签名
+    // 同步填充用户函数形参类型表（供 MIR_CALL 调用点 float->double 拓宽）。
+    cg_user_func_param_kinds_keys = [];
+    cg_user_func_param_kinds_vals = [];
     i = 0;
     while (i < len(mfuncs)) {
         let mfpd = mfuncs[i];
+        let pk_arr: array<int> = [];
+        let fpj = 0;
+        while (fpj < len(mfpd.params)) {
+            pk_arr = array_push(pk_arr, mfpd.params[fpj].type_kind);
+            fpj = fpj + 1;
+        }
+        cg_user_func_param_kinds_keys = array_push(cg_user_func_param_kinds_keys, mfpd.name);
+        cg_user_func_param_kinds_vals = array_push(cg_user_func_param_kinds_vals, pk_arr);
         let existing_decl = llvm_get_fn(cg_mod, mfpd.name);
         if ((existing_decl as any) == 0) {
             let fp_tys: array<any> = [];
