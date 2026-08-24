@@ -79,6 +79,10 @@ kimo main() -> int {
     rt_sys_exec(clang_c + " -O0 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o");
     rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
+    // 用户程序 runtime 的辅助对象（main_link_exe 从 self_dir/rt/ 精确取这些名字）
+    // miniz.o 无源码（bootstrap/ 预编译产物），直接复制；cxa_atexit_shim.c 现场编译。
+    rt_sys_exec("cmd /c copy /Y " + boot + "\\miniz.o build\\rt\\miniz.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
 
     // [0.4/7] patch runtime: CreateProcessA shadow_sys_exec
     println("[0.4/7] patch runtime: CreateProcessA shadow_sys_exec");
@@ -119,6 +123,42 @@ kimo main() -> int {
         + " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack"
         + " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack"
         + " " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
+    // 用户程序专用 runtime（main_link_exe Windows 分支链接用，与 Linux 同源 cpp 实现）：
+    // 用户产物内嵌 runtime_lib 的 define（shadow_array_len 等强符号）会与 C++ runtime 同名
+    // 冲突 → 这些符号加 __cpp_ 前缀；GC 符号（gc_poll/gc_root_range/gc_register_type）保留
+    // 原名（真 GC，对齐 Linux 用户产物链接 runtime_for_selfhost.o 的行为）。
+    // shadow_sys_exec 走 sys_exec_cpa.o。不链接 shadow_gc_supplement.o（no-op GC）——用户产物必须用真 GC。
+    rt_sys_exec(objcopy
+        + " --redefine-sym=shadow_sys_exec=__cpp_shadow_sys_exec"
+        + " --redefine-sym=shadow_any_box_ptr=__cpp_shadow_any_box_ptr"
+        + " --redefine-sym=shadow_any_box_string=__cpp_shadow_any_box_string"
+        + " --redefine-sym=shadow_any_print=__cpp_shadow_any_print"
+        + " --redefine-sym=shadow_any_to_string=__cpp_shadow_any_to_string"
+        + " --redefine-sym=shadow_any_unbox_ptr=__cpp_shadow_any_unbox_ptr"
+        + " --redefine-sym=shadow_array_get_int=__cpp_shadow_array_get_int"
+        + " --redefine-sym=shadow_array_get_ptr=__cpp_shadow_array_get_ptr"
+        + " --redefine-sym=shadow_array_len=__cpp_shadow_array_len"
+        + " --redefine-sym=shadow_array_pop=__cpp_shadow_array_pop"
+        + " --redefine-sym=shadow_array_push_float=__cpp_shadow_array_push_float"
+        + " --redefine-sym=shadow_array_push_int=__cpp_shadow_array_push_int"
+        + " --redefine-sym=shadow_array_push_long=__cpp_shadow_array_push_long"
+        + " --redefine-sym=shadow_array_push_ptr=__cpp_shadow_array_push_ptr"
+        + " --redefine-sym=shadow_array_set_int=__cpp_shadow_array_set_int"
+        + " --redefine-sym=shadow_array_set_ptr=__cpp_shadow_array_set_ptr"
+        + " --redefine-sym=shadow_content_hash=__cpp_shadow_content_hash"
+        + " --redefine-sym=shadow_int_to_str=__cpp_shadow_int_to_str"
+        + " --redefine-sym=shadow_llvm_set_alwaysinline=__cpp_shadow_llvm_set_alwaysinline"
+        + " --redefine-sym=shadow_println_int=__cpp_shadow_println_int"
+        + " --redefine-sym=shadow_println_str=__cpp_shadow_println_str"
+        + " --redefine-sym=shadow_set_cli_args=__cpp_shadow_set_cli_args"
+        + " --redefine-sym=shadow_string_concat=__cpp_shadow_string_concat"
+        + " --redefine-sym=shadow_string_len=__cpp_shadow_string_len"
+        + " --redefine-sym=shadow_sys_args=__cpp_shadow_sys_args"
+        + " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list"
+        + " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack"
+        + " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack"
+        + " " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
+    println("    wrote build/rt/runtime_for_selfhost_user.o (user-program runtime, GC kept)");
 
     // [1/7] stage1: HOST compile src/main.shadow
     println("[1/7] stage1: HOST(" + host + ") compile src/main.shadow");

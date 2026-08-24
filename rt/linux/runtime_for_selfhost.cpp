@@ -4126,11 +4126,25 @@ static struct ShadowCrashHandlerInit {
 #endif
 
 // ── Conservative stack scan: treat pointer-sized values on the current ──
-// ── thread's stack as GC roots. shadow-lang 0.2 doesn't emit explicit  ──
-// ── stack root registration, so without this GC would reclaim objects   ──
-// ── still referenced only from local variables (AST nodes, temporaries). ──
+// ── thread's stack as GC roots. 对齐 Windows rt_gc.c（§5.2.4）：保守栈扫   ──
+// ── 描默认关闭 —— 精确根集（frame root + global root + shadow frame range  ──
+// ── 根 + slot 键控 replace）是唯一依据。无条件保守扫栈会把编辑循环等热  ──
+// ── 路径栈上的残留旧指针当根 → 旧对象永不回收 → 长驻堆单调增长           ──
+// ── （ex_gc_longrun heap floor grew 的根因）。SHADOW_GC_CONSERVATIVE=1    ──
+// ── 才启用（对拍验证用，与 rt_gc.c 语义一致）。                            ──
+static int g_gc_cons_stack_init = 0;
+static int g_gc_cons_stack_on = 0;
+static int gc_cons_stack_on(void) {
+    if (!g_gc_cons_stack_init) {
+        g_gc_cons_stack_init = 1;
+        const char* e = getenv("SHADOW_GC_CONSERVATIVE");
+        g_gc_cons_stack_on = (e && *e && e[0] != '0') ? 1 : 0;
+    }
+    return g_gc_cons_stack_on;
+}
 static void gc_scan_stack(std::vector<void*>& worklist) {
 #ifdef _WIN32
+    if (!gc_cons_stack_on()) return;
     void* sp = (void*)_AddressOfReturnAddress();
     void* teb = (void*)NtCurrentTeb();
     void* stack_base = *(void**)((char*)teb + 0x08);  // NT_TIB.StackBase

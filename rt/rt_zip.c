@@ -9,13 +9,30 @@
  *   shadow_content_hash(path)          文件内容哈希（hex 字符串）
  *
  * 设计约束（§6.2）：纯 C + 系统 API + miniz；不依赖 C++ runtime。
- * ZIP 内路径统一正斜杠 '/'；磁盘路径用 '\\'。
+ * ZIP 内路径统一正斜杠 '/'；磁盘路径用 '\\'（Windows）/ '/'（POSIX）。
  * ============================================================ */
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "miniz.h"
+
+#ifdef _WIN32
+/* Windows 用 FindFirstFile/CreateFile 等 Win32 API；POSIX 用 dirent/stdio。
+ * 两分支各自实现平台相关函数，跨平台符号 ABI 保持一致（shadow_zip_* /
+ * shadow_content_hash），编译器 IR 无需改动。 */
+#define ZIP_PATHSEP '\\'
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#define ZIP_PATHSEP '/'
+#endif
 
 /* ---------------- 字符串构建（分号分隔列表） ---------------- */
 typedef struct strbuf {
@@ -54,7 +71,13 @@ static void sb_put_ch(strbuf* b, char c) {
 }
 
 /* ---------------- 目录递归收集（分号分隔相对路径） ---------------- */
-/* 把 dir 下所有文件的相对路径（反斜杠）追加到 list；dir 以 \ 结尾 */
+/* 把 dir 下所有文件的相对路径追加到 list；dir 以路径分隔符结尾。
+ * 平台分支：Windows 用 FindFirstFile；POSIX 用 opendir/readdir。 */
+
+/* 前向声明：分支辅助函数 */
+static void zip_collect_dir_branch(const char* dir, const char* name, const char* base, strbuf* list);
+static void zip_collect_dir_file(const char* dir, const char* name, const char* base, strbuf* list);
+#ifdef _WIN32
 static void zip_collect_dir(const char* dir, const char* base, strbuf* list) {
     char search[2048];
     WIN32_FIND_DATAA fd;
@@ -68,38 +91,80 @@ static void zip_collect_dir(const char* dir, const char* base, strbuf* list) {
             char full[2048];
             snprintf(full, sizeof(full), "%s%s", dir, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                /* 跳过 .spk_meta 打包元数据目录 */
-                if (strcmp(fd.cFileName, ".spk_meta") == 0) continue;
-                /* 跳过构建产物与版本库。build/ 下有 lu_cache 增量缓存（可达数 MB），
-                   其键是「发布方本机源文件路径」的 hash，且消费方只读自己 CWD 下的
-                   build\lu_cache —— 打进包里既无用又臃肿。 */
-                if (strcmp(fd.cFileName, "build") == 0) continue;
-                if (strcmp(fd.cFileName, ".git") == 0) continue;
-                {
-                    char sub[2048];
-                    snprintf(sub, sizeof(sub), "%s%s\\", dir, fd.cFileName);
-                    zip_collect_dir(sub, base, list);
-                }
+                zip_collect_dir_branch(dir, fd.cFileName, base, list);
             } else {
-                /* 相对路径：base 后的部分 */
-                size_t bl = strlen(base);
-                const char* rel = full + bl;
-                if (list->len > 0) sb_put_ch(list, ';');
-                sb_put(list, rel);
+                zip_collect_dir_file(dir, fd.cFileName, base, list);
             }
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
+#else
+static void zip_collect_dir(const char* dir, const char* base, strbuf* list) {
+    DIR* d = opendir(dir);
+    struct dirent* e;
+    if (!d) return;
+    while ((e = readdir(d)) != NULL) {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+        {
+            char full[2048];
+            struct stat st;
+            snprintf(full, sizeof(full), "%s%s", dir, e->d_name);
+            if (stat(full, &st) != 0) continue;
+            if (S_ISDIR(st.st_mode)) {
+                zip_collect_dir_branch(dir, e->d_name, base, list);
+            } else {
+                zip_collect_dir_file(dir, e->d_name, base, list);
+            }
+        }
+    }
+    closedir(d);
+}
+#endif
+
+/* 目录分支：跳过元数据/构建目录后递归。dir 以分隔符结尾，name 为子项名。 */
+static void zip_collect_dir_branch(const char* dir, const char* name, const char* base, strbuf* list) {
+    /* 跳过 .spk_meta 打包元数据目录 */
+    if (strcmp(name, ".spk_meta") == 0) return;
+    /* 跳过构建产物与版本库。build/ 下有 lu_cache 增量缓存（可达数 MB），
+       其键是「发布方本机源文件路径」的 hash，且消费方只读自己 CWD 下的
+       build/lu_cache —— 打进包里既无用又臃肿。 */
+    if (strcmp(name, "build") == 0) return;
+    if (strcmp(name, ".git") == 0) return;
+    {
+        char sub[2048];
+        snprintf(sub, sizeof(sub), "%s%s%c", dir, name, ZIP_PATHSEP);
+        zip_collect_dir(sub, base, list);
+    }
+}
+
+/* 文件分支：把相对路径追加到 list。 */
+static void zip_collect_dir_file(const char* dir, const char* name, const char* base, strbuf* list) {
+    char full[2048];
+    snprintf(full, sizeof(full), "%s%s", dir, name);
+    size_t bl = strlen(base);
+    const char* rel = full + bl;
+    if (list->len > 0) sb_put_ch(list, ';');
+    sb_put(list, rel);
+}
 
 /* 目录是否存在且为目录 */
+#ifdef _WIN32
 static int zip_is_dir(const char* p) {
     DWORD a = GetFileAttributesA(p);
     if (a == INVALID_FILE_ATTRIBUTES) return 0;
     return (a & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
 }
+#else
+static int zip_is_dir(const char* p) {
+    struct stat st;
+    if (stat(p, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+#endif
 
-/* 确保目录存在（递归创建） */
+/* 确保目录存在（递归创建）。POSIX 用 mkdir 逐段；Windows 用 CreateDirectoryA。 */
+#ifdef _WIN32
 static void zip_mkdirs(const char* path) {
     char tmp[2048];
     size_t i, n = strlen(path);
@@ -114,6 +179,22 @@ static void zip_mkdirs(const char* path) {
     }
     CreateDirectoryA(path, NULL);
 }
+#else
+static void zip_mkdirs(const char* path) {
+    char tmp[2048];
+    size_t i, n = strlen(path);
+    if (n >= sizeof(tmp)) return;
+    memcpy(tmp, path, n + 1);
+    for (i = 0; i < n; i++) {
+        if (tmp[i] == '/' || tmp[i] == '\\') {
+            tmp[i] = '\0';
+            if (mkdir(tmp, 0755) != 0 && errno != EEXIST) { /* best-effort */ }
+            tmp[i] = '/';
+        }
+    }
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) { /* best-effort */ }
+}
+#endif
 
 /* ---------------- pack：目录 → ZIP（STORE） ---------------- */
 /* 返回 0 成功，-1 失败 */
@@ -130,9 +211,9 @@ extern int32_t shadow_zip_pack(const char* src_dir, const char* out_spk) {
     bl = strlen(src_dir);
     if (bl == 0 || bl >= sizeof(base)) return -1;
     memcpy(base, src_dir, bl + 1);
-    /* base 统一以 \ 结尾（相对路径基准） */
+    /* base 统一以路径分隔符结尾（相对路径基准） */
     if (base[bl - 1] != '\\' && base[bl - 1] != '/') {
-        base[bl] = '\\';
+        base[bl] = ZIP_PATHSEP;
         base[bl + 1] = '\0';
     }
     memset(&zip, 0, sizeof(zip));
@@ -204,13 +285,13 @@ extern int32_t shadow_zip_unpack(const char* spk, const char* out_dir) {
         }
         /* 目录条目（以 / 结尾）→ mkdir */
         if (nl > 0 && (name[nl - 1] == '/' || name[nl - 1] == '\\')) {
-            snprintf(outpath, sizeof(outpath), "%s\\%s", out_dir, name);
-            for (k = 0; outpath[k]; k++) if (outpath[k] == '/') outpath[k] = '\\';
+            snprintf(outpath, sizeof(outpath), "%s%c%s", out_dir, ZIP_PATHSEP, name);
+            for (k = 0; outpath[k]; k++) if (outpath[k] == '/' || outpath[k] == '\\') outpath[k] = ZIP_PATHSEP;
             zip_mkdirs(outpath);
             continue;
         }
-        snprintf(outpath, sizeof(outpath), "%s\\%s", out_dir, name);
-        for (k = 0; outpath[k]; k++) if (outpath[k] == '/') outpath[k] = '\\';
+        snprintf(outpath, sizeof(outpath), "%s%c%s", out_dir, ZIP_PATHSEP, name);
+        for (k = 0; outpath[k]; k++) if (outpath[k] == '/' || outpath[k] == '\\') outpath[k] = ZIP_PATHSEP;
         /* 只创建父目录（zip_mkdirs 会把末段当目录建，文件名不能传给它） */
         {
             char parent[4096];
@@ -258,6 +339,7 @@ extern const char* shadow_zip_list(const char* spk) {
 
 /* ---------------- content_hash：文件内容 FNV-1a 64 ---------------- */
 /* 返回 malloc 的 hex 字符串（16 字符），失败返回 NULL */
+#ifdef _WIN32
 extern const char* shadow_content_hash(const char* path) {
     HANDLE h;
     unsigned char buf[65536];
@@ -287,3 +369,35 @@ extern const char* shadow_content_hash(const char* path) {
     hex[16] = '\0';
     return hex;
 }
+#else
+extern const char* shadow_content_hash(const char* path) {
+    int fd;
+    unsigned char buf[65536];
+    ssize_t rd;
+    uint64_t hsh = 0xcbf29ce484222325ULL;
+    char* hex;
+    int i;
+    if (!path) return NULL;
+    fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    for (;;) {
+        rd = read(fd, buf, sizeof(buf));
+        if (rd <= 0) break;
+        {
+            ssize_t j;
+            for (j = 0; j < rd; j++) {
+                hsh ^= buf[j];
+                hsh *= 0x100000001b3ULL;
+            }
+        }
+    }
+    close(fd);
+    hex = (char*)malloc(17);
+    if (!hex) return NULL;
+    for (i = 0; i < 8; i++) {
+        sprintf(hex + i * 2, "%02llx", (unsigned long long)(hsh >> (56 - i * 8)) & 0xff);
+    }
+    hex[16] = '\0';
+    return hex;
+}
+#endif

@@ -2274,12 +2274,23 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     let is_win = 1;
     let llc = llvm_home + "\\bin\\llc.exe";
     let clang = llvm_home + "\\bin\\clang++.exe";
+    // 统一用户程序 runtime：Windows 与 Linux 共用同一套 cpp runtime 对象（同源实现）。
+    // runtime_for_selfhost_user.o 由 bootstrap/runtime_for_selfhost.o 经 objcopy 生成：
+    // 与用户程序内嵌 runtime_lib 冲突的符号加 __cpp_ 前缀，GC 符号（gc_poll/gc_root_range）
+    // 保留原名（真 GC，对齐 Linux 用户产物）。不链接 shadow_gc_supplement.o（no-op GC）。
     let rt_dir = self_dir + "\\rt\\";
-    let rt_objs = "\"" + rt_dir + "rt_core.o\" \"" + rt_dir + "rt_fs.o\" \"" + rt_dir + "rt_proc.o\" \"" +
-                  rt_dir + "rt_time.o\" \"" + rt_dir + "rt_err.o\" \"" + rt_dir + "rt_extra.o\" \"" +
-                  rt_dir + "rt_gc.o\" \"" + rt_dir + "rt_thread.o\" \"" + rt_dir + "rt_io.o\"";
-    let miniz_obj = self_dir + "\\bootstrap\\miniz.o";
-    let link_tail = " -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\"";
+    let rt_objs = "\"" + rt_dir + "runtime_for_selfhost_user.o\" \"" + rt_dir + "miniz.o\" \"" +
+                  rt_dir + "sys_exec_cpa.o\" \"" + rt_dir + "rt_proc_spawn.o\" \"" +
+                  rt_dir + "rt_zip.o\" \"" + rt_dir + "shadow_index.o\" \"" +
+                  rt_dir + "cxa_atexit_shim.o\"";
+    let miniz_obj = "";
+    // CRT/系统库路径：仓库内开发用 <repo>/pkg/shadow/llvm/crt（build/../pkg/...），
+    // 安装后用 <install>/llvm/crt（bin/../llvm/crt，与 LLVM 工具链同级）。
+    // 两个候选都交给链接器（-L 多路径，lld 自动查找），避免 file_exists 对含 .. 的相对路径判断失败。
+    let crt_repo = self_dir + "\\..\\pkg\\shadow\\llvm\\crt";
+    let crt_inst = self_dir + "\\..\\llvm\\crt";
+    let link_tail = " -Wl,/subsystem:console -lws2_32 -lLLVM-C -L\"" + llvm_home + "\\lib\"" +
+                    " -L\"" + crt_repo + "\" -L\"" + crt_inst + "\"";
     if (file_exists(llvm_home + "/bin/llc") == 1 || len(custom_llc) > 0) {
         is_win = 0;
         if (len(custom_llc) > 0) { llc = custom_llc; } else { llc = llvm_home + "/bin/llc"; }
@@ -2287,7 +2298,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
         // Linux 用户程序 runtime：跨平台 .o 集合（self_dir/rt/ 下）。
         // 注意：不链接 shadow_gc_supplement.o（no-op GC 符号）——用户产物必须用
         // runtime_for_selfhost.o 的真 GC（自动触发 + shadow frame range 根 +
-        // 协作安全点），与 Windows 用户产物链接 rt_gc.o 的真实现对齐。
+        // 协作安全点），与 Windows 用户产物链接 runtime_for_selfhost_user.o 的真实现对齐。
         // supplement 仅留给编译器本体（stage1）链接。
         rt_dir = self_dir + "/rt/";
         rt_objs = "\"" + rt_dir + "runtime_for_selfhost.o\" \"" + rt_dir + "miniz.o\" \"" +
