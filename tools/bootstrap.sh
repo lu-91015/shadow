@@ -41,15 +41,47 @@ echo "[3] precompile runtime objects"
 "$bin/clang.exe" -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o
 "$bin/clang.exe" -O0 -I bootstrap -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o
 "$bin/clang.exe" -O0 -I bootstrap -c bootstrap/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o
-"$bin/llvm-objcopy.exe" --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob \
+"$bin/clang.exe" -O0 -c bootstrap/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o
+"$bin/llvm-objcopy.exe" \
+  --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob \
+  --redefine-sym=shadow_any_box_ptr=__cpp_shadow_any_box_ptr \
+  --redefine-sym=shadow_any_box_string=__cpp_shadow_any_box_string \
+  --redefine-sym=shadow_any_print=__cpp_shadow_any_print \
+  --redefine-sym=shadow_any_to_string=__cpp_shadow_any_to_string \
+  --redefine-sym=shadow_any_unbox_ptr=__cpp_shadow_any_unbox_ptr \
+  --redefine-sym=shadow_array_get_int=__cpp_shadow_array_get_int \
+  --redefine-sym=shadow_array_get_ptr=__cpp_shadow_array_get_ptr \
+  --redefine-sym=shadow_array_len=__cpp_shadow_array_len \
+  --redefine-sym=shadow_array_pop=__cpp_shadow_array_pop \
+  --redefine-sym=shadow_array_push_float=__cpp_shadow_array_push_float \
+  --redefine-sym=shadow_array_push_int=__cpp_shadow_array_push_int \
+  --redefine-sym=shadow_array_push_long=__cpp_shadow_array_push_long \
+  --redefine-sym=shadow_array_push_ptr=__cpp_shadow_array_push_ptr \
+  --redefine-sym=shadow_array_set_int=__cpp_shadow_array_set_int \
+  --redefine-sym=shadow_array_set_ptr=__cpp_shadow_array_set_ptr \
+  --redefine-sym=shadow_content_hash=__cpp_shadow_content_hash \
+  --redefine-sym=shadow_gc_poll=__cpp_shadow_gc_poll \
+  --redefine-sym=shadow_gc_register_type=__cpp_shadow_gc_register_type \
+  --redefine-sym=shadow_gc_root_range=__cpp_shadow_gc_root_range \
+  --redefine-sym=shadow_int_to_str=__cpp_shadow_int_to_str \
+  --redefine-sym=shadow_llvm_set_alwaysinline=__cpp_shadow_llvm_set_alwaysinline \
+  --redefine-sym=shadow_println_int=__cpp_shadow_println_int \
+  --redefine-sym=shadow_println_str=__cpp_shadow_println_str \
+  --redefine-sym=shadow_set_cli_args=__cpp_shadow_set_cli_args \
+  --redefine-sym=shadow_string_concat=__cpp_shadow_string_concat \
+  --redefine-sym=shadow_string_len=__cpp_shadow_string_len \
+  --redefine-sym=shadow_sys_args=__cpp_shadow_sys_args \
+  --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list \
+  --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack \
+  --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack \
   bootstrap/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o
 
 echo "[4] link driver build/build_shadow.exe"
 "$bin/clang++.exe" -std=c++17 \
   build/build_shadow.o build/rt/runtime_for_selfhost_wk.o bootstrap/miniz.o \
   build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o \
-  build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o \
-  -o build/build_shadow.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$LLVM_M/lib"
+  build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o \
+  -o build/build_shadow.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$LLVM_M/lib" -Lpkg/shadow/llvm/crt
 
 echo "[5] run bootstrap (7-stage self-host)"
 build/build_shadow.exe
