@@ -707,8 +707,19 @@ pub kimo cg_gen_array_push_inline(mi: MirInst) -> void {
     cg_push_counter = cg_push_counter + 1;
     let cn = int_to_str(cg_push_counter);
 
-    // 结果合并槽（LLVM SROA 提升为 phi；未提升时退化为栈读写，仍优于函数调用）
+    // 结果合并槽（LLVM SROA 提升为 phi；未提升时退化为栈读写，仍优于函数调用）。
+    // ★必须落在 entry 块：否则 -O0 下 alloca 被 emit 进当前（循环）块，每轮 rsp-=16 且不还原
+    //   → 热循环撑爆栈（SIGSEGV，见 array_push/prime_sieve -O0 崩溃，根因已 gdb 实证的栈泄漏）。
+    //   -O1+ 经 SROA 仍提升为 phi，故优化路径性能不受影响。cg_cur_bb 为当前块，alloca 后还原。
+    // ★必须落在 entry 块、且必须在 entry 的 terminator 之前（不能是块末尾，否则 alloca
+    //   被插到 terminator 之后成为孤儿指令，既畸形又让自举固定点不收敛）。定位到 entry 首条
+    //   指令之前插入即可（alloca 在 entry 顶部是 LLVM 标准写法）。cg_cur_bb 为当前块，alloca 后还原。
+    let saved_bb = cg_cur_bb;
+    let entry_bb0 = cg_block_ptrs[0];
+    let entry_first = llvm_first_inst(entry_bb0);
+    llvm_pos_builder(cg_builder, entry_bb0, entry_first);
     let result_slot = llvm_alloca(cg_builder, i8p_ty, "pushres" + cn);
+    llvm_pos_builder_end(cg_builder, saved_bb);
 
     // --- null 检查 → slow ---
     let isnull = llvm_icmp(cg_builder, LLVM_INT_EQ, arr_val, null_v, "pushnull" + cn);
