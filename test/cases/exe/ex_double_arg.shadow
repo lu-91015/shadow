@@ -1,0 +1,29 @@
+//@mode: exe
+//@desc: 回归测试 —— double 标量作用户函数实参（裸实数字面量被推断为 float，
+//       调用点必须 fpext 成 double 再传；否则高 32 位留垃圾，callee 收到病态 denormal）。
+//       修复前 add3(4.0,2.0,1.0) 返回 ~1.5e-315；修复后应得 7。
+//       idf(2.5)/mul2(3.0,4.0) 同理（裸字面量直接作 double 形参）。
+//@expect: 7
+//@expect: 2.5
+//@expect: 12
+dsb ex_double_arg;
+
+kimo add3(a: double, b: double, c: double) -> double {
+    return a + b + c;
+}
+
+kimo idf(x: double) -> double {
+    return x;
+}
+
+kimo mul2(a: double, b: double) -> double {
+    return a * b;
+}
+
+kimo main() -> int {
+    // 裸实数字面量（推断为 float）直接作 double 形参 —— 触发 bug 的路径
+    println(add3(4.0, 2.0, 1.0));
+    println(idf(2.5));
+    println(mul2(3.0, 4.0));
+    return 0;
+}

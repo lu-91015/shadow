@@ -4586,8 +4586,14 @@ extern "C" int64_t shadow_gc_collect() {
     // Conservative scan: trace pointer-sized values in registered memory regions
     // (e.g., process data segment for binaries without explicit GC root registration).
     gc_trace_conservative_regions(worklist);
-    gc_scan_stack(worklist);
-    gc_scan_process_heap(worklist);
+    /* §5.2.4：精确 GC（默认，SHADOW_GC_CONSERVATIVE 未设/0）只用精确根集
+     * （perm/global/thread roots/named_roots/range_roots）。保守栈/进程堆扫描
+     * 会把死对象内部或残留指针当 root 复活整图 → 零回收 → 堆谷底单调增长
+     * （ex_gc_longrun 漂移根因）。仅 SHADOW_GC_CONSERVATIVE=1 启用对拍。 */
+    if (gc_cons_stack_on()) {
+        gc_scan_stack(worklist);
+        gc_scan_process_heap(worklist);
+    }
     if (prof_on()) {
         g_prof_mark_roots_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t1).count();
         _gc_t1 = std::chrono::steady_clock::now();
