@@ -1,0 +1,72 @@
+// merge_sort：归并排序（整数数组，原地合并用 tmp）
+// 与 bench/go/merge_sort.go 同算法、同 N=100000。
+dsb merge_sort;
+
+kimo merge(a: array<int>, tmp: array<int>, lo: int, mid: int, hi: int) -> void {
+    let i = lo;
+    let j = mid;
+    let k = lo;
+    let cont = 1;
+    while (cont == 1) {
+        if (i < mid) {
+            if (j <= hi) {
+                if (a[i] <= a[j]) {
+                    tmp[k] = a[i];
+                    i = i + 1;
+                } else {
+                    tmp[k] = a[j];
+                    j = j + 1;
+                }
+                k = k + 1;
+            } else {
+                cont = 0;
+            }
+        } else {
+            cont = 0;
+        }
+    }
+    while (i < mid) {
+        tmp[k] = a[i];
+        i = i + 1;
+        k = k + 1;
+    }
+    while (j <= hi) {
+        tmp[k] = a[j];
+        j = j + 1;
+        k = k + 1;
+    }
+    let c = lo;
+    while (c <= hi) {
+        a[c] = tmp[c];
+        c = c + 1;
+    }
+}
+
+kimo msort(a: array<int>, tmp: array<int>, lo: int, hi: int) -> void {
+    if (lo < hi) {
+        let mid = (lo + hi) / 2;
+        msort(a, tmp, lo, mid);
+        msort(a, tmp, mid + 1, hi);
+        merge(a, tmp, lo, mid + 1, hi);
+    }
+}
+
+kimo main() -> int {
+    let n = 100000;
+    let a: array<int> = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, (n - i) % 7919);
+        i = i + 1;
+    }
+    let tmp: array<int> = [];
+    let j = 0;
+    while (j < n) {
+        tmp = array_push(tmp, 0);
+        j = j + 1;
+    }
+    msort(a, tmp, 0, n - 1);
+    println(a[0]);
+    println(a[n - 1]);
+    return 0;
+}
