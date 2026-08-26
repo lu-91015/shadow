@@ -1168,6 +1168,15 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         }
         let slot_ptr = cg_slots[mi.arg1];
         let k = cg_type_kind(mi.ty);
+        if (k == TYPE_FLOAT) {
+            // float 局部变量统一存于 8 字节槽（以 double 表示，与 cb1c67c 注释一致）：
+            // 必须先 load double 再 fptrunc 还原成 float。若直接 load float 只取 8 字节槽的
+            // 低 32 位，会把 double 1.5（=0x3FF8000000000000）读成 0.0，导致 `let a:float=1.5` 变 0.0。
+            let dv = llvm_load(cg_builder, llvm_double_ty(cg_ctx), slot_ptr, "loadtmp");
+            let v = llvm_fptrunc(cg_builder, dv, llvm_float_ty(cg_ctx), "fltrunc");
+            cg_set_reg(mi.dst, v, k);
+            return;
+        }
         let ty = cg_llvm_type(mi.ty);
         let v = llvm_load(cg_builder, ty, slot_ptr, "loadtmp");
         cg_set_reg(mi.dst, v, k);
@@ -1184,15 +1193,22 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         }
         if (src_k != dst_k) {
             if (cg_is_float_kind(src_k) == 1) {
-                // 目标为 double，或 mi.ty 未设置（局部/结构体槽统一 8 字节 double）时，
-                // float32 寄存器值必须 fpext 成 double 再存，否则高 32 位留垃圾（4.98503e-315 类病态值）。
-                // dst_k==TYPE_FLOAT（显式 float 槽）时 float->float 无需转换，保留原行为。
+                // float 源 -> 8 字节槽（double / 未知 mi.ty）：fpext 成 double 再存。
+                // float 槽在 Shadow 中统一以 double 表示（见 cb1c67c 注释），
+                // 高 32 位不会留垃圾（4.98503e-315 类病态值）。
                 if (dst_k == TYPE_DOUBLE || dst_k == 0) {
                     val = cg_cast_val(val, src_k, TYPE_DOUBLE);
                 }
+                // dst_k == TYPE_FLOAT 不在此分支处理：下方统一 fpext 成 double 槽。
             } else if (cg_is_int_kind(src_k) == 1 && cg_is_int_kind(dst_k) == 1) {
                 val = cg_cast_val(val, src_k, dst_k);
             }
+        }
+        // 目标为 float 变量：无论源是 float 还是 double，统一以 double 写入 8 字节槽。
+        // 加载侧用 load double + fptrunc 还原（MIR_LOAD_VAR 已对应修复）。
+        // 切忌在此 fptrunc 成 32 位 float——那会让 8 字节槽只剩低 4 字节有效，与 load double 不一致。
+        if (dst_k == TYPE_FLOAT && cg_is_float_kind(src_k) == 1) {
+            val = cg_cast_val(val, src_k, TYPE_DOUBLE);
         }
         if (mi.arg2 < 0) {
             let gptr = cg_global_lookup(mi.strval);

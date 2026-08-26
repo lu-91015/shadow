@@ -1,5 +1,4 @@
 //@desc: async kimo function — calling it auto-spawns a coroutine, returns Future
-//@xfail: 0.4 coroutine runtime AV (async/await crash, known bug)
 //@expect: 100
 dsb cg_async_func;
 

@@ -20,6 +20,13 @@ ALL = {
     "array_push":    ("bench/shadow/array_push.shadow.exe",    "bench/go/array_push.exe"),
     "ackermann":     ("bench/shadow/ackermann.shadow.exe",     "bench/go/ackermann.exe"),
     "float_pi":      ("bench/shadow/float_pi.shadow.exe",      "bench/go/float_pi.exe"),
+    # ---- AWFY（Are We Fast Yet?）权威跨语言基准子集 ----
+    "awfy_sieve":      ("bench/shadow/awfy_sieve.shadow.exe",      "bench/go/awfy_sieve.exe"),
+    "awfy_queens":     ("bench/shadow/awfy_queens.shadow.exe",     "bench/go/awfy_queens.exe"),
+    "awfy_permute":    ("bench/shadow/awfy_permute.shadow.exe",    "bench/go/awfy_permute.exe"),
+    "awfy_list":       ("bench/shadow/awfy_list.shadow.exe",       "bench/go/awfy_list.exe"),
+    "awfy_towers":     ("bench/shadow/awfy_towers.shadow.exe",    "bench/go/awfy_towers.exe"),
+    "awfy_mandelbrot": ("bench/shadow/awfy_mandelbrot.shadow.exe", "bench/go/awfy_mandelbrot.exe"),
 }
 
 # 命令行第一个参数若为 --shadow-suffix=XXX 可指定 shadow exe 后缀（默认 .shadow.exe）

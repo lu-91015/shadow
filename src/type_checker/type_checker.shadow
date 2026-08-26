@@ -2140,7 +2140,7 @@ pub kimo tc_register_decls(ctx: CompileContext, prog: Program) -> void {
             if (gk == EXPR_STRING) { gty = mk_type(TYPE_STRING); }
             else if (gk == EXPR_INT) { gty = mk_type(TYPE_INT); }
             else if (gk == EXPR_LONG) { gty = mk_type(TYPE_LONG); }
-            else if (gk == EXPR_FLOAT) { gty = mk_type(TYPE_FLOAT); }
+            else if (gk == EXPR_FLOAT) { gty = mk_type(TYPE_DOUBLE); }
             else if (gk == EXPR_BOOL) { gty = mk_type(TYPE_BOOL); }
             else { gty = mk_type(TYPE_INFER); }
         }
@@ -3137,7 +3137,9 @@ pub kimo tc_check_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         return t;
     }
     if (k == EXPR_FLOAT) {
-        let t = mk_type(TYPE_FLOAT);
+        // 未注解 float 字面量默认 double（同 C/Go/Java/Python），避免单精度塌缩。
+        // 原 TYPE_FLOAT 默认会让 `let x = 0.0;` 塌成 32 位，导致双精度迭代（如 Mandelbrot）精度丢失。
+        let t = mk_type(TYPE_DOUBLE);
         e.inferred_type = t;
         return t;
     }
@@ -4448,9 +4450,28 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         e.str1 = fd.name;
     }
     e.intval = -2;
-    // async 函数 → 改写 EXPR_SPAWN 返回 TYPE_FUTURE
+    // async 函数 → 改写 EXPR_SPAWN。
+    // 关键：带参 async 调用必须用「函数类型」(param_types+ret_type) 回填
+    // inferred_type，绝不能填 TYPE_FUTURE。MIR_SPAWN 把 inst.ty 当作被 spawn 的
+    // 函数类型，cg_gen_spawn 据此生成 thunk/env 打包（读 fn_ty2.param_types）。
+    // 若此处填 TYPE_FUTURE，则 cg_gen_spawn 把 Future 当函数结构解引用
+    // fn_ty2.param_types → 空指针崩溃（EXPR_SPAWN 带参时编译器在代码生成期
+    // SIGSEGV，见 cg_async_func）。这与 tc_check_spawn 的带参分支保持一致。
+    // await 侧（tc_check_await）无条件返回 TYPE_ANY，故 f 的类型是否为 Future
+    // 不影响 await 正确性。
     if (fd.is_async == 1) {
         e.kind = EXPR_SPAWN;
+        if (len(e.items) > 0) {
+            let fty = mk_func_type([], fd.return_type, 0);
+            let pi2 = 0;
+            while (pi2 < len(params)) {
+                let p = params[pi2] as Param;
+                fty.param_types = array_push(fty.param_types, p.type_ref);
+                pi2 = pi2 + 1;
+            }
+            e.inferred_type = fty;
+            return fty;
+        }
         let fut = mk_type(TYPE_FUTURE);
         e.inferred_type = fut;
         return fut;

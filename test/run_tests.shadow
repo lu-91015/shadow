@@ -37,6 +37,7 @@ dsb run_tests;
 @extern("shadow_test_launch") kimo shadow_test_launch(cmd: string, outpath: string, tag: int) -> int { return -1; }
 @extern("shadow_test_wait_any") kimo shadow_test_wait_any() -> int { return -1; }
 @extern("shadow_test_job_tag") kimo shadow_test_job_tag(job: int) -> int { return -1; }
+@extern("shadow_test_job_rc") kimo shadow_test_job_rc(job: int) -> int { return -1; }
 @extern("shadow_test_reap") kimo shadow_test_reap(job: int) -> int { return 0; }
 
 // str_starts_with / str_ends_with 内联自实现：这两个名字在 type_checker 的 builtin 表里被
@@ -279,12 +280,18 @@ kimo build_cmd(tc: TestCase, shadow_exe: string, build_dir: string, idx: int) ->
     return "";
 }
 
-// 判定单用例结果。out 为捕获到的（合并）输出；codegen 模式还会读 _rt_<idx>.ll 比对 IR。
-kimo judge(tc: TestCase, out: string, build_dir: string, idx: int) -> Result {
+// 判定单用例结果。out 为捕获到的（合并）输出；rc 为子进程退出码（exe 模式据此把崩溃
+// 程序判为 FAIL）；codegen 模式还会读 _rt_<idx>.ll 比对 IR。
+kimo judge(tc: TestCase, out: string, build_dir: string, idx: int, rc: int) -> Result {
     let mode = resolve_mode(tc);
     if (len(mode) == 0) { return Result { status: "SKIP", msg: "no mode" }; }
 
     if (str_eq(mode, "exe") == 1) {
+        // 子进程退出码非 0（崩溃/异常终止）一律判 FAIL：崩溃程序的输出不可信，
+        // 不能仅凭文字匹配 @expect 就判 PASS（这是旧框架的判定缺陷）。
+        if (rc != 0) {
+            return Result { status: "FAIL", msg: "non-zero exit code " + int_to_str(rc) };
+        }
         if (len(tc.expect_stderr) > 0) {
             if (str_contains(out, tc.expect_stderr) == 0) {
                 return Result { status: "FAIL", msg: "stderr missing '" + tc.expect_stderr + "'" };
@@ -323,12 +330,26 @@ kimo judge(tc: TestCase, out: string, build_dir: string, idx: int) -> Result {
     return Result { status: "SKIP", msg: "unknown mode " + mode };
 }
 
-// 串行执行单个用例（build_cmd + rt_sys_exec + judge），保留与旧版完全一致的行为。
+// 串行执行单个用例（build_cmd + 子进程启动 + judge）。
+// 复用 rt/rt_test_par.c 的 shadow_test_launch/wait_any/job_rc/reap 捕获子进程退出码，
+// 与并行路径行为完全一致；避免 rt_sys_exec 不回传退出码导致崩溃程序被误判 PASS。
+// 本函数仅在 jobs<=1 分支调用，彼时无在途并行任务，wait_any 不会误收其它用例。
 kimo run_case(tc: TestCase, shadow_exe: string, build_dir: string, idx: int) -> Result {
     let cmd = build_cmd(tc, shadow_exe, build_dir, idx);
     if (len(cmd) == 0) { return Result { status: "SKIP", msg: "no mode" }; }
-    let out = rt_sys_exec(cmd);
-    return judge(tc, out, build_dir, idx);
+    let out_path = path_join(build_dir, "_rj_" + int_to_str(idx) + ".txt");
+    let job = shadow_test_launch(cmd, out_path, idx);
+    if (job < 0) {
+        // 启动失败：退化为 rt_sys_exec（不回传退出码，保留旧行为）
+        let out = rt_sys_exec(cmd);
+        return judge(tc, out, build_dir, idx, 0);
+    }
+    shadow_test_wait_any();
+    let rc = shadow_test_job_rc(job);
+    let out = file_read(out_path);
+    shadow_test_reap(job);
+    rt_delete_file(out_path);
+    return judge(tc, out, build_dir, idx, rc);
 }
 
 // 统一上报：处理 xfail 翻转 + 打印 + 更新计数，返回更新后的 Counters。
@@ -478,9 +499,9 @@ kimo main() -> int {
                 let out_path = path_join(build_dir, "_rj_" + int_to_str(lid) + ".txt");
                 let job = shadow_test_launch(cmd, out_path, lid);
                 if (job < 0) {
-                    // 启动失败：退化为串行执行该用例
+                    // 启动失败：退化为串行执行该用例（不回传退出码，保留旧行为）
                     let out = rt_sys_exec(cmd);
-                    let res = judge(tc, out, build_dir, lid);
+                    let res = judge(tc, out, build_dir, lid, 0);
                     c = report(tc, res, c);
                     done = done + 1;
                     continue;
@@ -493,8 +514,9 @@ kimo main() -> int {
             let full = run_full[lid];
             let tc = parse_directives(full);
             let out_path = path_join(build_dir, "_rj_" + int_to_str(lid) + ".txt");
+            let rc = shadow_test_job_rc(job);
             let out = file_read(out_path);
-            let res = judge(tc, out, build_dir, lid);
+            let res = judge(tc, out, build_dir, lid, rc);
             shadow_test_reap(job);
             rt_delete_file(out_path);
             c = report(tc, res, c);

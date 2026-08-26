@@ -24,7 +24,7 @@
 #include <process.h>
 
 #define TEST_PAR_MAX 64
-typedef struct { HANDLE hProc; HANDLE hThread; int used; int tag; } TestJob;
+typedef struct { HANDLE hProc; HANDLE hThread; int used; int tag; DWORD rc; } TestJob;
 static TestJob g_jobs[TEST_PAR_MAX];
 
 /* 启动一个测试子进程。cmdline 形如 "shadow.exe <test> --run ..."。
@@ -107,6 +107,7 @@ extern int shadow_test_launch(const char* cmdline, const char* out_path, int tag
     g_jobs[slot].hThread = pi.hThread;
     g_jobs[slot].used = 1;
     g_jobs[slot].tag = tag;
+    g_jobs[slot].rc = (DWORD)-1; /* 未取到退出码前的哨兵值 */
     return slot;
 }
 
@@ -123,7 +124,10 @@ extern int shadow_test_wait_any(void) {
         HANDLE h = hs[r - WAIT_OBJECT_0];
         int j;
         for (j = 0; j < TEST_PAR_MAX; j++) {
-            if (g_jobs[j].used == 1 && g_jobs[j].hProc == h) return j;
+            if (g_jobs[j].used == 1 && g_jobs[j].hProc == h) {
+                GetExitCodeProcess(g_jobs[j].hProc, &g_jobs[j].rc);
+                return j;
+            }
         }
     }
     return -1;
@@ -135,6 +139,15 @@ extern int shadow_test_job_tag(int job) {
     return g_jobs[job].tag;
 }
 
+/* 取某 slot 的子进程退出码。须在 shadow_test_wait_any 返回该 slot 之后调用
+ * （wait_any 内部已用 GetExitCodeProcess 填充 rc）。无效 slot / 尚未回收返回 -1。
+ * 正常退出为 0；崩溃程序在 Windows 返回异常码（如 0xC0000005），在 Linux 返回
+ * 0x80|signal（如 SIGSEGV=139）；调用方据此把崩溃程序判为 FAIL。 */
+extern int shadow_test_job_rc(int job) {
+    if (job < 0 || job >= TEST_PAR_MAX || g_jobs[job].used == 0) return -1;
+    return (int)g_jobs[job].rc;
+}
+
 /* 回收 slot 句柄并释放槽位。 */
 extern int shadow_test_reap(int job) {
     if (job < 0 || job >= TEST_PAR_MAX || g_jobs[job].used == 0) return -1;
@@ -142,5 +155,6 @@ extern int shadow_test_reap(int job) {
     CloseHandle(g_jobs[job].hThread);
     g_jobs[job].used = 0;
     g_jobs[job].tag = -1;
+    g_jobs[job].rc = (DWORD)-1;
     return 0;
 }

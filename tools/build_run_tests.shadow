@@ -39,15 +39,51 @@ kimo main() -> int {
     // [0] 预编译 rt 对象（与 build_shadow.sh [0/7] 一致）
     println("[0] precompile rt objects");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_zip.c -o build/rt/rt_zip.o");
-    rt_sys_exec(clang_c + " -O0 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o");
     rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_test_par.c -o build/rt/rt_test_par.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
 
-    // [0.4] runtime patch：shadow_sys_exec 改用 CreateProcessA（含空格路径可启动）
-    println("[0.4] patch runtime: CreateProcessA shadow_sys_exec");
+    // [0.4] runtime patch：shadow_sys_exec 改用 CreateProcessA（含空格路径可启动）；
+    // run_tests.exe 是普通 Shadow 程序，使用【用户态 runtime = user.o】：
+    //   - 内建（shadow_array_len 等）加 __cpp_ 前缀，与编译器内联进 run_tests.o 的
+    //     同名强符号不冲突；
+    //   - GC 符号（gc_poll/gc_root_range/gc_register_type）保留原名 = 真 GC；
+    //   - 不链接 shadow_gc_supplement.o（no-op GC，仅编译器 wk 版使用）；
+    //   - sys_exec_cpa.o 提供 shadow_sys_exec，故 user.o 的 shadow_sys_exec 须改名让位。
+    // 依赖 bootstrap/runtime_for_selfhost.o（由 bootstrap.sh / rebuild_win_runtime.sh 产出）。
+    println("[0.4] patch runtime: user.o (CreateProcessA shadow_sys_exec)");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
-    rt_sys_exec(objcopy + " --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
+    rt_sys_exec(objcopy +
+        " --redefine-sym=shadow_sys_exec=__cpp_shadow_sys_exec" +
+        " --redefine-sym=shadow_any_box_ptr=__cpp_shadow_any_box_ptr" +
+        " --redefine-sym=shadow_any_box_string=__cpp_shadow_any_box_string" +
+        " --redefine-sym=shadow_any_print=__cpp_shadow_any_print" +
+        " --redefine-sym=shadow_any_to_string=__cpp_shadow_any_to_string" +
+        " --redefine-sym=shadow_any_unbox_ptr=__cpp_shadow_any_unbox_ptr" +
+        " --redefine-sym=shadow_array_get_int=__cpp_shadow_array_get_int" +
+        " --redefine-sym=shadow_array_get_ptr=__cpp_shadow_array_get_ptr" +
+        " --redefine-sym=shadow_array_len=__cpp_shadow_array_len" +
+        " --redefine-sym=shadow_array_pop=__cpp_shadow_array_pop" +
+        " --redefine-sym=shadow_array_push_float=__cpp_shadow_array_push_float" +
+        " --redefine-sym=shadow_array_push_int=__cpp_shadow_array_push_int" +
+        " --redefine-sym=shadow_array_push_long=__cpp_shadow_array_push_long" +
+        " --redefine-sym=shadow_array_push_ptr=__cpp_shadow_array_push_ptr" +
+        " --redefine-sym=shadow_array_set_int=__cpp_shadow_array_set_int" +
+        " --redefine-sym=shadow_array_set_ptr=__cpp_shadow_array_set_ptr" +
+        " --redefine-sym=shadow_content_hash=__cpp_shadow_content_hash" +
+        " --redefine-sym=shadow_int_to_str=__cpp_shadow_int_to_str" +
+        " --redefine-sym=shadow_llvm_set_alwaysinline=__cpp_shadow_llvm_set_alwaysinline" +
+        " --redefine-sym=shadow_println_int=__cpp_shadow_println_int" +
+        " --redefine-sym=shadow_println_str=__cpp_shadow_println_str" +
+        " --redefine-sym=shadow_set_cli_args=__cpp_shadow_set_cli_args" +
+        " --redefine-sym=shadow_string_concat=__cpp_shadow_string_concat" +
+        " --redefine-sym=shadow_string_len=__cpp_shadow_string_len" +
+        " --redefine-sym=shadow_sys_args=__cpp_shadow_sys_args" +
+        " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list" +
+        " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack" +
+        " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack" +
+        " " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
 
     // [1] 用冻结 HOST 编译 test/run_tests.shadow
     println("[1] compile test/run_tests.shadow -> build/run_tests.ll");
@@ -55,13 +91,15 @@ kimo main() -> int {
     // [2] llc -> .o
     println("[2] llc -> build/run_tests.o");
     rt_sys_exec(llc + " -O0 -filetype=obj build/run_tests.ll -o build/run_tests.o");
-    // [3] clang++ 链接 -> build/run_tests.exe
+    // [3] clang++ 链接 -> build/run_tests.exe（用户程序 runtime：user.o + cxa_atexit_shim，
+    //     不链 shadow_gc_supplement.o；-Lpkg/shadow/llvm/crt 提供 winhttp.lib 等）
     println("[3] clang++ link -> build/run_tests.exe");
     rt_sys_exec(clang + " -std=c++17 build/run_tests.o" +
-        " build/rt/runtime_for_selfhost_wk.o " + boot + "/miniz.o" +
-        " build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o" +
+        " build/rt/runtime_for_selfhost_user.o " + boot + "/miniz.o" +
+        " build/rt/rt_zip.o build/rt/shadow_index.o" +
         " build/rt/rt_proc_spawn.o build/rt/rt_test_par.o build/rt/sys_exec_cpa.o" +
-        " -o build/run_tests.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + llvm + "/lib");
+        " build/rt/cxa_atexit_shim.o" +
+        " -o build/run_tests.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + llvm + "/lib -Lpkg/shadow/llvm/crt");
 
     // 冒烟：run_tests.exe 能列出 tc 用例即代表链接产物可用
     let smoke = rt_sys_exec("build/run_tests.exe --cases test/cases/tc --list");
