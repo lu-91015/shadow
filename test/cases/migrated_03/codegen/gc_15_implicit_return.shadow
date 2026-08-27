@@ -1,5 +1,5 @@
-//@desc: GC with implicit fall-through return (no explicit return)
-//@expect-ir: shadow_gc_frame_leave
+//@desc: GC frame anchor pop on implicit fall-through return (no explicit return)
+//@expect-ir: shadow_gc_thread_frame_head
 dsb gc_15_implicit_return;
 struct P { x: int, y: int }
 kimo helper(p: int) -> int {

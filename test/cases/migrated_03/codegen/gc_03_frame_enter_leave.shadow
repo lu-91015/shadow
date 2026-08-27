@@ -1,6 +1,5 @@
-//@desc: GC frame enter/leave in function with struct
-//@expect-ir: shadow_gc_frame_enter
-//@expect-ir: shadow_gc_frame_leave
+//@desc: GC frame anchor (compile-time stack map) push/pop in function with struct
+//@expect-ir: shadow_gc_thread_frame_head
 dsb gc_03_frame_enter_leave;
 struct P { x: int, y: int }
 kimo main() -> int {

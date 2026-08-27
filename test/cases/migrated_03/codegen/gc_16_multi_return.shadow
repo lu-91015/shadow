@@ -1,5 +1,5 @@
-//@desc: GC frame leave on multiple return paths
-//@expect-ir: shadow_gc_frame_leave
+//@desc: GC frame anchor pop on multiple return paths
+//@expect-ir: shadow_gc_thread_frame_head
 dsb gc_16_multi_return;
 struct P { x: int, y: int }
 kimo classify(n: int) -> int {

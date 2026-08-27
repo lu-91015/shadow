@@ -3578,6 +3578,7 @@ static int32_t rt_gc_stress_n(void) {
 // Each OS thread that runs Shadow code gets its OWN root stack/frames so that
 // concurrent spawn bodies don't corrupt each other's root discipline. The mark
 // phase scans every live thread's roots via the global registry below.
+struct ShadowFrameAnchor;   // 前向声明：ThreadGCState::frame_head 用指针，struct 定义见下文
 struct ThreadGCState {
     std::mutex mtx;                                  // guards this thread's root containers
     std::vector<void*> roots;                        // frame-managed roots (popped by frame_leave)
@@ -3593,12 +3594,29 @@ struct ThreadGCState {
     // 免去旧实现的 O(n) 线性扫描删除（深递归 quicksort 的 O(n²) 开销来源）。
     std::vector<size_t> range_markers;               // per-frame range_roots length snapshot
     std::vector<std::pair<void*, uint32_t>> range_roots;                // flattened for scan
+    ShadowFrameAnchor* frame_head = nullptr;   // 编译期栈映射：本线程帧锚点链表头（per-thread）
     // 协作式 STW 状态（对齐 Windows rt_gc.o 的 rt_gc_thread.gc_state）：
     //   0 = free-running（mutator，可能在任意点）
     //   1 = at safepoint（shadow_gc_poll 自旋等待放行）
     //   2 = blocked on g_gc_mutex（等锁，不跑 mutator，collect 无需等待）
     std::atomic<int> stw_state{0};
 };
+
+// ── 编译期栈映射（compile-time stack map）的帧锚点（GC 重构）──
+// 取代运行时 shadow-frame 根注册（shadow_gc_root_range / per-param root_set）。
+// 每个 Shadow 函数序言把一个 [3 x i64] 锚点（frame_ptr, prev, frame_n）压入【本线程】的
+// 帧锚点链表；收尾弹出。collect 标记阶段遍历 g_gc_thread_states，逐线程沿本线程链表
+// 扫描整片连续 shadow frame（变量槽 + 寄存器 spill 区），逐槽 gc_trace_child —— 与旧
+// root_range 逐槽精确扫描位等价，但彻底消除每调用 unordered_map 根注册开销（递归/列表
+// 基准的 100~160× 差距根因），并修复 V1 单全局头在 spawn 多线程下交替 push/pop 互相截断
+// 根导致的随机活对象被回收（ex_gc_spawn 专门捕获该 bug）。链表头存于 ThreadGCState::
+// frame_head（per-thread），由 codegen 经 shadow_gc_thread_frame_head() 读写。
+struct ShadowFrameAnchor {
+    void* frame_ptr;                 // 连续 shadow frame 基址（[n_slots+sf_n x i64]）
+    ShadowFrameAnchor* prev;         // 调用链上一帧锚点
+    int32_t frame_n;                 // shadow frame 槽数（变量槽 + spill 槽）
+};
+
 static thread_local ThreadGCState* tl_gc_state = nullptr;
 static std::vector<ThreadGCState*> g_gc_thread_states;   // registry, guarded by g_gc_mutex
 static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_gc_remembered,
@@ -4000,6 +4018,15 @@ static ThreadGCState* gc_get_thread_state() {
     g_mutator_threads.fetch_add(1, std::memory_order_relaxed);
     tl_gc_state = s;
     return s;
+}
+
+// 编译期栈映射（per-thread）：返回【本线程】帧锚点链表头指针的地址（ShadowFrameAnchor**）。
+// codegen 的 frame enter/leave 通过该指针读写本线程的头，彻底避免 V1 单全局头在
+// spawn 多线程下交替 push/pop 互相截断根（ex_gc_spawn 专门捕获该 bug）。collect 经
+// g_gc_thread_states 遍历每个 ThreadGCState::frame_head 完成扫描。
+extern "C" void** shadow_gc_thread_frame_head() {
+    ThreadGCState* s = gc_get_thread_state();
+    return reinterpret_cast<void**>(&s->frame_head);
 }
 
 // 持锁辅助（mutator 路径）：等锁期间标记 blocked（stw_state=2），collect 扫根
@@ -4576,6 +4603,22 @@ extern "C" int64_t shadow_gc_collect() {
         for (auto& rg : s->range_roots) {
             char* base = reinterpret_cast<char*>(rg.first);
             uint32_t n = rg.second;
+            for (uint32_t i = 0; i < n; i++) {
+                void* slot_val;
+                std::memcpy(&slot_val, base + (size_t)i * sizeof(void*), sizeof(void*));
+                gc_trace_child(slot_val, worklist);
+            }
+        }
+    }
+    // 编译期栈映射：逐线程沿【本线程】帧锚点链表扫描整片连续 shadow frame（变量槽 + spill 区）。
+    // 取代旧 root_range（位等价、更全面，且无每调用根注册开销）。链表头存于 ThreadGCState::
+    // frame_head（per-thread），彻底修复 V1 单全局头在 spawn 多线程下根截断（ex_gc_spawn）。
+    for (ThreadGCState* s : g_gc_thread_states) {
+        std::lock_guard<std::mutex> lk(s->mtx);
+        for (ShadowFrameAnchor* a = s->frame_head; a != nullptr; a = a->prev) {
+            if (a->frame_n <= 0) continue;
+            char* base = reinterpret_cast<char*>(a->frame_ptr);
+            uint32_t n = (uint32_t)a->frame_n;
             for (uint32_t i = 0; i < n; i++) {
                 void* slot_val;
                 std::memcpy(&slot_val, base + (size_t)i * sizeof(void*), sizeof(void*));
