@@ -64,7 +64,13 @@ pkg/stage_llvm.sh
 pkg/shadow/uninstall.cmd
 # 载荷构建产物（stage_llvm.sh 收集的 LLVM 工具链 380MB + bin 二进制，不入库）
 pkg/shadow/bin/
-pkg/shadow/llvm/
+# llvm/bin 与 llvm/lib 是 stage_llvm.sh 收集的外部 LLVM 工具链，不入库；
+# llvm/crt 是 MSVC 静态 CRT/系统导入库（libucrt / libcpmt / libcmt / ws2_32 / winhttp / uuid …），
+# 自举 [4] 链接驱动与用户产物 --exe 都依赖它，必须入库，否则干净检出无法完成任何链接。
+pkg/shadow/llvm/bin/
+pkg/shadow/llvm/lib/
+# 放行：上方第 12 行的全局 *.lib 会一并挡掉这些导入库
+!pkg/shadow/llvm/crt/*.lib
 # 打包时对 src/ 与 std/ 标准库的拷贝（本体在 src/、std/，此处为副本；.sbg 缓存已被 *.sbg 忽略）
 pkg/shadow/src/
 
