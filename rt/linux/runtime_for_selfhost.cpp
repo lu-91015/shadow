@@ -4010,8 +4010,13 @@ struct GCTLSGuard {
 static thread_local GCTLSGuard gc_tls_guard;   // forces construction in each thread
 
 static ThreadGCState* gc_get_thread_state() {
-    (void)&gc_tls_guard;   // force construction of this thread's TLS guard
     if (tl_gc_state) return tl_gc_state;
+    // 冷路径（每线程仅首次）：强制构造本线程的 TLS 守卫，线程退出时反注册本线程 state。
+    // 该引用必须留在冷路径里 —— 放在函数首行会让【每次调用】都付 thread_local 初始化守卫：
+    // Linux 是 fs: 一次字节比较，Windows/MSVC ABI 则须经 CRT 导入跳板读 _Init_thread_epoch，
+    // 贵一个数量级。codegen 每个用户函数调用一次本 helper，awfy_permute_long 即 6.93 亿次：
+    // 实测帧簿记占 Windows 85.8% / Linux 26.6% 的总 CPU（@nogc A/B 对照，见 build/_frame_ab.sh）。
+    (void)&gc_tls_guard;
     ThreadGCState* s = new ThreadGCState();
     {
         std::lock_guard<std::mutex> lk(g_gc_mutex);

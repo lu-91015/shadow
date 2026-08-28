@@ -2854,8 +2854,24 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     cg_sf_off = total_slots;
     cg_frame_total = frame_total;
     let zero_v = llvm_const_int(llvm_i8(cg_ctx), 0, 1);
-    let len_v = llvm_const_int(i64_ty, frame_total * 8, 1);
-    llvm_memset(cg_builder, cg_sf_alloca, zero_v, len_v, 8);
+    // 分块清零：单次 memset 若需要超过 16 个 8 字节 store，LLVM 会放弃内联展开、
+    // 退化成对 CRT memset 的真实调用（MaxStoresPerMemset=16）。实测 17 槽的帧：
+    // 清零 128B=6443ms 而 136B=30294ms（awfy_permute_long，6.9 亿次调用）；
+    // Windows 上该调用还要穿 CRT 导入跳板，成本远高于 Linux —— 这正是同一份 IR
+    // 在 Windows 慢约 5 倍的全部来源。故每块至多 16 槽，保证 llc 一律内联展开。
+    // 清零总量与语义不变（变量槽 + spill 槽全部仍为 0，GC 扫描安全性不受影响）。
+    let zfb = 0;
+    while (zfb < frame_total) {
+        let zrem = frame_total - zfb;
+        let zblk = 16;
+        if (zrem < zblk) { zblk = zrem; }
+        let zbase = llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "zbase");
+        let zoff = llvm_const_int(i64_ty, zfb * 8, 1);
+        let zaddr = llvm_add(cg_builder, zbase, zoff, "zaddr");
+        let zp = llvm_inttoptr(cg_builder, zaddr, llvm_ptr_ty(i64_ty, 0), "zptr");
+        llvm_memset(cg_builder, zp, zero_v, llvm_const_int(i64_ty, zblk * 8, 1), 8);
+        zfb = zfb + zblk;
+    }
     // 变量槽 cg_slots[i] = 统一 frame 内偏移 i 的 i64*（inttoptr，避免 GEP 类型依赖）
     i = 0;
     while (i < total_slots) {
