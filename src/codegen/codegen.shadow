@@ -2872,13 +2872,16 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         llvm_memset(cg_builder, zp, zero_v, llvm_const_int(i64_ty, zblk * 8, 1), 8);
         zfb = zfb + zblk;
     }
-    // 变量槽 cg_slots[i] = 统一 frame 内偏移 i 的 i64*（inttoptr，避免 GEP 类型依赖）
+    // 变量槽 cg_slots[i] = 统一 frame 内偏移 i 的 i64*。
+    // 用 GEP 而非 ptrtoint+add+inttoptr：让 LLVM 看到 [N x i64] 数组结构，
+    // 使后续 load/store 有机会被提升到寄存器或向量化。GC 扫描帧时只依赖
+    // frame_ptr 指向连续 i64 数组这一事实（见 runtime_for_selfhost.cpp:3609-3612），
+    // 不依赖 inttoptr 语义，故安全。
     i = 0;
     while (i < total_slots) {
-        let fb = llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "fb");
-        let off = llvm_const_int(i64_ty, i * 8, 1);
-        let addr = llvm_add(cg_builder, fb, off, "fa");
-        cg_slots[i] = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i64_ty, 0), "fslot");
+        buf_reset();
+        buf_push(llvm_const_int(i64_ty, i, 1));
+        cg_slots[i] = llvm_gep(cg_builder, i64_ty, cg_sf_alloca, 1, "fslot");
         i = i + 1;
     }
     cg_gc_enter_frame();
