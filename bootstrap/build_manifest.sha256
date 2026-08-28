@@ -1,0 +1,6 @@
+# Shadow 0.5 构建产物指纹（由 tools/verify_build.sh --update 生成，勿手改）
+# 含义：在 tools/bootstrap.sh 记录的固定工具链与入库 crt 导入库下，
+#       下列二进制必须逐字节可重现；不一致即存在 runtime/.o 或链接输入漂移。
+# shadow 版本: shadow 0.5.1
+3b8a22e1cf6bf7b1d0f2cdda6955ffaf4db66ab5a2e66be3d20c19336bda5a32 build/shadow.exe
+30214492735d0cdf055dcd8a4e8909fe2ab3417cad6ad2d20bf7fccde507d852 build/run_tests.exe

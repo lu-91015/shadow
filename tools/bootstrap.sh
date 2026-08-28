@@ -155,4 +155,9 @@ MSYS2_ARG_CONV_EXCL='*' "$bin/clang++.exe" -std=c++17 \
 echo "[5] run bootstrap (7-stage self-host)"
 build/build_shadow.exe
 
+# 产物指纹校验：fixed-point 只比 .ll，看不见链进 shadow.exe 的 runtime/.o 漂移。
+# 换工具链或跨机器导致差异属预期时用 BUILD_ALLOW_DRIFT=1；有意改动后 --update 并提交 manifest。
+echo "[6] verify build artifact fingerprints"
+bash tools/verify_build.sh || { echo "[X] 产物指纹校验未通过"; exit 1; }
+
 echo "BOOTSTRAP_OK"
