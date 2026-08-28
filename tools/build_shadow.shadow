@@ -80,13 +80,21 @@ kimo main() -> int {
     rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
     // 用户程序 runtime 的辅助对象（main_link_exe 从 self_dir/rt/ 精确取这些名字）
-    // miniz.o 无源码（bootstrap/ 预编译产物），直接复制；cxa_atexit_shim.c 现场编译。
-    rt_sys_exec("cmd /c copy /Y " + boot + "\\miniz.o build\\rt\\miniz.o");
+    // miniz：源与头均已入库（bootstrap/miniz.c + miniz.h），一律现编，绝不复制预编译 .o。
+    // 同时产出 bootstrap/miniz.o —— [1/7]/[2/7] 的 stage 链接行直接引用该路径。
+    rt_sys_exec(clang_c + " -O1 -I " + boot + " -c " + boot + "/miniz.c -o " + boot + "/miniz.o");
+    rt_sys_exec(clang_c + " -O1 -I " + boot + " -c " + boot + "/miniz.c -o build/rt/miniz.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
 
     // [0.4/7] patch runtime: CreateProcessA shadow_sys_exec
     println("[0.4/7] patch runtime: CreateProcessA shadow_sys_exec");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
+    // runtime_for_selfhost.o 一律从源码现编：它是下面 wk.o / user.o 的唯一母本。
+    // 沿用已提交的 .o 会让 rt/ 的改动被静默忽略，而 fixed-point 只逐字节比 .ll、看不见 .o 漂移
+    // （历史事故：c0819b2 源码正确、.o 陈旧，ex_gc_longrun 被误判为"修了没用"）。
+    // 不再需要 -I build/linux —— miniz.h 已经 bootstrap/ 经 -I bootstrap 解析。
+    rt_sys_exec(clang + " -O1 -c rt/linux/runtime_for_selfhost.cpp -o " + boot + "/runtime_for_selfhost.o"
+        + " -I " + boot + " -I " + llvm + "/include -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w");
     // 运行时符号重命名：stage1.o 内含 shadow-lang 标准库实现（shadow_string_concat 等强符号），
     // runtime_for_selfhost.o 的 C++ 同名实现必须加 __cpp_ 前缀避免重复符号；shadow_sys_exec 走
     // CreateProcessA 补丁（sys_exec_cpa.o）。rt_alloc_cap 为新增原语，保留原名供编译器链接。

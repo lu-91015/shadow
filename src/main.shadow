@@ -1501,17 +1501,45 @@ pub kimo main_load_combined(main_path: string, arg0: string) -> string {
         main_eprint("module error: " + main_import_err + "\n");
         return "";
     }
-    // 3. runtime_lib.shadow 定位：①exe 上级的 src/runtime（build\shadow.exe → ../src/runtime）
-    //    ②主文件同目录 runtime/ ③CWD 相对 src/runtime
-    let rt_path = "src\\runtime\\runtime_lib.shadow";
-    let exe_dir = main_exe_dir(arg0);
-    if (len(exe_dir) > 0) {
-        let cand = exe_dir + "\\..\\src\\runtime\\runtime_lib.shadow";
-        if (file_exists(cand) == 1) { rt_path = cand; }
+    // 3. runtime_lib.shadow 定位：唯一事实来源必须是「编译器源码根」下的 src/runtime。
+    //    强标记：该 src/ 下同时存在 main.shadow（编译器自身入口）——只有真正的源码树满足，
+    //    借此拒绝 <root>/build/src/runtime 这类影子副本抢占（build/linux/shadow 的
+    //    exe_dir\..\src 恰为 build\src；副本陈旧时内建被误判 extern → 链接 undefined reference）。
+    //    候选顺序与 main_std_root 一致：①exe\..\src ②exe\src ③CWD src ④exe 向上最多 4 级
+    //    ⑤主文件目录 runtime/。
+    let rt_path = "";
+    let rtx = main_exe_dir(arg0);
+    if (len(rtx) > 0) {
+        let rr1 = rtx + "\\..\\src";
+        if (file_exists(rr1 + "\\main.shadow") == 1) { rt_path = rr1 + "\\runtime\\runtime_lib.shadow"; }
+    }
+    if (len(rt_path) == 0 && len(rtx) > 0) {
+        let rr2 = main_path_join(rtx, "src");
+        if (file_exists(rr2 + "\\main.shadow") == 1) { rt_path = rr2 + "\\runtime\\runtime_lib.shadow"; }
+    }
+    if (len(rt_path) == 0) {
+        if (file_exists("src\\main.shadow") == 1) { rt_path = "src\\runtime\\runtime_lib.shadow"; }
+    }
+    if (len(rt_path) == 0) {
+        let rrus = rtx;
+        let rrys = 0;
+        while (rrys < 4) {
+            let rrpar = main_exe_dir(rrus);
+            if (len(rrpar) == 0) { break; }
+            if (str_eq(rrpar, rrus) == 1) { break; }
+            rrus = rrpar;
+            if (file_exists(rrus + "\\src\\main.shadow") == 1) {
+                rt_path = rrus + "\\src\\runtime\\runtime_lib.shadow";
+                break;
+            }
+            rrys = rrys + 1;
+        }
     }
     if (file_exists(rt_path) == 0) {
+        rt_path = "";
         let cand2 = main_path_join(dir, "runtime\\runtime_lib.shadow");
         if (file_exists(cand2) == 1) { rt_path = cand2; }
+        if (len(rt_path) == 0) { rt_path = "src\\runtime\\runtime_lib.shadow"; }
     }
     let rt_src = main_read_or_empty(rt_path);
     // 4. runtime_lib.shadow 内容（去 dsb）—— 放最后；0.3 声明收集无顺序问题

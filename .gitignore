@@ -40,12 +40,9 @@ _spk_extracted/
 # 入库（自举链硬依赖，覆盖上方的 *.o / *.exe 忽略）：
 !bootstrap/s03.exe
 !bootstrap/runtime_clang.o
-!bootstrap/runtime_for_selfhost.o
-!bootstrap/miniz.o
-# 不入库：miniz.h（源码，非自举必需）。
-# sys_exec_cpa.c 已恢复入库（测试运行器 CreateProcessA 原生绑定源码，配合 build/run_tests.exe
-# 使干净克隆可直接 run_tests 而无需重建）；miniz.h 仍不入库。
-bootstrap/miniz.h
+# miniz.h/miniz.c 现在必须入库：rt/linux/runtime_for_selfhost.cpp 经 -I bootstrap 引 miniz.h，
+# 而 runtime_for_selfhost.o / miniz.o 已改为每次自举从源码现编（不再提交二进制）。
+# 若 miniz.h 不入库，干净检出上 runtime 源码就编不出来 —— 正是当初退回冻结 .o 的原因。
 
 # 测试/构建临时产物（exe tmp、SPK 锁）
 *.tmp*
@@ -93,6 +90,17 @@ pkg/shadow/tools/verify_fixed_point.py
 # 本地辅助 shell 工具（不入库，避免 CRLF/LF 提交噪音）
 tools/build_lspfix.sh
 tools/verify_index_batch.sh
+# 复跑编排脚本（含本机绝对路径：LLVM_HOME/go，不入库；见 tools/build.sh 等）
+tools/build.sh
+tools/test_basic.sh
+tools/bench_short.sh
+tools/bench_fourway.sh
+tools/_test_basic_linux.sh
+tools/_bench_short_linux.sh
 
 # 项目文档（不入库）
 开发原则.md
+tools/_win_awfy_long.sh
+tools/_linux_awfy_long.sh
+tools/env.local.sh
+
