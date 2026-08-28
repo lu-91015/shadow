@@ -99,7 +99,7 @@ kimo main() -> int {
         " build/rt/rt_zip.o build/rt/shadow_index.o" +
         " build/rt/rt_proc_spawn.o build/rt/rt_test_par.o build/rt/sys_exec_cpa.o" +
         " build/rt/cxa_atexit_shim.o" +
-        " -o build/run_tests.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + llvm + "/lib -Lpkg/shadow/llvm/crt");
+        " -o build/run_tests.exe -Wl,/subsystem:console -Wl,/Brepro -lws2_32 -lLLVM-C -L" + llvm + "/lib -Lpkg/shadow/llvm/crt");
 
     // 冒烟：run_tests.exe 能列出 tc 用例即代表链接产物可用
     let smoke = rt_sys_exec("build/run_tests.exe --cases test/cases/tc --list");

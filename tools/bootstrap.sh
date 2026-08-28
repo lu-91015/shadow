@@ -144,11 +144,13 @@ echo "[3] precompile runtime objects"
 echo "[user runtime] build/rt/runtime_for_selfhost_user.o written"
 
 echo "[4] link driver build/build_shadow.exe"
-"$bin/clang++.exe" -std=c++17 \
+# /Brepro：写入内容派生的固定 TimeDateStamp，产物才可逐字节重现。
+# 仅此次调用关闭 MSYS 参数路径转换 —— Git Bash 会把 /Brepro 改写成 D:/Git/Brepro。
+MSYS2_ARG_CONV_EXCL='*' "$bin/clang++.exe" -std=c++17 \
   build/build_shadow.o build/rt/runtime_for_selfhost_wk.o bootstrap/miniz.o \
   build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o \
   build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o \
-  -o build/build_shadow.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L"$LLVM_M/lib" -Lpkg/shadow/llvm/crt
+  -o build/build_shadow.exe -Wl,/subsystem:console -Wl,/Brepro -lws2_32 -lLLVM-C -L"$LLVM_M/lib" -Lpkg/shadow/llvm/crt
 
 echo "[5] run bootstrap (7-stage self-host)"
 build/build_shadow.exe

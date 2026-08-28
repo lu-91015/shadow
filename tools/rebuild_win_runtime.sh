@@ -47,10 +47,12 @@ echo "[3] generate user.o (user-program runtime, GC kept)"
   bootstrap/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o
 
 echo "[4] relink build/shadow.exe"
-"$BIN/clang++.exe" -std=c++17 \
+# /Brepro：内容派生的固定时间戳，重链产物才可逐字节比对；仅此次调用关闭 MSYS 路径转换
+# （否则 Git Bash 会把 /Brepro 改写成 D:/Git/Brepro）。
+MSYS2_ARG_CONV_EXCL='*' "$BIN/clang++.exe" -std=c++17 \
   "$STAGE" build/rt/runtime_for_selfhost_wk.o bootstrap/miniz.o \
   build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o \
   build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o \
-  -o build/shadow.exe -Wl,/subsystem:console -Wl,/stack:8388608 \
+  -o build/shadow.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 \
   -lws2_32 -lLLVM-C -L"$LLVM_HOME/lib" -Lpkg/shadow/llvm/crt
 echo "OK -> build/shadow.exe"
