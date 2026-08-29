@@ -1421,8 +1421,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         // 且 a 已知为空（let a=[]）→ 循环前一次性分配 cap=n（类似 Go 的 make），
         // 消除 2M 次 push 的倍增扩容 + memcpy（prime_sieve 等）。bound 仅限变量/字面量
         // （无副作用，可安全在循环前求值一次）；a 非空或模式不符则不触发（保守）。
-        let pre_a_slot = -1;
-        let pre_a_ty: Type = 0 as Type;
+        let pre_slots: array<int> = [];
+        let pre_tys: array<Type> = [];
         let pre_bound: HirExpr = 0 as HirExpr;
         let cond = h.child;
         if ((cond as any) != 0 && cond.kind == EXPR_BINARY &&
@@ -1446,8 +1446,16 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                                     let args = srhs.children;
                                     if (len(args) > 0 && args[0].kind == EXPR_VAR &&
                                         args[0].slot == slhs.slot && mir_empty_is(slhs.slot) == 1) {
-                                        pre_a_slot = slhs.slot;
-                                        pre_a_ty = slhs.inferred_type;
+                                        let dup = 0;
+                                        let di = 0;
+                                        while (di < len(pre_slots)) {
+                                            if (pre_slots[di] == slhs.slot) { dup = 1; }
+                                            di = di + 1;
+                                        }
+                                        if (dup == 0) {
+                                            pre_slots = array_push(pre_slots, slhs.slot);
+                                            pre_tys = array_push(pre_tys, slhs.inferred_type);
+                                        }
                                     }
                                 }
                                 if (srhs.kind == EXPR_BINARY && srhs.op == BIN_ADD) {
@@ -1462,40 +1470,51 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                         }
                         bi = bi + 1;
                     }
-                    if (pre_a_slot >= 0 && found_inc == 1) {
+                    if (len(pre_slots) > 0 && found_inc == 1) {
                         pre_bound = c1;
                     }
                 }
             }
         }
-        if (pre_a_slot >= 0 && (pre_bound as any) != 0) {
-            // 预分配：a = shadow_array_prealloc(elem_size, n)
-            let es = 8;
-            if ((pre_a_ty as any) != 0 && (pre_a_ty.elem_type as any) != 0) {
-                let ek = pre_a_ty.elem_type.kind;
-                if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT ||
-                    ek == TYPE_BOOL || ek == TYPE_ENUM || ek == TYPE_DATE) { es = 4; }
-            }
-            let es_reg = mir_new_reg();
-            let es_inst = mir_mk(MIR_CONST_INT);
-            es_inst.dst = es_reg;
-            es_inst.longval = es;
-            es_inst.ty = mk_type(TYPE_INT);
-            mir_emit(es_inst);
+        if (len(pre_slots) > 0 && (pre_bound as any) != 0) {
+            // 预分配：对每个合格目标各发一条 a = shadow_array_prealloc(elem_size, n)。
+            // 上界只求值一次并被所有目标共享（bound 限定为变量/字面量，无副作用）；
+            // elem_size 逐目标按各自元素类型算。原实现只保留最后一个目标，于是
+            // while(i<n){a=push(a);b=push(b);c=push(c);d=push(d)} 里三个数组仍走
+            // 倍增扩容（awfy_queens_long 实测 234 万次分配、其中 72 万次是 12 字节
+            // 空数组，正是这个形状）。
             let n_reg = mir_lower_expr(pre_bound);
-            let r = mir_new_reg();
-            let call = mir_mk(MIR_CALL);
-            call.dst = r;
-            call.strval = "shadow_array_prealloc";
-            call.args = [es_reg, n_reg];
-            call.ty = pre_a_ty;
-            mir_emit(call);
-            let st = mir_mk(MIR_STORE_VAR);
-            st.arg1 = r;
-            st.arg2 = pre_a_slot;
-            st.ty = pre_a_ty;
-            mir_emit(st);
-            mir_empty_set(pre_a_slot, 0);
+            let pi = 0;
+            while (pi < len(pre_slots)) {
+                let pslot = pre_slots[pi];
+                let pty: Type = pre_tys[pi];
+                let es = 8;
+                if ((pty as any) != 0 && (pty.elem_type as any) != 0) {
+                    let ek = pty.elem_type.kind;
+                    if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT ||
+                        ek == TYPE_BOOL || ek == TYPE_ENUM || ek == TYPE_DATE) { es = 4; }
+                }
+                let es_reg = mir_new_reg();
+                let es_inst = mir_mk(MIR_CONST_INT);
+                es_inst.dst = es_reg;
+                es_inst.longval = es;
+                es_inst.ty = mk_type(TYPE_INT);
+                mir_emit(es_inst);
+                let r = mir_new_reg();
+                let call = mir_mk(MIR_CALL);
+                call.dst = r;
+                call.strval = "shadow_array_prealloc";
+                call.args = [es_reg, n_reg];
+                call.ty = pty;
+                mir_emit(call);
+                let st = mir_mk(MIR_STORE_VAR);
+                st.arg1 = r;
+                st.arg2 = pslot;
+                st.ty = pty;
+                mir_emit(st);
+                mir_empty_set(pslot, 0);
+                pi = pi + 1;
+            }
         }
         // 循环入口：体内别名操作会让变量在下一次迭代被共享，清除所有权禁用就地追加
         mir_clear_loop_aliases(h.body);
