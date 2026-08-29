@@ -388,6 +388,119 @@ pub kimo cg_is_ptr_kind(k: int) -> int {
     return 0;
 }
 
+// W1：判定"定宽标量类型"——其值在运行时绝不可能是堆指针，故该槽无需被 GC 扫描。
+// 刻意用白名单而非 !cg_is_ptr_kind()：未列出的类型（TYPE_ANY / ENUM / TUPLE / FUTURE /
+// INFER / 以及任何新增种类）一律返回 0，即按指针处理、留在帧内。
+// 这样判定不完美的失败模式是"少优化一点"，而不是漏根导致提前释放。
+pub kimo cg_is_value_kind(k: int) -> int {
+    if (k == TYPE_INT || k == TYPE_LONG) { return 1; }
+    if (k == TYPE_FLOAT || k == TYPE_DOUBLE) { return 1; }
+    if (k == TYPE_BOOL || k == TYPE_CHAR || k == TYPE_SHORT) { return 1; }
+    if (k == TYPE_DATE || k == TYPE_TIMESTAMP || k == TYPE_NANOTIMESTAMP) { return 1; }
+    if (k == TYPE_UNIT || k == TYPE_VOID) { return 1; }
+    return 0;
+}
+
+// ⚠️ 不能用 cg_type_kind 做本判定：它对空类型返回 TYPE_INT（"无类型即 int"是既有
+// 表示约定），会把未标注类型的写点误判成标量、从而逐出 GC 帧 → 漏根 → 提前释放。
+// 这里把空类型显式映射为 -1（未知），由调用方按保守处理。
+pub kimo cg_slot_kind_of(t: Type) -> int {
+    if ((t as any) == 0) { return -1; }
+    return t.kind;
+}
+
+// W1：预遍指令流，推导每个变量槽是否可能持有堆指针。
+// 写帧槽的点只有两处（已核实：全文件仅 MIR_LOAD_VAR 读、MIR_STORE_VAR 写、序言参数落槽），
+// 但 MIR_STORE_VAR.ty 常常缺失，因此这里按指令序模拟 cg_reg_types 的传播，
+// 用"源寄存器在被定义时的类型"作为写入该槽的值类型。
+// 槽状态三值：0=无写证据 1=有指针证据 2=仅标量证据；只有状态 2 才逐出帧。
+// 任何未知（-1 / TYPE_ANY / 未列出类型）都会把状态推到 1，即保守留在帧内。
+pub kimo cg_scan_ptr_slots(mf: MirFunc, blocks_arg: array<MirBlock>, n_slots: int) -> array<int> {
+    let st: array<int> = [];
+    let i = 0;
+    while (i < n_slots) {
+        st = array_push(st, 0);
+        i = i + 1;
+    }
+    let n_regs = mf.n_regs;
+    if (n_regs <= 0) { n_regs = 1; }
+    let rk: array<int> = [];
+    i = 0;
+    while (i < n_regs) {
+        rk = array_push(rk, TYPE_ANY);      // 未定义寄存器：保守当指针
+        i = i + 1;
+    }
+    // 参数槽：类型来自 MirParam.type_kind（可靠），指针类型直接记为指针证据
+    let pi = 0;
+    while (pi < len(mf.params)) {
+        let p = mf.params[pi];
+        if (p.slot >= 0 && p.slot < n_slots) {
+            if (cg_is_value_kind(p.type_kind) == 1) {
+                if (st[p.slot] == 0) { st[p.slot] = 2; }
+            } else {
+                st[p.slot] = 1;
+            }
+        }
+        pi = pi + 1;
+    }
+    let bi = 0;
+    while (bi < len(blocks_arg)) {
+        // ⚠️ 必须把 blk.terminator 一并纳入扫描：它本身是 MirInst，可以承载 MIR_STORE_VAR
+        // 等写槽操作（cg_analyze_liveness 也是这样处理的）。只扫 insts 会把"由终止指令
+        // 写入过指针"的槽误判成纯标量并逐出帧 → 漏根。实测 cg_try_catch_cross_fn 即如此。
+        let allmi: array<MirInst> = [];
+        let jj = 0;
+        while (jj < len(blocks_arg[bi].insts)) {
+            allmi = array_push(allmi, blocks_arg[bi].insts[jj]);
+            jj = jj + 1;
+        }
+        let tm = blocks_arg[bi].terminator;
+        if ((tm as any) != 0) { allmi = array_push(allmi, tm); }
+        let insts = allmi;
+        let j = 0;
+        while (j < len(insts)) {
+            let mi = insts[j];
+            let k = cg_slot_kind_of(mi.ty);
+            if (mi.op == MIR_STORE_VAR) {
+                let s = mi.arg2;
+                if (s >= 0 && s < n_slots) {
+                    let vk = -1;
+                    if (mi.arg1 >= 0 && mi.arg1 < n_regs) { vk = rk[mi.arg1]; }
+                    if (vk >= 0 && cg_is_value_kind(vk) == 1) {
+                        if (st[s] == 0) { st[s] = 2; }
+                    } else {
+                        st[s] = 1;
+                    }
+                }
+            }
+            if (mi.op == MIR_LOAD_VAR) {
+                let rs = mi.arg1;
+                if (rs >= 0 && rs < n_slots) {
+                    if (k < 0 || cg_is_value_kind(k) == 0) { st[rs] = 1; }
+                }
+            }
+            if (mi.dst >= 0 && mi.dst < n_regs) {
+                if (k < 0) { rk[mi.dst] = TYPE_ANY; } else { rk[mi.dst] = k; }
+            }
+            j = j + 1;
+        }
+        bi = bi + 1;
+    }
+    let out: array<int> = [];
+    i = 0;
+    while (i < n_slots) {
+        // 只有"正向标量证据"（状态 2：确有写点、且全部写点类型都是定宽标量）才逐出帧。
+        // ⚠️ 不要放宽成"状态 0（未见写点）也可逐出"：实测那样会让 Windows 全量出现 8 个
+        // 失败，其中 gc_15_implicit_return / gc_16_multi_return / gc_09_recursive /
+        // cg_try_catch_cross_fn 表明返回值与异常路径会以 MIR_STORE_VAR 之外的方式建立
+        // 槽内容 —— "从未被写"在本编译器里并不成立，状态 0 必须继续扎根。
+        if (st[i] == 2) { out = array_push(out, 0); }
+        else { out = array_push(out, 1); }
+        i = i + 1;
+    }
+    return out;
+}
+
 // 把 LLVM 值从 src_k cast 到 dst_k
 pub kimo cg_cast_val(val: any, src_k: int, dst_k: int) -> any {
     if (src_k == dst_k) { return val; }
@@ -2852,20 +2965,36 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     // 沿链表逐帧扫描。取代运行时 shadow_gc_root_range / per-param root_set 登记（彻底消除
     // 每调用 GC 簿记）。等号右侧 spill 槽偏移 cg_sf_off = total_slots。
     let i64_ty = llvm_i64(cg_ctx);
-    let frame_total = total_slots + sf_n;
+    // W1：帧只收"可能持有堆指针"的变量槽。
+    // 关键理由：帧地址会被写进 GC 锚点（store frame_ptr → anchor），该 alloca 因此
+    // 逃逸，LLVM 的 mem2reg/SROA 无法把里面任何槽提升进寄存器 —— 于是每个局部变量
+    // 的每次读写都是真实栈访存。把定宽标量槽挪到独立 alloca（不被取址）后，它们才可
+    // 能进寄存器。判定保守：类型未知或非白名单的槽一律留在帧内（见 cg_is_value_kind）。
+    let ptrmap = cg_scan_ptr_slots(mf, blocks_arg, total_slots);
+    let nfvars = 0;
+    i = 0;
+    while (i < total_slots) {
+        if (ptrmap[i] == 1) { nfvars = nfvars + 1; }
+        i = i + 1;
+    }
+    let frame_total = nfvars + sf_n;
+    // 帧至少 1 槽、锚点无条件注册：%gc_anchor 的 alloca 由 cg_gc_enter_frame 发射，
+    // 而函数收尾的 leave 路径仍会引用它 —— 一旦按 frame_total==0 跳过 enter，就会留下
+    // "use of undefined value '%gc_anchor'" 的畸形 IR（实测 cg_try_catch_cross_fn 在
+    // opt 阶段报错）。故这里保持与原实现相同的不变式，W1 的收益仅体现在帧尺寸收缩上。
     if (frame_total < 1) { frame_total = 1; }
     let frame_ty = llvm_array_ty(i64_ty, frame_total);
     cg_sf_alloca = llvm_alloca(cg_builder, frame_ty, "frame");
     cg_sf_n = sf_n;
-    cg_sf_off = total_slots;
+    cg_sf_off = nfvars;
     cg_frame_total = frame_total;
     let zero_v = llvm_const_int(llvm_i8(cg_ctx), 0, 1);
     // 分块清零：单次 memset 若需要超过 16 个 8 字节 store，LLVM 会放弃内联展开、
     // 退化成对 CRT memset 的真实调用（MaxStoresPerMemset=16）。实测 17 槽的帧：
     // 清零 128B=6443ms 而 136B=30294ms（awfy_permute_long，6.9 亿次调用）；
-    // Windows 上该调用还要穿 CRT 导入跳板，成本远高于 Linux —— 这正是同一份 IR
-    // 在 Windows 慢约 5 倍的全部来源。故每块至多 16 槽，保证 llc 一律内联展开。
-    // 清零总量与语义不变（变量槽 + spill 槽全部仍为 0，GC 扫描安全性不受影响）。
+    // Windows 上该调用还要穿 CRT 导入跳板，成本远高于 Linux。故每块至多 16 槽。
+    // W1 之后 permute 这类"1 个指针 + 一堆整数"的函数帧已缩到远小于 16 槽，
+    // 分块只是为指针槽很多的大帧兜底。
     let zfb = 0;
     while (zfb < frame_total) {
         let zrem = frame_total - zfb;
@@ -2878,16 +3007,22 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         llvm_memset(cg_builder, zp, zero_v, llvm_const_int(i64_ty, zblk * 8, 1), 8);
         zfb = zfb + zblk;
     }
-    // 变量槽 cg_slots[i] = 统一 frame 内偏移 i 的 i64*。
-    // 用 GEP 而非 ptrtoint+add+inttoptr：让 LLVM 看到 [N x i64] 数组结构，
-    // 使后续 load/store 有机会被提升到寄存器或向量化。GC 扫描帧时只依赖
-    // frame_ptr 指向连续 i64 数组这一事实（见 runtime_for_selfhost.cpp:3609-3612），
-    // 不依赖 inttoptr 语义，故安全。
+    // 变量槽绑定：指针槽 = 帧内第 fidx 项（连续，供锚点整片扫描）；
+    // 标量槽 = 独立 alloca（不被锚点取址 ⇒ 不逃逸 ⇒ 可进寄存器）。
     i = 0;
+    let fidx = 0;
     while (i < total_slots) {
-        buf_reset();
-        buf_push(llvm_const_int(i64_ty, i, 1));
-        cg_slots[i] = llvm_gep(cg_builder, i64_ty, cg_sf_alloca, 1, "fslot");
+        if (ptrmap[i] == 1) {
+            buf_reset();
+            buf_push(llvm_const_int(i64_ty, fidx, 1));
+            cg_slots[i] = llvm_gep(cg_builder, i64_ty, cg_sf_alloca, 1, "fslot");
+            fidx = fidx + 1;
+        } else {
+            cg_slots[i] = llvm_alloca(cg_builder, i64_ty, "vslot");
+            // 必须清零：原先这些槽由帧的 memset 统一置 0，"未初始化读取得 0"是既有语义。
+            // 单独 store 后 LLVM 的 mem2reg 会把它与后续定义合并，不产生额外开销。
+            llvm_store(cg_builder, llvm_const_int(i64_ty, 0, 1), cg_slots[i]);
+        }
         i = i + 1;
     }
     cg_gc_enter_frame();
