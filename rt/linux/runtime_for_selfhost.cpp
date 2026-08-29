@@ -48,7 +48,24 @@
 // 此处提前声明以供 shadow_hashmap_*（line ~412）使用 —— hashmap_* 已与 dict 统一表示。
 // 由于 hashmap_* 需要访问成员（new ShadowDict、m->data 等），
 // 必须把完整 struct 定义移到此处（不能仅 forward declare）。
-using DictValue = std::variant<int64_t, double, std::string, bool, void*>;
+// DictValue: pure C tag+union layout for W3 in-band header
+struct DictValue {
+    int32_t tag; // 0=int64, 1=double, 2=string, 3=bool, 4=ptr
+    union { int64_t i; double d; const char* s; int32_t b; void* p; } val;
+    
+    DictValue() : tag(0), val{} {}
+    DictValue(int64_t v) : tag(0), val{} { val.i = v; }
+    DictValue(double v) : tag(1), val{} { val.d = v; }
+    DictValue(const char* v) : tag(2), val{} { val.s = v ? strdup(v) : nullptr; }
+    DictValue(std::string v) : tag(2), val{} { val.s = strdup(v.c_str()); }
+    DictValue(bool v) : tag(3), val{} { val.b = v ? 1 : 0; }
+    DictValue(void* v) : tag(4), val{} { val.p = v; }
+    DictValue& operator=(int64_t v) { tag=0; val.i=v; return *this; }
+    DictValue& operator=(double v) { tag=1; val.d=v; return *this; }
+    DictValue& operator=(const char* v) { tag=2; free((void*)val.s); val.s=v?strdup(v):nullptr; return *this; }
+    DictValue& operator=(bool v) { tag=3; val.b=v?1:0; return *this; }
+    DictValue& operator=(void* v) { tag=4; val.p=v; return *this; }
+};
 struct ShadowDict;
 struct ShadowArray;
 // Forward declarations for static helpers (defined below)
@@ -718,8 +735,8 @@ extern "C" const char* shadow_hashmap_get(void* map, const char* key) {
     auto it = m->data.find(key);
     if (it == m->data.end()) return dup_str("");
     // 仅当值为 string 变体时返回；非 string 变体返回其字符串表示（与原行为一致）
-    if (std::holds_alternative<std::string>(it->second)) {
-        return dup_str(std::get<std::string>(it->second).c_str());
+    if (it->second.tag == 2) {
+        return dup_str(it->second.val.s);
     }
     return dup_str(value_to_string(it->second).c_str());
 }
@@ -1088,23 +1105,23 @@ extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size);
 
 // Helper: convert Shadow value to string
 static std::string value_to_string(const DictValue& v) {
-    if (std::holds_alternative<int64_t>(v)) {
-        return std::to_string(std::get<int64_t>(v));
+    if (v.tag == 0) {
+        return std::to_string(v.val.i);
     }
-    if (std::holds_alternative<double>(v)) {
+    if (v.tag == 1) {
         std::ostringstream ss;
-        ss << std::get<double>(v);
+        ss << v.val.d;
         return ss.str();
     }
-    if (std::holds_alternative<bool>(v)) {
-        return std::get<bool>(v) ? "true" : "false";
+    if (v.tag == 3) {
+        return v.val.b ? "true" : "false";
     }
-    if (std::holds_alternative<std::string>(v)) {
-        return std::get<std::string>(v);
+    if (v.tag == 2) {
+        return std::string(v.val.s ? v.val.s : "");
     }
-    if (std::holds_alternative<void*>(v)) {
-        ShadowDict* d = reinterpret_cast<ShadowDict*>(std::get<void*>(v));
-        ShadowArray* a = reinterpret_cast<ShadowArray*>(std::get<void*>(v));
+    if (v.tag == 4) {
+        ShadowDict* d = reinterpret_cast<ShadowDict*>(v.val.p);
+        ShadowArray* a = reinterpret_cast<ShadowArray*>(v.val.p);
         if (d) return value_to_string_dict(d);
         if (a) return value_to_string_array(a);
     }
@@ -1333,24 +1350,24 @@ extern "C" void* shadow_dict_get(void* dict_ptr, const char* key) {
     auto it = d->data.find(key);
     if (it == d->data.end()) return nullptr;
     DictValue& val = it->second;
-    if (std::holds_alternative<int64_t>(val)) {
-        g_any_int_buf = std::get<int64_t>(val);
+    if (val.tag == 0) {
+        g_any_int_buf = val.val.i;
         return &g_any_int_buf;
     }
-    if (std::holds_alternative<double>(val)) {
-        g_any_float_buf = std::get<double>(val);
+    if (val.tag == 1) {
+        g_any_float_buf = val.val.d;
         return &g_any_float_buf;
     }
-    if (std::holds_alternative<bool>(val)) {
-        g_any_bool_buf = std::get<bool>(val);
+    if (val.tag == 3) {
+        g_any_bool_buf = val.val.b;
         return &g_any_bool_buf;
     }
-    if (std::holds_alternative<std::string>(val)) {
-        g_str_buf = std::get<std::string>(val);
+    if (val.tag == 2) {
+        g_str_buf = std::string(val.val.s ? val.val.s : "");
         return const_cast<char*>(g_str_buf.c_str());
     }
-    if (std::holds_alternative<void*>(val)) {
-        void* p = std::get<void*>(val);
+    if (val.tag == 4) {
+        void* p = val.val.p;
         // Nested dict/array
         ShadowArray* nested_a = reinterpret_cast<ShadowArray*>(p);
         if (nested_a && nested_a->type_tag == 0) {
@@ -1548,27 +1565,27 @@ extern "C" void* shadow_array_get(void* array_ptr, int32_t idx) {
     if (idx < 0) idx = (int32_t)a->size() + idx;
     if (idx < 0 || (size_t)idx >= a->size()) return nullptr;
     DictValue& val = (*a)[idx];
-    if (std::holds_alternative<int64_t>(val)) {
+    if (val.tag == 0) {
         // Transparent 'any' model: return the raw int64 value, not a box pointer.
         // The self-hosted codegen (and shadowc's compiled code) treat 'any' as the
         // raw value (e.g. an LLVM handle stored as i64), so returning &g_any_int_buf
         // would hand a box address where a raw handle is expected.
-        return (void*)(intptr_t)std::get<int64_t>(val);
+        return (void*)(intptr_t)val.val.i;
     }
-    if (std::holds_alternative<double>(val)) {
-        g_any_float_buf = std::get<double>(val);
+    if (val.tag == 1) {
+        g_any_float_buf = val.val.d;
         return &g_any_float_buf;
     }
-    if (std::holds_alternative<std::string>(val)) {
-        const char* c = std::get<std::string>(val).c_str();
+    if (val.tag == 2) {
+        const char* c = val.val.s;
         return (void*)c;
     }
-    if (std::holds_alternative<bool>(val)) {
-        g_any_bool_buf = std::get<bool>(val);
+    if (val.tag == 3) {
+        g_any_bool_buf = val.val.b;
         return &g_any_bool_buf;
     }
-    if (std::holds_alternative<void*>(val)) {
-        void* vp = std::get<void*>(val);
+    if (val.tag == 4) {
+        void* vp = val.val.p;
         return vp;
     }
     return nullptr;
@@ -1679,11 +1696,11 @@ extern "C" const char* shadow_string_array_join(void* arr_ptr, const char* sep) 
     for (size_t i = 0; i < a->size(); i++) {
         if (i > 0) result += d;
         const DictValue& v = (*a)[i];
-        if (std::holds_alternative<void*>(v)) {
-            void* p = std::get<void*>(v);
+        if (v.tag == 4) {
+            void* p = v.val.p;
             if (p) result += (const char*)p;
-        } else if (std::holds_alternative<std::string>(v)) {
-            result += std::get<std::string>(v);
+        } else if (v.tag == 2) {
+            result += std::string(v.val.s ? v.val.s : "");
         } else {
             result += value_to_string(v);
         }
@@ -1750,8 +1767,8 @@ extern "C" const char* shadow_json_get(const char* dict_ptr, const char* key) {
     auto it = d->data.find(key);
     if (it == d->data.end()) return dup_str("");
     const DictValue& v = it->second;
-    if (std::holds_alternative<std::string>(v))
-        return dup_str(std::get<std::string>(v).c_str());
+    if (v.tag == 2)
+        return dup_str(v.val.s);
     // Fall back to stringifying other variants (int/bool/etc.).
     return dup_str(value_to_string(v).c_str());
 }
@@ -1763,11 +1780,11 @@ extern "C" int64_t shadow_json_get_int(const char* dict_ptr, const char* key) {
     auto it = d->data.find(key);
     if (it == d->data.end()) return 0;
     const DictValue& v = it->second;
-    if (std::holds_alternative<int64_t>(v)) return std::get<int64_t>(v);
-    if (std::holds_alternative<double>(v)) return (int64_t)std::get<double>(v);
-    if (std::holds_alternative<bool>(v)) return std::get<bool>(v) ? 1 : 0;
-    if (std::holds_alternative<std::string>(v)) {
-        try { return std::stoll(std::get<std::string>(v)); } catch (...) { return 0; }
+    if (v.tag == 0) return v.val.i;
+    if (v.tag == 1) return (int64_t)v.val.d;
+    if (v.tag == 3) return v.val.b ? 1 : 0;
+    if (v.tag == 2) {
+        try { return std::stoll(std::string(v.val.s ? v.val.s : "")); } catch (...) { return 0; }
     }
     return 0;
 }
@@ -2583,8 +2600,8 @@ extern "C" int64_t shadow_array_get_int(void* array_ptr, int32_t idx) {
                 idx, a->size());
         return 0;
     }
-    if (std::holds_alternative<int64_t>((*a)[idx]))
-        return std::get<int64_t>((*a)[idx]);
+    if ((*a)[idx].tag == 0)
+        return (*a)[idx].val.i;
     return 0;
 }
 
@@ -2598,8 +2615,10 @@ extern "C" const char* shadow_array_get_string(void* array_ptr, int32_t idx) {
                 idx, a->size());
         return nullptr;
     }
-    if (std::holds_alternative<std::string>((*a)[idx]))
-        return strdup(std::get<std::string>((*a)[idx]).c_str());
+    if ((*a)[idx].tag == 2) {
+        const char* s = (*a)[idx].val.s;
+        return s ? strdup(s) : nullptr;
+    }
     return nullptr;
 }
 
@@ -2613,8 +2632,8 @@ extern "C" int32_t shadow_array_get_bool(void* array_ptr, int32_t idx) {
                 idx, a->size());
         return 0;
     }
-    if (std::holds_alternative<bool>((*a)[idx]))
-        return std::get<bool>((*a)[idx]) ? 1 : 0;
+    if ((*a)[idx].tag == 3)
+        return (*a)[idx].val.b ? 1 : 0;
     return 0;
 }
 
@@ -2636,20 +2655,20 @@ extern "C" void* shadow_array_get_ptr(void* array_ptr, int32_t idx) {
     // only string/void* were handled and scalars fell through to nullptr,
     // which made `a[i] as int` read 0 instead of the real element.
     DictValue& val = (*a)[idx];
-    if (std::holds_alternative<int64_t>(val))
-        return (void*)(intptr_t)std::get<int64_t>(val);
-    if (std::holds_alternative<double>(val)) {
-        g_any_float_buf = std::get<double>(val);
+    if (val.tag == 0)
+        return (void*)(intptr_t)val.val.i;
+    if (val.tag == 1) {
+        g_any_float_buf = val.val.d;
         return &g_any_float_buf;
     }
-    if (std::holds_alternative<std::string>(val))
-        return (void*)strdup(std::get<std::string>(val).c_str());
-    if (std::holds_alternative<bool>(val)) {
-        g_any_bool_buf = std::get<bool>(val);
+    if (val.tag == 2)
+        return (void*)strdup(val.val.s);
+    if (val.tag == 3) {
+        g_any_bool_buf = val.val.b;
         return &g_any_bool_buf;
     }
-    if (std::holds_alternative<void*>(val))
-        return std::get<void*>(val);
+    if (val.tag == 4)
+        return val.val.p;
     return nullptr;
 }
 
@@ -2861,19 +2880,19 @@ extern "C" void* shadow_array_pop(void* array_ptr) {
     if (a->empty()) return nullptr;
     DictValue v = a->back();
     a->pop_back();
-    if (std::holds_alternative<int64_t>(v)) return (void*)(intptr_t)std::get<int64_t>(v);
-    if (std::holds_alternative<bool>(v)) return (void*)(intptr_t)(std::get<bool>(v) ? 1 : 0);
-    if (std::holds_alternative<double>(v)) {
+    if (v.tag == 0) return (void*)(intptr_t)v.val.i;
+    if (v.tag == 3) return (void*)(intptr_t)(v.val.b ? 1 : 0);
+    if (v.tag == 1) {
         AnyBox* b = new AnyBox;
         b->magic = ANYBOX_MAGIC;
         b->tag = 2;  // float
         b->value = 0;
-        memcpy(&b->value, &std::get<double>(v), sizeof(double));
+        memcpy(&b->value, &v.val.d, sizeof(double));
         shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
         return b;
     }
-    if (std::holds_alternative<std::string>(v)) return (void*)strdup(std::get<std::string>(v).c_str());
-    return std::get<void*>(v);
+    if (v.tag == 2) return (void*)strdup(v.val.s);
+    return v.val.p;
 }
 
 // Ã¢ÂÂÃ¢ÂÂ shadow_dict_get_int Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -2881,8 +2900,8 @@ extern "C" int64_t shadow_dict_get_int(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return 0;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
     auto it = d->data.find(key);
-    if (it != d->data.end() && std::holds_alternative<int64_t>(it->second))
-        return std::get<int64_t>(it->second);
+    if (it != d->data.end() && it->second.tag == 0)
+        return it->second.val.i;
     return 0;
 }
 
@@ -2891,8 +2910,8 @@ extern "C" const char* shadow_dict_get_string(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return nullptr;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
     auto it = d->data.find(key);
-    if (it != d->data.end() && std::holds_alternative<std::string>(it->second))
-        return strdup(std::get<std::string>(it->second).c_str());
+    if (it != d->data.end() && it->second.tag == 2)
+        return strdup(it->second.val.s);
     return nullptr;
 }
 
@@ -4335,12 +4354,12 @@ static void gc_dump_referrers(void* target) {
             ShadowArray* a = reinterpret_cast<ShadowArray*>(obj);
             for (size_t _i = 0; _i < a->size(); ++_i) {
                 const DictValue& v = (*a)[_i];
-                if (std::holds_alternative<void*>(v) && std::get<void*>(v) == target) { refs = true; break; }
+                if (v.tag == 4 && v.val.p == target) { refs = true; break; }
             }
         } else if (m.kind == 2) {
             ShadowDict* d = reinterpret_cast<ShadowDict*>(obj);
             for (const auto& kv2 : d->data)
-                if (std::holds_alternative<void*>(kv2.second) && std::get<void*>(kv2.second) == target) { refs = true; break; }
+                if (kv2.second.tag == 4 && kv2.second.val.p == target) { refs = true; break; }
         } else if (m.kind == 0 && m.size > 0) {
             char* base = reinterpret_cast<char*>(obj);
             for (int64_t off = 0; off + (int64_t)sizeof(void*) <= m.size; off += sizeof(void*)) {
