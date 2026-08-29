@@ -3104,18 +3104,23 @@ extern "C" void* shadow_any_unbox(void* ptr) {
 //   - Finalizers may resurrect objects (add back to root set) — objects with
 //     finalizers that were dead get one extra cycle before actual free.
 //
-// kind: 0 = raw struct (conservative byte scan for inner pointers),
-//       1 = ShadowArray (precise: trace void* elements),
-//       2 = ShadowDict  (precise: trace void* values),
-//       3 = AnyBox      (precise: trace value field as pointer, delete on sweep).
-//           AnyBox holds an `any` value; its .value field may be a GC-managed
-//           pointer (struct/array). Without kind==3 tracing, the GC cannot
-//           follow the global→AnyBox→ShadowArray reachability chain, causing
-//           premature frees of objects still referenced through `any` globals.
+// kind = 类型 id（RT_T_*）。权威语义与分派逻辑见 gc_trace_object_children()：
+//   0   = 未分类（rt_malloc 通用对象）→ 逐字保守扫描，兜住 AnyBox.value、字符串内嵌指针
+//   1   = RT_T_STRING  纯字节，不扫内部
+//   2   = RT_T_ARRAY   shadow 层 C 布局 [len:4][cap:4][elem_size:4][data@12]
+//                      （runtime_lib.shadow_array_new 与各数组扩容路径传的就是 2，
+//                       不是"字典"——见下方历史注记）
+//   3   = RT_T_ANYBOX  [tag:4][value@4]；其 value 可能是 GC 指针，缺此类型会使
+//                      global→AnyBox→ShadowArray 链断裂而提前释放
+//   4   = RT_T_DICT    rt_dict
+//   5   = RT_T_CLOSURE [fn_ptr@0][env_ptr@8]
+//   ≥100= RT_T_USER    用户类型，按类型表 bitmap 精确追踪（>512B 退化为整块保守）
+// 历史注记：此处曾写作 "0=raw, 1=ShadowArray, 2=ShadowDict, 3=AnyBox"，与实现不符，
+// 已按代码更正。判断 kind 语义一律以 gc_trace_object_children 为准。
 struct GCMeta {
     std::atomic<uint32_t> marked;   // 跨轮存活标记（含"分配即黑"）——sweep 只认它
     std::atomic<uint32_t> visited;  // 本轮遍历去重位（三色标记：collect 开始清 visited，不动 marked）
-    int32_t  kind;    // 0=raw, 1=array, 2=dict, 3=anybox
+    int32_t  kind;    // 类型 id（RT_T_*），见本 struct 上方说明
     int32_t  owned;   // 1 = gc_alloc'd (free()), 0 = registered (delete)
     int64_t  size;    // 对齐后容量（rt_alloc_cap 返回、保守扫描范围）
     int64_t  req;     // 实际请求大小（g_heap_bytes / GC pacing 记账，避免对齐放大触发）
