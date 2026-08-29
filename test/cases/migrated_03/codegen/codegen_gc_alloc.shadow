@@ -1,6 +1,6 @@
 //@desc: GC alloc + frame anchor (compile-time stack map) for struct on GC heap
 //@expect-ir: shadow_gc_alloc
-//@expect-ir: shadow_gc_thread_frame_head
+//@expect-ir: shadow_gc_tls_frame_head
 dsb codegen_gc_alloc;
 struct Point { x: int, y: int }
 kimo main() -> int {

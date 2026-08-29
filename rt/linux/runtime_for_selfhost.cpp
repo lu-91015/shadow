@@ -3585,6 +3585,11 @@ static int32_t rt_gc_stress_n(void) {
 // Each OS thread that runs Shadow code gets its OWN root stack/frames so that
 // concurrent spawn bodies don't corrupt each other's root discipline. The mark
 // phase scans every live thread's roots via the global registry below.
+
+// codegen 直接读写的 per-thread 锚点链表头指针。取代每帧一次的 helper 调用：
+// enter/leave 变成一次 TLS load + store，无跨模块调用开销。
+extern "C" __thread void* shadow_gc_tls_frame_head = nullptr;
+
 struct ShadowFrameAnchor;   // 前向声明：ThreadGCState::frame_head 用指针，struct 定义见下文
 struct ThreadGCState {
     std::mutex mtx;                                  // guards this thread's root containers
@@ -3602,6 +3607,7 @@ struct ThreadGCState {
     std::vector<size_t> range_markers;               // per-frame range_roots length snapshot
     std::vector<std::pair<void*, uint32_t>> range_roots;                // flattened for scan
     ShadowFrameAnchor* frame_head = nullptr;   // 编译期栈映射：本线程帧锚点链表头（per-thread）
+    void** head_slot = nullptr;                  // 指向 shadow_gc_tls_frame_head（codegen 直写此处）
     // 协作式 STW 状态（对齐 Windows rt_gc.o 的 rt_gc_thread.gc_state）：
     //   0 = free-running（mutator，可能在任意点）
     //   1 = at safepoint（shadow_gc_poll 自旋等待放行）
@@ -4028,6 +4034,10 @@ static __attribute__((noinline, cold)) ThreadGCState* gc_thread_state_create() {
     }
     g_mutator_threads.fetch_add(1, std::memory_order_relaxed);
     tl_gc_state = s;
+    // 把 codegen 直写的 TLS 槽绑定到本线程 state 的 frame_head 字段。
+    // codegen enter/leave 直接读写 shadow_gc_tls_frame_head，collect 通过
+    // *s->head_slot 访问同一链表头，两者始终一致。
+    s->head_slot = &shadow_gc_tls_frame_head;
     return s;
 }
 
@@ -4039,6 +4049,13 @@ static inline ThreadGCState* gc_get_thread_state() {
     if (__builtin_expect(s != nullptr, 1)) return s;
     return gc_thread_state_create();
 }
+
+// 主线程注册兜底：进程启动时立即创建状态，确保第一个帧 push 之前 state 已存在。
+// spawned 线程由 task_run() 开头调 gc_get_thread_state() 兜底。
+// 注意：必须放在 gc_get_thread_state() 定义之后（C++ 要求函数在使用前声明）。
+static struct GcMainInit {
+    GcMainInit() { gc_get_thread_state(); }
+} g_gc_main_init;
 
 // 编译期栈映射（per-thread）：返回【本线程】帧锚点链表头指针的地址（ShadowFrameAnchor**）。
 // codegen 的 frame enter/leave 通过该指针读写本线程的头，彻底避免 V1 单全局头在
@@ -4632,10 +4649,13 @@ extern "C" int64_t shadow_gc_collect() {
     }
     // 编译期栈映射：逐线程沿【本线程】帧锚点链表扫描整片连续 shadow frame（变量槽 + spill 区）。
     // 取代旧 root_range（位等价、更全面，且无每调用根注册开销）。链表头存于 ThreadGCState::
-    // frame_head（per-thread），彻底修复 V1 单全局头在 spawn 多线程下根截断（ex_gc_spawn）。
+    // head_slot（per-thread，codegen 直写此处），彻底修复 V1 单全局头在 spawn 多线程下
+    // 根截断（ex_gc_spawn）。注意：必须读 *s->head_slot 而非 s->frame_head —— codegen
+    // enter/leave 直接读写 shadow_gc_tls_frame_head，两者始终一致。
     for (ThreadGCState* s : g_gc_thread_states) {
         std::lock_guard<std::mutex> lk(s->mtx);
-        for (ShadowFrameAnchor* a = s->frame_head; a != nullptr; a = a->prev) {
+        ShadowFrameAnchor* head = s->head_slot ? reinterpret_cast<ShadowFrameAnchor*>(*s->head_slot) : nullptr;
+        for (ShadowFrameAnchor* a = head; a != nullptr; a = a->prev) {
             if (a->frame_n <= 0) continue;
             char* base = reinterpret_cast<char*>(a->frame_ptr);
             uint32_t n = (uint32_t)a->frame_n;
@@ -5325,6 +5345,13 @@ extern "C" void shadow_llvm_set_alwaysinline(void* ctx, void* fn) {
     if (kind == 0) return;
     LLVMAttributeRef attr = LLVMCreateEnumAttribute((LLVMContextRef)ctx, kind, 0);
     LLVMAddAttributeAtIndex((LLVMValueRef)fn, LLVMAttributeFunctionIndex, attr);
+}
+
+// 把 LLVM 全局变量标记为 thread_local。codegen 用它声明 shadow_gc_tls_frame_head
+// 为 TLS 全局，使 enter/leave 能直接读写该槽而无需每帧调用 helper。
+extern "C" void shadow_llvm_set_tls(void* g) {
+    LLVMSetThreadLocal((LLVMValueRef)g, 1);
+    LLVMSetThreadLocalMode((LLVMValueRef)g, LLVMInitialExecTLSModel);
 }
 
 // ── Shadow-lang runtime I/O (used by user code compiled by shadow-lang) ─

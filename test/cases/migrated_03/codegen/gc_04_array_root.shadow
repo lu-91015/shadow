@@ -1,5 +1,5 @@
 //@desc: GC frame anchor (compile-time stack map) covers array literal root
-//@expect-ir: shadow_gc_thread_frame_head
+//@expect-ir: shadow_gc_tls_frame_head
 //@expect-ir: __rt_shadow_malloc
 dsb gc_04_array_root;
 kimo main() -> int {

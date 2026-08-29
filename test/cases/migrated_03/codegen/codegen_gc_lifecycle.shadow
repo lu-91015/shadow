@@ -1,6 +1,6 @@
 //@desc: GC across array + struct + for-loop (root management)
 //@expect-ir: shadow_gc_alloc
-//@expect-ir: shadow_gc_thread_frame_head
+//@expect-ir: shadow_gc_tls_frame_head
 dsb codegen_gc_lifecycle;
 struct Pair { a: int, b: int }
 kimo main() -> int {

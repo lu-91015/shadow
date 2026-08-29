@@ -1,6 +1,6 @@
 //@desc: GC alloc basic struct on heap
 //@expect-ir: shadow_gc_alloc
-//@expect-ir: shadow_gc_thread_frame_head
+//@expect-ir: shadow_gc_tls_frame_head
 dsb gc_01_basic_alloc;
 struct Point { x: int, y: int }
 kimo main() -> int {

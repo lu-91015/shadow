@@ -113,6 +113,7 @@ import core.utils;
 @extern("shadow_verify_module") kimo rt_verify_mod(m: any) -> int { return 0; }
 // 给函数加 alwaysinline 属性（热点运行时函数强制内联）
 @extern("shadow_llvm_set_alwaysinline") kimo llvm_set_alwaysinline(ctx: any, fn: any) -> void {}
+@extern("shadow_llvm_set_tls") kimo shadow_llvm_set_tls(g: any) -> void {}
 
 // ============ Codegen 全局状态 ============
 let cg_ctx: any = 0 as any;
@@ -1110,9 +1111,23 @@ pub kimo cg_emit_ret_default() -> void {
 }
 
 // GC 帧锚点（编译期栈映射）：序言把 [3 x i64] 锚点（frame_ptr, prev, frame_n）压入
-// g_shadow_gc_frame_head 链表，收尾弹出。collect 沿链表逐帧扫描统一 shadow frame
+// shadow_gc_tls_frame_head 链表，收尾弹出。collect 沿链表逐帧扫描统一 shadow frame
 // （变量槽 + 寄存器 spill 区），彻底取代运行时 shadow_gc_root_range / per-param root_set
 // 的每调用簿记（递归/列表基准 100~160× 差距根因）。取代旧 0.4 GC v1/v2 的 frame_enter/leave。
+//
+// 注意：head_slot 现在是 TLS 全局而非 helper 调用 —— enter/leave 各做一次 TLS load/store，
+// 无跨模块调用开销。runtime 中 shadow_gc_tls_frame_head 是 extern "C" __thread void*，
+// 由 gc_thread_state_create() 绑定到 ThreadGCState::head_slot；collect 通过 head_slot
+// 访问同一链表头，两者始终一致。
+let cg_tls_head_g: any = 0 as any;   // shadow_gc_tls_frame_head 外部 TLS 全局（懒创建）
+
+pub kimo cg_get_tls_head_global() -> any {
+    if ((cg_tls_head_g as any) != 0) { return cg_tls_head_g; }
+    cg_tls_head_g = llvm_add_global(cg_mod, llvm_ptr_ty(llvm_i8(cg_ctx), 0), "shadow_gc_tls_frame_head");
+    shadow_llvm_set_tls(cg_tls_head_g);
+    return cg_tls_head_g;
+}
+
 pub kimo cg_gc_enter_frame() -> void {
     cg_gc_anchor_alloca = 0 as any;
     if (cg_gc_frame_active == 0) { return; }
@@ -1129,8 +1144,8 @@ pub kimo cg_gc_enter_frame() -> void {
     let p2 = llvm_inttoptr(cg_builder, a2, llvm_ptr_ty(i64_ty, 0), "an2");
     // frame_ptr = 统一 frame 基址
     llvm_store(cg_builder, llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "fr"), p0);
-    // 本线程帧锚点头槽指针（ShadowFrameAnchor**）
-    let head_slot = cg_get_frame_head_global();
+    // 本线程帧锚点头槽指针（TLS 全局，codegen 直写此处）
+    let head_slot = cg_get_tls_head_global();
     // prev = 当前本线程头
     llvm_store(cg_builder, llvm_load(cg_builder, i64_ty, head_slot, "oldhead"), p1);
     // frame_n = 总槽数
@@ -1147,8 +1162,9 @@ pub kimo cg_gc_leave_frame() -> void {
     let p1 = llvm_inttoptr(cg_builder, llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, 8, 1), "an1b"),
                            llvm_ptr_ty(i64_ty, 0), "an1p");
     let prev_i = llvm_load(cg_builder, i64_ty, p1, "prev");
-    // 本线程头 = prev（弹栈）
-    llvm_store(cg_builder, prev_i, cg_get_frame_head_global());
+    // 本线程头 = prev（弹栈）—— 直接写 TLS 全局，无 helper 调用
+    let head_slot = cg_get_tls_head_global();
+    llvm_store(cg_builder, prev_i, head_slot);
 }
 
 pub kimo cg_gc_root_set_if_ptr(slot_ptr: any, val: any, kind: int) -> void {
