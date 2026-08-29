@@ -148,6 +148,7 @@ let cg_poll_flag_g: any = 0 as any;  // g_gc_poll_flag 外部全局（懒创建�
 let cg_poll_counter: int = 0;        // 内联 poll 块命名计数器（每函数重置，保证 IR 确定性）
 let cg_poll_skip_bb: any = 0 as any; // 最近一次内联 poll 的 skip 块（入口 poll 时 block 0 续接）
 let cg_push_counter: int = 0;        // 内联 array_push 块命名计数器（每函数重置）
+let cg_frame_head_slot: any = 0 as any; // 本函数已取的 frame_head 槽地址（每函数重置，见 cg_get_frame_head_global）
 let cg_str_keys: array<string> = [];
 let cg_str_vals: array<any> = [];
 let cg_extern_names: array<string> = [];
@@ -574,9 +575,16 @@ pub kimo cg_get_poll_flag_global() -> any {
 // 帧锚点链表头槽指针：调用 shadow_gc_thread_frame_head() 取【本线程】头指针的地址
 // （ShadowFrameAnchor**），codegen 经它读写本线程头，彻底避免 V1 单全局头在 spawn
 // 多线程下交替 push/pop 互相截断根（ex_gc_spawn）。collect 遍历各 ThreadGCState::frame_head。
-// 每次调用重新取（per-function 安全：返回本线程稳定地址，但调用须落在函数体内）。
+// 按函数记忆化：同一函数内 enter 与 leave 要的是同一个「本线程 frame_head 槽地址」。
+// 原实现每次调用都重发一次 rt_gc_thread_frame_head 外部调用，即每个用户函数调用付
+// 2 次跨模块调用只为求一个线程内常量地址（实测 awfy_list/towers_long 上
+// gc_get_thread_state + shadow_gc_thread_frame_head 合计仍占 43~54% CPU）。
+// ⚠️ 缓存必须在每个函数开始处清空（见 cg_frame_head_slot 的重置点）：否则会把上一个
+// 函数的指令结果引用进本函数，成为畸形 IR。
 pub kimo cg_get_frame_head_global() -> any {
-    return cg_call_named("rt_gc_thread_frame_head", TYPE_OPAQUE, []);
+    if ((cg_frame_head_slot as any) != 0) { return cg_frame_head_slot; }
+    cg_frame_head_slot = cg_call_named("rt_gc_thread_frame_head", TYPE_OPAQUE, []);
+    return cg_frame_head_slot;
 }
 
 pub kimo cg_emit_poll() -> void {
@@ -2888,6 +2896,9 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     cg_poll_skip_bb = 0 as any;
     cg_poll_counter = 0;
     cg_push_counter = 0;
+    // frame_head 槽地址缓存：存的是上一函数 entry 块的指令结果，必须清空，
+    // 否则会被跨函数引用而成为畸形 IR。
+    cg_frame_head_slot = 0 as any;
     let i = 0;
     while (i < n_params) {
         let p = params[i];
