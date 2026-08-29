@@ -69,8 +69,22 @@ struct ShadowDict {
 
 struct ShadowArray {
     uint32_t type_tag; // 0=array, 1=dict, 2=set
-    std::vector<DictValue> data;
-    ShadowArray() : type_tag(0) {}
+    DictValue* data;
+    size_t len;
+    size_t cap;
+    ShadowArray() : type_tag(0), data(nullptr), len(0), cap(0) {}
+    ~ShadowArray() { free(data); }
+    size_t size() const { return len; }
+    void push_back(const DictValue& v) {
+        if (len >= cap) { size_t nc = cap == 0 ? 8 : cap * 2; data = (DictValue*)realloc(data, nc * sizeof(DictValue)); cap = nc; }
+        data[len++] = v;
+    }
+    DictValue& operator[](size_t i) { return data[i]; }
+    const DictValue& operator[](size_t i) const { return data[i]; }
+    void resize(size_t n) { if (n > cap) { data = (DictValue*)realloc(data, n * sizeof(DictValue)); cap = n; } len = n; }
+    bool empty() const { return len == 0; }
+    DictValue& back() { return data[len - 1]; }
+    void pop_back() { if (len > 0) len--; }
 };
 
 struct ShadowSet {
@@ -1114,9 +1128,9 @@ static std::string value_to_string_dict(ShadowDict* d) {
 static std::string value_to_string_array(ShadowArray* a) {
     if (!a) return "[]";
     std::string result = "[";
-    for (size_t i = 0; i < a->data.size(); ++i) {
+    for (size_t i = 0; i < a->size(); ++i) {
         if (i > 0) result += ", ";
-        result += value_to_string(a->data[i]);
+        result += value_to_string((*a)[i]);
     }
     result += "]";
     return result;
@@ -1213,7 +1227,7 @@ static ShadowArray* parse_json_array(const std::string& json, size_t& pos) {
             ++pos;
             break;
         }
-        a->data.push_back(parse_json_value(json, pos));
+        a->push_back(parse_json_value(json, pos));
         skip_ws(json, pos);
         if (pos >= json.size()) break;
         if (json[pos] == ']') {
@@ -1358,7 +1372,7 @@ extern "C" void* shadow_dict_keys(void* dict_ptr) {
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
     ShadowArray* a = new ShadowArray();
     for (const auto& [k, v] : d->data) {
-        a->data.push_back(DictValue(k));
+        a->push_back(DictValue(k));
     }
     return a;
 }
@@ -1411,7 +1425,7 @@ extern "C" int shadow_dict_has_key(void* dict_ptr, const char* key) {
 // Create Array from values (variadic)
 extern "C" void* shadow_array_create(int count, ...) {
     ShadowArray* a = new ShadowArray();
-    a->data.resize(count);
+    a->resize(count);
     va_list args;
     va_start(args, count);
     for (int i = 0; i < count; ++i) {
@@ -1439,7 +1453,7 @@ extern "C" void* shadow_array_create(int count, ...) {
             }
             default: val = (int64_t)0; break;
         }
-        a->data[i] = val;
+        (*a)[i] = val;
     }
     va_end(args);
     return a;
@@ -1455,17 +1469,17 @@ extern "C" void* shadow_split(const char* str, const char* delim) {
     if (d == '\0') {
         // Empty delimiter: split into characters
         for (char c : s) {
-            arr->data.push_back(std::string(1, c));
+            arr->push_back(std::string(1, c));
         }
     } else {
         size_t pos = 0;
         while (true) {
             size_t next = s.find(d, pos);
             if (next == std::string::npos) {
-                arr->data.push_back(s.substr(pos));
+                arr->push_back(s.substr(pos));
                 break;
             }
-            arr->data.push_back(s.substr(pos, next - pos));
+            arr->push_back(s.substr(pos, next - pos));
             pos = next + 1;
         }
     }
@@ -1477,11 +1491,14 @@ extern "C" void* shadow_array_set(void* array_ptr, int32_t idx, int32_t type_tag
     if (!array_ptr) return nullptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
     ShadowArray* result = new ShadowArray();
-    result->data = a->data;  // Copy all elements
+    // Copy all elements from a to result
+    for (size_t i = 0; i < a->size(); ++i) {
+        result->push_back((*a)[i]);
+    }
     
     int64_t adjusted_idx = idx;
-    if (adjusted_idx < 0) adjusted_idx = (int64_t)result->data.size() + adjusted_idx;
-    if (adjusted_idx < 0 || (size_t)adjusted_idx >= result->data.size()) return result;
+    if (adjusted_idx < 0) adjusted_idx = (int64_t)result->size() + adjusted_idx;
+    if (adjusted_idx < 0 || (size_t)adjusted_idx >= result->size()) return result;
     
     va_list args;
     va_start(args, type_tag);
@@ -1497,7 +1514,7 @@ extern "C" void* shadow_array_set(void* array_ptr, int32_t idx, int32_t type_tag
     }
     va_end(args);
     
-    result->data[adjusted_idx] = val;
+    (*result)[adjusted_idx] = val;
     return result;
 }
 
@@ -1520,7 +1537,7 @@ extern "C" void* shadow_array_push(void* array_ptr, int32_t type_tag, ...) {
     }
     va_end(args);
     
-    a->data.push_back(val);
+    a->push_back(val);
     return a;
 }
 
@@ -1528,9 +1545,9 @@ extern "C" void* shadow_array_push(void* array_ptr, int32_t type_tag, ...) {
 extern "C" void* shadow_array_get(void* array_ptr, int32_t idx) {
     if (!array_ptr) return nullptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) return nullptr;
-    DictValue& val = a->data[idx];
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) return nullptr;
+    DictValue& val = (*a)[idx];
     if (std::holds_alternative<int64_t>(val)) {
         // Transparent 'any' model: return the raw int64 value, not a box pointer.
         // The self-hosted codegen (and shadowc's compiled code) treat 'any' as the
@@ -1561,16 +1578,16 @@ extern "C" void* shadow_array_get(void* array_ptr, int32_t idx) {
 extern "C" int32_t shadow_array_len(void* array_ptr) {
     if (!array_ptr) return 0;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    int32_t n = (int32_t)a->data.size();
+    int32_t n = (int32_t)a->size();
     return n;
 }
 
 // Create array from int buffer (non-variadic, for shadow-lang codegen)
 extern "C" void* shadow_array_create_ints(int32_t count, int32_t* values) {
     ShadowArray* a = new ShadowArray();
-    a->data.resize(count);
+    a->resize(count);
     for (int32_t i = 0; i < count; i++) {
-        a->data[i] = (int64_t)values[i];
+        (*a)[i] = (int64_t)values[i];
     }
     // Register with GC so shadow_gc_collect can reclaim it when unreachable.
     shadow_gc_register(a, 1, (int64_t)sizeof(ShadowArray));
@@ -1580,9 +1597,9 @@ extern "C" void* shadow_array_create_ints(int32_t count, int32_t* values) {
 // Create array from pointer array (string/any/nested-array element buffers)
 extern "C" void* shadow_array_create_ptrs(int32_t count, void** values) {
     ShadowArray* a = new ShadowArray();
-    a->data.resize(count);
+    a->resize(count);
     for (int32_t i = 0; i < count; i++) {
-        a->data[i] = (DictValue)values[i];
+        (*a)[i] = (DictValue)values[i];
     }
     shadow_gc_register(a, 1, (int64_t)sizeof(ShadowArray));
     return a;
@@ -1641,9 +1658,9 @@ extern "C" char* shadow_join(void* array_ptr, const char* delim) {
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
     std::string d(delim);
     std::string result;
-    for (size_t i = 0; i < a->data.size(); ++i) {
+    for (size_t i = 0; i < a->size(); ++i) {
         if (i > 0) result += d;
-        result += value_to_string(a->data[i]);
+        result += value_to_string((*a)[i]);
     }
     return dup_str(result.c_str());
 }
@@ -1659,9 +1676,9 @@ extern "C" const char* shadow_string_array_join(void* arr_ptr, const char* sep) 
     ShadowArray* a = reinterpret_cast<ShadowArray*>(arr_ptr);
     std::string d(sep ? sep : "");
     std::string result;
-    for (size_t i = 0; i < a->data.size(); i++) {
+    for (size_t i = 0; i < a->size(); i++) {
         if (i > 0) result += d;
-        const DictValue& v = a->data[i];
+        const DictValue& v = (*a)[i];
         if (std::holds_alternative<void*>(v)) {
             void* p = std::get<void*>(v);
             if (p) result += (const char*)p;
@@ -1690,7 +1707,7 @@ extern "C" const char* shadow_to_string_any(void* val_ptr) {
     }
     ShadowArray* a = reinterpret_cast<ShadowArray*>(val_ptr);
     if (a && a->type_tag == 0) {
-        if (!a->data.empty()) {
+        if (!a->empty()) {
             return dup_str(value_to_string_array(a).c_str());
         }
         return dup_str("[]");
@@ -1764,7 +1781,7 @@ extern "C" int32_t shadow_len_any(void* val_ptr) {
     ShadowArray* a = reinterpret_cast<ShadowArray*>(val_ptr);
     // Use type_tag to distinguish: 0 for arrays
     if (a && a->type_tag == 0) {
-        return (int32_t)a->data.size();
+        return (int32_t)a->size();
     }
     ShadowDict* d = reinterpret_cast<ShadowDict*>(val_ptr);
     if (d && d->type_tag == 1) {
@@ -2092,7 +2109,7 @@ extern "C" void shadow_set_cli_args(int argc, const char** argv) {
     if (g_cli_args) delete g_cli_args;
     g_cli_args = new ShadowArray();
     for (int i = 0; i < argc; ++i) {
-        g_cli_args->data.push_back(std::string(argv[i] ? argv[i] : ""));
+        g_cli_args->push_back(std::string(argv[i] ? argv[i] : ""));
     }
 }
 
@@ -2110,7 +2127,7 @@ extern "C" void* shadow_sys_args() {
 // len(any) to shadow_string_len).
 extern "C" int32_t shadow_sys_args_len() {
     if (!g_cli_args) return 0;
-    return (int32_t)g_cli_args->data.size();
+    return (int32_t)g_cli_args->size();
 }
 
 // Ã¢ÂÂÃ¢ÂÂ TCP Socket Operations Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -2302,8 +2319,8 @@ extern "C" void* shadow_array_concat(void* a, void* b) {
         if (ub > 10000) {
             ShadowArray* arr_b = reinterpret_cast<ShadowArray*>(b);
             if (arr_b->type_tag == 0) {
-                for (const auto& e : arr_b->data) {
-                    result->data.push_back(e);
+                for (size_t _i = 0; _i < arr_b->size(); ++_i) {
+                    result->push_back((*arr_b)[_i]);
                 }
             }
         }
@@ -2340,10 +2357,10 @@ extern "C" void* shadow_range(int32_t s, int32_t e, int32_t step) {
     if (step == 0) step = 1;
     if (step > 0) {
         for (int64_t v = s; v < (int64_t)e; v += step)
-            a->data.push_back(DictValue((int64_t)v));
+            a->push_back(DictValue((int64_t)v));
     } else {
         for (int64_t v = s; v > (int64_t)e; v += step)
-            a->data.push_back(DictValue((int64_t)v));
+            a->push_back(DictValue((int64_t)v));
     }
     return a;
 }
@@ -2560,14 +2577,14 @@ extern "C" int32_t shadow_rmdir(const char* path) {
 extern "C" int64_t shadow_array_get_int(void* array_ptr, int32_t idx) {
     if (!array_ptr) return 0;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return 0;
     }
-    if (std::holds_alternative<int64_t>(a->data[idx]))
-        return std::get<int64_t>(a->data[idx]);
+    if (std::holds_alternative<int64_t>((*a)[idx]))
+        return std::get<int64_t>((*a)[idx]);
     return 0;
 }
 
@@ -2575,14 +2592,14 @@ extern "C" int64_t shadow_array_get_int(void* array_ptr, int32_t idx) {
 extern "C" const char* shadow_array_get_string(void* array_ptr, int32_t idx) {
     if (!array_ptr) return nullptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return nullptr;
     }
-    if (std::holds_alternative<std::string>(a->data[idx]))
-        return strdup(std::get<std::string>(a->data[idx]).c_str());
+    if (std::holds_alternative<std::string>((*a)[idx]))
+        return strdup(std::get<std::string>((*a)[idx]).c_str());
     return nullptr;
 }
 
@@ -2590,14 +2607,14 @@ extern "C" const char* shadow_array_get_string(void* array_ptr, int32_t idx) {
 extern "C" int32_t shadow_array_get_bool(void* array_ptr, int32_t idx) {
     if (!array_ptr) return 0;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return 0;
     }
-    if (std::holds_alternative<bool>(a->data[idx]))
-        return std::get<bool>(a->data[idx]) ? 1 : 0;
+    if (std::holds_alternative<bool>((*a)[idx]))
+        return std::get<bool>((*a)[idx]) ? 1 : 0;
     return 0;
 }
 
@@ -2607,10 +2624,10 @@ extern "C" int32_t shadow_array_get_bool(void* array_ptr, int32_t idx) {
 extern "C" void* shadow_array_get_ptr(void* array_ptr, int32_t idx) {
     if (!array_ptr) return nullptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return nullptr;
     }
     // Full variant coverage (mirrors shadow_array_get). The transparent-`any`
@@ -2618,7 +2635,7 @@ extern "C" void* shadow_array_get_ptr(void* array_ptr, int32_t idx) {
     // (void*)(intptr_t)value so shadow_any_as_int can peel it; previously
     // only string/void* were handled and scalars fell through to nullptr,
     // which made `a[i] as int` read 0 instead of the real element.
-    DictValue& val = a->data[idx];
+    DictValue& val = (*a)[idx];
     if (std::holds_alternative<int64_t>(val))
         return (void*)(intptr_t)std::get<int64_t>(val);
     if (std::holds_alternative<double>(val)) {
@@ -2640,24 +2657,24 @@ extern "C" void* shadow_array_get_ptr(void* array_ptr, int32_t idx) {
 extern "C" void shadow_array_set_ptr(void* array_ptr, int32_t idx, void* val) {
     if (!array_ptr) return;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return;
     }
-    a->data[idx] = (DictValue)val;
+    (*a)[idx] = (DictValue)val;
 }
 extern "C" void* shadow_array_set_int(void* array_ptr, int32_t idx, int64_t val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return array_ptr;
     }
-    a->data[idx] = val;
+    (*a)[idx] = val;
     return array_ptr;
 }
 
@@ -2665,13 +2682,13 @@ extern "C" void* shadow_array_set_int(void* array_ptr, int32_t idx, int64_t val)
 extern "C" void* shadow_array_set_string(void* array_ptr, int32_t idx, const char* val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (idx < 0) idx = (int32_t)a->data.size() + idx;
-    if (idx < 0 || (size_t)idx >= a->data.size()) {
+    if (idx < 0) idx = (int32_t)a->size() + idx;
+    if (idx < 0 || (size_t)idx >= a->size()) {
         fprintf(stderr, "error: array index %d out of bounds (size=%zu)\n",
-                idx, a->data.size());
+                idx, a->size());
         return array_ptr;
     }
-    a->data[idx] = std::string(val ? val : "");
+    (*a)[idx] = std::string(val ? val : "");
     return array_ptr;
 }
 
@@ -2679,7 +2696,7 @@ extern "C" void* shadow_array_set_string(void* array_ptr, int32_t idx, const cha
 extern "C" void* shadow_array_push_int(void* array_ptr, int32_t val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    a->data.push_back((DictValue)(int64_t)val);
+    a->push_back((DictValue)(int64_t)val);
     return array_ptr;
 }
 
@@ -2820,19 +2837,19 @@ extern "C" void* shadow_array_push_ptr_fast(void* array_ptr, void* val) {
 extern "C" void* shadow_array_push_long(void* array_ptr, int64_t val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    a->data.push_back((DictValue)val);
+    a->push_back((DictValue)val);
     return array_ptr;
 }
 extern "C" void* shadow_array_push_float(void* array_ptr, double val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    a->data.push_back((DictValue)val);
+    a->push_back((DictValue)val);
     return array_ptr;
 }
 extern "C" void* shadow_array_push_ptr(void* array_ptr, void* val) {
     if (!array_ptr) return array_ptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    a->data.push_back((DictValue)val);
+    a->push_back((DictValue)val);
     return array_ptr;
 }
 
@@ -2841,9 +2858,9 @@ extern "C" void* shadow_array_push_ptr(void* array_ptr, void* val) {
 extern "C" void* shadow_array_pop(void* array_ptr) {
     if (!array_ptr) return nullptr;
     ShadowArray* a = reinterpret_cast<ShadowArray*>(array_ptr);
-    if (a->data.empty()) return nullptr;
-    DictValue v = a->data.back();
-    a->data.pop_back();
+    if (a->empty()) return nullptr;
+    DictValue v = a->back();
+    a->pop_back();
     if (std::holds_alternative<int64_t>(v)) return (void*)(intptr_t)std::get<int64_t>(v);
     if (std::holds_alternative<bool>(v)) return (void*)(intptr_t)(std::get<bool>(v) ? 1 : 0);
     if (std::holds_alternative<double>(v)) {
@@ -4316,8 +4333,10 @@ static void gc_dump_referrers(void* target) {
         bool refs = false;
         if (m.kind == 1) {
             ShadowArray* a = reinterpret_cast<ShadowArray*>(obj);
-            for (const DictValue& v : a->data)
+            for (size_t _i = 0; _i < a->size(); ++_i) {
+                const DictValue& v = (*a)[_i];
                 if (std::holds_alternative<void*>(v) && std::get<void*>(v) == target) { refs = true; break; }
+            }
         } else if (m.kind == 2) {
             ShadowDict* d = reinterpret_cast<ShadowDict*>(obj);
             for (const auto& kv2 : d->data)

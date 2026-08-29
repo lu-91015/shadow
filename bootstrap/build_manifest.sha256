@@ -2,5 +2,5 @@
 # 含义：在 tools/bootstrap.sh 记录的固定工具链与入库 crt 导入库下，
 #       下列二进制必须逐字节可重现；不一致即存在 runtime/.o 或链接输入漂移。
 # shadow 版本: shadow 0.5.1
-57dcede82177ddf9177255d8b9e5ed3e290f2f15b99a6111bde0f89dab3af5c1 build/shadow.exe
+8cf44363e0ebeec21bd9a297079606056d1da913d18fd5e6a3eec3ddd066690a build/shadow.exe
 3c63203e74cc193aa89c752fe8b76557ead1c52d7a5c7155b90b769519e7b6ba build/run_tests.exe
