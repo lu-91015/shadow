@@ -4014,14 +4014,13 @@ struct GCTLSGuard {
 };
 static thread_local GCTLSGuard gc_tls_guard;   // forces construction in each thread
 
-static ThreadGCState* gc_get_thread_state() {
-    if (tl_gc_state) return tl_gc_state;
-    // 冷路径（每线程仅首次）：强制构造本线程的 TLS 守卫，线程退出时反注册本线程 state。
-    // 该引用必须留在冷路径里 —— 放在函数首行会让【每次调用】都付 thread_local 初始化守卫：
-    // Linux 是 fs: 一次字节比较，Windows/MSVC ABI 则须经 CRT 导入跳板读 _Init_thread_epoch，
-    // 贵一个数量级。codegen 每个用户函数调用一次本 helper，awfy_permute_long 即 6.93 亿次：
-    // 实测帧簿记占 Windows 85.8% / Linux 26.6% 的总 CPU（@nogc A/B 对照，见 build/_frame_ab.sh）。
-    (void)&gc_tls_guard;
+// 冷路径：每线程仅首次执行。必须 noinline + cold —— 否则其中的 operator new 与
+// lock_guard 会迫使调用方（热路径 gc_get_thread_state）保存 8 个被调用者保存寄存器，
+// 于是「每次用户函数调用」都要付一整套 push/pop 序言：反汇编可见该函数曾长达 137 条
+// 指令，实测外提前它在 awfy_list_long 仍占 41.5%、awfy_towers_long 占 36.6%。
+// 外提后热路径只剩一次 TLS 读 + 判空 + 返回。
+static __attribute__((noinline, cold)) ThreadGCState* gc_thread_state_create() {
+    (void)&gc_tls_guard;   // 强制构造本线程 TLS 守卫（线程退出时反注册本线程 state）
     ThreadGCState* s = new ThreadGCState();
     {
         std::lock_guard<std::mutex> lk(g_gc_mutex);
@@ -4030,6 +4029,15 @@ static ThreadGCState* gc_get_thread_state() {
     g_mutator_threads.fetch_add(1, std::memory_order_relaxed);
     tl_gc_state = s;
     return s;
+}
+
+// 热路径。注意：thread_local 初始化守卫的引用只允许出现在上面的冷函数里 ——
+// 放在此处会让每次调用都读一次守卫（Linux 是 fs: 字节比较；Windows/MSVC ABI 还要
+// 经 CRT 导入跳板读 _Init_thread_epoch，贵一个数量级）。
+static inline ThreadGCState* gc_get_thread_state() {
+    ThreadGCState* s = tl_gc_state;
+    if (__builtin_expect(s != nullptr, 1)) return s;
+    return gc_thread_state_create();
 }
 
 // 编译期栈映射（per-thread）：返回【本线程】帧锚点链表头指针的地址（ShadowFrameAnchor**）。
