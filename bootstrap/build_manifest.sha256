@@ -3,4 +3,4 @@
 #       下列二进制必须逐字节可重现；不一致即存在 runtime/.o 或链接输入漂移。
 # shadow 版本: shadow 0.5.1
 991d04f5d2e17113319de5fbe8a81ed680029abc64807fe87815ee3cc70188b4 build/shadow.exe
-57767a0038eb918d98a190403e80dffe94b5e0749180591324364c4d04951e2f build/run_tests.exe
+82a4da34c3441e28fcd6890b011a6018300f5f18b02726613e9354df44a1ec97 build/run_tests.exe
