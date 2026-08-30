@@ -2274,13 +2274,17 @@ extern "C" void* shadow_member_any(void* obj, const char* type_name, const char*
 extern "C" int32_t shadow_gc_forget(void* ptr);
 // 前向声明：诊断用——指针是否在 GC meta 中（定义于文件后部）
 extern "C" int32_t shadow_gc_meta_contains(void* p);
+// 前向声明：W3/P1 段对象显式释放（置死标记，不能 free 段中内存；定义于文件后部）
+static int gc_hdr_release(void* p);
 
 extern "C" void shadow_free(void* ptr) {
     if (!ptr) return;
     // GC 登记的对象（shadow_gc_alloc / __rt_shadow_malloc 分配）：先从 meta 删除，
-    // 防止 sweep 阶段 double-free / 残留元数据导致 UAF。随后直接 free。
-    // （C 布局对象头不是 RFS 的 type_tag，走原 type_tag 判断会错删/泄漏。）
+    // 防止 sweep 阶段 double-free / 残留元数据导致 UAF。（C 布局对象头不是 RFS
+    // 的 type_tag，走原 type_tag 判断会错删/泄漏。）
     if (shadow_gc_forget(ptr)) {
+        // P1：分段堆槽位只能置死标记（+ 回空闲链表），直接 free() 会破坏段内存。
+        if (gc_hdr_release(ptr)) return;
         free(ptr);
         return;
     }
@@ -3944,6 +3948,157 @@ static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_
                                                         //   g_gc_perm_roots, g_gc_thread_states
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
 
+// ── W3/P1：带内对象头 + 分段堆（双写过渡期，设计见 W3_带内对象头方案.md）──
+// shadow_gc_alloc 的每个对象都带 16B 前置头：头在 (载荷 - 16) 处。
+// 双写期：写路径同时填头与 GCMetaMap；读路径除 rt_alloc_cap / tl_str_get_slow
+// （头优先、legacy 兜底）外仍走 meta 表。SHADOW_GC_VERIFY=1 开头/表一致性对拍。
+// 不变式：所有 gc_alloc 载荷前都有 16B 可写头区（段槽位）；因此清扫/显式释放
+// 绝不能对段槽位做 free()——只能置死标记（+ 回空闲链表），段内存由整段生命周期管理。
+typedef struct ShadowHdr {
+    std::atomic<uint32_t> epoch; // 最近一次「分配或标记」的 epoch；存活判据（P2 起）
+    uint16_t kind;               // RT_T_*；HDR_KIND_DEAD = 死槽位标记
+    uint8_t  gen;                // 0=young 1=old
+    uint8_t  surv;               // minor 幸存计数
+    uint32_t size;               // 对齐后载荷容量（与 meta.size 一致）
+    uint32_t req;                // 请求字节（与 meta.req 一致）
+} ShadowHdr;
+static_assert(sizeof(ShadowHdr) == 16, "ShadowHdr must be exactly 16 bytes");
+#define HDR_KIND_DEAD 0xFFFFu    // 死槽位标记：gc_header_of 必须 miss（等价旧 meta miss）
+
+static int g_gc_verify_on = -1;
+static int gc_verify_on(void) {
+    if (g_gc_verify_on < 0) { const char* e = getenv("SHADOW_GC_VERIFY"); g_gc_verify_on = (e && e[0] == '1') ? 1 : 0; }
+    return g_gc_verify_on;
+}
+
+#define GC_SEG_CAP_DEFAULT (1024u * 1024u)   // 1MB
+#define GC_SEG_MAX 8192                      // 段数上限 = 8GB 堆（工程不可达）
+struct GcSegment { char* base; size_t cap; size_t used; };
+static GcSegment* g_segments[GC_SEG_MAX];    // append-only（P3 才有段退役）
+static std::atomic<size_t> g_segment_n{0};   // 写者持 g_gc_mutex；读者 acquire
+
+static size_t gc_seg_cap(void) {
+    static size_t cap = 0;
+    if (!cap) {
+        const char* e = getenv("SHADOW_GC_SEG_CAP");
+        cap = (e && *e) ? (size_t)atoll(e) : GC_SEG_CAP_DEFAULT;
+        if (cap < 64 * 1024) cap = 64 * 1024;
+    }
+    return cap;
+}
+
+// 新建段（调用者持 g_gc_mutex）。达上限/内存不足返回 nullptr。
+static GcSegment* gc_segment_new_locked(size_t min_bytes) {
+    size_t n = g_segment_n.load(std::memory_order_relaxed);
+    if (n >= GC_SEG_MAX) return nullptr;
+    size_t cap = gc_seg_cap();
+    if (cap < min_bytes) cap = min_bytes;
+    char* base = (char*)malloc(cap);
+    if (!base) return nullptr;
+    GcSegment* s = (GcSegment*)malloc(sizeof(GcSegment));
+    if (!s) { free(base); return nullptr; }
+    s->base = base; s->cap = cap; s->used = 0;
+    g_segments[n] = s;
+    g_segment_n.store(n + 1, std::memory_order_release);
+    return s;
+}
+
+// 前向声明：持锁辅助（定义在下方，等锁期间标记 stw_state=2 供 STW 跳过）。
+static void gc_lock_blocked();
+
+// bump 分配：返回载荷指针（前置 16B 头区已预留）。
+// 单 mutator 走线程本地段无锁 bump；多 mutator / 段满走锁内路径。
+// 巨对象（槽 > 段容量）得专属段。段分配失败返回 nullptr（分配失败语义）。
+static void* gc_seg_alloc(int32_t asize) {
+    static thread_local GcSegment* tl_seg = nullptr;
+    size_t slot = 16 + (((size_t)asize + 15) & ~(size_t)15);
+    if (g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
+        GcSegment* s = tl_seg;
+        if (s && s->used + slot <= s->cap) {
+            size_t off = s->used;
+            s->used += slot;
+            return s->base + off + 16;
+        }
+    }
+    gc_lock_blocked();
+    GcSegment* s = tl_seg;   // 锁内允许 bump 任意段（多 mutator 只走此路径）
+    if (!(s && s->used + slot <= s->cap)) {
+        s = nullptr;
+        size_t n = g_segment_n.load(std::memory_order_relaxed);
+        for (size_t i = n; i-- > 0;) {
+            GcSegment* c = g_segments[i];
+            if (c->used + slot <= c->cap) { s = c; break; }
+        }
+        if (!s) s = gc_segment_new_locked(slot);
+        if (s) tl_seg = s;
+    }
+    void* p = nullptr;
+    if (s) {
+        size_t off = s->used;
+        s->used += slot;
+        p = s->base + off + 16;
+    }
+    g_gc_mutex.unlock();
+    return p;
+}
+
+// 对象身份判定：p 为分段堆上的活对象 → 头指针；否则 nullptr。
+// 段 append-only，新对象在尾部，逆序扫描通常 1–2 次命中。
+// 三重过滤（段区间 / 16B 槽对齐 / DEAD 标记 + epoch 上界）挡住野候选。
+static ShadowHdr* gc_header_of(void* p) {
+    uintptr_t u = (uintptr_t)p;
+    if (u < 16) return nullptr;
+    size_t n = g_segment_n.load(std::memory_order_acquire);
+    char* pc = (char*)p;
+    uint32_t ep = g_gc_epoch;
+    for (size_t i = n; i-- > 0;) {
+        GcSegment* s = g_segments[i];
+        char* base = s->base;
+        if (pc < base + 16 || pc > base + s->used) continue;
+        size_t off = (size_t)(pc - base);
+        if ((off & 15) != 0) return nullptr;  // 段内但不在槽边界 → 非对象指针
+        ShadowHdr* h = (ShadowHdr*)(pc - 16);
+        if (h->kind == HDR_KIND_DEAD) return nullptr;             // 死槽位 = miss
+        if (h->epoch.load(std::memory_order_relaxed) > ep) return nullptr; // 脏数据过滤
+        return h;
+    }
+    return nullptr;
+}
+
+// P1 一致性对拍（SHADOW_GC_VERIFY=1）：头的 size 必须与 legacy 路径（pend+meta 表）
+// 一致。legacy==0（对象已死/未登记）无对照基准，跳过。
+static void gc_cap_verify(void* p, ShadowHdr* h) {
+    int32_t legacy = 0;
+    for (int i = 0; i < g_pend_n; i++) {
+        if (g_pend[i].p == p) { legacy = g_pend[i].asize; break; }
+    }
+    if (!legacy) {
+        std::lock_guard<std::mutex> lk(g_gc_mutex);
+        GCMeta* m = g_gc_meta.find(p);
+        if (m) legacy = (int32_t)m->size;
+    }
+    if (legacy && legacy != (int32_t)h->size) {
+        fprintf(stderr, "[GCVERIFY] cap mismatch p=%p hdr=%d legacy=%d\n",
+                p, (int)h->size, (int)legacy);
+        fflush(stderr);
+        abort();
+    }
+}
+
+// P1：显式释放段对象 —— 置死标记（+ 回空闲链表）；段中段内存不能 free()。
+// p 是段对象返回 1；否则 0（调用方走原 free 路径）。
+static int gc_hdr_release(void* p) {
+    ShadowHdr* h = gc_header_of(p);
+    if (!h) return 0;
+    h->kind = HDR_KIND_DEAD;
+    if (fl_enabled() && h->size >= 16 && h->size <= 65536 &&
+        g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
+        fl_push(p, (int32_t)h->size);
+    }
+    return 1;
+}
+
+
 // ── 线程局部字符串长度/容量缓存 ──
 // str_reverse 热循环里 shadow_string_concat_char_fast 每次 strlen(out)（out 0→43 增长）
 // 是 O(n²) 瓶颈，且每次都要 g_pend 扫描 + g_gc_meta 哈希查找（带互斥锁）。缓存
@@ -4026,13 +4181,19 @@ static inline void tl_str_set(void* p, int32_t len, int32_t cap) {
 static void tl_str_get_slow(void* p, int32_t* len, int32_t* cap) {
     *len = (int32_t)strlen((const char*)p);
     *cap = 0;
-    for (int i = 0; i < g_pend_n; i++) {
-        if (g_pend[i].p == p) { *cap = g_pend[i].asize; break; }
-    }
-    if (*cap == 0) {
-        std::lock_guard<std::mutex> lk(g_gc_mutex);
-        GCMeta* m = g_gc_meta.find(p);
-        if (m) *cap = (int32_t)m->size;
+    // P1：带内头优先（段对象）；非段对象走 legacy（pend + meta 表）
+    ShadowHdr* h = gc_header_of(p);
+    if (h) {
+        *cap = (int32_t)h->size;
+    } else {
+        for (int i = 0; i < g_pend_n; i++) {
+            if (g_pend[i].p == p) { *cap = g_pend[i].asize; break; }
+        }
+        if (*cap == 0) {
+            std::lock_guard<std::mutex> lk(g_gc_mutex);
+            GCMeta* m = g_gc_meta.find(p);
+            if (m) *cap = (int32_t)m->size;
+        }
     }
     tl_str_set(p, *len, *cap);
 }
@@ -4052,6 +4213,14 @@ extern "C" void shadow_string_cache_set(void* p, int32_t len, int32_t cap) {
 // g_pend（≤RT_PEND_CAP=64；热循环里 s1 刚分配几乎必在批内）。
 extern "C" int32_t rt_alloc_cap(void* p) {
     if (!p) return 0;
+    // P1：带内头优先——段对象直接读头（无锁、免 g_pend 扫描与哈希查找）。
+    // SHADOW_GC_VERIFY=1 时对拍头/表一致性（不一致即 abort）。
+    ShadowHdr* h = gc_header_of(p);
+    if (h) {
+        if (gc_verify_on()) gc_cap_verify(p, h);
+        return (int32_t)h->size;
+    }
+    // 非段对象（如 new+register 登记的 C++ 对象）：走原路径。
     for (int i = 0; i < g_pend_n; i++) {
         if (g_pend[i].p == p) return g_pend[i].asize;
     }
@@ -4876,10 +5045,18 @@ static int64_t gc_sweep_dead(bool is_minor) {
             delete reinterpret_cast<ShadowArray*>(obj);
         } else if (mkind == 3 && !mowned) {
             delete reinterpret_cast<AnyBox*>(obj);
-        } else if (msize >= 16 && msize <= 65536 && fl_enabled() && g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
-            fl_push(obj, (int32_t)msize);
+        } else if (!mowned) {
+            free(obj);  // 防御：未知 owned=0 对象保持原语义（P1 预期只有上面两类）
         } else {
-            free(obj);
+            // P1：gc_alloc 对象都是段槽位 —— 置死标记，绝不能 free() 段中内存。
+            // 满足条件回空闲链表复用（弹出时头区重写）；否则原地废弃，
+            // 段内存由整段生命周期管理（P3 段退役回收）。
+            ShadowHdr* h = (ShadowHdr*)((char*)obj - 16);
+            h->kind = HDR_KIND_DEAD;
+            if (msize >= 16 && msize <= 65536 && fl_enabled() &&
+                g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
+                fl_push(obj, (int32_t)msize);
+            }
         }
         freed++;
     }
@@ -5255,15 +5432,27 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             shadow_gc_collect();
         }
     }
-    // 空闲链表快路径：单 mutator 时优先复用已死对象（免 malloc）。
+    // 空闲链表快路径：单 mutator 时优先复用已死对象（免段 bump）。
+    // P1：所有槽位（复用/新分配）载荷前都有 16B 头区。
     void* p = nullptr;
     if (fl_enabled() && asize >= 16 && asize <= 65536 &&
         g_mutator_threads.load(std::memory_order_relaxed) <= 1) {
         p = fl_pop(asize);
     }
     if (!p) {
-        p = malloc((size_t)asize);
+        p = gc_seg_alloc(asize);
         if (!p) return nullptr;
+    }
+    {   // P1：带内头写入（双写期：下方 pend/meta 登记照旧）。「分配即黑」=
+        // 写当前 epoch；kind/size/req 与 meta 严格一致（SHADOW_GC_VERIFY 对拍）。
+        ShadowHdr* h = (ShadowHdr*)((char*)p - 16);
+        int32_t k = kind < 0 ? 0 : (kind > (int32_t)0xFFFE ? (int32_t)0xFFFE : kind);
+        h->kind = (uint16_t)k;
+        h->gen = 0;
+        h->surv = 0;
+        h->size = (uint32_t)asize;
+        h->req = (uint32_t)size;
+        h->epoch.store(g_gc_epoch, std::memory_order_relaxed);
     }
     // 攒批快路径：单 mutator + GC 关闭 + 缓冲未满 → 无锁无哈希，登记推迟到 flush。
     if (g_gc_disabled == 0 && rt_gc_auto_on() &&
