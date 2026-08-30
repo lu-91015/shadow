@@ -36,6 +36,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
 #include <cctype>
 #include <sstream>
 #include <emmintrin.h>
@@ -77,6 +80,8 @@ static std::string value_to_string_array(ShadowArray* a);
 // Needed early because shadow_string_split/join/format (line ~453) create
 // ShadowArray objects that must be GC-tracked.
 extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size);
+// 前向声明：段分配器（定义于文件后部 GC 段）；RFS 数组/AnyBox 创建处使用。
+extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind);
 
 // ShadowDict: 纯 C 开放寻址哈希表（W3：替换 std::unordered_map<std::string, DictValue>）。
 // 布局纯 POD {type_tag, head, tail, cap, count, used, slots} —— 带内对象头的前置条件。
@@ -1882,25 +1887,27 @@ extern "C" int32_t shadow_array_len(void* array_ptr) {
 }
 
 // Create array from int buffer (non-variadic, for shadow-lang codegen)
+// P3：段分配 + 带内头（kind=1，扫描语义与原注册对象一致）。
 extern "C" void* shadow_array_create_ints(int32_t count, int32_t* values) {
-    ShadowArray* a = new ShadowArray();
+    ShadowArray* a = (ShadowArray*)shadow_gc_alloc((int32_t)sizeof(ShadowArray), 1);
+    if (!a) return nullptr;
+    new (a) ShadowArray();
     a->resize(count);
     for (int32_t i = 0; i < count; i++) {
         (*a)[i] = (int64_t)values[i];
     }
-    // Register with GC so shadow_gc_collect can reclaim it when unreachable.
-    shadow_gc_register(a, 1, (int64_t)sizeof(ShadowArray));
     return a;
 }
 
 // Create array from pointer array (string/any/nested-array element buffers)
 extern "C" void* shadow_array_create_ptrs(int32_t count, void** values) {
-    ShadowArray* a = new ShadowArray();
+    ShadowArray* a = (ShadowArray*)shadow_gc_alloc((int32_t)sizeof(ShadowArray), 1);
+    if (!a) return nullptr;
+    new (a) ShadowArray();
     a->resize(count);
     for (int32_t i = 0; i < count; i++) {
         (*a)[i] = (DictValue)values[i];
     }
-    shadow_gc_register(a, 1, (int64_t)sizeof(ShadowArray));
     return a;
 }
 
@@ -3159,12 +3166,12 @@ extern "C" void* shadow_array_pop(void* array_ptr) {
     if (v.tag == 0) return (void*)(intptr_t)v.val.i;
     if (v.tag == 3) return (void*)(intptr_t)(v.val.b ? 1 : 0);
     if (v.tag == 1) {
-        AnyBox* b = new AnyBox;
+        AnyBox* b = (AnyBox*)shadow_gc_alloc((int32_t)sizeof(AnyBox), 3);
+        if (!b) return nullptr;
         b->magic = ANYBOX_MAGIC;
         b->tag = 2;  // float
         b->value = 0;
         memcpy(&b->value, &v.val.d, sizeof(double));
-        shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
         return b;
     }
     if (v.tag == 2) return (void*)strdup(v.val.s);
@@ -3238,30 +3245,29 @@ extern "C" void shadow_exception_clear() {
 // (see the block after the #includes) so that shadow_index_any /
 // shadow_member_any / shadow_typeof can reference AnyBox before this point.
 extern "C" void* shadow_any_box(int32_t tag, int64_t value) {
-    AnyBox* b = new AnyBox;
+    AnyBox* b = (AnyBox*)shadow_gc_alloc((int32_t)sizeof(AnyBox), 3);
+    if (!b) return nullptr;
     b->magic = ANYBOX_MAGIC;
     b->tag = tag; b->value = value;
-    // Register with GC (kind=3) so the GC can trace AnyBox.value → GC objects.
-    // Without this, objects referenced only through `any` variables are invisible
-    // to the GC and get prematurely freed (use-after-free → 0xC0000005).
-    shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
+    // P3：段分配 + 带内头（kind=3），GC 经头追踪 AnyBox.value → GC 对象，
+    // 只被 `any` 变量引用的对象不再被过早回收。
     return b;
 }
 extern "C" void* shadow_any_box_ptr(int32_t tag, void* ptr) {
-    AnyBox* b = new AnyBox;
+    AnyBox* b = (AnyBox*)shadow_gc_alloc((int32_t)sizeof(AnyBox), 3);
+    if (!b) return nullptr;
     b->magic = ANYBOX_MAGIC;
     b->tag = tag;
     b->value = (int64_t)(intptr_t)ptr;
-    shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
     return b;
 }
 // Box a raw C string pointer as an AnyBox (tag 3 = string).
 extern "C" void* shadow_any_box_string(void* s) {
-    AnyBox* b = new AnyBox;
+    AnyBox* b = (AnyBox*)shadow_gc_alloc((int32_t)sizeof(AnyBox), 3);
+    if (!b) return nullptr;
     b->magic = ANYBOX_MAGIC;
     b->tag = 3;
     b->value = (int64_t)(intptr_t)s;
-    shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
     return b;
 }
 // Box a double as an AnyBox (tag 2 = float). Bit-cast the double to int64 so
@@ -3269,11 +3275,11 @@ extern "C" void* shadow_any_box_string(void* s) {
 extern "C" void* shadow_any_box_double(double d) {
     int64_t bits = 0;
     memcpy(&bits, &d, sizeof(bits));
-    AnyBox* b = new AnyBox;
+    AnyBox* b = (AnyBox*)shadow_gc_alloc((int32_t)sizeof(AnyBox), 3);
+    if (!b) return nullptr;
     b->magic = ANYBOX_MAGIC;
     b->tag = 2;
     b->value = bits;
-    shadow_gc_register(b, 3, (int64_t)sizeof(AnyBox));
     return b;
 }
 // Peel a boxed pointer back to the raw struct/array pointer. Array slots that
@@ -3388,10 +3394,12 @@ extern "C" void* shadow_any_unbox(void* ptr) {
     return ptr;  // already a raw value
 }
 
-// ── GC: generational lock-free mark-sweep with finalizer (Shadow 0.3 §11) ──
-// v2: Generational STW mark-sweep with lock-free metadata and finalizer support.
-//   - shadow_gc_alloc(size, kind): allocate raw GC heap block (tracked, young gen)
-//   - shadow_gc_register(ptr, kind, size): track an existing C++ object
+// ── GC: generational STW mark-sweep with in-band headers (W3) ──
+// P3：GCMetaMap 已退役。每个对象在载荷前 16B 带一个 ShadowHdr（epoch/kind/
+//   gen/surv/size/req），由分段堆（GcSegment bump 分配）承载。存活判据 =
+//   (hdr.epoch & HDR_EPOCH_MASK) == 当前轮；trace 位（HDR_TRACE_BIT）= 本轮已追。
+//   - shadow_gc_alloc(size, kind): 段分配 + 写头（分配即黑 = 写当前 epoch）
+//   - shadow_gc_register: 已空实现（仅留符号兼容；所有对象走段分配）
 //   - shadow_gc_frame_enter(): snapshot current root count → returns marker
 //   - shadow_gc_root_add(ptr): push a root (a live GC pointer)
 //   - shadow_gc_root_set(slot, val): replace-semantics root (keyed by slot addr)
@@ -3402,18 +3410,18 @@ extern "C" void* shadow_any_unbox(void* ptr) {
 //
 // Generational model:
 //   - Young gen (gen=0): newly allocated objects. Minor GC scans only young gen.
-//   - Old gen (gen=1): objects surviving PROMOTION_THRESHOLD minor GCs.
+//   - Old gen (gen=1): objects surviving PROMOTION_THRESHOLD cycles.
 //   - Remembered set: old→young references tracked via write barrier.
 //
 // Lock-free design:
-//   - GCMeta.marked uses std::atomic<uint32_t> for lock-free mark phase.
+//   - 头内 epoch 字用 std::atomic<uint32_t> CAS 完成去重+标记（无锁标记）。
 //   - GC collect uses a spinlock (std::atomic_flag) to coordinate concurrent collect triggers.
 //   - Root vectors use thread-local accumulation + atomic snapshot for mark phase.
 //
 // Finalizer:
-//   - GCMeta has finalizer_fn (void(*)(void*)) and finalizer_data fields.
+//   - 落旁路表 g_finalizers（段对象不在任何登记表中）。
 //   - During sweep, finalizers run in a separate pass BEFORE freeing.
-//   - Finalizers may resurrect objects (add back to root set) — objects with
+//   - Finalizers may resurrect objects (add back to a root set) — objects with
 //     finalizers that were dead get one extra cycle before actual free.
 //
 // kind = 类型 id（RT_T_*）。权威语义与分派逻辑见 gc_trace_object_children()：
@@ -3429,293 +3437,6 @@ extern "C" void* shadow_any_unbox(void* ptr) {
 //   ≥100= RT_T_USER    用户类型，按类型表 bitmap 精确追踪（>512B 退化为整块保守）
 // 历史注记：此处曾写作 "0=raw, 1=ShadowArray, 2=ShadowDict, 3=AnyBox"，与实现不符，
 // 已按代码更正。判断 kind 语义一律以 gc_trace_object_children 为准。
-struct GCMeta {
-    std::atomic<uint32_t> marked;   // 跨轮存活标记（含"分配即黑"）——sweep 只认它
-    std::atomic<uint32_t> visited;  // 本轮遍历去重位（三色标记：collect 开始清 visited，不动 marked）
-    int32_t  kind;    // 类型 id（RT_T_*），见本 struct 上方说明
-    int32_t  owned;   // 1 = gc_alloc'd (free()), 0 = registered (delete)
-    int64_t  size;    // 对齐后容量（rt_alloc_cap 返回、保守扫描范围）
-    int64_t  req;     // 实际请求大小（g_heap_bytes / GC pacing 记账，避免对齐放大触发）
-    uint32_t gen;     // 0=young, 1=old (tenured)
-    uint32_t survived;// minor GC survival count (for promotion)
-    void(*finalizer_fn)(void*);  // finalizer callback (nullptr = none)
-    void*   finalizer_data;      // passed to finalizer (usually the object ptr)
-    bool    finalized;           // finalizer already ran (prevent double-finalize)
-
-    GCMeta() : marked(0), visited(0), kind(0), owned(0), size(0), req(0), gen(0), survived(0),
-               finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
-    GCMeta(uint32_t m, int32_t k, int32_t o, int64_t s)
-        : marked(m), visited(0), kind(k), owned(o), size(s), req(s), gen(0), survived(0),
-          finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
-    GCMeta(uint32_t m, int32_t k, int32_t o, int64_t s, int64_t r)
-        : marked(m), visited(0), kind(k), owned(o), size(s), req(r), gen(0), survived(0),
-          finalizer_fn(nullptr), finalizer_data(nullptr), finalized(false) {}
-    // Explicit copy: std::atomic is non-copyable, so we load/store the value.
-    GCMeta(const GCMeta& o)
-        : marked(o.marked.load(std::memory_order_relaxed)),
-          visited(o.visited.load(std::memory_order_relaxed)),
-          kind(o.kind), owned(o.owned), size(o.size), req(o.req), gen(o.gen), survived(o.survived),
-          finalizer_fn(o.finalizer_fn), finalizer_data(o.finalizer_data), finalized(o.finalized) {}
-    GCMeta& operator=(const GCMeta& o) {
-        marked.store(o.marked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        visited.store(o.visited.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        kind = o.kind; owned = o.owned; size = o.size; req = o.req; gen = o.gen; survived = o.survived;
-        finalizer_fn = o.finalizer_fn; finalizer_data = o.finalizer_data; finalized = o.finalized;
-        return *this;
-    }
-};
-
-#include <unordered_map>
-#include <unordered_set>
-#include <atomic>
-#include <mutex>
-#include <thread>
-#include <condition_variable>
-#include <algorithm>
-
-// ── 自定义开放寻址哈希表（替代 std::unordered_map<void*, GCMeta>）──
-// 分配/清扫热点：unordered_map 每次插入分配节点、遍历缓存不友好（node-based
-// 分散内存）。开放寻址 + 线性探测 + 连续存储 → 插入无节点分配、遍历缓存友好。
-// 指针键本身分布良好；负载因子 0.7。
-// 删除用墓碑（TOMBSTONE 哨兵）而非回移：O(1) 删除且不搬动条目，配合
-// 活条目双向链表使 for_each 只遍历存活条目（表在峰值后不收缩，若遍历全部
-// 槽位，str_reverse 每轮 GC 要扫 128MB 空槽 → 100x 退化）。墓碑+存活数
-// 超 70% 时按需重建（清墓碑，必要时扩容）。
-class GCMetaMap {
-public:
-    struct Entry {
-        void* key;      // nullptr = 空槽, TOMBSTONE = 已删, 其它 = 活
-        GCMeta meta;
-        int32_t next;   // 活条目链表：下一索引，-1 = 尾
-        int32_t prev;   // 活条目链表：上一索引，-1 = 无
-    };
-
-    static void* const TOMBSTONE;
-
-    GCMetaMap() { slots.assign(64, Entry{}); mask = 63; }
-
-    size_t size() const { return count; }
-    size_t rebuilds() const { return rebuild_count; }
-    size_t capacity() const { return slots.size(); }
-    size_t tombstones_n() const { return tombstones; }
-    size_t total_probes = 0;
-    size_t insert_count = 0;
-    size_t max_probe = 0;
-    size_t max_occ = 0;
-
-    GCMeta* find(void* key) {
-        size_t i = hash(key) & mask;
-        while (slots[i].key) {
-            if (slots[i].key == key) return &slots[i].meta;
-            i = (i + 1) & mask;
-        }
-        return nullptr;
-    }
-
-    GCMeta& operator[](void* key) {
-        size_t i = hash(key) & mask;
-        int32_t first_tomb = -1;
-        while (slots[i].key) {
-            if (slots[i].key == key) return slots[i].meta;
-            if (slots[i].key == TOMBSTONE && first_tomb < 0) first_tomb = (int32_t)i;
-            i = (i + 1) & mask;
-        }
-        if ((count + tombstones + 1) * 10 >= slots.size() * 7) {
-            rebuild();
-            return (*this)[key];
-        }
-        size_t ins = (first_tomb >= 0) ? (size_t)first_tomb : i;
-        if (first_tomb >= 0) tombstones--;
-        slots[ins].key = key;
-        slots[ins].meta = GCMeta();
-        slots[ins].prev = -1;
-        slots[ins].next = head;
-        if (head >= 0) slots[head].prev = (int32_t)ins;
-        head = (int32_t)ins;
-        count++;
-        return slots[ins].meta;
-    }
-
-    // 批量插入（攒批 flush 用）：一次探测 + 字段初始化，免默认构造再覆盖。
-    GCMeta* insert(void* key, int32_t kind, int32_t asize, int32_t req) {
-        size_t i = hash(key) & mask;
-        int32_t first_tomb = -1;
-        size_t probes = 0;
-        while (slots[i].key) {
-            probes++;
-            if (slots[i].key == key) return &slots[i].meta;
-            if (slots[i].key == TOMBSTONE && first_tomb < 0) first_tomb = (int32_t)i;
-            i = (i + 1) & mask;
-        }
-        total_probes += probes + 1;
-        insert_count++;
-        if (probes + 1 > max_probe) max_probe = probes + 1;
-        size_t occ = count + tombstones;
-        if (occ > max_occ) max_occ = occ;
-        if ((count + tombstones + 1) * 10 >= slots.size() * 7) {
-            rebuild();
-            return insert(key, kind, asize, req);
-        }
-        size_t ins = (first_tomb >= 0) ? (size_t)first_tomb : i;
-        if (first_tomb >= 0) tombstones--;
-        slots[ins].key = key;
-        GCMeta& m = slots[ins].meta;
-        m.marked.store(1, std::memory_order_relaxed);
-        m.visited.store(0, std::memory_order_relaxed);
-        m.kind = kind;
-        m.owned = 1;
-        m.size = (int64_t)asize;
-        m.req = (int64_t)req;
-        m.gen = 0;
-        m.survived = 0;
-        m.finalizer_fn = nullptr;
-        m.finalizer_data = nullptr;
-        m.finalized = false;
-        slots[ins].prev = -1;
-        slots[ins].next = head;
-        if (head >= 0) slots[head].prev = (int32_t)ins;
-        head = (int32_t)ins;
-        count++;
-        return &slots[ins].meta;
-    }
-
-    bool erase(void* key) {
-        size_t i = hash(key) & mask;
-        while (slots[i].key) {
-            if (slots[i].key == key) {
-                int32_t idx = (int32_t)i;
-                if (slots[idx].prev >= 0) slots[slots[idx].prev].next = slots[idx].next;
-                else head = slots[idx].next;
-                if (slots[idx].next >= 0) slots[slots[idx].next].prev = slots[idx].prev;
-                slots[idx].key = TOMBSTONE;
-                slots[idx].meta = GCMeta();
-                slots[idx].prev = -1;
-                slots[idx].next = -1;
-                count--;
-                tombstones++;
-                return true;
-            }
-            i = (i + 1) & mask;
-        }
-        return false;
-    }
-
-    // 按元数据指针直接擦除（sweep 用，免二次哈希查找）。
-    // 指针由 for_each 回调提供，指向 slots 内条目；sweep 期间无插入 → 无 rebuild，
-    // 指针稳定；erase 只清当前槽，不影响其它条目。GCMeta 在 Entry 内偏移固定，
-    // 由指针差算出槽位索引。
-    bool erase_entry(GCMeta* m) {
-        if (!m) return false;
-        intptr_t off = (char*)m - (char*)&slots[0].meta;
-        if (off < 0) return false;
-        size_t idx = (size_t)off / sizeof(Entry);
-        if (idx >= slots.size()) return false;
-        if (slots[idx].key == nullptr || slots[idx].key == TOMBSTONE) return false;
-        if (slots[idx].prev >= 0) slots[slots[idx].prev].next = slots[idx].next;
-        else head = slots[idx].next;
-        if (slots[idx].next >= 0) slots[slots[idx].next].prev = slots[idx].prev;
-        slots[idx].key = TOMBSTONE;
-        slots[idx].meta = GCMeta();
-        slots[idx].prev = -1;
-        slots[idx].next = -1;
-        count--;
-        tombstones++;
-        return true;
-    }
-
-    // 遍历所有存活条目（回调签名：void(void* key, GCMeta& meta)）。
-    // 顺序扫槽位 ~5ns/槽（缓存友好，读 80B 槽的 key 字段），链表随机跳转
-    // ~100ns/条（缓存缺失）。交叉点约 5% 占用率：占用 ≥5% 顺序扫更快，
-    // 更低才走链表避免扫大量空槽。
-    template <typename F>
-    void for_each(F&& f) {
-        if ((int64_t)count * 20 >= (int64_t)slots.size()) {
-            for (size_t i = 0; i < slots.size(); i++) {
-                Entry& e = slots[i];
-                if (e.key && e.key != TOMBSTONE) f(e.key, e.meta);
-            }
-        } else {
-            int32_t idx = head;
-            while (idx >= 0) {
-                Entry& e = slots[idx];
-                int32_t nxt = e.next;
-                f(e.key, e.meta);
-                idx = nxt;
-            }
-        }
-    }
-
-    // 清扫后活条目远小于容量时收缩表，保持缓存驻留（524288 槽 × 80B = 42MB
-    // 远超 L3；收缩后 str_reverse 每轮 GC 后表回到 ~1K 槽，插入/擦除免缓存缺失）。
-    void shrink_if_sparse() {
-        if (count * 4 < slots.size() && slots.size() > 64) shrink();
-    }
-
-private:
-    static size_t hash(void* p) {
-        uintptr_t h = (uintptr_t)p;
-        h ^= h >> 16;
-        h *= 0x7feb352dU;
-        h ^= h >> 15;
-        h *= 0x846ca68bU;
-        h ^= h >> 16;
-        return (size_t)h;
-    }
-
-    void rebuild() {
-        size_t live = count;
-        size_t new_cap = slots.size();
-        if ((live + 1) * 10 >= new_cap * 7) new_cap *= 2;
-        rehash(new_cap);
-    }
-
-    void shrink() {
-        size_t live = count;
-        size_t new_cap = 64;
-        while (new_cap < live * 2) new_cap *= 2;
-        if (new_cap >= slots.size()) return;
-        rehash(new_cap);
-    }
-
-private:
-    void rehash(size_t new_cap) {
-        std::vector<Entry> old;
-        old.swap(slots);
-        slots.assign(new_cap, Entry{});
-        mask = new_cap - 1;
-        count = 0;
-        tombstones = 0;
-        head = -1;
-        for (auto& e : old) {
-            if (e.key && e.key != TOMBSTONE) {
-                size_t i = hash(e.key) & mask;
-                while (slots[i].key) i = (i + 1) & mask;
-                slots[i].key = e.key;
-                slots[i].meta = std::move(e.meta);
-                slots[i].prev = -1;
-                slots[i].next = head;
-                if (head >= 0) slots[head].prev = (int32_t)i;
-                head = (int32_t)i;
-                count++;
-            }
-        }
-        rebuild_count++;
-    }
-
-    size_t rebuild_count = 0;
-    size_t slots_size() const { return slots.size(); }
-
-    std::vector<Entry> slots;
-    size_t mask;
-    size_t count = 0;
-    size_t tombstones = 0;
-    int32_t head = -1;
-};
-
-void* const GCMetaMap::TOMBSTONE = reinterpret_cast<void*>(uintptr_t(1));
-
-// GC metadata table: void* → GCMeta (lock-free reads via atomic marked field)
-static GCMetaMap g_gc_meta;
 
 // ── 分配门控计数 ──
 // P2：攒批机制已删除——分配即写带内头，记账内联原子完成，无需攒批/延迟登记。
@@ -3827,10 +3548,7 @@ static void prof_atexit(void) {
             (long long)g_prof_mark_reset_ns, (long long)g_prof_mark_roots_ns, (long long)g_prof_mark_wl_ns);
     size_t _nseg = 0; int64_t _sobjs = 0;
     gc_seg_stats(&_nseg, &_sobjs);
-    fprintf(stderr, "[PROF] meta slots=%zu live=%zu tombs=%zu rebuilds=%zu avgprobe=%.1f maxprobe=%zu maxocc=%zu segments=%zu seg_objs=%lld\n",
-            g_gc_meta.capacity(), g_gc_meta.size(), g_gc_meta.tombstones_n(), g_gc_meta.rebuilds(),
-            g_gc_meta.insert_count > 0 ? (double)g_gc_meta.total_probes / (double)g_gc_meta.insert_count : 0.0,
-            g_gc_meta.max_probe, g_gc_meta.max_occ, _nseg, (long long)_sobjs);
+    fprintf(stderr, "[PROF] segments=%zu seg_objs=%lld\n", _nseg, (long long)_sobjs);
 }
 struct ProfAtexit { ~ProfAtexit() { prof_atexit(); } };
 static ProfAtexit _prof_atexit;
@@ -3926,48 +3644,41 @@ struct ShadowFrameAnchor {
 
 static thread_local ThreadGCState* tl_gc_state = nullptr;
 static std::vector<ThreadGCState*> g_gc_thread_states;   // registry, guarded by g_gc_mutex
-static std::mutex g_gc_mutex;                            // guards g_gc_meta, g_gc_remembered,
-                                                        //   g_gc_perm_roots, g_gc_thread_states
+static std::mutex g_gc_mutex;                            // guards g_gc_remembered, g_finalizers,
+                                                        //   g_gc_perm_roots, g_gc_thread_states, 段注册表
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
 
-// ── W3/P1：带内对象头 + 分段堆（双写过渡期，设计见 W3_带内对象头方案.md）──
+// ── W3：带内对象头 + 分段堆（设计见 W3_带内对象头方案.md）──
 // shadow_gc_alloc 的每个对象都带 16B 前置头：头在 (载荷 - 16) 处。
-// 双写期：写路径同时填头与 GCMetaMap；读路径除 rt_alloc_cap / tl_str_get_slow
-// （头优先、legacy 兜底）外仍走 meta 表。SHADOW_GC_VERIFY=1 开头/表一致性对拍。
+// P3：带内头是唯一元数据（GCMetaMap 已退役）；分配/标记/清扫/屏障全走头。
 // 不变式：所有 gc_alloc 载荷前都有 16B 可写头区（段槽位）；因此清扫/显式释放
 // 绝不能对段槽位做 free()——只能置死标记（+ 回空闲链表），段内存由整段生命周期管理。
 typedef struct ShadowHdr {
-    std::atomic<uint32_t> epoch; // 最近一次「分配或标记」的 epoch；存活判据（P2 起）
+    std::atomic<uint32_t> epoch; // 最近一次「分配或标记」的 epoch（+trace 位）
     uint16_t kind;               // RT_T_*；HDR_KIND_DEAD = 死槽位标记
     uint8_t  gen;                // 0=young 1=old
-    uint8_t  surv;               // minor 幸存计数
-    uint32_t size;               // 对齐后载荷容量（与 meta.size 一致）
-    uint32_t req;                // 请求字节（与 meta.req 一致）
+    uint8_t  surv;               // 幸存计数（晋升用）
+    uint32_t size;               // 对齐后载荷容量（= 旧 meta.size）
+    uint32_t req;                // 请求字节（= 旧 meta.req，pacing 记账）
 } ShadowHdr;
 static_assert(sizeof(ShadowHdr) == 16, "ShadowHdr must be exactly 16 bytes");
-#define HDR_KIND_DEAD 0xFFFFu    // 死槽位标记：gc_header_of 必须 miss（等价旧 meta miss）
+#define HDR_KIND_DEAD 0xFFFFu    // 死槽位标记：gc_header_of 必须 miss
 // epoch 字双义：低 31 位 = 最近「分配或标记」的 epoch；bit31 = 本轮被追踪到
 // （trace 位）。存活判据 = (epoch & MASK) == 当前轮；pacing 活字节只认 trace 位
-// （对齐旧 visited==epoch 口径：分配即黑但未扎根的残留不计入 live，防 trigger
-// 正反馈放大——ex_gc_longrun 谷底漂移的历史根因）。
+// （分配即黑但未扎根的残留不计入 live，防 trigger 正反馈放大——
+// ex_gc_longrun 谷底漂移的历史根因）。
 #define HDR_TRACE_BIT  0x80000000u
 #define HDR_EPOCH_MASK 0x7FFFFFFFu
 
-// P2：段对象计数（供 shadow_gc_live_objects = 段对象 + 登记表对象）。
+// 段对象计数（供 shadow_gc_live_objects / 诊断）。
 static std::atomic<int64_t> g_seg_objs{0};
 
-// ── P2：finalizer 旁路表（段对象的 Drop/终结器；g_gc_mutex 保护）──
-// codegen 为含 Drop trait 的结构体发 shadow_gc_set_finalizer；P2 起段对象
-// 不在 GCMetaMap 里，终结器统一落此表。复活语义与旧实现一致：执行后写回
-// 当前 epoch（无 trace 位）→ 本轮存活，下轮未扎根才真正回收。
+// ── finalizer 旁路表（段对象的 Drop/终结器；g_gc_mutex 保护）──
+// codegen 为含 Drop trait 的结构体发 shadow_gc_set_finalizer；段对象不在任何
+// 登记表里，终结器统一落此表。复活语义与旧实现一致：执行后写回当前 epoch
+// （无 trace 位）→ 本轮存活，下轮未扎根才真正回收。
 struct GcFinalizerRec { void(*fn)(void*); void* data; bool finalized; };
 static std::unordered_map<void*, GcFinalizerRec> g_finalizers;
-
-static int g_gc_verify_on = -1;
-static int gc_verify_on(void) {
-    if (g_gc_verify_on < 0) { const char* e = getenv("SHADOW_GC_VERIFY"); g_gc_verify_on = (e && e[0] == '1') ? 1 : 0; }
-    return g_gc_verify_on;
-}
 
 #define GC_SEG_CAP_DEFAULT (1024u * 1024u)   // 1MB
 #define GC_SEG_MAX 8192                      // 段数上限 = 8GB 堆（工程不可达）
@@ -4069,23 +3780,6 @@ static ShadowHdr* gc_header_of(void* p) {
     return nullptr;
 }
 
-// P1/P2 一致性对拍（SHADOW_GC_VERIFY=1）：头的 size 必须与登记表（仅登记对象）
-// 一致。P2 起段对象不在 meta 表，legacy==0 属正常，跳过。
-static void gc_cap_verify(void* p, ShadowHdr* h) {
-    int32_t legacy = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_gc_mutex);
-        GCMeta* m = g_gc_meta.find(p);
-        if (m) legacy = (int32_t)m->size;
-    }
-    if (legacy && legacy != (int32_t)h->size) {
-        fprintf(stderr, "[GCVERIFY] cap mismatch p=%p hdr=%d legacy=%d\n",
-                p, (int)h->size, (int)legacy);
-        fflush(stderr);
-        abort();
-    }
-}
-
 // P1：显式释放段对象 —— 置死标记（+ 回空闲链表）；段中段内存不能 free()。
 // p 是段对象返回 1；否则 0（调用方走原 free 路径）。
 // P2：heap 记账与对象计数同步递减（原由 shadow_gc_forget 负责）。
@@ -4105,7 +3799,7 @@ static int gc_hdr_release(void* p) {
 
 // ── 线程局部字符串长度/容量缓存 ──
 // str_reverse 热循环里 shadow_string_concat_char_fast 每次 strlen(out)（out 0→43 增长）
-// 是 O(n²) 瓶颈，且每次都要 g_pend 扫描 + g_gc_meta 哈希查找（带互斥锁）。缓存
+// 是 O(n²) 瓶颈，且每次都要查带内头（P3 前是 g_pend 扫描 + 哈希查找）。缓存
 // (ptr, len, cap) 三元组：命中即免 strlen 和哈希查找。
 // ABA 安全：字符串只会在 GC 清扫（collect）时被释放，collect 后 g_gc_epoch 递增；
 // 缓存条目记录 epoch，epoch 不匹配即视为失效（地址复用不会误用旧长度）。
@@ -4185,15 +3879,9 @@ static inline void tl_str_set(void* p, int32_t len, int32_t cap) {
 static void tl_str_get_slow(void* p, int32_t* len, int32_t* cap) {
     *len = (int32_t)strlen((const char*)p);
     *cap = 0;
-    // P1：带内头优先（段对象）；非段对象走 legacy（pend + meta 表）
+    // P3：带内头直读；非段对象（字面量/栈上）cap=0（无就地余量，行为同旧 miss）
     ShadowHdr* h = gc_header_of(p);
-    if (h) {
-        *cap = (int32_t)h->size;
-    } else {
-        std::lock_guard<std::mutex> lk(g_gc_mutex);
-        GCMeta* m = g_gc_meta.find(p);
-        if (m) *cap = (int32_t)m->size;
-    }
+    if (h) *cap = (int32_t)h->size;
     tl_str_set(p, *len, *cap);
 }
 static inline void tl_str_get(void* p, int32_t* len, int32_t* cap) {
@@ -4208,22 +3896,11 @@ extern "C" void shadow_string_cache_set(void* p, int32_t len, int32_t cap) {
 
 // 查询 GC 堆对象的数据区容量（分配时记录的 size）；非堆对象（字面量/栈上）返回 0。
 // 供 shadow_string_concat_inplace 判断能否就地追加（与 Windows rt_gc.c 的 rt_alloc_cap 对齐）。
-// 注意：攒批快路径期间新对象只进 g_pend、尚未入哈希表，哈希查找 miss 时须线性扫
-// g_pend（≤RT_PEND_CAP=64；热循环里 s1 刚分配几乎必在批内）。
+// P3：带内头直读——无锁、免哈希，字符串拼接热循环直接受益。
 extern "C" int32_t rt_alloc_cap(void* p) {
     if (!p) return 0;
-    // P1：带内头优先——段对象直接读头（无锁、免 g_pend 扫描与哈希查找）。
-    // SHADOW_GC_VERIFY=1 时对拍头/表一致性（不一致即 abort）。
     ShadowHdr* h = gc_header_of(p);
-    if (h) {
-        if (gc_verify_on()) gc_cap_verify(p, h);
-        return (int32_t)h->size;
-    }
-    // 非段对象（如 new+register 登记的 C++ 对象）：走登记表。
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
-    GCMeta* m = g_gc_meta.find(p);
-    if (!m) return 0;
-    return (int32_t)m->size;
+    return h ? (int32_t)h->size : 0;
 }
 
 // 快速路径单字符追加：单次 C 调用完成 strlen + alloc_cap 判断 + 就地写字节/扩容，
@@ -4397,7 +4074,7 @@ static std::unordered_map<void*, void*> g_gc_global_roots;
 // registration (e.g., s03.exe compiled by shadow-lang 0.2). The GC scans these
 // regions for pointer-sized values that match tracked GC objects, treating
 // matches as additional roots. This is safe because gc_trace_child checks
-// g_gc_meta.find() before tracing — non-GC pointers are silently ignored.
+// gc_header_of() before tracing — non-GC pointers are silently ignored.
 // Trade-off: stale pointers may cause false positives (keeping dead objects
 // alive), but never crashes. Acceptable for LSP long-running mode.
 static std::vector<std::pair<void*, int64_t>> g_gc_conservative_regions;
@@ -4714,9 +4391,8 @@ extern "C" void shadow_gc_enable()  {
 // semanticTokens/full request). These two read-only counters let the host
 // implement a high-water-mark policy without guessing.
 extern "C" int64_t shadow_gc_live_objects() {
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
-    // P2：段对象（带内头）+ 登记表对象（new+register）
-    return (int64_t)g_gc_meta.size() + g_seg_objs.load(std::memory_order_relaxed);
+    // P3：全部对象在段上
+    return g_seg_objs.load(std::memory_order_relaxed);
 }
 
 extern "C" int64_t shadow_gc_alloc_count() {
@@ -4726,42 +4402,24 @@ extern "C" int64_t shadow_gc_alloc_count() {
     return (int64_t)g_heap_bytes.load(std::memory_order_relaxed);
 }
 
-// Trace a single candidate child pointer（P2：头优先，登记表兜底登记对象）。
-// 段对象：CAS epoch 字 → 当前轮|trace位（一次原子操作完成去重+标记）；
-// 已带 trace 位（本轮已追）直接跳过。登记对象（new+register）：legacy
-// visited CAS + marked 置位。
+// Trace a single candidate child pointer（P3：纯段对象，带内头判定）。
+// CAS epoch 字 → 当前轮|trace位（一次原子操作完成去重+标记）；
+// 已带 trace 位（本轮已追）直接跳过。
 static inline void gc_trace_child(void* child, std::vector<void*>& worklist) {
     if (!child) return;
-    uint32_t epoch = g_gc_epoch;
     ShadowHdr* h = gc_header_of(child);
-    if (h) {
-        uint32_t want = epoch | HDR_TRACE_BIT;
-        uint32_t v = h->epoch.load(std::memory_order_relaxed);
-        if (v == want) return;  // 本轮已追踪
-        if (!h->epoch.compare_exchange_strong(v, want, std::memory_order_acq_rel)) return;
-        worklist.push_back(child);
-        return;
-    }
-    GCMeta* m = g_gc_meta.find(child);
-    if (!m) return;
-    uint32_t v = m->visited.load(std::memory_order_relaxed);
-    if (v == epoch) return;
-    if (!m->visited.compare_exchange_strong(v, epoch,
-            std::memory_order_acq_rel)) return;
-    m->marked.store(1, std::memory_order_relaxed);
+    if (!h) return;
+    uint32_t want = g_gc_epoch | HDR_TRACE_BIT;
+    uint32_t v = h->epoch.load(std::memory_order_relaxed);
+    if (v == want) return;  // 本轮已追踪
+    if (!h->epoch.compare_exchange_strong(v, want, std::memory_order_acq_rel)) return;
     worklist.push_back(child);
 }
 
-// P2：取对象分代（段头优先，登记表兜底）；-1 = 非 GC 对象。
+// P3：取对象分代（带内头）；-1 = 非 GC 对象。
 static int gc_obj_gen(void* p) {
     ShadowHdr* h = gc_header_of(p);
-    if (h) return (int)h->gen;
-    int g = -1;
-    gc_lock_blocked();
-    GCMeta* m = g_gc_meta.find(p);
-    if (m) g = m->gen;
-    g_gc_mutex.unlock();
-    return g;
+    return h ? (int)h->gen : -1;
 }
 
 // Write barrier: call when old-gen object `parent` gains a reference to `child`.
@@ -4800,34 +4458,6 @@ extern "C" void shadow_gc_watch(void* p) {
 // Report every tracked object that references `target`, with its mark state.
 static void gc_dump_referrers(void* target) {
     fprintf(stderr, "[GCWATCH] sweeping %p — searching referrers...\n", target);
-    g_gc_meta.for_each([&](void* obj, GCMeta& m) {
-        bool refs = false;
-        if (m.kind == 1) {
-            ShadowArray* a = reinterpret_cast<ShadowArray*>(obj);
-            for (size_t _i = 0; _i < a->size(); ++_i) {
-                const DictValue& v = (*a)[_i];
-                if (v.tag == 4 && v.val.p == target) { refs = true; break; }
-            }
-        } else if (m.kind == 2) {
-            ShadowDict* d = reinterpret_cast<ShadowDict*>(obj);
-            for (int32_t _i = d->head; _i >= 0 && !refs; _i = d->slots[_i].next) {
-                const DictValue& _v = d->slots[_i].val;
-                if (_v.tag == 4 && _v.val.p == target) { refs = true; break; }
-            }
-        } else if (m.kind == 0 && m.size > 0) {
-            char* base = reinterpret_cast<char*>(obj);
-            for (int64_t off = 0; off + (int64_t)sizeof(void*) <= m.size; off += sizeof(void*)) {
-                void* cand; std::memcpy(&cand, base + off, sizeof(void*));
-                if (cand == target) { refs = true; break; }
-            }
-        } else if (m.kind == 3) {
-            AnyBox* b = reinterpret_cast<AnyBox*>(obj);
-            if ((void*)(intptr_t)b->value == target) { refs = true; }
-        }
-        if (refs)
-            fprintf(stderr, "[GCWATCH]   referrer %p kind=%d size=%lld marked=%u\n",
-                    obj, m.kind, (long long)m.size, m.marked.load(std::memory_order_relaxed));
-    });
     // Also check root sets
     for (void* r : g_gc_perm_roots)  if (r == target) fprintf(stderr, "[GCWATCH]   in PERM roots\n");
     for (auto& kv : g_gc_global_roots) if (kv.second == target)
@@ -4838,7 +4468,7 @@ static void gc_dump_referrers(void* target) {
         for (auto& kv : s->named_roots) if (kv.second == target)
             fprintf(stderr, "[GCWATCH]   in NAMED roots (slot=%p)\n", kv.first);
     }
-    // P2：段对象（不在登记表）——按字保守扫描引用
+    // P3：全部对象在段上——按字保守扫描引用
     {
         size_t sn = g_segment_n.load(std::memory_order_acquire);
         for (size_t si = 0; si < sn; si++) {
@@ -4998,11 +4628,9 @@ static inline void gc_trace_object_children(void* obj, int32_t tid, int64_t size
     // tid == 1（RT_T_STRING）及其它：不扫描
 }
 
-// Internal: run finalizers for dead objects, then free them.
+// Internal: run finalizers for dead objects, then reclaim them.
 // Objects with finalizers that haven't run yet get one extra cycle (resurrection).
-// 单次 for_each 收集 to_free/resurrected（存 GCMeta* 免去 free 阶段二次哈希查找；
-// erase_entry 按指针擦除）。sweep 期间无插入 → 无 rebuild，指针稳定。
-// P2：段对象清扫 —— 线性遍历，存活判据 = (epoch & MASK) == 当前轮。
+// P3：段对象清扫 —— 线性遍历，存活判据 = (epoch & MASK) == 当前轮。
 // 活字节只累计带 trace 位的对象（pacing 口径对齐旧 visited==epoch：
 // 分配即黑但未扎根的残留不计入 live）。返回回收对象数。
 // 终结器走旁路表：未执行过 → 执行并复活一轮（写当前 epoch，无 trace 位）。
@@ -5051,6 +4679,11 @@ static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
                 if (git->second == obj) git = g_gc_global_roots.erase(git);
                 else ++git;
             }
+            // P3：类型化载荷回收前终结——kind==1（迁移自注册的 RFS ShadowArray）
+            // 的 data 缓冲是独立 malloc 内存，须先析构释放。
+            if (h->kind == 1) {
+                reinterpret_cast<ShadowArray*>(obj)->~ShadowArray();
+            }
             h->kind = HDR_KIND_DEAD;   // 置死标记；段中内存绝不 free()
             g_heap_bytes.fetch_sub((int64_t)h->req, std::memory_order_relaxed);
             g_seg_objs.fetch_sub(1, std::memory_order_relaxed);
@@ -5066,96 +4699,8 @@ static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
 }
 
 static int64_t gc_sweep_dead(bool is_minor, int64_t* out_live) {
-    int64_t freed = 0;
-
-    // ── [1] 段对象：带内头线性遍历（P2 主路径） ──
-    freed += gc_sweep_segments(is_minor, out_live);
-
-    // ── [2] 登记对象（new+register，owned=0）：legacy marked 逻辑 ──
-    struct ToFree { void* obj; GCMeta* m; };
-    std::vector<ToFree> to_free;
-    std::vector<ToFree> resurrected;  // objects waiting for finalizer, get one more cycle
-
-    g_gc_meta.for_each([&](void* key, GCMeta& m) {
-        if (is_minor && m.gen != 0) return;  // minor GC: only sweep young-gen
-        if (m.marked.load(std::memory_order_relaxed)) return;
-
-        // Run finalizer if registered and not yet finalized.
-        if (m.finalizer_fn && !m.finalized) {
-            if (g_gc_log_on)
-                fprintf(stderr, "[GCLOG] finalize #%lld %p kind=%d\n",
-                        (long long)g_gc_collect_count, key, m.kind);
-            m.finalized = true;
-            // Call the finalizer. It may resurrect the object by re-rooting it.
-            m.finalizer_fn(m.finalizer_data ? m.finalizer_data : key);
-            // Give finalized objects one more cycle — they'll be freed next
-            // collect if not resurrected by the finalizer.
-            resurrected.push_back({key, &m});
-        } else {
-            // No finalizer (or already finalized) → free immediately.
-            to_free.push_back({key, &m});
-        }
-    });
-
-    // Forensics BEFORE resetting marks / freeing.
-    if (g_gc_watch) {
-        for (auto& tf : to_free) {
-            if (tf.obj == g_gc_watch) gc_dump_referrers(tf.obj);
-        }
-    }
-
-    // Free dead registered objects.
-    for (auto& tf : to_free) {
-        void* obj = tf.obj;
-        GCMeta* m = tf.m;
-        if (getenv("SHADOW_GC_SWEEP_DBG")) {
-            // 诊断：被 free 对象是否仍被全局根直接引用（漏标证据）
-            int refd = 0;
-            for (auto& gkv : g_gc_global_roots) { if (gkv.second == obj) { refd = 1; break; } }
-            if (refd)
-                fprintf(stderr, "[sweep-dbg] FREE-ROOTED obj=%p kind=%d size=%lld\n", obj, m->kind, (long long)m->size);
-        }
-        if (g_gc_log_on)
-            fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%lld gen=%u (reg)\n",
-                    (long long)g_gc_collect_count, obj, m->kind, (long long)m->size, m->gen);
-        // 先读 req/size/kind/owned 再 erase：erase 会把 meta 清零，之后
-        // m->req 恒为 0 → g_heap_bytes 从不递减 → GC 风暴。
-        int64_t mreq = m->req > 0 ? m->req : 0;
-        int32_t mkind = m->kind;
-        int32_t mowned = m->owned;
-        g_gc_meta.erase_entry(m);
-        g_heap_bytes.fetch_sub(mreq, std::memory_order_relaxed);
-        // Clear from remembered set if present。major GC 结束时整体 clear（全量重标
-        // 不需要 remembered），这里跳过省哈希擦除；minor GC 必须逐对象摘。
-        if (is_minor) g_gc_remembered.erase(obj);
-        // Clean up global roots that still point to this freed object.
-        for (auto git = g_gc_global_roots.begin(); git != g_gc_global_roots.end(); ) {
-            if (git->second == obj) git = g_gc_global_roots.erase(git);
-            else ++git;
-        }
-        // 登记对象释放（kind==1 RFS ShadowArray / kind==3 RFS AnyBox → delete）。
-        if (mkind == 1) {
-            delete reinterpret_cast<ShadowArray*>(obj);
-        } else if (mkind == 3 && !mowned) {
-            delete reinterpret_cast<AnyBox*>(obj);
-        } else {
-            free(obj);  // 防御：未知登记对象保持原语义
-        }
-        freed++;
-    }
-
-    // Resurrected objects: clear finalized flag won't help — they'll be
-    // re-checked next cycle. If still unrooted, they'll be freed then.
-    // Mark them so they survive THIS sweep (they were already in `dead`).
-    for (auto& rf : resurrected) {
-        rf.m->marked.store(1, std::memory_order_relaxed);
-    }
-
-    // 清扫后活条目远小于容量时收缩表（缓存驻留优化，见 GCMetaMap::shrink_if_sparse）。
-    // 此时 to_free 的 GCMeta* 已不再使用，rehash 安全。
-    g_gc_meta.shrink_if_sparse();
-
-    return freed;
+    // P3：GCMetaMap 已退役——全部对象在段上，清扫 = 纯线性遍历。
+    return gc_sweep_segments(is_minor, out_live);
 }
 
 // ── Major GC: full mark-sweep over ALL objects (both generations) ──
@@ -5163,7 +4708,7 @@ extern "C" int64_t shadow_gc_collect() {
     if (g_gc_disabled) return 0;
     // P20-5: debug trace must honour g_gc_log_on — an unconditional fprintf here
     // pollutes the LSP server's stderr on every collect.
-    if (g_gc_log_on) { fprintf(stderr, "[GC] major START meta=%zu\n", g_gc_meta.size()); fflush(stderr); }
+    if (g_gc_log_on) { fprintf(stderr, "[GC] major START segments=%zu objs=%lld\n", g_segment_n.load(std::memory_order_relaxed), (long long)g_seg_objs.load(std::memory_order_relaxed)); fflush(stderr); }
     gc_lock();  // lock-free spinlock: prevent concurrent collect
     g_gc_running.store(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
@@ -5172,26 +4717,23 @@ extern "C" int64_t shadow_gc_collect() {
     //    扫根/清扫窗口内其它线程改 roots 或写刚分配对象 → 漏标 → 误回收）──
     gc_stw_begin();
     if (g_gc_log_on)
-        fprintf(stderr, "[GCLOG] major collect #%lld meta=%zu perm=%zu global=%zu threads=%zu remembered=%zu conservative=%zu heap=%lld trigger=%lld\n",
-                (long long)g_gc_major_count, g_gc_meta.size(), g_gc_perm_roots.size(),
+        fprintf(stderr, "[GCLOG] major collect #%lld segments=%zu objs=%lld perm=%zu global=%zu threads=%zu remembered=%zu conservative=%zu heap=%lld trigger=%lld\n",
+                (long long)g_gc_major_count, g_segment_n.load(std::memory_order_relaxed),
+                (long long)g_seg_objs.load(std::memory_order_relaxed), g_gc_perm_roots.size(),
                 g_gc_global_roots.size(), g_gc_thread_states.size(), g_gc_remembered.size(),
                 g_gc_conservative_regions.size(),
                 (long long)g_heap_bytes.load(std::memory_order_relaxed),
                 (long long)g_gc_trigger.load(std::memory_order_relaxed));
 
     // ── Mark phase: trace from all roots ──
-    // P2 头优先标记：段对象的存活/去重由头内 epoch 字承担（trace 位 = 本轮已追），
-    // 登记对象（new+register）仍走 visited+marked。epoch 递增即「新一轮」，
-    // 无需清任何标记；分配即黑 = 分配时写当前 epoch。
+    // P3：全部对象带内头——存活/去重由头内 epoch 字承担（trace 位 = 本轮已追）。
+    // epoch 递增即「新一轮」，无需清任何标记；分配即黑 = 分配时写当前 epoch。
     auto _gc_t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto _gc_t0_mark = _gc_t0;
     auto _gc_t1 = _gc_t0;
     uint32_t epoch = g_gc_epoch + 1;
     if (epoch == 0) {
-        // epoch 回绕（2^31 次 GC 一轮）：清登记表 visited + 全部段头后从 1 重新开始。
-        g_gc_meta.for_each([](void*, GCMeta& m) {
-            m.visited.store(0, std::memory_order_relaxed);
-        });
+        // epoch 回绕（2^31 次 GC 一轮）：清全部段头后从 1 重新开始。
         size_t sn = g_segment_n.load(std::memory_order_relaxed);
         for (size_t si = 0; si < sn; si++) {
             GcSegment* seg = g_segments[si];
@@ -5265,13 +4807,8 @@ extern "C" int64_t shadow_gc_collect() {
     while (!worklist.empty()) {
         void* obj = worklist.back(); worklist.pop_back();
         ShadowHdr* h = gc_header_of(obj);
-        if (h) {
-            gc_trace_object_children(obj, (int32_t)h->kind, (int64_t)h->size, worklist);
-            continue;
-        }
-        GCMeta* m = g_gc_meta.find(obj);
-        if (!m) continue;
-        gc_trace_object_children(obj, m->kind, m->size, worklist);
+        if (!h) continue;
+        gc_trace_object_children(obj, (int32_t)h->kind, (int64_t)h->size, worklist);
     }
     if (prof_on()) {
         g_prof_mark_wl_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t1).count();
@@ -5285,8 +4822,8 @@ extern "C" int64_t shadow_gc_collect() {
     g_gc_collect_count++;
     g_gc_major_count++;
 
-    // Run finalizers + free dead objects（段遍历 + 登记表遍历）。
-    int64_t live = 0;   // 段对象活字节由清扫累计（只认 trace 位）
+    // Run finalizers + free dead objects（纯段遍历）。
+    int64_t live = 0;   // 活字节由段清扫累计（只认 trace 位）
     int64_t freed = gc_sweep_dead(false, &live);
     if (prof_on()) {
         g_prof_sweep_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
@@ -5294,23 +4831,9 @@ extern "C" int64_t shadow_gc_collect() {
         g_prof_gc_count++;
     }
 
-    // ── Promotion + GOGC pacing（登记对象部分）──
-    // GOGC pacing：live = 本轮真实可达堆。段对象部分已在清扫时按 trace 位累计
-    // （分配即黑未扎根的残留不计入，防 trigger 正反馈放大——ex_gc_longrun
-    // 谷底漂移的历史根因）；此处补登记对象并重置其 marked。
-    g_gc_meta.for_each([&](void*, GCMeta& m) {
-        if (m.marked.load(std::memory_order_relaxed)) {
-            if (m.gen == 0) {
-                m.survived++;
-                if (m.survived >= PROMOTION_THRESHOLD) {
-                    m.gen = 1;  // promote to old gen
-                }
-            }
-            live += m.req;
-        }
-        // Reset marks for next cycle.
-        m.marked.store(0, std::memory_order_relaxed);
-    });
+    // ── GOGC pacing ──
+    // live = 本轮真实可达堆（trace 位对象）。分配即黑未扎根的残留不计入，
+    // 防 trigger 正反馈放大（ex_gc_longrun 谷底漂移的历史根因）。
     // Clear remembered set after major GC (all references re-traced).
     g_gc_remembered.clear();
     {
@@ -5335,14 +4858,15 @@ extern "C" int64_t shadow_gc_collect() {
 // Old-gen objects are NOT swept (assumed alive unless a major GC runs).
 extern "C" int64_t shadow_gc_minor_collect() {
     if (g_gc_disabled) return 0;
-    if (g_gc_log_on) { fprintf(stderr, "[GC] minor START meta=%zu\n", g_gc_meta.size()); fflush(stderr); }
+    if (g_gc_log_on) { fprintf(stderr, "[GC] minor START segments=%zu objs=%lld\n", g_segment_n.load(std::memory_order_relaxed), (long long)g_seg_objs.load(std::memory_order_relaxed)); fflush(stderr); }
     gc_lock();
     std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
     gc_stw_begin();
     if (g_gc_log_on)
-        fprintf(stderr, "[GCLOG] minor collect #%lld young=%zu remembered=%zu\n",
-                (long long)g_gc_minor_count, g_gc_meta.size(), g_gc_remembered.size());
+        fprintf(stderr, "[GCLOG] minor collect #%lld objs=%lld remembered=%zu\n",
+                (long long)g_gc_minor_count,
+                (long long)g_seg_objs.load(std::memory_order_relaxed), g_gc_remembered.size());
 
     // ── Mark phase: trace from roots, but only mark young-gen objects ──
     // Old-gen objects are treated as alive (not swept in minor GC —— 段清扫
@@ -5350,12 +4874,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     auto _gc_t0 = prof_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto _gc_t0_mark = _gc_t0;
     uint32_t epoch = g_gc_epoch + 1;
-    if (epoch == 0) {
-        g_gc_meta.for_each([](void*, GCMeta& m) {
-            m.visited.store(0, std::memory_order_relaxed);
-        });
-        epoch = 1;
-    }
+    if (epoch == 0) epoch = 1;   // 回绕：段头清零由 major 负责（此处罕见且无害）
     g_gc_epoch = epoch;
     std::vector<void*> worklist;
 
@@ -5384,26 +4903,16 @@ extern "C" int64_t shadow_gc_minor_collect() {
     // Trace from remembered set: old-gen objects referencing young-gen.
     for (void* parent : g_gc_remembered) {
         ShadowHdr* h = gc_header_of(parent);
-        if (h) {
-            gc_trace_object_children(parent, (int32_t)h->kind, (int64_t)h->size, worklist);
-            continue;
-        }
-        GCMeta* m = g_gc_meta.find(parent);
-        if (!m) continue;
-        gc_trace_object_children(parent, m->kind, m->size, worklist);
+        if (!h) continue;
+        gc_trace_object_children(parent, (int32_t)h->kind, (int64_t)h->size, worklist);
     }
 
     // Expand worklist: trace children of marked young-gen objects.
     while (!worklist.empty()) {
         void* obj = worklist.back(); worklist.pop_back();
         ShadowHdr* h = gc_header_of(obj);
-        if (h) {
-            gc_trace_object_children(obj, (int32_t)h->kind, (int64_t)h->size, worklist);
-            continue;
-        }
-        GCMeta* m = g_gc_meta.find(obj);
-        if (!m) continue;
-        gc_trace_object_children(obj, m->kind, m->size, worklist);
+        if (!h) continue;
+        gc_trace_object_children(obj, (int32_t)h->kind, (int64_t)h->size, worklist);
     }
     if (prof_on()) {
         g_prof_mark_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0).count();
@@ -5415,7 +4924,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     g_gc_collect_count++;
     g_gc_minor_count++;
 
-    // Run finalizers + free dead young-gen objects（段遍历 + 登记表遍历）。
+    // Run finalizers + free dead young-gen objects（纯段遍历）。
     int64_t _minor_live = 0;
     int64_t freed = gc_sweep_dead(true, &_minor_live);
     if (prof_on()) {
@@ -5423,21 +4932,6 @@ extern "C" int64_t shadow_gc_minor_collect() {
         g_prof_gc_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - _gc_t0_mark).count();
         g_prof_gc_count++;
     }
-
-    // ── Promotion（登记对象部分；段对象晋升已在段清扫内完成）──
-    g_gc_meta.for_each([](void* key, GCMeta& m) {
-        if (m.gen == 0 && m.marked.load(std::memory_order_relaxed)) {
-            m.survived++;
-            if (m.survived >= PROMOTION_THRESHOLD) {
-                m.gen = 1;  // promote to old gen
-                if (g_gc_log_on)
-                    fprintf(stderr, "[GCLOG] promote %p to old gen (survived %u)\n",
-                            key, m.survived);
-            }
-        }
-        // Reset marks for next cycle.
-        m.marked.store(0, std::memory_order_relaxed);
-    });
 
     gc_stw_end();
     gc_unlock();
@@ -5448,43 +4942,25 @@ extern "C" int64_t shadow_gc_minor_collect() {
 // The finalizer fn(void* data) will be called BEFORE the object is freed.
 // If the finalizer re-roots the object (adds it back to a root set),
 // the object survives this cycle (resurrection).
-// P2：段对象（不在登记表）落旁路表；登记对象保留 meta 字段。
+// P3：段对象（唯一对象来源）落旁路表。
 extern "C" void shadow_gc_set_finalizer(void* ptr, void(*fn)(void*), void* data) {
     if (!ptr || !fn) return;
     gc_lock_blocked();
-    GCMeta* m = g_gc_meta.find(ptr);
-    if (m) {
-        m->finalizer_fn = fn;
-        m->finalizer_data = data;
-    } else {
-        g_finalizers[ptr] = GcFinalizerRec{fn, data, false};
-    }
+    g_finalizers[ptr] = GcFinalizerRec{fn, data, false};
     g_gc_mutex.unlock();
 }
 
-// GC 登记对象删除辅助：shadow_free 在前部调用（GC 状态定义在后部）。
-// 返回 1 = ptr 是 GC 登记对象（已从 meta/remembered 删除，调用方负责 free）；
-// 返回 0 = 非 GC 对象（调用方走原 type_tag 逻辑）。
+// GC 登记对象删除辅助：shadow_free 在段释放（gc_hdr_release）之后调用。
+// P3：登记表已退役，此处恒 0（段对象已被前一步处理）；保留符号兼容。
 extern "C" int32_t shadow_gc_forget(void* ptr) {
-    if (!ptr) return 0;
-    gc_lock_blocked();
-    GCMeta* m = g_gc_meta.find(ptr);
-    if (!m) { g_gc_mutex.unlock(); return 0; }
-    g_heap_bytes.fetch_sub(m->req > 0 ? m->req : 0, std::memory_order_relaxed);
-    g_gc_meta.erase(ptr);
-    g_gc_remembered.erase(ptr);
-    g_gc_mutex.unlock();
-    return 1;
+    (void)ptr;
+    return 0;
 }
 
-// 诊断：指针是否是活 GC 对象（0=已回收/从未登记）。P2：段对象查头。
+// 诊断：指针是否是活 GC 对象（0=已回收/非堆对象）。P3：查带内头。
 extern "C" int32_t shadow_gc_meta_contains(void* p) {
     if (!p) return 0;
-    if (gc_header_of(p)) return 1;
-    gc_lock_blocked();
-    int r = g_gc_meta.find(p) ? 1 : 0;
-    g_gc_mutex.unlock();
-    return r;
+    return gc_header_of(p) ? 1 : 0;
 }
 
 // Allocate a raw GC-managed block (used by codegen for `new Struct{...}`).
@@ -5529,8 +5005,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
         p = gc_seg_alloc(asize);
         if (!p) return nullptr;
     }
-    {   // P2：带内头是唯一元数据（GCMetaMap 只留 new+register 的登记对象）。
-        // 「分配即黑」= 写当前 epoch → 本轮清扫必然存活。
+    {   // P3：带内头是唯一元数据。「分配即黑」= 写当前 epoch → 本轮清扫必然存活。
         ShadowHdr* h = (ShadowHdr*)((char*)p - 16);
         int32_t k = kind < 0 ? 0 : (kind > (int32_t)0xFFFE ? (int32_t)0xFFFE : kind);
         h->kind = (uint16_t)k;
@@ -5558,20 +5033,9 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
 // arrays/dicts that are never bound to a slot are still kept alive by
 // shadow_gc_root_add (frame roots) until the enclosing frame returns.
 extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size) {
-    if (!ptr) return;
-    ThreadGCState* s = gc_get_thread_state();
-    while (!g_gc_mutex.try_lock()) {
-        s->stw_state.store(2, std::memory_order_release);
-        std::this_thread::yield();
-    }
-    s->stw_state.store(0, std::memory_order_release);
-    GCMeta& m = g_gc_meta[ptr];
-    m.kind = kind;
-    m.owned = 0;
-    m.size = size;
-    m.req = size;
-    if (size > 0) g_heap_bytes.fetch_add(size, std::memory_order_relaxed);
-    g_gc_mutex.unlock();
+    // P3：GCMetaMap 已退役——所有 GC 对象走段分配 + 带内头，不再有「登记既有
+    // 对象」路径。保留符号仅为 codegen 兼容（rt_gc_register 映射，无实际调用方）。
+    (void)ptr; (void)kind; (void)size;
 }
 
 // ── Root management (LIFO frame discipline) ──
