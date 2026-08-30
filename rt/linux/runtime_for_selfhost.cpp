@@ -3487,6 +3487,19 @@ static void* fl_pop(int32_t asize) {
     return nullptr;
 }
 
+// P3b：摘除落在 [lo, hi) 内的空闲链表节点（整段退役前必做——段内存即将
+// 重置复用，悬空的复用槽会与新分配对象重叠）。
+static void fl_purge_range(char* lo, char* hi) {
+    for (int c = 0; c < FL_NUM_CLASS; c++) {
+        FLNode** pp = (FLNode**)&g_fl_head[c];
+        while (*pp) {
+            char* np = (char*)(*pp);
+            if (np >= lo && np < hi) *pp = (*pp)->next;  // 丢弃（不回收其它内存）
+            else pp = &(*pp)->next;
+        }
+    }
+}
+
 // Lock-free collect coordination: spinlock prevents concurrent collect cycles.
 // (gc_lock/gc_unlock defined after ThreadGCState — they mark stw_state while
 // spinning so a concurrent collector is treated as blocked by the STW wait.)
@@ -4630,26 +4643,33 @@ static inline void gc_trace_object_children(void* obj, int32_t tid, int64_t size
 
 // Internal: run finalizers for dead objects, then reclaim them.
 // Objects with finalizers that haven't run yet get one extra cycle (resurrection).
-// P3：段对象清扫 —— 线性遍历，存活判据 = (epoch & MASK) == 当前轮。
+// P3/P3b：段对象清扫 —— 线性遍历，存活判据 = (epoch & MASK) == 当前轮。
 // 活字节只累计带 trace 位的对象（pacing 口径对齐旧 visited==epoch：
 // 分配即黑但未扎根的残留不计入 live）。返回回收对象数。
 // 终结器走旁路表：未执行过 → 执行并复活一轮（写当前 epoch，无 trace 位）。
+// P3b 整段退役：段内无任何活居民 → 摘除段内空闲链表节点、重置 used，
+// 整段立即重新参与 bump 分配（成批分配-丢弃型负载的悬崖对策）。
 static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
     int64_t freed = 0;
     uint32_t ep = g_gc_epoch;
     size_t n = g_segment_n.load(std::memory_order_acquire);
+    std::vector<size_t> dead_offs;   // 本段新死槽位偏移（免二次全段扫描）
     for (size_t si = 0; si < n; si++) {
         GcSegment* seg = g_segments[si];
-        size_t off = 16;
-        while (off <= seg->used) {
+        if (seg->used == 0) continue;
+        dead_offs.clear();
+        size_t live_cnt = 0;         // 活居民（minor 下老年代算居民但不扫）
+        // ── 单遍：存活判定 + 晋升 + 终结器 + 死槽收集 ──
+        for (size_t off = 16; off <= seg->used; ) {
             ShadowHdr* h = (ShadowHdr*)(seg->base + off - 16);
             size_t stride = 16 + ((((size_t)(uint32_t)h->size) + 15) & ~(size_t)15);
             void* obj = seg->base + off;
             if (h->kind == HDR_KIND_DEAD) { off += stride; continue; }  // 已死（待复用/废弃）
-            if (is_minor && h->gen != 0) { off += stride; continue; }  // minor 不清扫老年代
+            if (is_minor && h->gen != 0) { live_cnt++; off += stride; continue; }  // 老年代：居民，不扫
             uint32_t ew = h->epoch.load(std::memory_order_relaxed);
             if ((ew & HDR_EPOCH_MASK) == ep) {
                 // 存活：晋升记账（年轻代）+ 活字节（只认 trace 位）
+                live_cnt++;
                 if (h->gen == 0) {
                     if (h->surv < 200) h->surv++;
                     if (h->surv >= PROMOTION_THRESHOLD) h->gen = 1;
@@ -4658,31 +4678,64 @@ static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
                 off += stride;
                 continue;
             }
-            // ── 死对象 ──
+            // 死对象 —— 先查终结器（可能复活）
+            auto fit = g_finalizers.find(obj);
+            if (fit != g_finalizers.end() && !fit->second.finalized) {
+                fit->second.finalized = true;
+                fit->second.fn(fit->second.data ? fit->second.data : obj);
+                h->epoch.store(ep, std::memory_order_relaxed);  // 复活一轮（无 trace 位）
+                live_cnt++;
+                off += stride;
+                continue;
+            }
+            if (fit != g_finalizers.end()) g_finalizers.erase(fit);
             if (g_gc_watch && obj == g_gc_watch) gc_dump_referrers(obj);
             if (g_gc_log_on)
                 fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%u gen=%u (seg)\n",
                         (long long)g_gc_collect_count, obj, (int)h->kind,
                         (unsigned)h->size, (unsigned)h->gen);
             if (h->kind == 0) g_diag_kind0++;
-            auto fit = g_finalizers.find(obj);
-            if (fit != g_finalizers.end() && !fit->second.finalized) {
-                fit->second.finalized = true;
-                fit->second.fn(fit->second.data ? fit->second.data : obj);
-                h->epoch.store(ep, std::memory_order_relaxed);  // 复活一轮（无 trace 位）
-                off += stride;
-                continue;
+            dead_offs.push_back(off);
+            off += stride;
+        }
+        // ── 整段退役：无活居民（新死槽 + 既有 DEAD 槽）→ 摘 fl + 重置 ──
+        if (live_cnt == 0) {
+            int64_t dead_req = 0;
+            for (size_t off : dead_offs) {
+                ShadowHdr* h = (ShadowHdr*)(seg->base + off - 16);
+                void* obj = seg->base + off;
+                if (h->kind == 1) reinterpret_cast<ShadowArray*>(obj)->~ShadowArray();
+                if (is_minor) g_gc_remembered.erase(obj);
+                for (auto git = g_gc_global_roots.begin(); git != g_gc_global_roots.end(); ) {
+                    if (git->second == obj) git = g_gc_global_roots.erase(git);
+                    else ++git;
+                }
+                dead_req += (int64_t)h->req;
             }
-            if (fit != g_finalizers.end()) g_finalizers.erase(fit);
-            if (is_minor) g_gc_remembered.erase(obj);
-            for (auto git = g_gc_global_roots.begin(); git != g_gc_global_roots.end(); ) {
-                if (git->second == obj) git = g_gc_global_roots.erase(git);
-                else ++git;
-            }
+            fl_purge_range(seg->base, seg->base + seg->cap);
+            seg->used = 0;   // 重置：段整体重新参与 bump（头在分配时重写）
+            g_heap_bytes.fetch_sub(dead_req, std::memory_order_relaxed);
+            g_seg_objs.fetch_sub((int64_t)dead_offs.size(), std::memory_order_relaxed);
+            freed += (int64_t)dead_offs.size();
+            if (g_gc_log_on)
+                fprintf(stderr, "[GCLOG] sweep #%lld retire segment #%zu (%lld objs)\n",
+                        (long long)g_gc_collect_count, si, (long long)dead_offs.size());
+            continue;
+        }
+        if (dead_offs.empty()) continue;
+        // ── 有活居民：逐槽回收死对象 ──
+        for (size_t off : dead_offs) {
+            ShadowHdr* h = (ShadowHdr*)(seg->base + off - 16);
+            void* obj = seg->base + off;
             // P3：类型化载荷回收前终结——kind==1（迁移自注册的 RFS ShadowArray）
             // 的 data 缓冲是独立 malloc 内存，须先析构释放。
             if (h->kind == 1) {
                 reinterpret_cast<ShadowArray*>(obj)->~ShadowArray();
+            }
+            if (is_minor) g_gc_remembered.erase(obj);
+            for (auto git = g_gc_global_roots.begin(); git != g_gc_global_roots.end(); ) {
+                if (git->second == obj) git = g_gc_global_roots.erase(git);
+                else ++git;
             }
             h->kind = HDR_KIND_DEAD;   // 置死标记；段中内存绝不 free()
             g_heap_bytes.fetch_sub((int64_t)h->req, std::memory_order_relaxed);
@@ -4692,7 +4745,6 @@ static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
                 fl_push(obj, (int32_t)h->size);
             }
             freed++;
-            off += stride;
         }
     }
     return freed;
