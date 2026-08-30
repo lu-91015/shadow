@@ -78,11 +78,154 @@ static std::string value_to_string_array(ShadowArray* a);
 // ShadowArray objects that must be GC-tracked.
 extern "C" void shadow_gc_register(void* ptr, int32_t kind, int64_t size);
 
+// ShadowDict: 纯 C 开放寻址哈希表（W3：替换 std::unordered_map<std::string, DictValue>）。
+// 布局纯 POD {type_tag, head, tail, cap, count, used, slots} —— 带内对象头的前置条件。
+// 方案：开放寻址 + 线性探测 + 墓碑删除，容量 2 的幂，FNV-1a 哈希；负载因子 0.7
+// （按 count+tombstones 计），墓碑膨胀时原地重建、活条目多时倍增。
+// 迭代序 = 插入序（slots 内嵌 prev/next 索引链），确定且跨平台一致。
+// 所有权：表拥有 key（strdup）与 val.tag==2 的字符串（DictValue 构造时 strdup）；
+// 覆盖/擦除/释放时先释放旧字符串 —— 顺带修复旧 unordered_map erase 泄漏 val.s。
+#define SDICT_TOMBSTONE ((char*)(uintptr_t)1)
+struct SDictEntry {
+    char* key;      // nullptr=空槽; SDICT_TOMBSTONE=已删; 其它=活条目（strdup 拥有）
+    uint64_t h;     // 缓存全量哈希（重建时免重算）
+    int32_t next;   // 插入序链：下一索引，-1=尾
+    int32_t prev;   // 插入序链：上一索引，-1=无
+    DictValue val;  // tag==2 的 val.s 由表拥有
+};
 struct ShadowDict {
     uint32_t type_tag; // 0=array, 1=dict
-    std::unordered_map<std::string, DictValue> data;
-    ShadowDict() : type_tag(1) {}
+    int32_t head;      // 插入序链头，-1=空
+    int32_t tail;      // 插入序链尾，-1=空
+    size_t cap;        // 槽位数（2 的幂），0=空表
+    size_t count;      // 活条目数
+    size_t used;       // count + 墓碑数（探测占用）
+    SDictEntry* slots;
+    ShadowDict() : type_tag(1), head(-1), tail(-1), cap(0), count(0), used(0), slots(nullptr) {}
+    ~ShadowDict();
 };
+static uint64_t sdict_hash(const char* s) {
+    uint64_t h = 1469598103934665603ULL; // FNV-1a 64
+    for (const unsigned char* p = (const unsigned char*)s; *p; ++p) {
+        h ^= (uint64_t)*p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+// 重建表：新容量插入（清除墓碑），保持插入序链不变。
+static void sdict_rehash(ShadowDict* d, size_t new_cap) {
+    SDictEntry* old = d->slots;
+    SDictEntry* ns = (SDictEntry*)calloc(new_cap, sizeof(SDictEntry));
+    size_t mask = new_cap - 1;
+    int32_t new_head = -1, new_prev = -1;
+    for (int32_t idx = d->head; idx >= 0; idx = old[idx].next) {
+        SDictEntry& oe = old[idx];
+        size_t i = (size_t)oe.h & mask;
+        while (ns[i].key) i = (i + 1) & mask;
+        ns[i].key = oe.key;
+        ns[i].h = oe.h;
+        ns[i].val = oe.val;
+        ns[i].prev = new_prev;
+        ns[i].next = -1;
+        if (new_prev >= 0) ns[new_prev].next = (int32_t)i;
+        else new_head = (int32_t)i;
+        new_prev = (int32_t)i;
+    }
+    free(old);
+    d->slots = ns;
+    d->cap = new_cap;
+    d->head = new_head;
+    d->tail = new_prev;
+    d->used = d->count;
+}
+// 查找：命中返回条目指针，未命中返回 nullptr。
+static SDictEntry* sdict_lookup(const ShadowDict* d, const char* key, uint64_t h) {
+    if (!d->slots) return nullptr;
+    size_t mask = d->cap - 1;
+    size_t i = (size_t)h & mask;
+    for (;;) {
+        SDictEntry& e = d->slots[i];
+        if (!e.key) return nullptr; // 空槽 → 不存在
+        if (e.key != SDICT_TOMBSTONE && e.h == h && strcmp(e.key, key) == 0) return &e;
+        i = (i + 1) & mask;
+    }
+}
+static DictValue* sdict_get(ShadowDict* d, const char* key) {
+    if (!d || !key) return nullptr;
+    SDictEntry* e = sdict_lookup(d, key, sdict_hash(key));
+    return e ? &e->val : nullptr;
+}
+// 插入或定位：返回可写的值指针；键不存在则插入（默认值 int 0）。
+static DictValue* sdict_put(ShadowDict* d, const char* key) {
+    uint64_t h = sdict_hash(key);
+    SDictEntry* e = sdict_lookup(d, key, h);
+    if (e) return &e->val;
+    if (d->cap == 0 || (d->used + 1) * 10 >= d->cap * 7) {
+        size_t nc = d->cap ? d->cap : 8;
+        while ((d->count + 1) * 10 >= nc * 7) nc *= 2; // 活条目驱动倍增；墓碑膨胀则等容重建
+        sdict_rehash(d, nc);
+    }
+    size_t mask = d->cap - 1;
+    size_t i = (size_t)h & mask;
+    size_t tomb = SIZE_MAX;
+    while (d->slots[i].key) {
+        if (d->slots[i].key == SDICT_TOMBSTONE && tomb == SIZE_MAX) tomb = i;
+        i = (i + 1) & mask;
+    }
+    size_t ins = (tomb != SIZE_MAX) ? tomb : i;
+    if (d->slots[ins].key == SDICT_TOMBSTONE) d->used--; // 复用墓碑槽
+    d->slots[ins].key = strdup(key);
+    d->slots[ins].h = h;
+    d->slots[ins].val = DictValue();
+    d->slots[ins].prev = d->tail;                        // 追加到插入序链尾
+    d->slots[ins].next = -1;
+    if (d->tail >= 0) d->slots[d->tail].next = (int32_t)ins;
+    else d->head = (int32_t)ins;
+    d->tail = (int32_t)ins;
+    d->count++;
+    d->used++;
+    return &d->slots[ins].val;
+}
+// 覆盖写入：先释放被覆盖的旧字符串，再做浅拷贝（v.val.s 所有权转归表）。
+static void sdict_set(ShadowDict* d, const char* key, const DictValue& v) {
+    DictValue* slot = sdict_put(d, key);
+    if (slot->tag == 2 && slot->val.s) free((void*)slot->val.s);
+    *slot = v;
+}
+// 擦除：命中返回 1；释放 key 与 tag==2 的字符串。
+static int sdict_erase(ShadowDict* d, const char* key) {
+    if (!d || !key) return 0;
+    SDictEntry* e = sdict_lookup(d, key, sdict_hash(key));
+    if (!e) return 0;
+    if (e->prev >= 0) d->slots[e->prev].next = e->next;
+    else d->head = e->next;
+    if (e->next >= 0) d->slots[e->next].prev = e->prev;
+    else d->tail = e->prev;
+    free(e->key);
+    if (e->val.tag == 2) free((void*)e->val.val.s);
+    e->key = SDICT_TOMBSTONE;
+    e->h = 0;
+    e->prev = e->next = -1;
+    e->val = DictValue();
+    d->count--;
+    return 1;
+}
+// 释放表内全部资源（键、字符串值、槽位数组）。
+static void sdict_release(ShadowDict* d) {
+    if (!d->slots) return;
+    for (size_t i = 0; i < d->cap; i++) {
+        SDictEntry& e = d->slots[i];
+        if (e.key && e.key != SDICT_TOMBSTONE) {
+            free(e.key);
+            if (e.val.tag == 2) free((void*)e.val.val.s);
+        }
+    }
+    free(d->slots);
+    d->slots = nullptr;
+    d->cap = d->count = d->used = 0;
+    d->head = d->tail = -1;
+}
+inline ShadowDict::~ShadowDict() { sdict_release(this); }
 
 struct ShadowArray {
     uint32_t type_tag; // 0=array, 1=dict, 2=set
@@ -717,7 +860,7 @@ extern "C" void* shadow_hashmap_new() {
 extern "C" void shadow_hashmap_insert(void* map, const char* key, const char* value) {
     if (!map || !key) return;
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    m->data[key] = DictValue(std::string(value ? value : ""));
+    sdict_set(m, key, DictValue(value ? value : ""));
 }
 
 // dict<K, int/long/bool/date/timestamp> 的 hashmap_insert 变体。
@@ -726,37 +869,37 @@ extern "C" void shadow_hashmap_insert(void* map, const char* key, const char* va
 extern "C" void shadow_hashmap_insert_int(void* map, const char* key, int64_t value) {
     if (!map || !key) return;
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    m->data[key] = DictValue(value);
+    sdict_set(m, key, DictValue(value));
 }
 
 extern "C" const char* shadow_hashmap_get(void* map, const char* key) {
     if (!map || !key) return dup_str("");
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    auto it = m->data.find(key);
-    if (it == m->data.end()) return dup_str("");
+    DictValue* v = sdict_get(m, key);
+    if (!v) return dup_str("");
     // 仅当值为 string 变体时返回；非 string 变体返回其字符串表示（与原行为一致）
-    if (it->second.tag == 2) {
-        return dup_str(it->second.val.s);
+    if (v->tag == 2) {
+        return dup_str(v->val.s);
     }
-    return dup_str(value_to_string(it->second).c_str());
+    return dup_str(value_to_string(*v).c_str());
 }
 
 extern "C" int shadow_hashmap_contains(void* map, const char* key) {
     if (!map || !key) return 0;
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    return m->data.find(key) != m->data.end() ? 1 : 0;
+    return sdict_get(m, key) != nullptr ? 1 : 0;
 }
 
 extern "C" int shadow_hashmap_remove(void* map, const char* key) {
     if (!map || !key) return 0;
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    return m->data.erase(key) > 0 ? 1 : 0;
+    return sdict_erase(m, key);
 }
 
 extern "C" int shadow_hashmap_size(void* map) {
     if (!map) return 0;
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
-    return (int)m->data.size();
+    return (int)m->count;
 }
 
 extern "C" void shadow_hashmap_free(void* map) {
@@ -1132,10 +1275,11 @@ static std::string value_to_string_dict(ShadowDict* d) {
     if (!d) return "{}";
     std::string result = "{";
     bool first = true;
-    for (const auto& [k, v] : d->data) {
+    for (int32_t _i = d->head; _i >= 0; _i = d->slots[_i].next) {
+        SDictEntry& _e = d->slots[_i];
         if (!first) result += ", ";
-        result += "\"" + k + "\": ";
-        result += value_to_string(v);
+        result += "\"" + std::string(_e.key) + "\": ";
+        result += value_to_string(_e.val);
         first = false;
     }
     result += "}";
@@ -1211,7 +1355,7 @@ static ShadowDict* parse_json_object(const std::string& json, size_t& pos) {
         ++pos; // skip ':'
         skip_ws(json, pos);
         DictValue val = parse_json_value(json, pos);
-        d->data[key] = val;
+        sdict_set(d, key.c_str(), val);
         skip_ws(json, pos);
         if (pos >= json.size()) break;
         if (json[pos] == '}') {
@@ -1293,7 +1437,7 @@ static DictValue parse_json_value(const std::string& json, size_t& pos) {
     if (is_double) {
         try { return std::stod(num_str); } catch (...) {}
     } else {
-        try { return std::stoll(num_str); } catch (...) {}
+        try { return (DictValue)(int64_t)std::stoll(num_str); } catch (...) {}
     }
     return (int64_t)0;
 }
@@ -1326,7 +1470,7 @@ extern "C" void* shadow_dict_create(int count, ...) {
             }
             default: val = (int64_t)0; break;
         }
-        if (key) d->data[key] = val;
+        if (key) sdict_set(d, key, val);
     }
     va_end(args);
     return d;
@@ -1347,27 +1491,26 @@ static thread_local std::string g_str_buf;
 extern "C" void* shadow_dict_get(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return nullptr;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    auto it = d->data.find(key);
-    if (it == d->data.end()) return nullptr;
-    DictValue& val = it->second;
-    if (val.tag == 0) {
-        g_any_int_buf = val.val.i;
+    DictValue* val = sdict_get(d, key);
+    if (!val) return nullptr;
+    if (val->tag == 0) {
+        g_any_int_buf = val->val.i;
         return &g_any_int_buf;
     }
-    if (val.tag == 1) {
-        g_any_float_buf = val.val.d;
+    if (val->tag == 1) {
+        g_any_float_buf = val->val.d;
         return &g_any_float_buf;
     }
-    if (val.tag == 3) {
-        g_any_bool_buf = val.val.b;
+    if (val->tag == 3) {
+        g_any_bool_buf = val->val.b;
         return &g_any_bool_buf;
     }
-    if (val.tag == 2) {
-        g_str_buf = std::string(val.val.s ? val.val.s : "");
+    if (val->tag == 2) {
+        g_str_buf = std::string(val->val.s ? val->val.s : "");
         return const_cast<char*>(g_str_buf.c_str());
     }
-    if (val.tag == 4) {
-        void* p = val.val.p;
+    if (val->tag == 4) {
+        void* p = val->val.p;
         // Nested dict/array
         ShadowArray* nested_a = reinterpret_cast<ShadowArray*>(p);
         if (nested_a && nested_a->type_tag == 0) {
@@ -1388,8 +1531,8 @@ extern "C" void* shadow_dict_keys(void* dict_ptr) {
     if (!dict_ptr) return new ShadowArray();
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
     ShadowArray* a = new ShadowArray();
-    for (const auto& [k, v] : d->data) {
-        a->push_back(DictValue(k));
+    for (int32_t _i = d->head; _i >= 0; _i = d->slots[_i].next) {
+        a->push_back(DictValue(d->slots[_i].key));
     }
     return a;
 }
@@ -1400,7 +1543,7 @@ extern "C" void* shadow_dict_keys(void* dict_ptr) {
 extern "C" int32_t shadow_dict_size(void* dict_ptr) {
     if (!dict_ptr) return 0;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    return (int32_t)d->data.size();
+    return (int32_t)d->count;
 }
 
 // shadow_dict_key_at: return key string at given index (C++ ShadowDict)
@@ -1408,14 +1551,15 @@ extern "C" int32_t shadow_dict_size(void* dict_ptr) {
 extern "C" const char* shadow_dict_key_at(void* dict_ptr, int32_t idx) {
     if (!dict_ptr) return nullptr;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    if (idx < 0 || (size_t)idx >= d->data.size()) {
+    if (idx < 0 || (size_t)idx >= d->count) {
         fprintf(stderr, "error: dict index %d out of bounds (size=%zu)\n",
-                idx, d->data.size());
+                idx, d->count);
         return nullptr;
     }
-    auto it = d->data.begin();
-    std::advance(it, idx);
-    return strdup(it->first.c_str());
+    int32_t i = d->head;
+    for (int32_t k = 0; k < idx && i >= 0; k++) i = d->slots[i].next;
+    if (i < 0) return nullptr;
+    return strdup(d->slots[i].key);
 }
 
 // Get all values as array (semicolon-separated, values as strings)
@@ -1424,9 +1568,9 @@ extern "C" const char* shadow_dict_values(void* dict_ptr) {
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
     std::string result;
     bool first = true;
-    for (const auto& [k, v] : d->data) {
+    for (int32_t _i = d->head; _i >= 0; _i = d->slots[_i].next) {
         if (!first) result += ";";
-        result += value_to_string(v);
+        result += value_to_string(d->slots[_i].val);
         first = false;
     }
     return dup_str(result);
@@ -1436,7 +1580,7 @@ extern "C" const char* shadow_dict_values(void* dict_ptr) {
 extern "C" int shadow_dict_has_key(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return 0;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    return d->data.find(key) != d->data.end() ? 1 : 0;
+    return sdict_get(d, key) != nullptr ? 1 : 0;
 }
 
 // Create Array from values (variadic)
@@ -1731,7 +1875,7 @@ extern "C" const char* shadow_to_string_any(void* val_ptr) {
     }
     ShadowDict* d = reinterpret_cast<ShadowDict*>(val_ptr);
     if (d && d->type_tag == 1) {
-        if (!d->data.empty()) {
+        if (d->count > 0) {
             return dup_str(value_to_string_dict(d).c_str());
         }
         return dup_str("{}");
@@ -1764,27 +1908,25 @@ extern "C" const char* shadow_json_get(const char* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return dup_str("");
     ShadowDict* d = reinterpret_cast<ShadowDict*>(const_cast<char*>(dict_ptr));
     if (!d || d->type_tag != 1) return dup_str("");
-    auto it = d->data.find(key);
-    if (it == d->data.end()) return dup_str("");
-    const DictValue& v = it->second;
-    if (v.tag == 2)
-        return dup_str(v.val.s);
+    DictValue* v = sdict_get(d, key);
+    if (!v) return dup_str("");
+    if (v->tag == 2)
+        return dup_str(v->val.s);
     // Fall back to stringifying other variants (int/bool/etc.).
-    return dup_str(value_to_string(v).c_str());
+    return dup_str(value_to_string(*v).c_str());
 }
 
 extern "C" int64_t shadow_json_get_int(const char* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return 0;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(const_cast<char*>(dict_ptr));
     if (!d || d->type_tag != 1) return 0;
-    auto it = d->data.find(key);
-    if (it == d->data.end()) return 0;
-    const DictValue& v = it->second;
-    if (v.tag == 0) return v.val.i;
-    if (v.tag == 1) return (int64_t)v.val.d;
-    if (v.tag == 3) return v.val.b ? 1 : 0;
-    if (v.tag == 2) {
-        try { return std::stoll(std::string(v.val.s ? v.val.s : "")); } catch (...) { return 0; }
+    DictValue* v = sdict_get(d, key);
+    if (!v) return 0;
+    if (v->tag == 0) return v->val.i;
+    if (v->tag == 1) return (int64_t)v->val.d;
+    if (v->tag == 3) return v->val.b ? 1 : 0;
+    if (v->tag == 2) {
+        try { return std::stoll(std::string(v->val.s ? v->val.s : "")); } catch (...) { return 0; }
     }
     return 0;
 }
@@ -1802,7 +1944,7 @@ extern "C" int32_t shadow_len_any(void* val_ptr) {
     }
     ShadowDict* d = reinterpret_cast<ShadowDict*>(val_ptr);
     if (d && d->type_tag == 1) {
-        return (int32_t)d->data.size();
+        return (int32_t)d->count;
     }
     // Fallback: treat as string
     return (int32_t)strlen((const char*)val_ptr);
@@ -2416,7 +2558,7 @@ extern "C" void* shadow_dict_set(void* dict_ptr, void* key, int32_t tag, void* v
         case 4:  dv = DictValue((void*)val); break;                    // struct/ptr
         default: dv = DictValue((int64_t)(intptr_t)val); break;
     }
-    d->data[(const char*)key] = dv;
+    sdict_set(d, (const char*)key, dv);
     return dict_ptr;
 }
 
@@ -2899,9 +3041,9 @@ extern "C" void* shadow_array_pop(void* array_ptr) {
 extern "C" int64_t shadow_dict_get_int(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return 0;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    auto it = d->data.find(key);
-    if (it != d->data.end() && it->second.tag == 0)
-        return it->second.val.i;
+    DictValue* v = sdict_get(d, key);
+    if (v && v->tag == 0)
+        return v->val.i;
     return 0;
 }
 
@@ -2909,9 +3051,9 @@ extern "C" int64_t shadow_dict_get_int(void* dict_ptr, const char* key) {
 extern "C" const char* shadow_dict_get_string(void* dict_ptr, const char* key) {
     if (!dict_ptr || !key) return nullptr;
     ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
-    auto it = d->data.find(key);
-    if (it != d->data.end() && it->second.tag == 2)
-        return strdup(it->second.val.s);
+    DictValue* v = sdict_get(d, key);
+    if (v && v->tag == 2)
+        return strdup(v->val.s);
     return nullptr;
 }
 
@@ -4358,8 +4500,10 @@ static void gc_dump_referrers(void* target) {
             }
         } else if (m.kind == 2) {
             ShadowDict* d = reinterpret_cast<ShadowDict*>(obj);
-            for (const auto& kv2 : d->data)
-                if (kv2.second.tag == 4 && kv2.second.val.p == target) { refs = true; break; }
+            for (int32_t _i = d->head; _i >= 0 && !refs; _i = d->slots[_i].next) {
+                const DictValue& _v = d->slots[_i].val;
+                if (_v.tag == 4 && _v.val.p == target) { refs = true; break; }
+            }
         } else if (m.kind == 0 && m.size > 0) {
             char* base = reinterpret_cast<char*>(obj);
             for (int64_t off = 0; off + (int64_t)sizeof(void*) <= m.size; off += sizeof(void*)) {
