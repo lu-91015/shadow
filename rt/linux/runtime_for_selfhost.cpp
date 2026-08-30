@@ -3445,20 +3445,25 @@ static std::atomic<int32_t> g_mutator_threads{0};
 extern std::atomic<int64_t> g_heap_bytes;
 
 // ── 大小类空闲链表分配器（Linux 单 mutator 优化）──
-// 清扫把死对象按大小类压入空闲链表（免 free()），分配从链表弹出（免 malloc）。
-// 对象数据前 16 字节存 FLNode（next + size）：size 用于弹出时校验 ≥ 请求，
-// 避免同类的较小对象被较大请求复用（类区间是 2 的幂开区间，同类可含多个
-// 8 对齐尺寸）。仅 16B..64KB 的对象走链表（<16B 无节点空间、>64KB 大对象
-// 直接 free/malloc），且仅 g_mutator_threads<=1 时启用（与攒批快路径同门控）。
-#define FL_NUM_CLASS 14           // 8,16,...,65536
+// 清扫把死对象按【16B 槽位桶】压入空闲链表（免 free()），分配从链表弹出（免 malloc）。
+// 对象数据前 16 字节存 FLNode（next + size）。
+// 不变量（正确性命门）：链表按槽位【精确分桶】，弹出块的新头 size 与原块 size 落在
+// 同一个 16B 桶 → 头推出的 stride 恒等于该块在段内的物理占用。
+// 历史缺陷：曾按 2 的幂大类分桶并允许"大块的复用给小请求"，于是新头 stride 小于
+// 物理占用，线性清扫从块中部读出假头 → 活对象被判未标记而回收（ex_gc_mixed 压测
+// 下 tags 数组被回收并复用成字符串）。仅 16B..64KB 的对象走链表（<16B 无节点空间、
+// >64KB 大对象直接 free/malloc），且仅 g_mutator_threads<=1 时启用（与攒批快路径同门控）。
+#define FL_SLOT_SHIFT 4                              // 槽位粒度 = 16B（与段 bump 同式）
+#define FL_NUM_CLASS ((65536 >> FL_SLOT_SHIFT) + 1)  // 索引 = 槽位载荷 >> 4（1..4096）
 struct FLNode { FLNode* next; int32_t size; };
 static void* g_fl_head[FL_NUM_CLASS] = {0};
 
+// 槽位载荷 = gc_seg_alloc 的 bump 步长去掉 16B 头 —— 三处（bump / 清扫 / 复用）必须同式。
 static int fl_class_of(int32_t asize) {
-    int c = 0;
-    int32_t s = 8;
-    while (s < asize && c < FL_NUM_CLASS - 1) { s <<= 1; c++; }
-    return c;
+    int32_t slot = (asize + 15) & ~15;
+    if (slot < 16) slot = 16;
+    int c = slot >> FL_SLOT_SHIFT;
+    return c >= FL_NUM_CLASS ? FL_NUM_CLASS - 1 : c;
 }
 
 static bool fl_enabled() {
@@ -3476,14 +3481,11 @@ static void fl_push(void* p, int32_t msize) {
 }
 
 static void* fl_pop(int32_t asize) {
-    int c = fl_class_of(asize);
-    FLNode** pp = (FLNode**)&g_fl_head[c];
-    while (*pp) {
-        FLNode* n = *pp;
-        if (n->size >= asize) { *pp = n->next; return n; }
-        pp = &n->next;
-    }
-    return nullptr;
+    FLNode** pp = (FLNode**)&g_fl_head[fl_class_of(asize)];
+    FLNode* n = *pp;
+    if (!n) return nullptr;
+    *pp = n->next;
+    return n;
 }
 
 // P3b：摘除落在 [lo, hi) 内的空闲链表节点（整段退役前必做——段内存即将

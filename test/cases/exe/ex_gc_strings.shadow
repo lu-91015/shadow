@@ -1,3 +1,6 @@
+//@timeout: 240
+// ↑ 超时上调：SHADOW_GC_STRESS=8 压测门禁下实测编译+运行约 63s（-j 4 竞争更久），
+//   默认 30s 会被 run_tests.py 记成 TIMEOUT→FAIL，掩盖真实结果。
 // ex_gc_strings.shadow — GC v1：大量 string/array 分配回收，验证引用保活
 // 每轮分配 5000 个字符串并保留一半，重复多轮；若 GC 误回收则崩溃/输出错。
 dsb ex_gc_strings;
