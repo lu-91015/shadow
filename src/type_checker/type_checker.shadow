@@ -49,6 +49,11 @@ pub kimo tc_unmangle(name: string) -> string {
     return name;
 }
 
+// trait impl 方法的注册名（parser 建符号、TC 查符号、codegen 找终结器三处共用，务必单点）。
+pub kimo tc_impl_symbol(type_name: string, trait_name: string, method: string) -> string {
+    return "__impl__" + tc_unmangle(type_name) + "__" + tc_unmangle(trait_name) + "__" + method;
+}
+
 // 从 mangle 名（__mod_<mod>__<func>）提取所属模块；非 mangle 名返回 ""
 pub kimo tc_mod_of(name: string) -> string {
     if (str_starts_with(name, "__mod_") == 0) { return ""; }
@@ -2483,7 +2488,7 @@ pub kimo tc_impl_find_method(ctx: CompileContext, type_name: string, method_name
                     // 0.5 严格态：type/trait 名已 mangled，但注册的 impl 方法名
                     // （parser 生成 __impl__<type>__<trait>__<method>）是裸名段——
                     // 还原裸名拼查找键，否则 tc_func_lookup 查不到（link undefined / undefined function）。
-                    return "__impl__" + tc_unmangle(type_name) + "__" + tc_unmangle(trait_n) + "__" + method_name;
+                    return tc_impl_symbol(type_name, trait_n, method_name);
                 }
                 j = j + 1;
             }
@@ -3466,7 +3471,7 @@ pub kimo tc_check_binary(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                         if (str_eq(mn, opname) == 1) {
                             // 改写为 __impl__<Type>__<Trait>__<method> 调用
                             // 0.5 严格态：注册名是裸名段（parser 生成），mangled 段还原后拼接
-                            let mangled = "__impl__" + tc_unmangle(lhs.name) + "__" + tc_unmangle(id.trait_name) + "__" + opname;
+                            let mangled = tc_impl_symbol(lhs.name, id.trait_name, opname);
                             e.kind = EXPR_CALL;
                             e.str1 = mangled;
                             let args: array<Expr> = [];

@@ -3686,10 +3686,21 @@ static std::atomic<int64_t> g_seg_objs{0};
 
 // ── finalizer 旁路表（段对象的 Drop/终结器；g_gc_mutex 保护）──
 // codegen 为含 Drop trait 的结构体发 shadow_gc_set_finalizer；段对象不在任何
-// 登记表里，终结器统一落此表。复活语义与旧实现一致：执行后写回当前 epoch
-// （无 trace 位）→ 本轮存活，下轮未扎根才真正回收。
-struct GcFinalizerRec { void(*fn)(void*); void* data; bool finalized; };
+// 登记表里，终结器统一落此表。state：0=待执行 1=已入队（drain 在飞，内存钉住）
+// 2=已执行（下轮判死直接回收）→ Drop 至多一次。
+// 复活语义与旧实现一致：入队时写回当前 epoch（无 trace 位）→ 本轮存活，
+// 下轮未扎根才真正回收。
+struct GcFinalizerRec { void(*fn)(void*); void* data; int state; };
 static std::unordered_map<void*, GcFinalizerRec> g_finalizers;
+
+// ── 终结器待执行队列（§5.2.8：独立队列）──
+// 清扫只把死对象的终结器摘进队列并复活该对象一轮；实际调用推迟到收集结束、
+// g_gc_mutex 释放之后 —— 否则终结器里任何分配（含 println 的字符串拼接）都会
+// 在 gc_lock_blocked 上自旋死锁（锁被正在跑终结器的收集线程自己持着）。
+// 队列条目在 state==1 期间钉住对象内存，故 drain 窗口内的并发/重入收集
+// 只会再多复活一轮，不会把待 Drop 的块回收复用。
+struct GcPendingFin { void(*fn)(void*); void* obj; void* data; };
+static std::vector<GcPendingFin> g_fin_pending;   // drain 实现见 gc_sweep_segments 旁
 
 #define GC_SEG_CAP_DEFAULT (1024u * 1024u)   // 1MB
 #define GC_SEG_MAX 8192                      // 段数上限 = 8GB 堆（工程不可达）
@@ -4639,12 +4650,33 @@ static inline void gc_trace_object_children(void* obj, int32_t tid, int64_t size
     // tid == 1（RT_T_STRING）及其它：不扫描
 }
 
+// 锁外执行队列中的终结器：只在取队列/回写 state 两步持 g_gc_mutex，
+// Drop 本体在无锁状态调用（Drop 里可以分配、可以再起一次 GC）。
+static void gc_run_pending_finalizers() {
+    std::vector<GcPendingFin> local;
+    gc_lock_blocked();
+    local.swap(g_fin_pending);
+    g_gc_mutex.unlock();
+    if (local.empty()) return;
+    for (GcPendingFin& p : local) {
+        if (!p.fn) continue;
+        p.fn(p.data ? p.data : p.obj);
+    }
+    gc_lock_blocked();
+    for (GcPendingFin& p : local) {
+        auto it = g_finalizers.find(p.obj);
+        if (it != g_finalizers.end() && it->second.state == 1) it->second.state = 2;
+    }
+    g_gc_mutex.unlock();
+}
+
 // Internal: run finalizers for dead objects, then reclaim them.
 // Objects with finalizers that haven't run yet get one extra cycle (resurrection).
 // P3/P3b：段对象清扫 —— 线性遍历，存活判据 = (epoch & MASK) == 当前轮。
 // 活字节只累计带 trace 位的对象（pacing 口径对齐旧 visited==epoch：
 // 分配即黑但未扎根的残留不计入 live）。返回回收对象数。
-// 终结器走旁路表：未执行过 → 执行并复活一轮（写当前 epoch，无 trace 位）。
+// 终结器走旁路表：命中的记录移交待执行队列并复活一轮（写当前 epoch，无 trace 位），
+// 真正的 Drop 调用在收集结束、GC 锁释放后由 gc_run_pending_finalizers 完成。
 // P3b 整段退役：段内无任何活居民 → 摘除段内空闲链表节点、重置 used，
 // 整段立即重新参与 bump 分配（成批分配-丢弃型负载的悬崖对策）。
 static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
@@ -4676,17 +4708,22 @@ static int64_t gc_sweep_segments(bool is_minor, int64_t* out_live) {
                 off += stride;
                 continue;
             }
-            // 死对象 —— 先查终结器（可能复活）
+            // 死对象 —— 先查终结器（state 0 入队 / 1 drain 在飞钉住 / 2 已跑过可回收）
             auto fit = g_finalizers.find(obj);
-            if (fit != g_finalizers.end() && !fit->second.finalized) {
-                fit->second.finalized = true;
-                fit->second.fn(fit->second.data ? fit->second.data : obj);
-                h->epoch.store(ep, std::memory_order_relaxed);  // 复活一轮（无 trace 位）
-                live_cnt++;
-                off += stride;
-                continue;
+            if (fit != g_finalizers.end()) {
+                if (fit->second.state == 2) {
+                    g_finalizers.erase(fit);        // Drop 已执行：走下面的正常回收
+                } else {
+                    if (fit->second.state == 0) {
+                        fit->second.state = 1;
+                        g_fin_pending.push_back(GcPendingFin{fit->second.fn, obj, fit->second.data});
+                    }
+                    h->epoch.store(ep, std::memory_order_relaxed);  // 复活一轮（无 trace 位）
+                    live_cnt++;
+                    off += stride;
+                    continue;
+                }
             }
-            if (fit != g_finalizers.end()) g_finalizers.erase(fit);
             if (g_gc_watch && obj == g_gc_watch) gc_dump_referrers(obj);
             if (g_gc_log_on)
                 fprintf(stderr, "[GCLOG] sweep #%lld free %p kind=%d size=%u gen=%u (seg)\n",
@@ -4761,7 +4798,7 @@ extern "C" int64_t shadow_gc_collect() {
     if (g_gc_log_on) { fprintf(stderr, "[GC] major START segments=%zu objs=%lld\n", g_segment_n.load(std::memory_order_relaxed), (long long)g_seg_objs.load(std::memory_order_relaxed)); fflush(stderr); }
     gc_lock();  // lock-free spinlock: prevent concurrent collect
     g_gc_running.store(1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
+    std::unique_lock<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
     // ── STW：请求所有其它线程到达安全点，冻结根集（多线程并发下防止
     //    扫根/清扫窗口内其它线程改 roots 或写刚分配对象 → 漏标 → 误回收）──
@@ -4900,6 +4937,10 @@ extern "C" int64_t shadow_gc_collect() {
     gc_stw_end();
     g_gc_running.store(0, std::memory_order_relaxed);
     gc_unlock();
+    // 终结器必须在 GC 锁外跑：Drop 里任何分配都要拿 g_gc_mutex；
+    // 入队记录 state==1 已把对象内存钉住，锁释放窗口内的并发收集不会误回收它。
+    lk.unlock();
+    gc_run_pending_finalizers();
     return freed;
 }
 
@@ -4910,7 +4951,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     if (g_gc_disabled) return 0;
     if (g_gc_log_on) { fprintf(stderr, "[GC] minor START segments=%zu objs=%lld\n", g_segment_n.load(std::memory_order_relaxed), (long long)g_seg_objs.load(std::memory_order_relaxed)); fflush(stderr); }
     gc_lock();
-    std::lock_guard<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
+    std::unique_lock<std::mutex> lk(g_gc_mutex);   // serialize GC metadata/root access
     gc_diag_init();
     gc_stw_begin();
     if (g_gc_log_on)
@@ -4985,6 +5026,8 @@ extern "C" int64_t shadow_gc_minor_collect() {
 
     gc_stw_end();
     gc_unlock();
+    lk.unlock();                      // 同 major：终结器只能在 GC 锁外跑
+    gc_run_pending_finalizers();
     return freed;
 }
 
@@ -4996,7 +5039,16 @@ extern "C" int64_t shadow_gc_minor_collect() {
 extern "C" void shadow_gc_set_finalizer(void* ptr, void(*fn)(void*), void* data) {
     if (!ptr || !fn) return;
     gc_lock_blocked();
-    g_finalizers[ptr] = GcFinalizerRec{fn, data, false};
+    g_finalizers[ptr] = GcFinalizerRec{fn, data, 0};
+    g_gc_mutex.unlock();
+}
+
+// 注销终结器：确定性 Drop（with 块 / 显式 x.drop()）已执行过，
+// 同一对象的 GC 终结器不得再跑第二次（Drop 至多一次语义）。
+extern "C" void shadow_gc_clear_finalizer(void* ptr) {
+    if (!ptr) return;
+    gc_lock_blocked();
+    g_finalizers.erase(ptr);
     g_gc_mutex.unlock();
 }
 

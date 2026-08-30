@@ -1,6 +1,9 @@
 //@timeout: 180
+//@expect: GC_DROP_OK
 // ↑ 超时上调：SHADOW_GC_STRESS 压测门禁下每 8 次分配触发一次同步 GC，
 //   编译+运行远超默认 30s；run_tests.py 把 TIMEOUT 计入 FAIL，会掩盖真实结果。
+// ↑ 必须用 expect 断言：--run 只回传子进程 stdout，退出码被 src/main.shadow 吞掉
+//   （恒 return 0），只写 `return 1` 的用例永远不会红。
 // ex_gc_finalizer.shadow — GC v1：Drop finalizer 在对象回收时执行
 // 大量分配带 Drop 的结构体并丢弃，GC 触发后 drop 应被调用。
 dsb ex_gc_finalizer;
@@ -50,5 +53,6 @@ kimo main() -> int {
         println("ERR too few drops");
         return 1;
     }
+    println("GC_DROP_OK");
     return 0;
 }

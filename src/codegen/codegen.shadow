@@ -15,6 +15,7 @@ dsb codegen;
 import core.ast;
 import core.const;
 import core.utils;
+import type_checker.type_checker;
 
 // ============ LLVM-C API 桥接（@extern，64 位句柄必须用 any） ============
 @extern("LLVMContextCreate") kimo llvm_ctx_create() -> any { return 0 as any; }
@@ -99,6 +100,7 @@ import core.utils;
 @extern("shadow_gc_disable") kimo rt_gc_disable() -> void {}
 @extern("shadow_gc_alloc") kimo rt_gc_alloc(size: int, kind: int) -> any { return 0 as any; }
 @extern("shadow_gc_set_finalizer") kimo rt_gc_set_finalizer(ptr: any, fn: any, data: any) -> void {}
+@extern("shadow_gc_clear_finalizer") kimo rt_gc_clear_finalizer(ptr: any) -> void {}
 @extern("shadow_gc_write_barrier") kimo rt_gc_write_barrier(parent: any, child: any) -> void {}
 @extern("shadow_gc_frame_enter") kimo rt_gc_frame_enter() -> int { return 0; }
 @extern("shadow_gc_frame_leave") kimo rt_gc_frame_leave(marker: int) -> int { return 0; }
@@ -303,6 +305,7 @@ pub kimo cg_resolve_extern_name(name: string) -> string {
     if (str_eq(name, "rt_gc_collect") == 1) { return "shadow_gc_collect"; }
     if (str_eq(name, "rt_gc_minor_collect") == 1) { return "shadow_gc_minor_collect"; }
     if (str_eq(name, "rt_gc_set_finalizer") == 1) { return "shadow_gc_set_finalizer"; }
+    if (str_eq(name, "rt_gc_clear_finalizer") == 1) { return "shadow_gc_clear_finalizer"; }
     if (str_eq(name, "rt_gc_write_barrier") == 1) { return "shadow_gc_write_barrier"; }
     if (str_eq(name, "rt_gc_frame_enter") == 1) { return "shadow_gc_frame_enter"; }
     if (str_eq(name, "rt_gc_frame_leave") == 1) { return "shadow_gc_frame_leave"; }
@@ -1631,7 +1634,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         let has_drop = 0;
         let drop_fn_name = "";
         if (len(mi.strval) > 0) {
-            drop_fn_name = "__impl__" + mi.strval + "__Drop__drop";
+            drop_fn_name = tc_impl_symbol(mi.strval, "Drop", "drop");
             if ((llvm_get_fn(cg_mod, drop_fn_name) as any) != 0) {
                 has_drop = 1;
             }
@@ -2172,6 +2175,15 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                     hnew_args = array_push(hnew_args, hext_val);
                     arg_vals = hnew_args;
                 }
+            }
+        }
+        // Drop 至多一次：确定性 drop()（with 块末 / 显式调用）先注销该对象的 GC 终结器，
+        // 否则结构体字面量注册的终结器会在回收时把同一段 Drop 再跑一遍。
+        let rn_n = len(resolved_name);
+        if (rn_n > 12 && len(arg_vals) >= 1) {
+            if (str_eq(substr2(resolved_name, rn_n - 12, rn_n), "__Drop__drop") == 1) {
+                let clear_args: array<any> = [arg_vals[0]];
+                cg_call_named("rt_gc_clear_finalizer", TYPE_VOID, clear_args);
             }
         }
         let callee = cg_get_or_declare_fn(resolved_name, k, arg_vals);

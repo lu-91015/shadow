@@ -1855,8 +1855,11 @@ kimo main_mod_in_src(idx: int) -> int {
 // v10_s8：codegen 内联 array_push（静态类型数组 es 已知 → 无调用 push，仅首推/扩容走慢路径），
 //   旧 v10_s7 缓存 IR 仍是 push_fast 调用 → 需整体失效。
 // v10_s9：MirFunc 序列化增加 is_nogc 字段（@nogc 免 GC 帧）→ 旧 v10_s8 缓存缺该字段 → 需整体失效。
+// v10_s10：codegen Drop 终结器修复——结构体字面量按裸名段找 __impl__<T>__Drop__drop 并注册
+//   终结器（旧键用 mangled 名，恒查不到 → 从不注册），确定性 drop() 前加 clear；
+//   旧 v10_s9 缓存 IR 两者皆缺 → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s9_" + main_hash_src(path);
+    return main_lu_base + "/v10_s10_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
