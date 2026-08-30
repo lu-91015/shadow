@@ -125,6 +125,7 @@ let cg_cur_ret_default: any = 0 as any;
 let cg_cur_ret_is_void: int = 0;
 let cg_gc_frame_marker: any = 0 as any;
 let cg_gc_frame_active: int = 0;            // 1 = 本函数需要 GC 帧（有活指针/指针参数）
+let cg_ana_has_safepoint: int = 0;          // 预扫描：本函数含真安全点（runtime 调用或回边 poll）
 // GC 类型注册缓存（0.4 GC v1：按 名称+大小+位图 复用 type_id，首次生成 register_type 调用）
 let cg_gc_type_keys: array<string> = [];
 let cg_gc_type_ids: array<int> = [];
@@ -660,6 +661,9 @@ pub kimo cg_set_reg(idx: int, val: any, ty_kind: int) -> void {
 pub kimo cg_sf_store(slot: int, val: any, kind: int) -> void {
     if ((cg_sf_alloca as any) == 0) { return; }
     if (slot < 0) { return; }
+    // 免帧函数（无真安全点 / @nogc）没有注册到 GC 锚点的帧，spill 无处可去。
+    // 预扫描已保证此时所有 cg_sf_reg_slot 均为 -1，本短路只为兜住内部临时槽路径。
+    if (cg_gc_frame_active == 0) { return; }
     let i64_ty = llvm_i64(cg_ctx);
     let base_i = llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "sfb");
     // 统一 frame：变量槽占 [0, cg_sf_off)，寄存器 spill 占 [cg_sf_off, ...)
@@ -2667,6 +2671,100 @@ pub kimo cg_safepoint_op(op: int) -> int {
     return 0;
 }
 
+// 预扫描某寄存器的可信 kind（-1 = 不可信：未定义、越界或 codegen 实际登记值无法预测）
+pub kimo cg_prescan_kind(kinds: array<int>, trust: array<int>, r: int) -> int {
+    if (r < 0) { return -1; }
+    if (r >= len(kinds)) { return -1; }
+    if (trust[r] == 0) { return -1; }
+    return kinds[r];
+}
+
+// 该指令 def 出的寄存器 kind 是否可预测？判据是"codegen 的 cg_set_reg 逐字用
+// cg_type_kind(mi.ty) 登记"，两侧同源故必然相等。失败方向刻意保守：
+// 判 0 只是让 cg_inst_safepoint 回落到 opcode 级超集（多保活），绝不漏根。
+pub kimo cg_def_kind_trusted(mi: MirInst) -> int {
+    if ((mi.ty as any) == 0) { return 0; }
+    let op = mi.op;
+    let k = mi.ty.kind;
+    if (op == MIR_LOAD_VAR) {
+        // 全局槽的 kind 来自 cg_global_kind（预扫描不可知），只有局部槽可靠
+        if (mi.arg1 < 0) { return 0; }
+        return 1;
+    }
+    if (op == MIR_INDEX || op == MIR_MEMBER || op == MIR_CAST) { return 1; }
+    if (op == MIR_CALL) { return 1; }
+    if (op == MIR_ARRAY_LIT) {
+        if (k == TYPE_ARRAY) { return 1; }
+        return 0;
+    }
+    if (op == MIR_BINOP) {
+        // 比较路径恒登记 TYPE_BOOL；算术路径（含 ptr 操作数改写）登记 mi.ty 或更标量的一侧
+        if (cg_is_comparison_op(mi.longval as int) == 1) {
+            if (k == TYPE_BOOL) { return 1; }
+            return 0;
+        }
+        return 1;
+    }
+    if (op == MIR_CONST_INT) { return 1; }
+    if (op == MIR_CONST_FLOAT) {
+        if (cg_is_float_kind(k) == 1) { return 1; }
+        return 0;
+    }
+    if (op == MIR_CONST_BOOL || op == MIR_CONST_STR) {
+        if (k == TYPE_BOOL || k == TYPE_STRING) { return 1; }
+        return 0;
+    }
+    if (op == MIR_CONST_NULL) {
+        if (k == TYPE_ANY) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// 精确安全点：按**单条指令**判定 codegen 是否会发 runtime 调用（唯一可能触发 GC 的点）。
+// cg_safepoint_op 是 opcode 级保守超集 —— 数组下标走直接 GEP、数值运算与数值转换走内联
+// 指令时一条调用都不发，却被它标成安全点，于是热路径上每个 def 都白付一次 shadow frame
+// spill，且"有指针形参即需帧"的规则让纯直路 helper（如 queens 的 getRowColumn）也建帧。
+// 判 0 的条件刻意只覆盖"可证明不发调用"的路径，任何未知（kind 不可信、越界、
+// 指针元素写屏障、字符串/any 运算）一律回落 1。与免帧配套，见 cg_gen_func frame_needed。
+pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) -> int {
+    let op = mi.op;
+    if (op == MIR_INDEX || op == MIR_STORE_INDEX) {
+        // 必须逐字对齐 cg_gen_inst 的直路条件：
+        // base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) && (ik == INT || ik == LONG)
+        let bk = cg_prescan_kind(kinds, trust, mi.arg1);
+        if (bk != TYPE_ARRAY) { return 1; }
+        let ik = cg_prescan_kind(kinds, trust, mi.arg2);
+        if (ik != TYPE_INT && ik != TYPE_LONG) { return 1; }
+        let ek = cg_slot_kind_of(mi.ty);
+        if (ek < 0) { return 1; }
+        if (cg_array_direct_ok(ek) == 0) { return 1; }
+        if (op == MIR_INDEX) { return 0; }
+        // 指针元素 store 会补发 rt_gc_write_barrier；且 store 的正是那个指针，保守留帧
+        let vr = -1;
+        if (len(mi.args) > 0) { vr = mi.args[0] as int; }
+        let vk = cg_prescan_kind(kinds, trust, vr);
+        if (cg_is_value_kind(vk) == 1) { return 0; }
+        return 1;
+    }
+    if (op == MIR_BINOP) {
+        let lk = cg_prescan_kind(kinds, trust, mi.arg1);
+        let rk = cg_prescan_kind(kinds, trust, mi.arg2);
+        let k = cg_slot_kind_of(mi.ty);
+        // 三者皆定宽标量 → 拼接/字符串比较/any 改写/动态乘法等所有调用路径都不可达
+        if (cg_is_value_kind(lk) == 1 && cg_is_value_kind(rk) == 1 && cg_is_value_kind(k) == 1) { return 0; }
+        return 1;
+    }
+    if (op == MIR_CAST) {
+        let sk = cg_prescan_kind(kinds, trust, mi.arg1);
+        let dk = cg_slot_kind_of(mi.ty);
+        // 两侧皆标量 → shadow_parse_* 一族与指针转换都不可达
+        if (cg_is_value_kind(sk) == 1 && cg_is_value_kind(dk) == 1) { return 0; }
+        return 1;
+    }
+    return cg_safepoint_op(op);
+}
+
 // 内部临时指针必须保活：该 opcode 的 codegen 在多个 call 之间持有中间指针
 // （array_lit 的 arr_ptr、struct_lit 的 obj_ptr、enum 的 buf、closure 的 env），
 // 只有指令结束才写入 dst reg —— 中途没有任何根指向它们，必须强制分配 sf 槽。
@@ -2709,6 +2807,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     let n_regs = mf.n_regs;
     if (n_regs <= 0) { n_regs = 1; }
     let kinds: array<int> = [];
+    let trust: array<int> = [];
     let has_use: array<int> = [];
     let first_use: array<int> = [];
     let last_def: array<int> = [];
@@ -2717,6 +2816,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     let i = 0;
     while (i < n_regs) {
         kinds = array_push(kinds, TYPE_ANY);       // 空 ty 保守当指针
+        trust = array_push(trust, 0);              // 0 = kind 预测不可信（不参与直路判定）
         has_use = array_push(has_use, 0);
         first_use = array_push(first_use, -1);
         last_def = array_push(last_def, -1);
@@ -2724,6 +2824,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         safepoint_after_def = array_push(safepoint_after_def, 0);
         i = i + 1;
     }
+    let has_sp = 0;                                 // 本函数是否存在真安全点（runtime 调用/回边 poll）
     let blocks = blocks_arg;
     let n_blks = len(blocks);
     let seq = 0;
@@ -2757,10 +2858,12 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mi.dst >= 0 && mi.dst < n_regs) {
                 last_def[mi.dst] = seq;
                 if ((mi.ty as any) != 0) { kinds[mi.dst] = mi.ty.kind; }
+                trust[mi.dst] = cg_def_kind_trusted(mi);
                 if (cg_force_slot_op(mi.op) == 1) { forced[mi.dst] = 1; }
             }
             // 安全点：def 后遇过安全点的 reg 全部置位
-            if (cg_safepoint_op(mi.op) == 1) {
+            if (cg_inst_safepoint(mi, kinds, trust) == 1) {
+                has_sp = 1;
                 let ri = 0;
                 while (ri < n_regs) {
                     if (last_def[ri] >= 0) { safepoint_after_def[ri] = 1; }
@@ -2793,17 +2896,22 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mt.dst >= 0 && mt.dst < n_regs) {
                 last_def[mt.dst] = seq;
                 if ((mt.ty as any) != 0) { kinds[mt.dst] = mt.ty.kind; }
+                trust[mt.dst] = cg_def_kind_trusted(mt);
                 if (cg_force_slot_op(mt.op) == 1) { forced[mt.dst] = 1; }
             }
             // 安全点：runtime 调用 opcode，或循环回边（§5.2.4 协作式 poll 点）
+            // 回边算真安全点不可省：poll 自身就可能同步触发 collect（shadow_gc_poll 的
+            // 触发检查分支）。has_sp 因此等价于"本函数含调用或循环" —— 免帧函数必须是
+            // 直路无调用的短函数，才可以在不插 poll 的前提下仍不拖累多线程 STW 协作。
             let mt_sp = 0;
-            if (cg_safepoint_op(mt.op) == 1) { mt_sp = 1; }
+            if (cg_inst_safepoint(mt, kinds, trust) == 1) { mt_sp = 1; }
             if (mt.op == MIR_BR || mt.op == MIR_CONDBR) {
                 let ta = cg_ana_blk_index(mt.strval, blocks, n_blks);
                 let tb = cg_ana_blk_index(mt.strval2, blocks, n_blks);
                 if ((ta >= 0 && ta < bi) || (tb >= 0 && tb < bi)) { mt_sp = 1; }
             }
             if (mt_sp == 1) {
+                has_sp = 1;
                 let ri2 = 0;
                 while (ri2 < n_regs) {
                     if (last_def[ri2] >= 0) { safepoint_after_def[ri2] = 1; }
@@ -2825,7 +2933,9 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     let r = 0;
     while (r < n_regs) {
         let need = 0;
-        if (forced[r] == 1) {
+        if (has_sp == 0) {
+            need = 0;                       // 无真安全点 ⇒ 免帧 ⇒ 一槽不发
+        } else if (forced[r] == 1) {
             need = 1;
         } else if (cg_is_ptr_kind(kinds[r]) == 1 && has_use[r] == 1 && last_def[r] >= 0) {
             if (safepoint_after_def[r] == 1 || first_use[r] < last_def[r]) {
@@ -2849,7 +2959,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         let j2 = 0;
         while (j2 < n_insts2) {
             let mi2 = insts2[j2];
-            let ni = cg_intr_slot_count(mi2.op, mi2);
+            let ni = 0;
+            if (has_sp == 1) { ni = cg_intr_slot_count(mi2.op, mi2); }
             let ki = 0;
             while (ki < ni) {
                 cg_sf_intr_seq = array_push(cg_sf_intr_seq, slot);
@@ -2861,7 +2972,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         let term2 = blk2.terminator;
         if ((term2 as any) != 0) {
             let mt2 = term2;
-            let nt = cg_intr_slot_count(mt2.op, mt2);
+            let nt = 0;
+            if (has_sp == 1) { nt = cg_intr_slot_count(mt2.op, mt2); }
             let kt = 0;
             while (kt < nt) {
                 cg_sf_intr_seq = array_push(cg_sf_intr_seq, slot);
@@ -2871,6 +2983,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         }
         bi2 = bi2 + 1;
     }
+    cg_ana_has_safepoint = has_sp;
     return slot;
 }
 
@@ -2897,14 +3010,22 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     // §5.2.4 GC 帧跳过：无活指针（sf_n==0）且无指针参数（且非 main）的函数
     // 不需要帧 enter/leave 与根集登记，仅保留入口/回边 poll（协作 STW 仍成立）。
     // 纯运行时函数（cg_is_nogc_fn）强制免帧：不分配不触发 GC，内联后消除热循环开销。
+    // W4 精确安全点：三条规则统一受"本函数含真安全点"门控。cg_ana_has_safepoint==0
+    // 意味着函数体既没有任何可触发 GC 的调用（含 array_lit/写屏障/字符串运算）也没有
+    // 循环回边 poll —— 它是直路短函数，自身永不触发 collect，故完全不必建帧。此前仅因
+    // "有指针形参"就建帧，让 queens 的 getRowColumn/setRowColumn 这类纯下标读 helper
+    // 每次调用白付锚点 push/pop + 帧清零 + 每 def 一次 spill（实测占该基准 1.5× 的大头）。
+    // 免帧后帧 alloca 不再被锚点取址 ⇒ 不逃逸 ⇒ LLVM SROA 能把指针槽一并提升进寄存器。
     let frame_needed = 0;
-    if (sf_n > 0) { frame_needed = 1; }
-    if (is_main == 1) { frame_needed = 1; }
-    let pi = 0;
-    while (pi < n_params) {
-        let pp = params[pi];
-        if (cg_is_ptr_kind(pp.type_kind) == 1) { frame_needed = 1; }
-        pi = pi + 1;
+    if (cg_ana_has_safepoint == 1) {
+        if (sf_n > 0) { frame_needed = 1; }
+        if (is_main == 1) { frame_needed = 1; }
+        let pi = 0;
+        while (pi < n_params) {
+            let pp = params[pi];
+            if (cg_is_ptr_kind(pp.type_kind) == 1) { frame_needed = 1; }
+            pi = pi + 1;
+        }
     }
     if (mf.is_nogc == 1 || cg_is_nogc_fn(mf.name) == 1) { frame_needed = 0; }
     cg_gc_frame_active = frame_needed;
