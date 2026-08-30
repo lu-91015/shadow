@@ -247,22 +247,156 @@ struct ShadowArray {
     void pop_back() { if (len > 0) len--; }
 };
 
+// ShadowSet: 纯 C 字符串集（W3：替换 std::unordered_set<std::string>）。
+// 与 ShadowDict 同构的开放寻址表，仅存键；迭代序 = 插入序。
+struct SSetEntry {
+    char* key;      // nullptr=空槽; SDICT_TOMBSTONE=已删; 其它=活元素（strdup 拥有）
+    uint64_t h;
+    int32_t next;   // 插入序链：下一索引，-1=尾
+    int32_t prev;   // 插入序链：上一索引，-1=无
+};
 struct ShadowSet {
     uint32_t type_tag; // 0=array, 1=dict, 2=set
-    std::unordered_set<std::string> data;
-    ShadowSet() : type_tag(2) {}
+    int32_t head;      // 插入序链头，-1=空
+    int32_t tail;      // 插入序链尾，-1=空
+    size_t cap;        // 槽位数（2 的幂），0=空表
+    size_t count;      // 活元素数
+    size_t used;       // count + 墓碑数（探测占用）
+    SSetEntry* slots;
+    ShadowSet() : type_tag(2), head(-1), tail(-1), cap(0), count(0), used(0), slots(nullptr) {}
+    ~ShadowSet();
 };
+static void sset_rehash(ShadowSet* s, size_t new_cap) {
+    SSetEntry* old = s->slots;
+    SSetEntry* ns = (SSetEntry*)calloc(new_cap, sizeof(SSetEntry));
+    size_t mask = new_cap - 1;
+    int32_t new_head = -1, new_prev = -1;
+    for (int32_t idx = s->head; idx >= 0; idx = old[idx].next) {
+        SSetEntry& oe = old[idx];
+        size_t i = (size_t)oe.h & mask;
+        while (ns[i].key) i = (i + 1) & mask;
+        ns[i].key = oe.key;
+        ns[i].h = oe.h;
+        ns[i].prev = new_prev;
+        ns[i].next = -1;
+        if (new_prev >= 0) ns[new_prev].next = (int32_t)i;
+        else new_head = (int32_t)i;
+        new_prev = (int32_t)i;
+    }
+    free(old);
+    s->slots = ns;
+    s->cap = new_cap;
+    s->head = new_head;
+    s->tail = new_prev;
+    s->used = s->count;
+}
+static SSetEntry* sset_lookup(const ShadowSet* s, const char* key, uint64_t h) {
+    if (!s->slots) return nullptr;
+    size_t mask = s->cap - 1;
+    size_t i = (size_t)h & mask;
+    for (;;) {
+        SSetEntry& e = s->slots[i];
+        if (!e.key) return nullptr; // 空槽 → 不存在
+        if (e.key != SDICT_TOMBSTONE && e.h == h && strcmp(e.key, key) == 0) return &e;
+        i = (i + 1) & mask;
+    }
+}
+static void sset_add(ShadowSet* s, const char* key) {
+    uint64_t h = sdict_hash(key); // 与 dict 共用 FNV-1a
+    if (sset_lookup(s, key, h)) return; // 已存在
+    if (s->cap == 0 || (s->used + 1) * 10 >= s->cap * 7) {
+        size_t nc = s->cap ? s->cap : 8;
+        while ((s->count + 1) * 10 >= nc * 7) nc *= 2;
+        sset_rehash(s, nc);
+    }
+    size_t mask = s->cap - 1;
+    size_t i = (size_t)h & mask;
+    size_t tomb = SIZE_MAX;
+    while (s->slots[i].key) {
+        if (s->slots[i].key == SDICT_TOMBSTONE && tomb == SIZE_MAX) tomb = i;
+        i = (i + 1) & mask;
+    }
+    size_t ins = (tomb != SIZE_MAX) ? tomb : i;
+    if (s->slots[ins].key == SDICT_TOMBSTONE) s->used--;
+    s->slots[ins].key = strdup(key);
+    s->slots[ins].h = h;
+    s->slots[ins].prev = s->tail;
+    s->slots[ins].next = -1;
+    if (s->tail >= 0) s->slots[s->tail].next = (int32_t)ins;
+    else s->head = (int32_t)ins;
+    s->tail = (int32_t)ins;
+    s->count++;
+    s->used++;
+}
+static int sset_erase(ShadowSet* s, const char* key) {
+    if (!s || !key) return 0;
+    SSetEntry* e = sset_lookup(s, key, sdict_hash(key));
+    if (!e) return 0;
+    if (e->prev >= 0) s->slots[e->prev].next = e->next;
+    else s->head = e->next;
+    if (e->next >= 0) s->slots[e->next].prev = e->prev;
+    else s->tail = e->prev;
+    free(e->key);
+    e->key = SDICT_TOMBSTONE;
+    e->h = 0;
+    e->prev = e->next = -1;
+    s->count--;
+    return 1;
+}
+static void sset_release(ShadowSet* s) {
+    if (!s->slots) return;
+    for (size_t i = 0; i < s->cap; i++) {
+        SSetEntry& e = s->slots[i];
+        if (e.key && e.key != SDICT_TOMBSTONE) free(e.key);
+    }
+    free(s->slots);
+    s->slots = nullptr;
+    s->cap = s->count = s->used = 0;
+    s->head = s->tail = -1;
+}
+inline ShadowSet::~ShadowSet() { sset_release(this); }
 
+// ShadowArena: 纯 C 块列表（W3：替换 3 个 std::vector）。
 struct ShadowArena {
     uint32_t type_tag; // 3=arena
     size_t block_size;
-    std::vector<void*> blocks;
-    std::vector<size_t> caps;
-    std::vector<size_t> used;
+    size_t count;      // 块数
+    size_t cap;        // blocks/caps/used 数组容量
+    void** blocks;
+    size_t* caps;
+    size_t* used;
     size_t total_used;
     size_t high_water;
-    ShadowArena(size_t bs) : type_tag(3), block_size(bs), total_used(0), high_water(0) {}
+    ShadowArena(size_t bs) : type_tag(3), block_size(bs), count(0), cap(0),
+                             blocks(nullptr), caps(nullptr), used(nullptr),
+                             total_used(0), high_water(0) {}
+    ~ShadowArena();
 };
+static void sarena_push(ShadowArena* ar, void* b, size_t c) {
+    if (ar->count >= ar->cap) {
+        size_t nc = ar->cap ? ar->cap * 2 : 8;
+        ar->blocks = (void**)realloc(ar->blocks, nc * sizeof(void*));
+        ar->caps = (size_t*)realloc(ar->caps, nc * sizeof(size_t));
+        ar->used = (size_t*)realloc(ar->used, nc * sizeof(size_t));
+        ar->cap = nc;
+    }
+    ar->blocks[ar->count] = b;
+    ar->caps[ar->count] = c;
+    ar->used[ar->count] = 0;
+    ar->count++;
+}
+static void sarena_release(ShadowArena* ar) {
+    for (size_t i = 0; i < ar->count; i++) free(ar->blocks[i]);
+    free(ar->blocks);
+    free(ar->caps);
+    free(ar->used);
+    ar->blocks = nullptr;
+    ar->caps = nullptr;
+    ar->used = nullptr;
+    ar->count = ar->cap = 0;
+    ar->total_used = 0;
+}
+inline ShadowArena::~ShadowArena() { sarena_release(this); }
 
 // miniz: 用于 .spk 包的 DEFLATE 压缩（miniz.h 是 self-contained，会自动 include 它需要的一切）
 // 头与源均在 bootstrap/（miniz.h + miniz.c），经 -I bootstrap 解析；
@@ -908,7 +1042,7 @@ extern "C" void shadow_hashmap_free(void* map) {
     delete m;
 }
 
-// ── Set operations (ShadowSet: std::unordered_set<string>) ──
+// ── Set operations (ShadowSet: 纯 C 开放寻址字符串集) ──
 // set<T> 容器的运行时实现。
 // 统一存储为 string：string 元素直接存，int/long 元素序列化为 string。
 // 这样 set<int> 和 set<string> 可以共存于同一容器类型。
@@ -920,26 +1054,26 @@ extern "C" void* shadow_set_new() {
 extern "C" int shadow_set_add(void* set, const char* value) {
     if (!set || !value) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    s->data.insert(std::string(value));
+    sset_add(s, value);
     return 0;
 }
 
 extern "C" int shadow_set_contains(void* set, const char* value) {
     if (!set || !value) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    return s->data.find(value) != s->data.end() ? 1 : 0;
+    return sset_lookup(s, value, sdict_hash(value)) != nullptr ? 1 : 0;
 }
 
 extern "C" int shadow_set_remove(void* set, const char* value) {
     if (!set || !value) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    return s->data.erase(value) > 0 ? 1 : 0;
+    return sset_erase(s, value);
 }
 
 extern "C" int shadow_set_size(void* set) {
     if (!set) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    return (int)s->data.size();
+    return (int)s->count;
 }
 
 extern "C" void shadow_set_free(void* set) {
@@ -952,35 +1086,42 @@ extern "C" void shadow_set_free(void* set) {
 extern "C" int shadow_set_add_int(void* set, int64_t value) {
     if (!set) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    s->data.insert(std::to_string(value));
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    sset_add(s, buf);
     return 0;
 }
 
 extern "C" int shadow_set_contains_int(void* set, int64_t value) {
     if (!set) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    return s->data.find(std::to_string(value)) != s->data.end() ? 1 : 0;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    return sset_lookup(s, buf, sdict_hash(buf)) != nullptr ? 1 : 0;
 }
 
 extern "C" int shadow_set_remove_int(void* set, int64_t value) {
     if (!set) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    return s->data.erase(std::to_string(value)) > 0 ? 1 : 0;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    return sset_erase(s, buf);
 }
 
 // shadow_set_at_string: return string element at given index (strdup'd, caller owns).
-// Used by for (x in set) iteration. Order is unspecified (unordered_set).
+// Used by for (x in set) iteration. Order is insertion order (deterministic).
 extern "C" const char* shadow_set_at_string(void* set, int32_t idx) {
     if (!set) return nullptr;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    if (idx < 0 || (size_t)idx >= s->data.size()) {
+    if (idx < 0 || (size_t)idx >= s->count) {
         fprintf(stderr, "error: set index %d out of bounds (size=%zu)\n",
-                idx, s->data.size());
+                idx, s->count);
         return nullptr;
     }
-    auto it = s->data.begin();
-    std::advance(it, idx);
-    return strdup(it->c_str());
+    int32_t i = s->head;
+    for (int32_t k = 0; k < idx && i >= 0; k++) i = s->slots[i].next;
+    if (i < 0) return nullptr;
+    return strdup(s->slots[i].key);
 }
 
 // shadow_set_at_int: return int64 element at given index (parsed from stored string).
@@ -988,18 +1129,15 @@ extern "C" const char* shadow_set_at_string(void* set, int32_t idx) {
 extern "C" int64_t shadow_set_at_int(void* set, int32_t idx) {
     if (!set) return 0;
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
-    if (idx < 0 || (size_t)idx >= s->data.size()) {
+    if (idx < 0 || (size_t)idx >= s->count) {
         fprintf(stderr, "error: set index %d out of bounds (size=%zu)\n",
-                idx, s->data.size());
+                idx, s->count);
         return 0;
     }
-    auto it = s->data.begin();
-    std::advance(it, idx);
-    try {
-        return std::stoll(*it);
-    } catch (...) {
-        return 0;
-    }
+    int32_t i = s->head;
+    for (int32_t k = 0; k < idx && i >= 0; k++) i = s->slots[i].next;
+    if (i < 0) return 0;
+    return (int64_t)strtoll(s->slots[i].key, nullptr, 10);
 }
 
 // Ã¢ÂÂÃ¢ÂÂ JSON Operations Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -2157,11 +2295,7 @@ extern "C" void shadow_free(void* ptr) {
         // ShadowSet
         delete reinterpret_cast<ShadowSet*>(ptr);
     } else if (tag == 3) {
-        auto* ar = reinterpret_cast<ShadowArena*>(ptr);
-        for (void* b : ar->blocks) {
-            free(b);
-        }
-        delete ar;
+        delete reinterpret_cast<ShadowArena*>(ptr);
     }
     // 其他 type_tag 值：不释放（可能是 GC 管理的对象）
 }
@@ -2176,15 +2310,13 @@ extern "C" void* shadow_arena_alloc(void* arena, int32_t size) {
     if (!arena || size <= 0) return nullptr;
     auto* ar = reinterpret_cast<ShadowArena*>(arena);
     size_t n = ((size_t)size + 7u) & ~((size_t)7u);
-    if (ar->blocks.empty() || ar->used.back() + n > ar->caps.back()) {
-        size_t cap = n > ar->block_size ? n : ar->block_size;
-        void* block = calloc(1, cap);
+    if (ar->count == 0 || ar->used[ar->count - 1] + n > ar->caps[ar->count - 1]) {
+        size_t c = n > ar->block_size ? n : ar->block_size;
+        void* block = calloc(1, c);
         if (!block) return nullptr;
-        ar->blocks.push_back(block);
-        ar->caps.push_back(cap);
-        ar->used.push_back(0);
+        sarena_push(ar, block, c);
     }
-    size_t idx = ar->blocks.size() - 1;
+    size_t idx = ar->count - 1;
     char* p = reinterpret_cast<char*>(ar->blocks[idx]) + ar->used[idx];
     ar->used[idx] += n;
     ar->total_used += n;
@@ -2206,7 +2338,7 @@ extern "C" void shadow_arena_rewind(void* arena, int32_t mark) {
     if (target >= ar->total_used) return;
     size_t consumed = 0;
     size_t keep_blocks = 0;
-    for (size_t i = 0; i < ar->blocks.size(); ++i) {
+    for (size_t i = 0; i < ar->count; ++i) {
         size_t u = ar->used[i];
         if (target <= consumed + u) {
             ar->used[i] = target - consumed;
@@ -2215,12 +2347,10 @@ extern "C" void shadow_arena_rewind(void* arena, int32_t mark) {
         }
         consumed += u;
     }
-    for (size_t i = keep_blocks; i < ar->blocks.size(); ++i) {
+    for (size_t i = keep_blocks; i < ar->count; ++i) {
         free(ar->blocks[i]);
     }
-    ar->blocks.resize(keep_blocks);
-    ar->caps.resize(keep_blocks);
-    ar->used.resize(keep_blocks);
+    ar->count = keep_blocks; // 容量不收缩（与原 vector::resize 语义一致）
     ar->total_used = target;
 }
 
