@@ -3008,7 +3008,6 @@ extern "C" void* shadow_array_push_int(void* array_ptr, int32_t val) {
 // 消除 shadow 层每次 push 的多次 extern 调用（__rt_shadow_load_int×3 +
 // __rt_shadow_store_int×2 → 1 次调用）。语义与 runtime_lib.shadow 的
 // shadow_array_push_int 完全一致（含 null 首推、2x 倍增扩容、es 4/8 分派）。
-extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind);  // defined later in TU
 extern "C" int32_t shadow_gc_root_set(void* slot, void* val);  // defined later in TU
 extern "C" void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
     if (!array_ptr) {
@@ -3510,14 +3509,11 @@ static thread_local int64_t tl_gc_alloc_count = 0;
 static std::atomic<int64_t> g_gc_total_alloc_count{0};
 
 // ── 阶段计时（SHADOW_GC_PROFILE=1 时 atexit 打印分配/标记/清扫耗时）──
-static int64_t g_prof_alloc_ns = 0;
 static int64_t g_prof_mark_ns = 0;
 static int64_t g_prof_sweep_ns = 0;
 static int64_t g_prof_gc_ns = 0;
 static int64_t g_prof_gc_count = 0;
-static int64_t g_prof_meta_peak = 0;
-static int64_t g_prof_meta_ops = 0;
-static int64_t g_prof_mark_reset_ns = 0;   // mark：清 visited 的 for_each
+static int64_t g_prof_mark_reset_ns = 0;   // mark：epoch 推进/回绕处理
 static int64_t g_prof_mark_roots_ns = 0;   // mark：根追踪
 static int64_t g_prof_mark_wl_ns = 0;      // mark：worklist 展开
 static int g_prof_on = -1;
@@ -3546,15 +3542,15 @@ static int64_t rt_gc_min_heap(void) {
     return g_gc_min_heap;
 }
 
-// P2 前向声明：段堆统计（定义在下方带内头基础设施块）。
+// 前向声明：段堆统计（定义在下方带内头基础设施块）。
 static void gc_seg_stats(size_t* nseg, int64_t* objs);
 
 static void prof_atexit(void) {
     if (!prof_on()) return;
-    fprintf(stderr, "[PROF] alloc_ns=%lld mark_ns=%lld sweep_ns=%lld gc_ns=%lld gc_count=%lld meta_peak=%lld meta_ops=%lld total_alloc=%lld heap=%lld trigger=%lld\n",
-            (long long)g_prof_alloc_ns, (long long)g_prof_mark_ns, (long long)g_prof_sweep_ns,
-            (long long)g_prof_gc_ns, (long long)g_prof_gc_count, (long long)g_prof_meta_peak,
-            (long long)g_prof_meta_ops, (long long)g_gc_total_alloc_count.load(std::memory_order_relaxed),
+    fprintf(stderr, "[PROF] mark_ns=%lld sweep_ns=%lld gc_ns=%lld gc_count=%lld total_alloc=%lld heap=%lld trigger=%lld\n",
+            (long long)g_prof_mark_ns, (long long)g_prof_sweep_ns,
+            (long long)g_prof_gc_ns, (long long)g_prof_gc_count,
+            (long long)g_gc_total_alloc_count.load(std::memory_order_relaxed),
             (long long)g_heap_bytes.load(std::memory_order_relaxed),
             (long long)g_gc_trigger.load(std::memory_order_relaxed));
     fprintf(stderr, "[PROF] mark_reset_ns=%lld mark_roots_ns=%lld mark_wl_ns=%lld\n",
