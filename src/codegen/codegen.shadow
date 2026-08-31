@@ -694,7 +694,7 @@ pub kimo cg_set_reg(idx: int, val: any, ty_kind: int) -> void {
     }
 }
 
-// §5.2.4 shadow frame：把值写入 [N x i64] 数组的 slot 号槽位（ptrtoint+add+inttoptr 模拟 GEP）
+// §5.2.4 shadow frame：把值写入 [N x i64] 数组的 slot 号槽位（对 %frame 取真实 GEP）
 pub kimo cg_sf_store(slot: int, val: any, kind: int) -> void {
     if ((cg_sf_alloca as any) == 0) { return; }
     if (slot < 0) { return; }
@@ -702,11 +702,12 @@ pub kimo cg_sf_store(slot: int, val: any, kind: int) -> void {
     // 预扫描已保证此时所有 cg_sf_reg_slot 均为 -1，本短路只为兜住内部临时槽路径。
     if (cg_gc_frame_active == 0) { return; }
     let i64_ty = llvm_i64(cg_ctx);
-    let base_i = llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "sfb");
     // 统一 frame：变量槽占 [0, cg_sf_off)，寄存器 spill 占 [cg_sf_off, ...)
-    let off = llvm_const_int(i64_ty, (cg_sf_off + slot) * 8, 1);
-    let addr = llvm_add(cg_builder, base_i, off, "sfa");
-    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i64_ty, 0), "sfp");
+    // 必须用常量下标 GEP 而不是 ptrtoint+add+inttoptr：后者产出的指针 LLVM 无法证明与
+    // %frame 其它槽位不别名，导致每条 spill 之后所有 %frame 读取都被强制重新加载。
+    buf_reset();
+    buf_push(llvm_const_int(i64_ty, cg_sf_off + slot, 1));
+    let ptr = llvm_gep(cg_builder, i64_ty, cg_sf_alloca, 1, "sfp");
     let iv = cg_val_to_i64(val, kind);
     llvm_store(cg_builder, iv, ptr);
 }
@@ -2932,6 +2933,70 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     let self_sp = 0;                                // 其中**非调用**指令造成的安全点（子树分析的起点）
     let blocks = blocks_arg;
     let n_blks = len(blocks);
+    // W5 参数槽直根：某变量槽若 ①是指针型形参（序言 store 一次落槽）②全函数再无
+    // MIR_STORE_VAR 写入，则其内容自入口起恒定不变。任何仅由这类槽载入的 reg，其值
+    // 恒等于某个帧内恒定槽位的值 —— 收集器扫帧即已扎根，寄存器 spill 槽纯属重复。
+    // 保守性：reg 若有**任一** def 不是这类载入，即失去直根资格（见 alias[] 的 AND 累积）。
+    // ⚠️ 不可放宽成"局部槽只有一条 MIR_STORE_VAR 也可直根"：那条指令可能在循环里
+    //   （`a = array_push(a, x)` 就是），槽内容会反复换（每次扩容还是新对象），
+    //   先载入的 reg 届时已不被帧覆盖 —— 必须另外证明该写点在动态上只执行一次。
+    let total_slots = mf.n_slots;
+    if (total_slots < 1) { total_slots = 1; }
+    if (total_slots > 256) { total_slots = 256; }
+    let ptrmap = cg_scan_ptr_slots(mf, blocks_arg, total_slots);
+    let rootable: array<int> = [];
+    let ri0 = 0;
+    while (ri0 < total_slots) {
+        rootable = array_push(rootable, 0);
+        ri0 = ri0 + 1;
+    }
+    let pa = 0;
+    let par_cnt: array<int> = [];
+    ri0 = 0;
+    while (ri0 < total_slots) {
+        par_cnt = array_push(par_cnt, 0);
+        ri0 = ri0 + 1;
+    }
+    while (pa < len(mf.params)) {
+        let pp = mf.params[pa];
+        if (pp.slot >= 0 && pp.slot < total_slots) { par_cnt[pp.slot] = par_cnt[pp.slot] + 1; }
+        pa = pa + 1;
+    }
+    pa = 0;
+    while (pa < len(mf.params)) {
+        let pp2 = mf.params[pa];
+        if (pp2.slot >= 0 && pp2.slot < total_slots && ptrmap[pp2.slot] == 1
+                && par_cnt[pp2.slot] == 1) {
+            rootable[pp2.slot] = 1;
+        }
+        pa = pa + 1;
+    }
+    let sb = 0;
+    while (sb < n_blks) {
+        let sblk = blocks[sb];
+        let sinsts = sblk.insts;
+        let sj = 0;
+        while (sj < len(sinsts)) {
+            let smi = sinsts[sj];
+            if (smi.op == MIR_STORE_VAR && smi.arg2 >= 0 && smi.arg2 < total_slots) {
+                rootable[smi.arg2] = 0;
+            }
+            sj = sj + 1;
+        }
+        let stm = sblk.terminator;
+        if ((stm as any) != 0) {
+            if (stm.op == MIR_STORE_VAR && stm.arg2 >= 0 && stm.arg2 < total_slots) {
+                rootable[stm.arg2] = 0;
+            }
+        }
+        sb = sb + 1;
+    }
+    let alias: array<int> = [];
+    ri0 = 0;
+    while (ri0 < n_regs) {
+        alias = array_push(alias, 1);               // 1 = 迄今所有 def 都是直根载入
+        ri0 = ri0 + 1;
+    }
     let sp_dbg = 0;
     let dbg_want = cg_sp_dbg_want();
     if (len(dbg_want) > 0) {
@@ -2971,6 +3036,11 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (pk >= 0) { kinds[mi.dst] = pk; }
                 trust[mi.dst] = cg_def_kind_trusted(mi);
                 if (cg_force_slot_op(mi.op) == 1) { forced[mi.dst] = 1; }
+                let direct = 0;
+                if (mi.op == MIR_LOAD_VAR && mi.arg1 >= 0 && mi.arg1 < total_slots) {
+                    if (rootable[mi.arg1] == 1) { direct = 1; }
+                }
+                if (direct == 0) { alias[mi.dst] = 0; }
             }
             // 安全点：def 后遇过安全点的 reg 全部置位
             let sp = cg_inst_safepoint(mi, kinds, trust);
@@ -3020,6 +3090,11 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if ((mt.ty as any) != 0) { kinds[mt.dst] = mt.ty.kind; }
                 trust[mt.dst] = cg_def_kind_trusted(mt);
                 if (cg_force_slot_op(mt.op) == 1) { forced[mt.dst] = 1; }
+                let direct_t = 0;
+                if (mt.op == MIR_LOAD_VAR && mt.arg1 >= 0 && mt.arg1 < total_slots) {
+                    if (rootable[mt.arg1] == 1) { direct_t = 1; }
+                }
+                if (direct_t == 0) { alias[mt.dst] = 0; }
             }
             // 安全点：runtime 调用 opcode，或循环回边（§5.2.4 协作式 poll 点）
             // 回边算真安全点不可省：poll 自身就可能同步触发 collect（shadow_gc_poll 的
@@ -3071,6 +3146,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             need = 0;                       // 无真安全点 ⇒ 免帧 ⇒ 一槽不发
         } else if (forced[r] == 1) {
             need = 1;
+        } else if (alias[r] == 1 && last_def[r] >= 0) {
+            need = 0;                       // W5：值恒被帧内参数槽直根，寄存器 spill 冗余
         } else if (cg_is_ptr_kind(kinds[r]) == 1 && has_use[r] == 1 && last_def[r] >= 0) {
             if (safepoint_after_def[r] == 1 || first_use[r] < last_def[r]) {
                 need = 1;
@@ -3289,11 +3366,10 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         let zrem = frame_total - zfb;
         let zblk = 16;
         if (zrem < zblk) { zblk = zrem; }
-        let zbase = llvm_ptrtoint(cg_builder, cg_sf_alloca, i64_ty, "zbase");
-        let zoff = llvm_const_int(i64_ty, zfb * 8, 1);
-        let zaddr = llvm_add(cg_builder, zbase, zoff, "zaddr");
-        let zp = llvm_inttoptr(cg_builder, zaddr, llvm_ptr_ty(i64_ty, 0), "zptr");
-        llvm_memset(cg_builder, zp, zero_v, llvm_const_int(i64_ty, zblk * 8, 1), 8);
+        buf_reset();
+        buf_push(llvm_const_int(i64_ty, zfb, 1));
+        let zptr = llvm_gep(cg_builder, i64_ty, cg_sf_alloca, 1, "zptr");
+        llvm_memset(cg_builder, zptr, zero_v, llvm_const_int(i64_ty, zblk * 8, 1), 8);
         zfb = zfb + zblk;
     }
     // 变量槽绑定：指针槽 = 帧内第 fidx 项（连续，供锚点整片扫描）；
