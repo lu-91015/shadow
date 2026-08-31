@@ -18,6 +18,20 @@ import core.utils;
 import type_checker.type_checker;
 
 // ============ LLVM-C API 桥接（@extern，64 位句柄必须用 any） ============
+@extern("shadow_env_get") kimo cg_env_get(name: string) -> string { return ""; }
+
+// 安全点预扫描诊断：SHADOW_SP_DBG=<函数名|*>。用于定位"预扫描判为安全点、
+// 运行时其实不发调用"的假阳性（假阳性 = 白建 GC 帧 + 每 def 一次 spill）。
+let cg_sp_dbg_name: string = "";
+let cg_sp_dbg_read: int = -1;
+pub kimo cg_sp_dbg_want() -> string {
+    if (cg_sp_dbg_read < 0) {
+        cg_sp_dbg_name = cg_env_get("SHADOW_SP_DBG");
+        cg_sp_dbg_read = 1;
+    }
+    return cg_sp_dbg_name;
+}
+
 @extern("LLVMContextCreate") kimo llvm_ctx_create() -> any { return 0 as any; }
 @extern("LLVMModuleCreateWithNameInContext") kimo llvm_mod_create(name: string, ctx: any) -> any { return 0 as any; }
 @extern("LLVMDisposeModule") kimo llvm_mod_dispose(m: any) -> void {}
@@ -2691,6 +2705,15 @@ pub kimo cg_prescan_kind(kinds: array<int>, trust: array<int>, r: int) -> int {
     return kinds[r];
 }
 
+// 预测运行时 cg_set_reg 为本指令 dst 登记的 kind；-1 = 该指令不登记（保守未知）。
+// 必须与 cg_def_kind_trusted 严格配对：trusted 的含义正是"kinds[r] == 运行时登记的 kind"。
+pub kimo cg_def_kind_predict(mi: MirInst) -> int {
+    if (mi.op == MIR_UNOP) {
+        if ((mi.longval as int) == UN_NOT) { return TYPE_BOOL; }
+    }
+    return cg_slot_kind_of(mi.ty);
+}
+
 // 该指令 def 出的寄存器 kind 是否可预测？判据是"codegen 的 cg_set_reg 逐字用
 // cg_type_kind(mi.ty) 登记"，两侧同源故必然相等。失败方向刻意保守：
 // 判 0 只是让 cg_inst_safepoint 回落到 opcode 级超集（多保活），绝不漏根。
@@ -2702,6 +2725,15 @@ pub kimo cg_def_kind_trusted(mi: MirInst) -> int {
         // 全局槽的 kind 来自 cg_global_kind（预扫描不可知），只有局部槽可靠
         if (mi.arg1 < 0) { return 0; }
         return 1;
+    }
+    if (op == MIR_UNOP) {
+        // 运行时三个分支全发内联指令（neg/fsub/not），一条调用都不发。
+        // UN_NEG 登记 cg_type_kind(mi.ty)、UN_NOT 恒登记 TYPE_BOOL，均可预测。
+        // UN_BITNOT 复用的 k 只在 UN_NEG 分支里赋值（其余情况是未初始化值），
+        // 未知 unop 更是直接 return 而不登记 → 两者一律不可信。
+        let uo = mi.longval as int;
+        if (uo == UN_NEG || uo == UN_NOT) { return 1; }
+        return 0;
     }
     if (op == MIR_INDEX || op == MIR_MEMBER || op == MIR_CAST) { return 1; }
     if (op == MIR_CALL) { return 1; }
@@ -2839,6 +2871,11 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     let has_sp = 0;                                 // 本函数是否存在真安全点（runtime 调用/回边 poll）
     let blocks = blocks_arg;
     let n_blks = len(blocks);
+    let sp_dbg = 0;
+    let dbg_want = cg_sp_dbg_want();
+    if (len(dbg_want) > 0) {
+        if (str_eq(dbg_want, "*") == 1 || str_eq(dbg_want, mf.name) == 1) { sp_dbg = 1; }
+    }
     let seq = 0;
     let bi = 0;
     while (bi < n_blks) {
@@ -2869,12 +2906,23 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             // defs
             if (mi.dst >= 0 && mi.dst < n_regs) {
                 last_def[mi.dst] = seq;
-                if ((mi.ty as any) != 0) { kinds[mi.dst] = mi.ty.kind; }
+                let pk = cg_def_kind_predict(mi);
+                if (pk >= 0) { kinds[mi.dst] = pk; }
                 trust[mi.dst] = cg_def_kind_trusted(mi);
                 if (cg_force_slot_op(mi.op) == 1) { forced[mi.dst] = 1; }
             }
             // 安全点：def 后遇过安全点的 reg 全部置位
-            if (cg_inst_safepoint(mi, kinds, trust) == 1) {
+            let sp = cg_inst_safepoint(mi, kinds, trust);
+            if (sp_dbg == 1) {
+                println("SPDBG " + mf.name + " seq=" + int_to_str(seq) + " op=" + int_to_str(mi.op)
+                    + " dst=" + int_to_str(mi.dst)
+                    + " a1=" + int_to_str(mi.arg1) + "/k" + int_to_str(cg_prescan_kind(kinds, trust, mi.arg1))
+                    + " a2=" + int_to_str(mi.arg2) + "/k" + int_to_str(cg_prescan_kind(kinds, trust, mi.arg2))
+                    + " ty=" + int_to_str(cg_slot_kind_of(mi.ty))
+                    + " nreg=" + int_to_str(n_regs)
+                    + " sp=" + int_to_str(sp));
+            }
+            if (sp == 1) {
                 has_sp = 1;
                 let ri = 0;
                 while (ri < n_regs) {
@@ -2921,6 +2969,15 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 let ta = cg_ana_blk_index(mt.strval, blocks, n_blks);
                 let tb = cg_ana_blk_index(mt.strval2, blocks, n_blks);
                 if ((ta >= 0 && ta < bi) || (tb >= 0 && tb < bi)) { mt_sp = 1; }
+            }
+            if (sp_dbg == 1) {
+                println("SPDBG " + mf.name + " TERM seq=" + int_to_str(seq) + " op=" + int_to_str(mt.op)
+                    + " dst=" + int_to_str(mt.dst)
+                    + " a1=" + int_to_str(mt.arg1) + "/k" + int_to_str(cg_prescan_kind(kinds, trust, mt.arg1))
+                    + " a2=" + int_to_str(mt.arg2) + "/k" + int_to_str(cg_prescan_kind(kinds, trust, mt.arg2))
+                    + " ty=" + int_to_str(cg_slot_kind_of(mt.ty))
+                    + " blk=" + int_to_str(bi)
+                    + " sp=" + int_to_str(mt_sp));
             }
             if (mt_sp == 1) {
                 has_sp = 1;
@@ -2994,6 +3051,11 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             }
         }
         bi2 = bi2 + 1;
+    }
+    if (sp_dbg == 1) {
+        println("SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
+            + " nparams=" + int_to_str(len(mf.params)) + " nblk=" + int_to_str(n_blks)
+            + " has_sp=" + int_to_str(has_sp) + " sf_n=" + int_to_str(slot));
     }
     cg_ana_has_safepoint = has_sp;
     return slot;

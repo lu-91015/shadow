@@ -1858,8 +1858,13 @@ kimo main_mod_in_src(idx: int) -> int {
 // v10_s10：codegen Drop 终结器修复——结构体字面量按裸名段找 __impl__<T>__Drop__drop 并注册
 //   终结器（旧键用 mangled 名，恒查不到 → 从不注册），确定性 drop() 前加 clear；
 //   旧 v10_s9 缓存 IR 两者皆缺 → 需整体失效。
+// v10_s11：（无效尝试，已回退）按形参签名预置 kinds/trust —— MIR reg 与变量 slot 是两套编号，
+//   且数组实参总经 LOAD_VAR 临时 reg，发射 IR 与 s10 逐字节相同。
+// v10_s12：cg_def_kind_trusted/cg_def_kind_predict 补 MIR_UNOP——`-1` 这类取负旧版被判
+//   "kind 不可预测"，令 STORE_INDEX 回落保守安全点，popDisk 等纯下标 helper 因此白建帧；
+//   旧 v10_s11 缓存 IR 仍带帧 + 逐 def spill → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s10_" + main_hash_src(path);
+    return main_lu_base + "/v10_s12_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
