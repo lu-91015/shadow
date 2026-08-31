@@ -142,6 +142,26 @@ let cg_cur_ret_is_void: int = 0;
 let cg_gc_frame_marker: any = 0 as any;
 let cg_gc_frame_active: int = 0;            // 1 = 本函数需要 GC 帧（有活指针/指针参数）
 let cg_ana_has_safepoint: int = 0;          // 预扫描：本函数含真安全点（runtime 调用或回边 poll）
+// §5.2.5 "调用点可否不算安全点"的全程序表。
+// 一次 collect 只可能从两类点开始：① 本指令自己发 runtime 调用（分配/写屏障…）；
+// ② 别的线程已举旗、本线程在 poll（入口/回边）上落地。故若被调函数的**整棵调用子树**
+// 里两者都没有，则调用期间不可能有 collect 落地 ⇒ 调用方既不必为该调用点 spill，
+// 也不必仅因"有指针形参"而建帧（帧一旦不建，形参也不再被槽化，寄存器分配整体恢复）。
+// 判据刻意取"有 poll 即算 1"：被调方若在子树里 poll，它可能就地停住被扫，
+// 而调用方没 spill 就漏根 —— 所以 poll 与分配在这条规则里同等对待，绝不因
+// @nogc/cg_is_nogc_fn"不分配"就把子树判 0（那类函数常有循环 poll）。
+let cg_may_collect_names: array<string> = [];   // 函数名 → 1=子树内可能开始 collect（保守缺省 1）
+let cg_may_collect_vals: array<int> = [];
+let cg_may_collect_ready: int = 0;              // 0=表未建（调用一律算安全点）
+let cg_ana_self_sp: int = 0;                    // 预扫描输出：本函数**非调用**指令是否含安全点
+// §5.2.5 前置开关：本程序是否可能有第二个线程在跑 shadow 代码（出现 spawn/await）。
+// 免帧判据要求"调用子树内不会开始 collect"，单线程下这条恒成立（collect 只能由本线程
+// 的 runtime 调用发起，而那些点仍算安全点）。多线程下 STW 是协作式的：collect 开始前
+// 必须等**每个** mutator 停到 poll 上，而免帧函数一条 poll 都不发（poll 与帧同源，见
+// cg_gc_frame_active 门控）。若某个免帧区可持续任意久（深递归），另一线程就永远举不成
+// 旗 —— 内存安全没问题（collect 根本没推进），但整机停摆。故多线程程序一律退回
+// "调用即安全点"的旧行为，不冒这个停摆风险。
+let cg_prog_has_threads: int = 0;
 // GC 类型注册缓存（0.4 GC v1：按 名称+大小+位图 复用 type_id，首次生成 register_type 调用）
 let cg_gc_type_keys: array<string> = [];
 let cg_gc_type_ids: array<int> = [];
@@ -2765,6 +2785,39 @@ pub kimo cg_def_kind_trusted(mi: MirInst) -> int {
     return 0;
 }
 
+// 被查名函数的调用子树是否可能开始一次 collect？表里没有的名字（extern/C 函数、
+// 运行期 helper、反射调用目标）一律 1 —— 失败方向必须是"多建帧"，绝不漏根。
+pub kimo cg_callee_may_collect(name: string) -> int {
+    let i = 0;
+    while (i < len(cg_may_collect_names)) {
+        if (str_eq(cg_may_collect_names[i] as string, name) == 1) { return cg_may_collect_vals[i]; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// 本程序是否用 spawn/await（= 可能有第二个线程跑 shadow 代码）。整程序级判据，
+// 必须在建 can-collect 表之前一次性算好（见 cg_prog_has_threads 注释）。
+pub kimo cg_scan_threads(mfuncs: array<MirFunc>) -> int {
+    let i = 0;
+    while (i < len(mfuncs)) {
+        let mbs = mfuncs[i].blocks;
+        let b = 0;
+        while (b < len(mbs)) {
+            let insts = mbs[b].insts;
+            let j = 0;
+            while (j < len(insts)) {
+                let op = insts[j].op;
+                if (op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
+                j = j + 1;
+            }
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // 精确安全点：按**单条指令**判定 codegen 是否会发 runtime 调用（唯一可能触发 GC 的点）。
 // cg_safepoint_op 是 opcode 级保守超集 —— 数组下标走直接 GEP、数值运算与数值转换走内联
 // 指令时一条调用都不发，却被它标成安全点，于是热路径上每个 def 都白付一次 shadow frame
@@ -2806,6 +2859,13 @@ pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) ->
         if (cg_is_value_kind(sk) == 1 && cg_is_value_kind(dk) == 1) { return 0; }
         return 1;
     }
+    if (op == MIR_CALL) {
+        // 静态可解析的被调函数：子树内既不分配也不 poll ⇒ 调用期间不可能开始 collect，
+        // 本调用点就不是安全点（表未建好的预扫描阶段一律按安全点算）。
+        if (cg_may_collect_ready == 0) { return 1; }
+        return cg_callee_may_collect(mi.strval);
+    }
+    if (op == MIR_CALL_INDIRECT || op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
     return cg_safepoint_op(op);
 }
 
@@ -2869,6 +2929,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         i = i + 1;
     }
     let has_sp = 0;                                 // 本函数是否存在真安全点（runtime 调用/回边 poll）
+    let self_sp = 0;                                // 其中**非调用**指令造成的安全点（子树分析的起点）
     let blocks = blocks_arg;
     let n_blks = len(blocks);
     let sp_dbg = 0;
@@ -2924,6 +2985,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             }
             if (sp == 1) {
                 has_sp = 1;
+                if (mi.op != MIR_CALL) { self_sp = 1; }
                 let ri = 0;
                 while (ri < n_regs) {
                     if (last_def[ri] >= 0) { safepoint_after_def[ri] = 1; }
@@ -2981,6 +3043,9 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             }
             if (mt_sp == 1) {
                 has_sp = 1;
+                // 终止指令（回边 poll / main 的 RET）不是调用，但同样是 collect 可能
+                // 落地的点 —— 别的线程举旗后就在这里停住并被扫根，故必须计入 self_sp。
+                self_sp = 1;
                 let ri2 = 0;
                 while (ri2 < n_regs) {
                     if (last_def[ri2] >= 0) { safepoint_after_def[ri2] = 1; }
@@ -3055,9 +3120,11 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     if (sp_dbg == 1) {
         println("SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
             + " nparams=" + int_to_str(len(mf.params)) + " nblk=" + int_to_str(n_blks)
-            + " has_sp=" + int_to_str(has_sp) + " sf_n=" + int_to_str(slot));
+            + " has_sp=" + int_to_str(has_sp) + " self_sp=" + int_to_str(self_sp)
+            + " sf_n=" + int_to_str(slot));
     }
     cg_ana_has_safepoint = has_sp;
+    cg_ana_self_sp = self_sp;
     return slot;
 }
 
@@ -3522,6 +3589,83 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
         }
         i = i + 1;
     }
+    // ============ §5.2.5 全程序 can-collect 调用图（发射任何函数之前一次性算好） ============
+    // may_collect[f] = f 体内有非调用安全点（分配 / 写屏障 / 循环回边 poll）
+    //                  或 存在调用边 f→g 且 may_collect[g]（解析不到的目标恒 1）。
+    // 判出 0 的函数，其整棵调用子树既不分配也不 poll ⇒ 调用它期间不可能开始 collect，
+    // 于是调用点不算安全点、调用方也不必仅因"有指针形参"而建帧。
+    // 不动点只增不减，故递归/互相调用自然收敛，不必求 SCC。
+    cg_may_collect_names = [];
+    cg_may_collect_vals = [];
+    cg_may_collect_ready = 0;
+    // 有多线程 ⇒ 整块分析直接跳过（mc_n=0 让下面的建表与不动点都成为空转），
+    // 调用点从而一律按安全点算 —— 与 §5.2.5 之前的已提交行为逐字一致。
+    let mc_n = 0;
+    if (cg_prog_has_threads == 0) { mc_n = len(mfuncs); }
+    let mc_may: array<int> = [];
+    let mc_e_callee: array<int> = [];
+    let mc_e_caller: array<int> = [];
+    i = 0;
+    while (i < mc_n) {
+        let mfm = mfuncs[i];
+        cg_analyze_liveness(mfm, cg_all_blocks[i]);
+        // extern/C 函数体不在这里，一律按"可能"处理（宁多建帧，绝不漏根）
+        let seed = cg_ana_self_sp;
+        if (len(mfm.extern_name) > 0) { seed = 1; }
+        mc_may = array_push(mc_may, seed);
+        let mbs = cg_all_blocks[i];
+        let mbs_n = len(mbs);
+        let mbi = 0;
+        while (mbi < mbs_n) {
+            let insts_m = mbs[mbi].insts;
+            let mij = 0;
+            while (mij < len(insts_m)) {
+                let mi2 = insts_m[mij];
+                if (mi2.op == MIR_CALL) {
+                    let ci = -1;
+                    let ck = 0;
+                    while (ck < len(cg_last_idx_names)) {
+                        if (str_eq(cg_last_idx_names[ck] as string, mi2.strval) == 1) {
+                            ci = cg_last_idx_vals[ck];
+                            ck = len(cg_last_idx_names);
+                        }
+                        ck = ck + 1;
+                    }
+                    mc_e_callee = array_push(mc_e_callee, ci);
+                    mc_e_caller = array_push(mc_e_caller, i);
+                }
+                mij = mij + 1;
+            }
+            mbi = mbi + 1;
+        }
+        i = i + 1;
+    }
+    let mc_changed = 1;
+    while (mc_changed == 1) {
+        mc_changed = 0;
+        let me = 0;
+        while (me < len(mc_e_callee)) {
+            let ci2 = mc_e_callee[me];
+            let cv = 1;
+            if (ci2 >= 0) { cv = mc_may[ci2]; }
+            let ui = mc_e_caller[me];
+            if (cv == 1 && mc_may[ui] == 0) {
+                mc_may[ui] = 1;
+                mc_changed = 1;
+            }
+            me = me + 1;
+        }
+    }
+    let mr = 0;
+    let mr_n = 0;
+    if (cg_prog_has_threads == 0) { mr_n = len(cg_last_idx_names); }
+    while (mr < mr_n) {
+        cg_may_collect_names = array_push(cg_may_collect_names, cg_last_idx_names[mr] as string);
+        cg_may_collect_vals = array_push(cg_may_collect_vals, mc_may[cg_last_idx_vals[mr]]);
+        mr = mr + 1;
+    }
+    if (cg_prog_has_threads == 0) { cg_may_collect_ready = 1; }
+
     i = 0;
     while (i < len(mfuncs)) {
         let mfi = mfuncs[i];
@@ -3552,6 +3696,7 @@ pub kimo cg_link_modules(dest: any, src: any) -> int {
 // 兼容单模块路径（行为与原 cg_gen_program 完全一致，输出字节不变）
 pub kimo cg_gen_program(prog: Program, mfuncs: array<MirFunc>) -> string {
     let ctx = llvm_ctx_create();
+    cg_prog_has_threads = cg_scan_threads(mfuncs);
     let mod = llvm_mod_create("shadow_module", ctx);
     cg_gen_module(prog, mfuncs, ctx, mod);
     let ir = llvm_print_mod(mod);
@@ -3564,6 +3709,14 @@ pub kimo cg_gen_program(prog: Program, mfuncs: array<MirFunc>) -> string {
 // 符号前缀隔离（模块命名空间）在后续里程碑经 prefix 参数接入。
 pub kimo cg_gen_program_multi(modules: array<Program>, mfuncs_list: array<any>) -> string {
     let ctx = llvm_ctx_create();
+    // §5.2.5：can-collect 表按模块建，但"是否有第二个线程"是全程序属性 —— 必须先在
+    // 所有模块上扫一遍，否则"无 spawn 的模块"会在"有 spawn 的模块"之前被乐观优化。
+    cg_prog_has_threads = 0;
+    let ti = 0;
+    while (ti < len(mfuncs_list)) {
+        if (cg_scan_threads(mfuncs_list[ti] as array<MirFunc>) == 1) { cg_prog_has_threads = 1; }
+        ti = ti + 1;
+    }
     let final_mod = llvm_mod_create("shadow_program", ctx);
     let bi = 0;
     while (bi < len(modules)) {

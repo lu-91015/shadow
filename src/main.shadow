@@ -1863,8 +1863,14 @@ kimo main_mod_in_src(idx: int) -> int {
 // v10_s12：cg_def_kind_trusted/cg_def_kind_predict 补 MIR_UNOP——`-1` 这类取负旧版被判
 //   "kind 不可预测"，令 STORE_INDEX 回落保守安全点，popDisk 等纯下标 helper 因此白建帧；
 //   旧 v10_s11 缓存 IR 仍带帧 + 逐 def spill → 需整体失效。
+// v10_s13：调用点安全点改为查全程序 can-collect 表（被调子树既不分配也不 poll 即非安全点）
+//   → 纯递归 helper（moveDisks/moveTopDisk/length/tail/permute）整帧消失；
+//   旧 v10_s12 缓存 IR 仍带这些帧 → 需整体失效。
+// v10_s14：can-collect 表追加"全程序无 spawn/await"前置门 —— 协作式 STW 要求每个 mutator
+//   都能停到 poll 上，而免帧函数一条 poll 都不发，深递归免帧区可让整机停摆；
+//   旧 v10_s13 缓存 IR 对含 spawn 的程序过度免帧 → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s12_" + main_hash_src(path);
+    return main_lu_base + "/v10_s14_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
