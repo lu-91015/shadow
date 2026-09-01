@@ -1882,8 +1882,13 @@ kimo main_mod_in_src(idx: int) -> int {
 //   spawn/await）不再发入口/回边 poll，回边也不再计入真安全点 —— 只含循环、一次分配
 //   都不做的函数（sieve 等）连帧都不必建，热循环里的 volatile 加载 + 分支、以及 escaped
 //   alloca 造成的每次数组访问从栈重载，一并消失。旧 v10_s16 缓存 IR 仍带这些 poll/帧。
+// v10_s18：MIR 填充循环强度削减 —— while(i<n){a=array_push(a,v); i=i+1} 在预分配之上再进
+//   一步，体内改写成 a[i-base]=v 的直接索引存储，len 挪到循环出口用新的
+//   shadow_array_set_len 一次补上，于是 loop-carried 的 load len→store len+1 链消失、
+//   循环体可向量化。容量同步改准为 n-base（按下标写越过 cap 是堆越界，不再由扩容兜底）。
+//   旧 v10_s17 缓存 IR 仍是逐元素 append → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s17_" + main_hash_src(path);
+    return main_lu_base + "/v10_s18_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。

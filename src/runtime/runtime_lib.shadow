@@ -159,6 +159,18 @@ pub kimo shadow_array_prealloc(elem_size: int, cap: int) -> any {
     return shadow_array_new(elem_size, cap);
 }
 
+// 填充循环计数存储削减（编译器 v10_s18）：循环体内按下标直写元素、len 留到循环出口一次
+// 补上（见 src/mir/mir.shadow 的 mir_sred_*）。正常路径下 n 恰为实际写入数；夹到
+// [0, cap] 是为了让这条形状判据哪天出错时退化成"少数组"，而不是长度越界被人读穿。
+pub kimo shadow_array_set_len(arr: any, n: int) -> any {
+    if (arr == null) { return arr; }
+    let cap: int = rt_load_int(arr, 4);
+    if (n < 0) { n = 0; }
+    if (n > cap) { n = cap; }
+    rt_store_int(arr, 0, n);
+    return arr;
+}
+
 pub kimo shadow_array_len(arr: any) -> int {
     if (arr == null) { return 0; }
     return rt_load_int(arr, 0);

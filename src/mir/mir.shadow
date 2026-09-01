@@ -78,6 +78,271 @@ pub kimo mir_empty_set(slot: int, v: int) -> void {
     }
 }
 
+// === 填充循环计数存储强度削减（v10_s18）===
+// 适用形状（循环体除下列语句外不得有任何别的东西）：
+//     let a: array<T> = [];                        // mir_empty_is(a)=1
+//     while (i < n) { a = array_push(a, v); i = i + 1; }
+// 预分配把 cap 一次给够，于是每次 push 都是"load len → 判容量 → 写 data[len] →
+// store len+1"：len 既是索引又是被更新的状态，构成一条**经过堆的** loop-carried 依赖，
+// 每元素至少一次 store→load 转发延迟（实测 sieve 填充环 1.94ns/元素），且 LLVM 无法
+// 向量化。改成用归纳变量当下标 `a[i-base] = v`、把 len 的写入挪到循环出口一次，循环体
+// 就只剩"一条存储 + 计数器自增"，与 Go 的 make+下标填充同形，可向量化。
+//
+// 上下文：mir_lower_stmt 处理 STMT_ASSIGN 时查 mir_sred_n；0 表示当前循环体不适用。
+let mir_sred_n: int = 0;
+let mir_sred_slots: array<int> = [];      // 目标数组槽
+let mir_sred_adj: array<int> = [];        // 与 slots 同序：0=该 append 在 i=i+1 之前，1=之后
+                                          // （下标要减掉本轮已发生的自增，否则整体错 1 → 越过 cap）
+let mir_sred_arr_h: array<HirExpr> = [];  // 每个目标的 a（EXPR_VAR），出口修 len 时复用
+let mir_sred_i_h: HirExpr = 0 as HirExpr; // 循环计数器的 EXPR_VAR
+let mir_sred_base_reg: int = -1;          // 进入循环时 i 的值（跨块使用：entry 支配循环体）
+
+// 元素槽宽（与 codegen cg_elem_size 同式）：4 字节标量数据区不含指针。
+kimo mir_sred_elem4(e_ty: Type) -> int {
+    if ((e_ty as any) == 0) { return 0; }
+    let ek = e_ty.kind;
+    if (ek == TYPE_INT || ek == TYPE_CHAR || ek == TYPE_SHORT || ek == TYPE_BOOL ||
+        ek == TYPE_ENUM || ek == TYPE_DATE) { return 1; }
+    return 0;
+}
+
+// 值表达式是否"纯读、不分配、不逃逸"。数组/结构体字面量、new、闭包、调用都会分配，
+// 而**一次分配就是一个安全点**：collect 可能落在 len 还未补的窗口里。放行叶子与
+// 二元/一元/索引/成员/转换（只读内存，与逐个 push 时的求值顺序一致）。
+kimo mir_sred_pure(h: HirExpr) -> int {
+    if ((h as any) == 0) { return 0; }
+    let k = h.kind;
+    if (k == EXPR_INT || k == EXPR_LONG || k == EXPR_FLOAT || k == EXPR_BOOL ||
+        k == EXPR_STRING || k == EXPR_NULL || k == EXPR_VAR) { return 1; }
+    if (k == EXPR_BINARY || k == EXPR_UNARY || k == EXPR_INDEX || k == EXPR_MEMBER ||
+        k == EXPR_CAST) {
+        let ch = h.children;
+        let i = 0;
+        while (i < len(ch)) {
+            if (mir_sred_pure(ch[i]) == 0) { return 0; }
+            i = i + 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+// 值表达式是否读了某个目标数组槽。削减后 len 要到循环出口才补上，体内按 len 读 a
+// （a[0]、len(a) 等）与逐元素 push 时不同 —— push 后上一轮写入的元素已可见。命中即拒。
+kimo mir_sred_reads_slot(h: HirExpr, slots: array<int>) -> int {
+    if ((h as any) == 0) { return 0; }
+    if (h.kind == EXPR_VAR) {
+        let k = 0;
+        while (k < len(slots)) {
+            if (h.slot == slots[k]) { return 1; }
+            k = k + 1;
+        }
+        return 0;
+    }
+    let ch = h.children;
+    let i = 0;
+    while (i < len(ch)) {
+        if (mir_sred_reads_slot(ch[i], slots) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 体内每条语句都必须是"某个目标的 append"或"i = i + 1"，且各出现一次。
+// 多出来的语句一律拒：break/continue/return/try/throw 会破坏"push 次数 == 迭代次数"
+// 或绕过出口修复；对 i/界变量的额外赋值会让下标越出 cap（那是堆写坏，不是慢）。
+kimo mir_sred_body_ok(body: array<HirStmt>, slots: array<int>, i_slot: int) -> int {
+    let need = len(slots);
+    let got: array<int> = [];
+    let gi = 0;
+    while (gi < need) {
+        got = array_push(got, 0);
+        gi = gi + 1;
+    }
+    let seen_inc = 0;
+    let i = 0;
+    while (i < len(body)) {
+        let st = body[i];
+        if (st.kind != STMT_ASSIGN) { return 0; }
+        let lhs = st.child;
+        let rhs = st.rhs;
+        if ((lhs as any) == 0 || (rhs as any) == 0 || lhs.kind != EXPR_VAR) { return 0; }
+        if (rhs.kind == EXPR_BINARY && rhs.op == BIN_ADD) {
+            if (seen_inc == 1 || lhs.slot != i_slot) { return 0; }
+            let rc = rhs.children;
+            if (len(rc) != 2) { return 0; }
+            if (rc[0].kind != EXPR_VAR || rc[0].slot != i_slot) { return 0; }
+            if (rc[1].kind != EXPR_INT || rc[1].intval != 1) { return 0; }
+            seen_inc = 1;
+            i = i + 1;
+            continue;
+        }
+        if (rhs.kind == EXPR_CALL && str_eq(rhs.str1, "array_push") == 1) {
+            let args = rhs.children;
+            if (len(args) != 2) { return 0; }
+            if (args[0].kind != EXPR_VAR || args[0].slot != lhs.slot) { return 0; }
+            if (mir_sred_pure(args[1]) == 0) { return 0; }
+            if (mir_sred_reads_slot(args[1], slots) == 1) { return 0; }
+            // es 必须是 4：指针型数据区里"已写但 len 未补"的元素在 GC 扫描范围外，
+            // 会被当成不可达而回收。
+            let aty = args[0].inferred_type;
+            if ((aty as any) == 0 || mir_sred_elem4(aty.elem_type) == 0) { return 0; }
+            let k = 0;
+            let hit = -1;
+            while (k < need) {
+                if (slots[k] == lhs.slot) { hit = k; }
+                k = k + 1;
+            }
+            if (hit < 0 || got[hit] == 1) { return 0; }
+            got[hit] = 1;
+            // 体内遇到目标的次序必须与 slots 的收集次序一致，否则下面两份并行数组会
+            // 错位（出口把 len 补到另一个数组上）。不一致就直接拒。
+            if (len(mir_sred_arr_h) != hit) { return 0; }
+            // 记下 a 的 EXPR_VAR：出口处还要按同样的类型读它
+            mir_sred_arr_h = array_push(mir_sred_arr_h, args[0]);
+            mir_sred_adj = array_push(mir_sred_adj, seen_inc);
+            i = i + 1;
+            continue;
+        }
+        return 0;
+    }
+    if (seen_inc != 1) { return 0; }
+    let j = 0;
+    while (j < need) {
+        if (got[j] != 1) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+// 判定 + 建上下文 + 把预分配容量改准为 n - base。返回 -1 表示不适用；否则返回装
+// "实际元素数"的寄存器 id（>0），调用方用它作为预分配容量。
+// 容量必须按"实际写入次数"给：base>0 时迭代数 = n - base < n，而按下标写 data 时
+// 一旦越过 cap 就是堆越界写（原先走 push 则由运行时自动扩容，所以 cap=n 只是浪费）。
+kimo mir_sred_begin(cond: HirExpr, body: array<HirStmt>, slots: array<int>,
+                    n_reg: int) -> int {
+    if (mir_sred_n != 0) { return -1; }
+    if (len(slots) == 0) { return -1; }
+    if ((cond as any) == 0 || cond.kind != EXPR_BINARY || cond.op != BIN_LT) { return -1; }
+    let bch = cond.children;
+    if (len(bch) != 2 || bch[0].kind != EXPR_VAR) { return -1; }
+    let i_h = bch[0];
+    let ity = i_h.inferred_type;
+    if ((ity as any) == 0) { return -1; }
+    // codegen 的直接 GEP 只对 int/long 下标启用；否则 a[k]=v 会退回运行时 set，
+    // 而运行时 set 对"index >= len"的写入是丢弃的 —— 静默少写元素。
+    if (ity.kind != TYPE_INT && ity.kind != TYPE_LONG) { return -1; }
+    let si = 0;
+    while (si < len(slots)) {
+        let s0 = slots[si];
+        if (mir_empty_is(s0) == 0) { return -1; }
+        si = si + 1;
+    }
+    mir_sred_arr_h = [];
+    mir_sred_adj = [];
+    if (mir_sred_body_ok(body, slots, i_h.slot) == 0) { return -1; }
+    mir_sred_i_h = i_h;
+    mir_sred_base_reg = mir_lower_expr(i_h);
+    let cnt = mir_new_reg();
+    let sb = mir_mk(MIR_BINOP);
+    sb.dst = cnt;
+    sb.arg1 = n_reg;
+    sb.arg2 = mir_sred_base_reg;
+    sb.longval = BIN_SUB;
+    sb.ty = ity;
+    mir_emit(sb);
+    mir_sred_slots = slots;
+    mir_sred_n = len(slots);
+    return cnt;
+}
+
+// 循环出口：把每个目标的 len 补成实际写入的元素数，并关闭上下文。
+kimo mir_sred_finish() -> void {
+    if (mir_sred_n == 0) { return; }
+    let i_r = mir_lower_expr(mir_sred_i_h);
+    let cnt = mir_new_reg();
+    let sb = mir_mk(MIR_BINOP);
+    sb.dst = cnt;
+    sb.arg1 = i_r;
+    sb.arg2 = mir_sred_base_reg;
+    sb.longval = BIN_SUB;
+    sb.ty = mir_sred_i_h.inferred_type;
+    mir_emit(sb);
+    let k = 0;
+    while (k < mir_sred_n) {
+        let a_r = mir_lower_expr(mir_sred_arr_h[k]);
+        let r = mir_new_reg();
+        let call = mir_mk(MIR_CALL);
+        call.dst = r;
+        call.strval = "shadow_array_set_len";
+        call.ty = mir_sred_arr_h[k].inferred_type;
+        call.args = array_push([], a_r);
+        call.args = array_push(call.args, cnt);
+        mir_emit(call);
+        k = k + 1;
+    }
+    mir_sred_n = 0;
+    mir_sred_slots = [];
+    mir_sred_adj = [];
+    mir_sred_arr_h = [];
+    mir_sred_i_h = 0 as HirExpr;
+    mir_sred_base_reg = -1;
+    return;
+}
+
+// STMT_ASSIGN 钩子：命中则发 a[(i-base)] = v 并返回 1（调用方据此跳过常规 push lowering
+// 与槽回写 —— 数组对象自始至终没换）。
+kimo mir_sred_try_store(lhs_slot: int, call_h: HirExpr) -> int {
+    if (mir_sred_n == 0) { return 0; }
+    let hit = -1;
+    let k = 0;
+    while (k < mir_sred_n) {
+        if (mir_sred_slots[k] == lhs_slot) { hit = k; }
+        k = k + 1;
+    }
+    if (hit < 0) { return 0; }
+    let args = call_h.children;
+    if (len(args) != 2) { return 0; }
+    if (args[0].kind != EXPR_VAR || args[0].slot != lhs_slot) { return 0; }
+    let v_reg = mir_lower_expr(args[1]);
+    let a_r = mir_lower_expr(args[0]);
+    let i_r = mir_lower_expr(mir_sred_i_h);
+    let idx = mir_new_reg();
+    let sub = mir_mk(MIR_BINOP);
+    sub.dst = idx;
+    sub.arg1 = i_r;
+    sub.arg2 = mir_sred_base_reg;
+    sub.longval = BIN_SUB;
+    sub.ty = mir_sred_i_h.inferred_type;
+    mir_emit(sub);
+    // 该 append 写在 i = i + 1 之后 → 本轮 i 已自增，下标要再减 1，否则整体错 1，
+    // 且最后一次迭代写到 cap 之外（堆越界）。
+    if (mir_sred_adj[hit] == 1) {
+        let one = mir_new_reg();
+        let ci = mir_mk(MIR_CONST_INT);
+        ci.dst = one;
+        ci.longval = 1;
+        ci.ty = mk_type(TYPE_INT);
+        mir_emit(ci);
+        let idx2 = mir_new_reg();
+        let sub2 = mir_mk(MIR_BINOP);
+        sub2.dst = idx2;
+        sub2.arg1 = idx;
+        sub2.arg2 = one;
+        sub2.longval = BIN_SUB;
+        sub2.ty = mir_sred_i_h.inferred_type;
+        mir_emit(sub2);
+        idx = idx2;
+    }
+    let st = mir_mk(MIR_STORE_INDEX);
+    st.arg1 = a_r;
+    st.arg2 = idx;
+    st.ty = args[0].inferred_type.elem_type;
+    st.args = array_push([], v_reg);
+    mir_emit(st);
+    return 1;
+}
+
 // 循环体别名扫描（只读，不改 mir_owned）：找出体内会被共享的 slot。
 // 表达式层别名仅来自函数调用实参（callee 可能保留）与闭包捕获。
 pub kimo mir_scan_aliases_expr(h: HirExpr, aliased: array<int>) -> void {
@@ -1484,6 +1749,11 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             // 倍增扩容（awfy_queens_long 实测 234 万次分配、其中 72 万次是 12 字节
             // 空数组，正是这个形状）。
             let n_reg = mir_lower_expr(pre_bound);
+            // v10_s18：形状条件更严时把逐元素 append 改成计数下标直写。按下标写一旦越过
+            // cap 就是堆越界（原先由 push 的扩容接住），所以容量改准为实际写入数 n - base。
+            let cap_reg = n_reg;
+            let sred_cnt = mir_sred_begin(cond, h.body, pre_slots, n_reg);
+            if (sred_cnt >= 0) { cap_reg = sred_cnt; }
             let pi = 0;
             while (pi < len(pre_slots)) {
                 let pslot = pre_slots[pi];
@@ -1504,7 +1774,7 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                 let call = mir_mk(MIR_CALL);
                 call.dst = r;
                 call.strval = "shadow_array_prealloc";
-                call.args = [es_reg, n_reg];
+                call.args = [es_reg, cap_reg];
                 call.ty = pty;
                 mir_emit(call);
                 let st = mir_mk(MIR_STORE_VAR);
@@ -1544,6 +1814,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         mir_emit_br(cond_label);
 
         mir_seal_and_begin(exit_label);
+        // v10_s18：出口一次性把各目标的 len 补成实际写入数（未启用削减时是空操作）。
+        mir_sred_finish();
         return;
     }
 
@@ -1575,6 +1847,13 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                 mir_empty_set(lhs.slot, 1);
             } else {
                 mir_empty_set(lhs.slot, 0);
+            }
+            // v10_s18：本循环已启用计数存储削减 → a = array_push(a, v) 改成 a[i-base] = v。
+            // 不回写槽：数组对象从头到尾没换过（容量在循环前一次给足）。
+            if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_CALL &&
+                mir_sred_try_store(lhs.slot, rhs_h) == 1) {
+                mir_owned_set(lhs.slot, 0);
+                return;
             }
             // 就地追加优化：a = a + b（静态 string 类型）→ shadow_string_concat_inplace(a, b)。
             // 复用 a 的缓冲，避免热循环里每次拼接都分配新缓冲 + 全量复制（str_reverse 等）。
@@ -2150,6 +2429,12 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
         mir_slot_empty = array_push(mir_slot_empty, 0);
         ei = ei + 1;
     }
+    mir_sred_n = 0;
+    mir_sred_slots = [];
+    mir_sred_adj = [];
+    mir_sred_arr_h = [];
+    mir_sred_i_h = 0 as HirExpr;
+    mir_sred_base_reg = -1;
 
     let body = hf.body;
     let i = 0;
