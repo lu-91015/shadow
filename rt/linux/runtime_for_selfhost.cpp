@@ -3576,6 +3576,20 @@ static std::atomic<int> g_gc_stw_active{0};
 // extern "C" 保证 MSVC ABI 下符号不 mangle（Linux 全局变量本就不 mangle），
 // 否则 lld-link 找不到未修饰的 g_gc_poll_flag 引用。
 extern "C" std::atomic<int> g_gc_poll_flag{0};
+// ⚠️ 本标志是**两位独立语义的复用字**，绝不能再当"一个可被谁清掉的布尔"用：
+//   bit0 GC_POLL_STW  = 有 STW 在请求/进行中。只有发起者能清（gc_stw_end）。
+//   bit1 GC_POLL_TRIG = alloc 触发待别的线程复查。任何进入慢路径的线程都可消费。
+// 历史 bug（ex_gc_spawn 在 Windows 下 ~80% 概率永久挂起）：poll 慢路径一进门
+// 就无条件 `flag = 0`，于是**第一个**进入慢路径的线程把唤醒位吃掉，其余还在跑
+// mutator 的线程内联检查读到 0 → 不再调用 poll → 永远不置 stw_state=1；而收集
+// 线程正卡在 gc_stw_begin 的等待循环里等它们，且整窗 g_gc_running=1 让 alloc
+// 侧也无法再置位补上这次唤醒 —— 屏障永久不满足（协作式 STW 的经典丢唤醒）。
+// 分位后 STW 位只由发起者成对置/清，任何线程都偷不走。
+#define GC_POLL_STW  1
+#define GC_POLL_TRIG 2
+// ThreadGCState::stw_state 的第 4 个取值：本线程已退出，登记项只是还没回收。
+// 屏障侧无需特判（它只等 0），但**扫根侧必须跳过**——见 ~GCTLSGuard 注释。
+#define GC_STW_DEAD  3
 static int rt_gc_auto_on(void) {
     if (g_gc_auto < 0) {
         const char* e = getenv("SHADOW_GC_AUTO");
@@ -3635,8 +3649,10 @@ struct ThreadGCState {
     //   0 = free-running（mutator，可能在任意点）
     //   1 = at safepoint（shadow_gc_poll 自旋等待放行）
     //   2 = blocked on g_gc_mutex（等锁，不跑 mutator，collect 无需等待）
+    //   3 = GC_STW_DEAD（线程已退出，登记项待回收；扫根须跳过）
     std::atomic<int> stw_state{0};
 };
+
 
 // ── 编译期栈映射（compile-time stack map）的帧锚点（GC 重构）──
 // 取代运行时 shadow-frame 根注册（shadow_gc_root_range / per-param root_set）。
@@ -3655,6 +3671,9 @@ struct ShadowFrameAnchor {
 
 static thread_local ThreadGCState* tl_gc_state = nullptr;
 static std::vector<ThreadGCState*> g_gc_thread_states;   // registry, guarded by g_gc_mutex
+// 已退出线程留下的登记项计数（stw_state==GC_STW_DEAD）。退出侧只能原子加，
+// 不能取锁；取锁与真正的回收都集中在 gc_thread_state_create。
+static std::atomic<int> g_gc_dead_states{0};
 static std::mutex g_gc_mutex;                            // guards g_gc_remembered, g_finalizers,
                                                         //   g_gc_perm_roots, g_gc_thread_states, 段注册表
 static std::vector<void*> g_gc_perm_roots;     // permanent roots (popped by gc_perm_root_remove)
@@ -4076,11 +4095,14 @@ extern "C" int32_t shadow_index_of_fast(void* s, void* needle) {
 // 时不跑 mutator，collect 的 STW 等待无需等它（否则并发 collect 死锁）。
 static inline void gc_lock() {
     ThreadGCState* s = tl_gc_state;
+    // 保存/恢复而非写死 0：调用方可能已处 blocked 区（如 shadow_sched_run 的
+    // join 段），置 0 会让屏障重新等一个正阻塞的线程 → 永久卡死。
+    int saved = s ? s->stw_state.load(std::memory_order_relaxed) : 0;
     while (g_gc_collect_lock.test_and_set(std::memory_order_acquire)) {
         if (s) s->stw_state.store(2, std::memory_order_release);
         std::this_thread::yield();
     }
-    if (s) s->stw_state.store(0, std::memory_order_release);
+    if (s) s->stw_state.store(saved, std::memory_order_release);
 }
 static inline void gc_unlock() { g_gc_collect_lock.clear(std::memory_order_release); }
 
@@ -4103,8 +4125,9 @@ static std::vector<std::pair<void*, int64_t>> g_gc_conservative_regions;
 
 extern "C" void shadow_gc_add_conservative_root(void* start, int64_t size) {
     if (!start || size <= 0) return;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    gc_lock_blocked();          /* 等锁期间必须 stw_state=2，否则屏障会等一个等锁线程 */
     g_gc_conservative_regions.push_back({start, size});
+    g_gc_mutex.unlock();
 }
 
 // Conservative scan helper: trace pointer-sized values in registered regions.
@@ -4167,30 +4190,47 @@ extern "C" void shadow_gc_init_conservative_globals() {
 #endif
 }
 
-// thread_local guard: unregister this thread's state at thread exit. We do NOT
-// free it (another thread's in-flight collect may still hold the pointer).
+// thread_local guard: 线程退出时把自己的登记项标成 GC_STW_DEAD（不做别的，见函数体）。
 // Declared BEFORE gc_get_thread_state so that function can force-construct it.
 struct GCTLSGuard {
     ~GCTLSGuard() {
-        if (tl_gc_state) {
-            ThreadGCState* s = tl_gc_state;
-            // 退出中：取 g_gc_mutex 前标记 blocked（stw_state=2），否则 collect
-            // 的 STW 等待循环会把本线程当 free-running 无限等待 → 死锁。
-            s->stw_state.store(2, std::memory_order_release);
-            {
-                std::lock_guard<std::mutex> lk(g_gc_mutex);
-                auto& v = g_gc_thread_states;
-                for (size_t i = 0; i < v.size(); i++) {
-                    if (v[i] == s) { v[i] = v.back(); v.pop_back(); break; }
-                }
-            }
-            s->stw_state.store(0, std::memory_order_release);
-            tl_gc_state = nullptr;
-            g_mutator_threads.fetch_sub(1, std::memory_order_relaxed);
-        }
+        ThreadGCState* s = tl_gc_state;
+        if (!s) return;
+        // ⚠️ 本析构在【加载器锁】下执行（TLS 回调 DLL_THREAD_DETACH）。在这里等任何
+        // GC 锁都会成环：collect 整场屏障都持着 g_gc_mutex，而屏障等的正是被这把
+        // 加载器锁卡住的 mutator（stw_state=0、CPU 增量为 0、永远回不到安全点）→
+        // ex_gc_spawn 永久挂死。屏障转储抓到的直接证据就是一条 stw_state=2 且 CPU
+        // 增量为 0 的线程，它停的位置正是本函数旧版的裸 lock_guard(g_gc_mutex)。
+        // 所以注销只做一个原子标记，摘表与 delete 推迟给 gc_thread_state_create：
+        // 那里已持 g_gc_mutex，屏障和扫根都不可能同时进行。
+        g_mutator_threads.fetch_sub(1, std::memory_order_relaxed);
+        g_gc_dead_states.fetch_add(1, std::memory_order_relaxed);
+        tl_gc_state = nullptr;
+        s->stw_state.store(GC_STW_DEAD, std::memory_order_release);  // 最后一次触碰 *s
     }
 };
 static thread_local GCTLSGuard gc_tls_guard;   // forces construction in each thread
+
+// 本线程已退出、登记项待回收。扫根处必须逐个跳过：它的 head_slot 指向退出线程的
+// TLS 槽，别的线程解引用只会读到【自己】那份（等于把扫描者的帧链当成它的根），
+// roots/named_roots 里也可能是退出前的残值。
+static inline bool gc_state_dead(ThreadGCState* s) {
+    return s->stw_state.load(std::memory_order_relaxed) == GC_STW_DEAD;
+}
+
+// 摘表 + 释放已退出线程的登记项。只能持 g_gc_mutex 时调用：遍历登记表的屏障与扫根
+// 都在同一把锁下进行，所以此处既无并发遍历，也无 in-flight collect 还攥着这些指针。
+static void gc_registry_reap_locked() {
+    auto& v = g_gc_thread_states;
+    size_t w = 0;
+    for (size_t i = 0; i < v.size(); i++) {
+        ThreadGCState* s = v[i];
+        if (gc_state_dead(s)) delete s;
+        else v[w++] = s;
+    }
+    v.resize(w);
+    g_gc_dead_states.store(0, std::memory_order_relaxed);
+}
 
 // 冷路径：每线程仅首次执行。必须 noinline + cold —— 否则其中的 operator new 与
 // lock_guard 会迫使调用方（热路径 gc_get_thread_state）保存 8 个被调用者保存寄存器，
@@ -4202,6 +4242,9 @@ static __attribute__((noinline, cold)) ThreadGCState* gc_thread_state_create() {
     ThreadGCState* s = new ThreadGCState();
     {
         std::lock_guard<std::mutex> lk(g_gc_mutex);
+        // 注册必须留在这把锁里：屏障全程持锁，于是新线程在登记前就被挡到本轮
+        // collect 结束，绝不会「屏障已经收齐后才冒出来」而漏扫自己的栈。
+        if (g_gc_dead_states.load(std::memory_order_relaxed) > 8) gc_registry_reap_locked();
         g_gc_thread_states.push_back(s);
     }
     g_mutator_threads.fetch_add(1, std::memory_order_relaxed);
@@ -4243,22 +4286,26 @@ extern "C" void** shadow_gc_thread_frame_head() {
 // 的线程不会被等待」契约，避免 collect 等一个永远到不了安全点的等锁线程。
 static void gc_lock_blocked() {
     ThreadGCState* s = gc_get_thread_state();
+    int saved = s->stw_state.load(std::memory_order_relaxed);
     while (!g_gc_mutex.try_lock()) {
         s->stw_state.store(2, std::memory_order_release);
         std::this_thread::yield();
     }
-    s->stw_state.store(0, std::memory_order_release);
+    // 恢复调用方原状态：blocked 区（join/await）里取一次锁不该把该区降级成
+    // free-running，否则屏障会等一个其实正阻塞的线程 → 永久卡死。
+    s->stw_state.store(saved, std::memory_order_release);
 }
 
 // ── 协作式 STW（对齐 Windows rt_gc.o 的 gc_stw_begin/gc_stw_end）──
 // collect 持 g_gc_mutex 调用：置 req=1 → 等所有其它线程 stw_state!=0
-// （1=安全点自旋，2=等锁阻塞）→ active=1、清 req → 精确扫根/清扫 →
-// active=0 放行。等待循环只读原子 stw_state，不取 s->mtx（避免与 mutator
-// 的 root_set 死锁）；g_gc_thread_states 在 g_gc_mutex 保护下稳定（collect
-// 持锁期间无增删）。collect 自身（me）跳过 —— 它不跑 mutator，根集冻结。
+// （1=安全点自旋，2=等锁阻塞，3=线程已退出）→ active=1、清 req →
+// 精确扫根/清扫 → active=0 放行。等待循环只读原子 stw_state，不取 s->mtx
+// （避免与 mutator 的 root_set 死锁）；登记表的增删都要持 g_gc_mutex，而线程
+// 退出只留一个 GC_STW_DEAD 原子标记、不碰表，所以持锁遍历期间表始终稳定。
+// collect 自身（me）跳过 —— 它不跑 mutator，根集冻结。
 static void gc_stw_begin() {
     g_gc_stw_req.store(1, std::memory_order_relaxed);
-    g_gc_poll_flag.store(1, std::memory_order_relaxed);
+    g_gc_poll_flag.fetch_or(GC_POLL_STW, std::memory_order_relaxed);
     ThreadGCState* me = tl_gc_state;
     for (;;) {
         int all = 1;
@@ -4267,6 +4314,7 @@ static void gc_stw_begin() {
             // acquire：与 mutator 在 poll 的 stw_state=1 release store 配对，
             // 建立「mutator 快路径根修改 → collect 扫根」的 happens-before 链
             // （无锁快路径依赖此序，见 shadow_gc_frame_enter 注释）。
+            // 只等 0：1=已停靠、2=阻塞在锁上、3=GC_STW_DEAD 线程已退出，都不必等。
             if (s->stw_state.load(std::memory_order_acquire) == 0) { all = 0; break; }
         }
         if (all) break;
@@ -4277,7 +4325,7 @@ static void gc_stw_begin() {
 }
 static void gc_stw_end() {
     g_gc_stw_active.store(0, std::memory_order_relaxed);
-    g_gc_poll_flag.store(0, std::memory_order_relaxed);
+    g_gc_poll_flag.fetch_and(~GC_POLL_STW, std::memory_order_relaxed);
 }
 
 static void gc_perm_root_add(void* p) {
@@ -4300,12 +4348,16 @@ static void gc_perm_root_remove(void* p) {
 // raw GC pointer). A null val erases the slot's root.
 extern "C" int32_t shadow_gc_global_root_set(void* slot, void* val) {
     if (!slot) return 0;
-    std::lock_guard<std::mutex> lk(g_gc_mutex);
+    /* 必须走 gc_lock_blocked()：裸 lock_guard 等锁期间 stw_state 仍是 0（自由
+     * 运行），而收集线程正是**持着 g_gc_mutex** 在 gc_stw_begin 的屏障里等这个
+     * 线程到安全点 —— 它等锁、屏障等它，永久死锁。 */
+    gc_lock_blocked();
     if (val) {
         g_gc_global_roots[slot] = val;
     } else {
         g_gc_global_roots.erase(slot);
     }
+    g_gc_mutex.unlock();
     return 0;
 }
 
@@ -4842,6 +4894,7 @@ extern "C" int64_t shadow_gc_collect() {
     for (void* root : g_gc_perm_roots) { gc_trace_child(root, worklist); }
     for (auto& kv : g_gc_global_roots) { gc_trace_child(kv.second, worklist); }
     for (ThreadGCState* s : g_gc_thread_states) {
+        if (gc_state_dead(s)) continue;   // 退出线程：head_slot 读到的是本线程 TLS，roots 也是残值
         std::lock_guard<std::mutex> lk(s->mtx);
         for (void* root : s->roots) gc_trace_child(root, worklist);
         for (auto& kv : s->named_roots) gc_trace_child(kv.second, worklist);
@@ -4862,6 +4915,7 @@ extern "C" int64_t shadow_gc_collect() {
     // 根截断（ex_gc_spawn）。注意：必须读 *s->head_slot 而非 s->frame_head —— codegen
     // enter/leave 直接读写 shadow_gc_tls_frame_head，两者始终一致。
     for (ThreadGCState* s : g_gc_thread_states) {
+        if (gc_state_dead(s)) continue;   // 退出线程：head_slot 读到的是本线程 TLS，等于把自己帧链当它的根
         std::lock_guard<std::mutex> lk(s->mtx);
         ShadowFrameAnchor* head = s->head_slot ? reinterpret_cast<ShadowFrameAnchor*>(*s->head_slot) : nullptr;
         for (ShadowFrameAnchor* a = head; a != nullptr; a = a->prev) {
@@ -4973,6 +5027,7 @@ extern "C" int64_t shadow_gc_minor_collect() {
     for (void* root : g_gc_perm_roots) { gc_trace_child(root, worklist); }
     for (auto& kv : g_gc_global_roots) { gc_trace_child(kv.second, worklist); }
     for (ThreadGCState* s : g_gc_thread_states) {
+        if (gc_state_dead(s)) continue;   // 退出线程：head_slot 读到的是本线程 TLS，roots 也是残值
         std::lock_guard<std::mutex> lk(s->mtx);
         for (void* root : s->roots) gc_trace_child(root, worklist);
         for (auto& kv : s->named_roots) gc_trace_child(kv.second, worklist);
@@ -5092,7 +5147,7 @@ extern "C" void* shadow_gc_alloc(int32_t size, int32_t kind) {
             if (hb >= g_gc_trigger.load(std::memory_order_relaxed) && hb > 0) want = 1;
         }
         if (want) {
-            g_gc_poll_flag.store(1, std::memory_order_relaxed);  // 提示 poll 兜底复查
+            g_gc_poll_flag.fetch_or(GC_POLL_TRIG, std::memory_order_relaxed);  // 提示 poll 兜底复查
             shadow_gc_collect();
         }
     }
@@ -5284,8 +5339,10 @@ extern "C" void shadow_gc_poll() {
     // 快路径：单原子加载。STW 请求或 alloc 触发时标志置 1，否则无分配热循环
     // （sum_loop 等）直接返回，免去每次 6+ 次加载 + rt_gc_auto_on 调用。
     if (g_gc_poll_flag.load(std::memory_order_relaxed) == 0) return;
-    g_gc_poll_flag.store(0, std::memory_order_relaxed);
     // ① STW 协作：collect 请求时到达安全点并自旋，等放行。
+    //    ⚠️ 判据只看 req/active，且**绝不消费 GC_POLL_STW 位** —— 那一位归发起
+    //    者（gc_stw_end）独占。原先此处无条件 `flag = 0` 会把唤醒位从别人手里
+    //    偷走：后进慢路径的线程读到 0 就不再调 poll，屏障永远等不到它。
     if (g_gc_stw_req.load(std::memory_order_relaxed) ||
         g_gc_stw_active.load(std::memory_order_relaxed)) {
         ThreadGCState* s = gc_get_thread_state();
@@ -5302,6 +5359,10 @@ extern "C" void shadow_gc_poll() {
         s->stw_state.store(0, std::memory_order_release);
         return;
     }
+    // 先摘掉 TRIG 位：它是本分支的私有信号（alloc 线程自己已经去过一次
+    // collect，置位只是提示别的线程兜底复查），谁消费都可以，故在此清掉。
+    if ((g_gc_poll_flag.fetch_and(~GC_POLL_TRIG, std::memory_order_relaxed)
+         & GC_POLL_TRIG) == 0) return;
     // ② 触发检查（安全点处活指针已 spill 到 shadow frame；GOGC/STRESS 达标即同步 collect）
     if (g_gc_disabled) return;
     if (!rt_gc_auto_on()) return;
@@ -6259,6 +6320,8 @@ static void task_run(ShadowTask* t) {
         t->fut->ready = 1;
     }
     // 结果作为 GC 永久根，防止并发 GC 在 await 前回收。
+    // 顺序要紧：必须先扎根再唤醒 await —— 反过来会留出一个「唯一引用只在
+    // fut->value（非 GC 内存）里」的窗口，正是 ex_gc_spawn 头部列的第 3 类 bug。
     gc_perm_root_add(result);
     t->fut->cv.notify_all();
 }

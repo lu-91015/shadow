@@ -1,0 +1,86 @@
+//@mode: exe
+//@desc: 线程churn——反复 spawn/await 让线程持续创建与退出，压 GC 登记表的注销与回收
+//@expect: churn ok jobs=120 nodes=3600
+//@env: SHADOW_GC_STRESS=64 SHADOW_GC_VERIFY=1
+//@timeout: 300
+// ex_thread_churn.shadow — 补 ex_gc_spawn 覆盖不到的那一面。
+//
+// ex_gc_spawn 只起 8 条线程、之后再也不起，于是「线程退出后又有新线程注册」这条
+// 路径一次都走不到：GC 登记表的摘除与释放（gc_registry_reap_locked）永远不执行。
+// 而线程退出恰恰是 Windows 上最容易出事的地方——TLS 析构在加载器锁下运行，那里
+// 一旦等 GC 锁，就会和「collect 持 g_gc_mutex 等屏障」闭合成环（ex_gc_spawn 曾
+// 因此永久挂死）。所以这里专门制造 120 次注册 / 120 次退出的交替：
+//   · 每轮都 spawn 一条**新**线程并 await，线程干完就退出；
+//   · 主线程同轮持续分配，保证退出总发生在 GC 正在跑或即将跑的时刻；
+//   · worker 手里有一条 30 节点长命链，必须活过自己退出前的所有 collect。
+// 回收一旦做错（漏摘、摘掉活线程、或释放了别人还在引用的 state），表现就是
+// 下面任一种：链断计数不对、tag 校验失败、或直接崩。
+dsb ex_thread_churn;
+
+struct Node {
+    tag: string;
+    next: Node;
+}
+
+kimo build_chain(n: int, seed: int) -> Node {
+    let head: Node = 0 as Node;
+    let i = 0;
+    while (i < n) {
+        let nd: Node = Node { tag: "n-" + int_to_str(seed) + "-" + int_to_str(i), next: head };
+        head = nd;
+        i = i + 1;
+    }
+    return head;
+}
+
+// 沿链走一遍并校验 tag；返回节点数（-1 表示内容已被回收/污染）。
+kimo walk_chain(head: Node, seed: int) -> int {
+    let cur: Node = head;
+    let count = 0;
+    while ((cur as any) != 0) {
+        if (str_contains(cur.tag, "n-" + int_to_str(seed) + "-") == 0) { return 0 - 1; }
+        cur = cur.next;
+        count = count + 1;
+    }
+    return count;
+}
+
+// 纯短命垃圾：驱动 GC 高频触发。
+kimo junk(n: int) -> int {
+    let a: array<string> = [];
+    let i = 0;
+    while (i < n) {
+        a = array_push(a, "j-" + int_to_str(i));
+        i = i + 1;
+    }
+    return len(a);
+}
+
+// worker：长命链 + 一屏短命垃圾，返回链长。
+kimo job() -> int {
+    let keep: Node = build_chain(30, 7);
+    if (junk(200) != 200) { return 0 - 2; }
+    return walk_chain(keep, 7);
+}
+
+kimo main() -> int {
+    let total = 0;
+    let r = 0;
+    while (r < 120) {
+        let f = spawn job();
+        let n = (await f) as int;
+        if (n != 30) {
+            println("ERR round=" + int_to_str(r) + " n=" + int_to_str(n));
+            return 1;
+        }
+        total = total + n;
+        if (junk(80) != 80) { return 2; }
+        r = r + 1;
+    }
+    if (total != 3600) {
+        println("ERR total=" + int_to_str(total) + " expected 3600");
+        return 3;
+    }
+    println("churn ok jobs=120 nodes=3600");
+    return 0;
+}
