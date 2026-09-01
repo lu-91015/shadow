@@ -626,6 +626,17 @@ pub kimo cg_get_frame_head_global() -> any {
     return cg_frame_head_slot;
 }
 
+// poll 的唯一用途：让**别的线程**能把本线程停在一个根集完整处（协作式 STW），外加一处
+// 与分配点完全等价的触发复查（shadow_gc_poll ② 与 alloc hook 用的是同一个 want 判据）。
+// 单线程程序里 collect 只可能由本线程自己的 runtime 调用（分配/写屏障）发起，而那些点
+// 本来就按真安全点计 ⇒ 回边 poll 与入口 poll 在热循环里纯属额外的加载 + 分支。
+// ⚠️ 发射侧（MIR_BR/MIR_CONDBR、函数入口）与分析侧（cg_analyze_liveness 里"回边算不算
+//   安全点"）必须走同一判据：两处一旦分叉，就会出现"分析判免帧、发射仍发 poll"（或反向）
+//   的根集漏扫 —— 那是内存安全问题，不是性能问题。
+pub kimo cg_poll_is_needed() -> int {
+    return cg_prog_has_threads;
+}
+
 pub kimo cg_emit_poll() -> void {
     let i32_ty = llvm_i32(cg_ctx);
     let flag = llvm_load(cg_builder, i32_ty, cg_get_poll_flag_global(), "pollflag");
@@ -1524,8 +1535,10 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
     if (op == MIR_BR) {
         // §5.2.4 协作式安全点：循环回边插 poll（目标块序 < 当前块序 = 回跳）。
         // 免帧函数（@nogc 或无可保活指针）无根可保护，跳过回边 poll 消除热循环开销。
+        // 单线程程序（无 spawn/await）里回边也不算安全点：没有第二个线程需要把它停在这里，
+        // collect 只能从本线程的分配点发起。判据与分析侧（cg_analyze_liveness）共用一个函数。
         let tidx = cg_blk_index(mi.strval);
-        if (cg_gc_frame_active == 1 && tidx >= 0 && tidx < cg_cur_blk_idx) { cg_emit_poll(); }
+        if (cg_gc_frame_active == 1 && cg_poll_is_needed() == 1 && tidx >= 0 && tidx < cg_cur_blk_idx) { cg_emit_poll(); }
         let target = cg_find_block(mi.strval);
         llvm_br(cg_builder, target);
         return;
@@ -1535,7 +1548,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         // §5.2.4 协作式安全点：条件回边（then 或 else 任一回跳）插 poll
         let tidx1 = cg_blk_index(mi.strval);
         let tidx2 = cg_blk_index(mi.strval2);
-        if (cg_gc_frame_active == 1 && ((tidx1 >= 0 && tidx1 < cg_cur_blk_idx) || (tidx2 >= 0 && tidx2 < cg_cur_blk_idx))) {
+        if (cg_gc_frame_active == 1 && cg_poll_is_needed() == 1 && ((tidx1 >= 0 && tidx1 < cg_cur_blk_idx) || (tidx2 >= 0 && tidx2 < cg_cur_blk_idx))) {
             cg_emit_poll();
         }
         let cond = cg_get_reg(mi.arg1);
@@ -3097,12 +3110,14 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (direct_t == 0) { alias[mt.dst] = 0; }
             }
             // 安全点：runtime 调用 opcode，或循环回边（§5.2.4 协作式 poll 点）
-            // 回边算真安全点不可省：poll 自身就可能同步触发 collect（shadow_gc_poll 的
-            // 触发检查分支）。has_sp 因此等价于"本函数含调用或循环" —— 免帧函数必须是
-            // 直路无调用的短函数，才可以在不插 poll 的前提下仍不拖累多线程 STW 协作。
+            // 回边算真安全点仅当**真的会发 poll**：多线程下 poll 自身就可能同步触发 collect
+            // （shadow_gc_poll 的触发检查分支），故 has_sp 等价于"本函数含调用或循环"。
+            // 单线程程序里回边不发 poll（见 cg_poll_is_needed），于是回边也不是 collect
+            // 可能落地的点 —— 否则 sieve 这类"只含循环、一次分配都不做"的函数会白建帧，
+            // 帧一旦存在，escaped alloca 就让循环里每次数组访问都从栈重载一遍。
             let mt_sp = 0;
             if (cg_inst_safepoint(mt, kinds, trust) == 1) { mt_sp = 1; }
-            if (mt.op == MIR_BR || mt.op == MIR_CONDBR) {
+            if (cg_poll_is_needed() == 1 && (mt.op == MIR_BR || mt.op == MIR_CONDBR)) {
                 let ta = cg_ana_blk_index(mt.strval, blocks, n_blks);
                 let tb = cg_ana_blk_index(mt.strval2, blocks, n_blks);
                 if ((ta >= 0 && ta < bi) || (tb >= 0 && tb < bi)) { mt_sp = 1; }
@@ -3423,7 +3438,9 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     // 入口处参数已在 slot / shadow frame，根集完整。
     // 免 GC 帧函数（纯运行时）跳过入口 poll：内联后避免在热循环里注入多余 poll，
     // 未内联时由调用方下一安全点覆盖（纯函数无分配无 GC，短小立即返回）。
-    if (frame_needed == 1) {
+    // 单线程程序连入口 poll 也不发：没有第二个线程需要在此协作，且入口本身不可能开始
+    // collect。省掉的是"每次调用一条 volatile 加载 + 分支"（深递归路径按调用次数计费）。
+    if (frame_needed == 1 && cg_poll_is_needed() == 1) {
         cg_emit_poll();
     }
 

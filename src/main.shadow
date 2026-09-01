@@ -1878,8 +1878,12 @@ kimo main_mod_in_src(idx: int) -> int {
 //   （tail 帧 15→1 槽、spill 14→0；permute 11→1；placeQueen 18→4；实测同机 A/B
 //    list -46.9%、permute -39.2%、queens -26.4%），旧 v10_s15 缓存 IR 仍带这些冗余
 //   spill → 需整体失效。
+// v10_s17：poll 只为"让别的线程把本线程停在根集完整处"而存在，故单线程程序（无
+//   spawn/await）不再发入口/回边 poll，回边也不再计入真安全点 —— 只含循环、一次分配
+//   都不做的函数（sieve 等）连帧都不必建，热循环里的 volatile 加载 + 分支、以及 escaped
+//   alloca 造成的每次数组访问从栈重载，一并消失。旧 v10_s16 缓存 IR 仍带这些 poll/帧。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s16_" + main_hash_src(path);
+    return main_lu_base + "/v10_s17_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
