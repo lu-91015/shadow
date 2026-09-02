@@ -1894,6 +1894,9 @@ kimo main_mod_in_src(idx: int) -> int {
 //   其成立前提（容量在 64 位里精确算出、界与计数器在体内不可动）也由同一批改动钉死；
 //   runtime 侧数组字节数算式改为 64 位并按硬上限判死，使头里的 cap 恒等于物理容量。
 //   旧 v10_s18 缓存 IR 不含护栏、对象容量约束也不同 → 需整体失效。
+// v10_s21 曾把护栏判据折成一条 icmp ult，真产物 A/B 里 sieve +10.2%、list +6.0%（尽管机器码
+//   每条访问严格少 2 条），已整体回退到上面的有符号两侧式 → 生成的 IR 与 v10_s19 逐字节相同，
+//   故键**不动**： bump 只会白白失效全部已提交缓存，换不来任何区分度。
 kimo main_lu_key(path: string) -> string {
     return main_lu_base + "/v10_s19_" + main_hash_src(path);
 }

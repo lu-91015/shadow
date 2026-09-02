@@ -1064,13 +1064,21 @@ pub kimo cg_get_oob_zero_ptr() -> any {
     return cg_oob_zero_g;
 }
 
-// 数组下标护栏条件：i1 = (0 <= idx && idx < cap)。
+// 数组下标护栏条件：i1 = (0 <= idx) && (idx < cap)，有符号两侧式。
 // cap 由数组头 offset 4 直读（cg_array_hdr_load_i32），全程不发 call，
 // 故帧/安全点判定（cg_inst_safepoint / cg_prescan_kind）不受影响。
+// 为什么不用更短的单次无符号式 idx <ᵤ cap：它逐位等价（见下面那条前提），机器码也确实
+// 每次访问少两条，但实测更慢（见弯路 4），所以形态由度量决定，不由指令数决定。
+// 等价性前提（保留下来，别再重新推一遍）：头里的 cap 恒落在 [0, INT_MAX]。写 cap 的只有
+// 三处，全部先夹后写——runtime_lib.shadow 的 shadow_array_new（cap<0 → 0，字节数超
+// 2147479552 直接 panic）、rt 侧 rt_array_block（同式，need > RT_ARRAY_MAX_BYTES 即死）、
+// 倍增出的 nc（要翻倍成负数须 cap ≥ 2^30，而那份请求早在 rt_array_block 里 panic 掉）。
+// 于是 idx<0 时无符号值 ≥ 2^32 > cap，必判越界；cap 侧不会翻签。
 // 按 cap 而非 len 判定：预分配窗口 [len,cap) 的直写是合法的（数组填充循环先写数据、
-// 出循环一次性 set_len），runtime_lib.shadow 的 shadow_array_idx_ok 同式（亦为有符号）。
+// 出循环一次性 set_len）。runtime_lib.shadow 的 shadow_array_idx_ok 是有符号式，
+// 那是一条 call，不在热循环里逐访问付费，与内联路径的取舍不同。
 //
-// 四条走过的弯路，数字都出自同一轮五臂 A/B（build/logs/ab3.sh：每臂独立目录、IR 与
+// 五条走过的弯路，数字都出自同一轮五臂 A/B（build/logs/ab3.sh：每臂独立目录、IR 与
 // exe 的 md5 两两不同、护栏站点数与臂定义逐条断言、stdout 逐字节一致、best-of-3 交错），
 // 括号内是相对"完全不发护栏"的 HEAD 编译器，顺序 list / permute / queens / towers。
 // 落地前又在空闲机器上按 best-of-5、三臂顺序轮换复测过一轮（build/logs/ig_retaste.sh），
@@ -1080,8 +1088,11 @@ pub kimo cg_get_oob_zero_ptr() -> any {
 //      对照 1) 只回收 1~3 个点——当初据此写下"单这一步回收 11~14%、list 甚至快过基线"
 //      是错的，那个数字来自一条臂定义混了的比较，别照它判断。整数地址链确实该换掉
 //      （它让每条 store 之后都得重载 cap，且语义上是在造 LLVM 无法追踪的指针），
-//      但代价的主体从来不是头读形式，而是护栏自身那几条依赖指令：permute 每轮 8 次
-//      下标访问都在热递归里，于是 +73%。
+//      但代价的主体从来不是头读形式，而是护栏每次访问都要"造一个可能是 sink 的指针"：
+//      llc 之后 permute 的热循环（.LBB1_3）循环体 39 条指令，无护栏臂只有 14 条——
+//      每次访问多出 movq+cmovlq 一对（全局 sink 地址既折不进 cmov，也让访存再也用不上
+//      12(%rdi,%rcx,4) 这种变址寻址），另加每轮 4 次头访问。访问密度越高的循环越贵，
+//      permute 每轮 8 次下标访问全在热递归里，于是 +73%。
 //   3) 给这条 cap 装载挂 !invariant.group，声称"同一对象内 cap 恒等值"来消掉重载
 //      （+17.1 / +54.9 / +27.1 / +11.3）：permute 省 18 个点、queens/towers 各省 3~4 个点，
 //      只有 list 亏 7 个点——四臂里三臂净赚，所以"标记没用、整套删掉"是删早了。
@@ -1091,14 +1102,47 @@ pub kimo cg_get_oob_zero_ptr() -> any {
 //      恢复它得连同双平台四档门禁重跑，值得单独一轮改动。
 //      更该走的路是编译器侧自己把"同一数组的 cap 在一个无别名写区域内只读一次"做掉，
 //      那样连 list 那 7 个点的亏也能一并省掉。
-//   4) 判据折成一次无符号比较 idx_u < cap_u（省两条指令）：当年那一轮确实测到明显变慢，
-//      但同一轮里两臂的差别不止比较形式，数字不能算干净，所以这里不引它。
-//      不采用它的理由是确定的：它要额外依赖"头里的 cap 恒非负"这个前提（rt 侧
-//      rt_array_block 与 shadow_array_new 都先把负数夹成 0 才成立），而
-//      runtime_lib.shadow 那侧是有符号式——同一条判据两处同形，比省两条指令值钱。
-// 结论：判据保持朴素有符号三段（load cap + icmp sge + icmp slt + and）+ 真 GEP 头读。
-// 要再往下压，方向是 3) 的不变性表达（或它的编译器侧等价物），其次是换判据形状
-// （比如 cond_br + phi 让界内路径用裸 GEP）。
+//   4) 判据折成一次无符号比较 idx_u < cap_u（v10_s21，**已实现并全量验证后回退**）。
+//      两侧式逐位等价（前提见函数头注），而且机器码层面确实严格更短：拿两臂各自生成的
+//      sieve 模块 IR 走 opt -O2 + llc -O2，扫描循环 12→10、标记循环 11→9、整个 sieve()
+//      47→40，少的正是 testl + 第二条 cmov，main 里免护栏的填充循环一条不变
+//      （build/logs/f21_{old,new}/、build/logs/s21_fasm.sh）。双平台四档门禁全绿
+//      （全量 956/0，gc plain/64/512/STRESS=8 各 99/0）。
+//      真产物 A/B 却把它否掉了：六基准两臂各自目录编译、臂身份按 IR 判据断言、产物 md5
+//      互异、stdout 逐字节一致、best-of-3 交错（build/logs/ab_s21.sh，括号内 old→new）
+//      list 1602→1698(+6.0) / permute 2917→2882(-1.2) / queens 471→441(-6.4) /
+//      towers 323→293(-9.3) / sieve 52881→58777(+11.1) / mandelbrot 60204→60141(-0.1)。
+//      sieve 单独复测 5 轮：52972→58379(+10.2)，new 的每一轮都比 old 最慢的一轮还慢，
+//      不是热漂移。按绝对时间加权整套是 +4.9%（sieve 一条就占 45%），故回退。
+//      教训：这条路径上"静态少几条"不预测运行时间——两侧式还额外把 idx >= 0 显式喂给了
+//      LLVM 的值域推断，省下的两条 cmov 抵不过那部分信息损失，但机制未经证实，
+//      数字才是结论。护栏判据的形状到此为止，别再从指令数角度重开。
+//   5) 把元素 GEP 的下标改成 select(0 <= idx, idx, 0)，指望 LLVM 由此证明 12 字节头区与
+//      元素区不重叠、从而自动合并同一块内的多条 cap 装载（v10_s20，已回退）。
+//      最小探针确实成立，但它证明的是另一件事：源码里 3 次 cap 装载，opt -O2 之后
+//      裸 sext 下标直写剩 2 次、钳位下标直写剩 1 次，而只要 store 的地址是
+//      "元素指针 与 全局 sink" 的 select，两种下标都剩 2 次（build/logs/aa_probe2.ll
+//      的 hdrA/hdrB/hdrC/hdrD）。也就是说挡住 CSE 的是那个指针 select——LLVM 证明不了
+//      一个堆参数指针不等于某个全局对象——下标符号根本不是瓶颈。
+//      五基准实测同一轮：opt 后的 cap 装载数两臂逐项相同（list 7 / permute 4 /
+//      queens 7 / towers 13 / sieve 2），钳位却在 list/queens/towers/sieve 的热路径上
+//      多出 24/16/36/4 条 select。permute 里它连留都留不下——低界已由分支条件可证，
+//      直接被折成 zext nneg。
+// 结论：判据现为 load cap + (icmp sge 0)+(icmp slt cap)+and + select（真 GEP 头读）。
+// 分支形态（cond_br + 界内路径裸 GEP）已按最小探针证伪：它与 select 形态、alloca-sink
+// 形态、分支+钳位形态在 llc 之后彼此相差 ≤2 条，而"完全不发护栏"那臂少 12 条
+// （build/logs/guard_shape_probe.ll）——X86 的 if-converter 会把这些小基本块折回 cmov，
+// IR 层看到的 multi_br2（3 次头读并 1 次）到不了机器码。挡住 CSE 的是"元素 store 地址
+// 可能落回头区"这件事本身，不是判据形状。判据折成单次无符号比较（弯路 4）也已按真产物
+// 度量证伪。
+// 要再往下压只剩两条：①让 MIR 把更多访问证明成静态界内（inb=1，直接不发护栏）；
+//   ②走 3) 的元数据路线把 cap 读成循环不变量（须 C++ shim）。
+//   ①的可行范围已按六个 AWFY 基准逐个核过，比看着要小得多：目前 inb=1 只由 mir_sred_try_store
+//   发出（填充循环的 store），而 cg_gen_array_load_direct 的调用点把 inb 硬编成 0，
+//   即所有下标读一律带护栏。这些基准的热访问都证不了：sieve 的界是形参 size、permute 是
+//   形参 n、queens 的 r/c 与 towers 的 pile 都是形参（真界在调用方构造数组时才有）、
+//   list 的 nexts[idx] 下标直接来自数组内容。要覆盖它们得让 MIR 带上"跨调用的数组容量"
+//   事实，是一次分析框架级别的改动，不是再加一条模式匹配。
 // 度量纪律：曾经因为 A/B 脚本让各臂共用同一个输出路径、某臂编译失败后 cp 静默复用了
 // 上一臂的产物，把"护栏近乎免费"写成了结论——两臂跑的其实是同一个文件。
 
