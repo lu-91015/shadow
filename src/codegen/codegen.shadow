@@ -82,6 +82,7 @@ pub kimo cg_sp_dbg_want() -> string {
 @extern("LLVMBuildTrunc") kimo llvm_trunc(b: any, v: any, ty: any, name: string) -> any { return 0 as any; }
 @extern("LLVMBuildBr") kimo llvm_br(b: any, dest: any) -> any { return 0 as any; }
 @extern("LLVMBuildCondBr") kimo llvm_cond_br(b: any, cond: any, then_bb: any, else_bb: any) -> any { return 0 as any; }
+@extern("LLVMBuildSelect") kimo llvm_select(b: any, cond: any, then_v: any, else_v: any, name: string) -> any { return 0 as any; }
 @extern("LLVMConstInt") kimo llvm_const_int(ty: any, v: long, sign_extend: int) -> any { return 0 as any; }
 @extern("LLVMConstNull") kimo llvm_const_null(ty: any) -> any { return 0 as any; }
 @extern("shadow_llvm_const_string") kimo llvm_const_str(s: string, slen: int, dont_null: int) -> any { return 0 as any; }
@@ -186,6 +187,7 @@ let cg_poll_flag_g: any = 0 as any;  // g_gc_poll_flag 外部全局（懒创建�
 let cg_poll_counter: int = 0;        // 内联 poll 块命名计数器（每函数重置，保证 IR 确定性）
 let cg_poll_skip_bb: any = 0 as any; // 最近一次内联 poll 的 skip 块（入口 poll 时 block 0 续接）
 let cg_push_counter: int = 0;        // 内联 array_push 块命名计数器（每函数重置）
+let cg_oob_counter: int = 0;         // 数组下标护栏块命名计数器（每函数重置）
 let cg_frame_head_slot: any = 0 as any; // 本函数已取的 frame_head 槽地址（每函数重置，见 cg_get_frame_head_global）
 let cg_str_keys: array<string> = [];
 let cg_str_vals: array<any> = [];
@@ -869,24 +871,30 @@ pub kimo cg_array_push_inline_ok(mi: MirInst) -> int {
     return cg_array_direct_ok(elem_ty.kind);
 }
 
-// 数组头字段 i32 加载（offset 字节处）：base + offset（模拟 GEP）
+// 数组头字段 i32 读写（offset 字节处）：真 i8 GEP + bitcast，不再拼整数地址。
+// 旧实现 ptrtoint → add → inttoptr 造出的指针与任何对象都没有可证的关系，别名分析
+// 一律按"可能与任何 store 重叠"处理，于是两条头读之间只要出现过 store 就得重载。
+// v10_s19 把 cap 读挂到每次下标访问上，这条链的成本随之放大成热循环每轮的头读重载
+// （护栏 select 出的元素指针同样可能落到头字上），所以这里必须先还它一个真 GEP。
 pub kimo cg_array_hdr_load_i32(arr_val: any, offset: int, name: string) -> any {
     let i64_ty = llvm_i64(cg_ctx);
     let i32_ty = llvm_i32(cg_ctx);
-    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "hdrbase");
-    let addr = llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, offset, 1), "hdraddr");
-    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i32_ty, 0), "hdrptr");
-    return llvm_load(cg_builder, i32_ty, ptr, name);
+    buf_reset();
+    buf_push(llvm_const_int(i64_ty, offset, 1));
+    let p8 = llvm_gep(cg_builder, llvm_i8(cg_ctx), arr_val, 1, "hdrgep");
+    let p32 = llvm_bitcast(cg_builder, p8, llvm_ptr_ty(i32_ty, 0), "hdrptr");
+    return llvm_load(cg_builder, i32_ty, p32, name);
 }
 
 // 数组头字段 i32 存储（offset 字节处）
 pub kimo cg_array_hdr_store_i32(arr_val: any, offset: int, v: any) -> void {
     let i64_ty = llvm_i64(cg_ctx);
     let i32_ty = llvm_i32(cg_ctx);
-    let base_i = llvm_ptrtoint(cg_builder, arr_val, i64_ty, "hdrbase");
-    let addr = llvm_add(cg_builder, base_i, llvm_const_int(i64_ty, offset, 1), "hdraddr");
-    let ptr = llvm_inttoptr(cg_builder, addr, llvm_ptr_ty(i32_ty, 0), "hdrptr");
-    llvm_store(cg_builder, v, ptr);
+    buf_reset();
+    buf_push(llvm_const_int(i64_ty, offset, 1));
+    let p8 = llvm_gep(cg_builder, llvm_i8(cg_ctx), arr_val, 1, "hdrgep");
+    let p32 = llvm_bitcast(cg_builder, p8, llvm_ptr_ty(i32_ty, 0), "hdrptr");
+    llvm_store(cg_builder, v, p32);
 }
 
 // 内联 array_push：静态类型数组（es 已知）→ 生成无调用 push 快速路径，
@@ -1027,6 +1035,87 @@ pub kimo cg_array_direct_ok(ek: int) -> int {
     return 0;
 }
 
+// 越界访问的两个中转单元（模块级唯一、8 字节、零初始化、private）：
+//   sink —— 越界写落这里被丢弃（与 shadow_array_set_* 的丢弃语义一致）；
+//   zero —— 越界读从这里取，且永不写入，所以读出来恒为 0：int→0、float→0.0、
+//           指针→null、char/short/bool 截断后→0，与 shadow_array_get_* 完全同值。
+// 两者分开是必须的：共用一格会让"先越界写、再越界读"把写进去的位模式读回来，
+// 那条指针还可能是早已作废的地址，被当成活的 GC 引用扎根。
+let cg_oob_sink_g: any = 0 as any;
+let cg_oob_zero_g: any = 0 as any;
+
+kimo cg_oob_new_global(name: string) -> any {
+    let i64_ty = llvm_i64(cg_ctx);
+    let g = llvm_add_global(cg_mod, i64_ty, name);
+    llvm_set_init(g, llvm_const_int(i64_ty, 0, 0));
+    llvm_set_linkage(g, 9);  // LLVMPrivateLinkage
+    return g;
+}
+
+pub kimo cg_get_oob_sink_ptr() -> any {
+    if ((cg_oob_sink_g as any) != 0) { return cg_oob_sink_g; }
+    cg_oob_sink_g = cg_oob_new_global("shadow_oob_sink");
+    return cg_oob_sink_g;
+}
+
+pub kimo cg_get_oob_zero_ptr() -> any {
+    if ((cg_oob_zero_g as any) != 0) { return cg_oob_zero_g; }
+    cg_oob_zero_g = cg_oob_new_global("shadow_oob_zero");
+    return cg_oob_zero_g;
+}
+
+// 数组下标护栏条件：i1 = (0 <= idx && idx < cap)。
+// cap 由数组头 offset 4 直读（cg_array_hdr_load_i32），全程不发 call，
+// 故帧/安全点判定（cg_inst_safepoint / cg_prescan_kind）不受影响。
+// 按 cap 而非 len 判定：预分配窗口 [len,cap) 的直写是合法的（数组填充循环先写数据、
+// 出循环一次性 set_len），runtime_lib.shadow 的 shadow_array_idx_ok 同式（亦为有符号）。
+//
+// 四条走过的弯路，数字都出自同一轮五臂 A/B（build/logs/ab3.sh：每臂独立目录、IR 与
+// exe 的 md5 两两不同、护栏站点数与臂定义逐条断言、stdout 逐字节一致、best-of-3 交错），
+// 括号内是相对"完全不发护栏"的 HEAD 编译器，顺序 list / permute / queens / towers。
+// 落地前又在空闲机器上按 best-of-5、三臂顺序轮换复测过一轮（build/logs/ig_retaste.sh），
+// 两轮数字互差 ≤3 个点，下面取空闲轮：
+//   1) 头读走 ptrtoint→add→inttoptr 整数地址链（+11.4 / +73.4 / +31.2 / +19.3）。
+//   2) 头读改真 i8 GEP + bitcast（+9.8 / +73.0 / +31.3 / +14.8）。
+//      对照 1) 只回收 1~3 个点——当初据此写下"单这一步回收 11~14%、list 甚至快过基线"
+//      是错的，那个数字来自一条臂定义混了的比较，别照它判断。整数地址链确实该换掉
+//      （它让每条 store 之后都得重载 cap，且语义上是在造 LLVM 无法追踪的指针），
+//      但代价的主体从来不是头读形式，而是护栏自身那几条依赖指令：permute 每轮 8 次
+//      下标访问都在热递归里，于是 +73%。
+//   3) 给这条 cap 装载挂 !invariant.group，声称"同一对象内 cap 恒等值"来消掉重载
+//      （+17.1 / +54.9 / +27.1 / +11.3）：permute 省 18 个点、queens/towers 各省 3~4 个点，
+//      只有 list 亏 7 个点——四臂里三臂净赚，所以"标记没用、整套删掉"是删早了。
+//      本次落地仍不带它，只因为它必须经 C++ shim 才能挂上（Shadow 侧 @extern 直调
+//      LLVMMDNodeInContext2 实测就崩，LLVM 22 把 LLVMMetadataRef 与 LLVMValueRef
+//      分成两套句柄、长度参数又是 size_t，同样这串调用在 C++ 里能正常出 !{}），
+//      恢复它得连同双平台四档门禁重跑，值得单独一轮改动。
+//      更该走的路是编译器侧自己把"同一数组的 cap 在一个无别名写区域内只读一次"做掉，
+//      那样连 list 那 7 个点的亏也能一并省掉。
+//   4) 判据折成一次无符号比较 idx_u < cap_u（省两条指令）：当年那一轮确实测到明显变慢，
+//      但同一轮里两臂的差别不止比较形式，数字不能算干净，所以这里不引它。
+//      不采用它的理由是确定的：它要额外依赖"头里的 cap 恒非负"这个前提（rt 侧
+//      rt_array_block 与 shadow_array_new 都先把负数夹成 0 才成立），而
+//      runtime_lib.shadow 那侧是有符号式——同一条判据两处同形，比省两条指令值钱。
+// 结论：判据保持朴素有符号三段（load cap + icmp sge + icmp slt + and）+ 真 GEP 头读。
+// 要再往下压，方向是 3) 的不变性表达（或它的编译器侧等价物），其次是换判据形状
+// （比如 cond_br + phi 让界内路径用裸 GEP）。
+// 度量纪律：曾经因为 A/B 脚本让各臂共用同一个输出路径、某臂编译失败后 cp 静默复用了
+// 上一臂的产物，把"护栏近乎免费"写成了结论——两臂跑的其实是同一个文件。
+
+pub kimo cg_array_idx_ok(arr_val: any, idx_val: any, ik: int, tag: string) -> any {
+    let cap = cg_array_hdr_load_i32(arr_val, 4, "oobcap" + tag);
+    // long 下标时把 cap 零扩展到 64 位（头里的 cap 恒非负），两侧同宽再比。
+    let idx_ty = llvm_i32(cg_ctx);
+    if (ik == TYPE_LONG) { idx_ty = llvm_i64(cg_ctx); }
+    let cap_cmp = cap;
+    if (ik == TYPE_LONG) {
+        cap_cmp = llvm_zext(cg_builder, cap, idx_ty, "oobcapw" + tag);
+    }
+    let lo_ok = llvm_icmp(cg_builder, LLVM_INT_SGE, idx_val, llvm_const_int(idx_ty, 0, 0), "ooblo" + tag);
+    let hi_ok = llvm_icmp(cg_builder, LLVM_INT_SLT, idx_val, cap_cmp, "oobhi" + tag);
+    return llvm_and(cg_builder, lo_ok, hi_ok, "oobok" + tag);
+}
+
 // 计算数组元素指针：用真实 GEP，不再拼整数地址。
 // 旧实现 ptrtoint → mul → add → inttoptr 让 LLVM 完全看不到指针结构，
 // 别名分析失效、元素访问无法与相邻访存合并或提升为寄存器；实测
@@ -1047,7 +1136,8 @@ pub kimo cg_array_elem_ptr(arr_val: any, idx_val: any, ik: int, slot_ty: any) ->
 }
 
 // 直接 GEP+load 数组元素（char/short/bool 以 4 字节槽存储，读后截断到实际宽度）
-pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int, ek: int) -> void {
+// inb=1：MIR 已证明下标恒在界内（数组填充循环强度削减），免护栏。
+pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int, ek: int, inb: int) -> void {
     let es = cg_elem_size(ek);
     let slot_ty = llvm_i32(cg_ctx);
     if (es == 8) {
@@ -1055,7 +1145,16 @@ pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int,
         else if (cg_is_ptr_kind(ek) == 1) { slot_ty = llvm_ptr_ty(llvm_i8(cg_ctx), 0); }
         else { slot_ty = llvm_i64(cg_ctx); }
     }
+    let tag = int_to_str(cg_oob_counter);
+    let ok: any = 0 as any;
+    if (inb == 0) {
+        cg_oob_counter = cg_oob_counter + 1;
+        ok = cg_array_idx_ok(arr_val, idx_val, ik, tag);
+    }
     let ptr = cg_array_elem_ptr(arr_val, idx_val, ik, slot_ty);
+    if (inb == 0) {
+        ptr = llvm_select(cg_builder, ok, ptr, cg_get_oob_zero_ptr(), "oobptr" + tag);
+    }
     let val = llvm_load(cg_builder, slot_ty, ptr, "arrval");
     if (ek == TYPE_CHAR) { val = llvm_trunc(cg_builder, val, llvm_i8(cg_ctx), "chtrunc"); }
     else if (ek == TYPE_SHORT) { val = llvm_trunc(cg_builder, val, llvm_i16(cg_ctx), "shtrunc"); }
@@ -1067,7 +1166,8 @@ pub kimo cg_gen_array_load_direct(dst: int, arr_val: any, idx_val: any, ik: int,
 
 // 直接 GEP+store 数组元素（标量无需写屏障；char/short/bool 扩展回 4 字节槽；
 // 指针元素补发 rt_gc_write_barrier——分代 GC 需把 old→young 引用记入 remembered set）
-pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int, val_val: any, vk: int) -> void {
+// inb=1：MIR 已证明下标恒在界内（数组填充循环强度削减），免护栏。
+pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int, val_val: any, vk: int, inb: int) -> void {
     let es = cg_elem_size(ek);
     let slot_ty = llvm_i32(cg_ctx);
     if (es == 8) {
@@ -1075,7 +1175,18 @@ pub kimo cg_gen_array_store_direct(arr_val: any, idx_val: any, ik: int, ek: int,
         else if (cg_is_ptr_kind(ek) == 1) { slot_ty = llvm_ptr_ty(llvm_i8(cg_ctx), 0); }
         else { slot_ty = llvm_i64(cg_ctx); }
     }
+    let tag = int_to_str(cg_oob_counter);
+    let ok: any = 0 as any;
+    if (inb == 0) {
+        cg_oob_counter = cg_oob_counter + 1;
+        ok = cg_array_idx_ok(arr_val, idx_val, ik, tag);
+    }
     let ptr = cg_array_elem_ptr(arr_val, idx_val, ik, slot_ty);
+    // 越界写改落 sink 单元：不拆分基本块（每条 store 三块会让 IR 与编译时间翻倍），
+    // 且 store 保持无分支——分支会把整个循环踢出向量化。
+    if (inb == 0) {
+        ptr = llvm_select(cg_builder, ok, ptr, cg_get_oob_sink_ptr(), "oobptr" + tag);
+    }
     let sv = cg_cast_val(val_val, vk, ek);
     if (ek == TYPE_CHAR) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "chzext"); }
     else if (ek == TYPE_SHORT) { sv = llvm_zext(cg_builder, sv, llvm_i32(cg_ctx), "shzext"); }
@@ -1602,7 +1713,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         // 静态类型标量数组 → 直接 GEP+load，绕过运行时函数
         let ik = cg_get_reg_kind(mi.arg2);
         if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
-            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek);
+            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek, 0);
             return;
         }
         let arg_vals: array<any> = [];
@@ -1764,7 +1875,9 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         let ek = cg_type_kind(mi.ty);
         let ik = cg_get_reg_kind(mi.arg2);
         if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
-            cg_gen_array_store_direct(arr_val, idx_val, ik, ek, val_val, vk);
+            let inb = 0;
+            if ((mi.longval as int) != 0) { inb = 1; }
+            cg_gen_array_store_direct(arr_val, idx_val, ik, ek, val_val, vk, inb);
             return;
         }
         let arg_vals: array<any> = [];
@@ -3266,6 +3379,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
     cg_poll_skip_bb = 0 as any;
     cg_poll_counter = 0;
     cg_push_counter = 0;
+    cg_oob_counter = 0;
     // frame_head 槽地址缓存：存的是上一函数 entry 块的指令结果，必须清空，
     // 否则会被跨函数引用而成为畸形 IR。
     cg_frame_head_slot = 0 as any;

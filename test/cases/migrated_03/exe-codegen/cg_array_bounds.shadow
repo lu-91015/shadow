@@ -1,0 +1,69 @@
+//@expect: 1048575
+//@ desc: v10_s19 数组下标护栏：直接 GEP 读写与运行时 get/set 两条路径的越界行为必须一致
+//@       （越界读回 0、越界写丢弃），且越界访问不得碰到数组对象之外的内存。
+//@       判别力来自「越界写后立刻同址读回」：无护栏时 store 与 load 算出同一地址，
+//@       store-to-load forwarding 会让读回写进去的值，本用例即失败——所以它真的能证明
+//@       护栏在位（只测「越界读回 0」是无效判别：新堆本来就是 0）。
+//@       同时覆盖填充循环削减（v10_s18）免护栏直写的边界：容量按 64 位精确算出，
+//@       计数器为 long 时也不再截断。
+dsb cg_array_bounds;
+
+kimo main() -> int {
+    let sum = 0;
+    let big = 100000;
+    let neg = -7;
+
+    // (1) 直接 GEP 路径：静态 array<int> + int 下标
+    let a: array<int> = [1, 2, 3];
+    a = array_push(a, 4);
+    a = array_push(a, 5);
+    if (a[big] == 0) { sum = sum + 1; }
+    if (a[neg] == 0) { sum = sum + 2; }
+    a[big] = 12345;
+    a[neg] = 12345;
+    if (a[big] == 0) { sum = sum + 16; }      // 写进 sink，不许被同址读回
+    if (a[neg] == 0) { sum = sum + 32; }
+    if (len(a) == 5) { sum = sum + 4; }
+    if (a[0] + a[1] + a[2] + a[3] + a[4] == 15) { sum = sum + 8; }
+
+    // (2) 邻近数组没被越界写花（越过 cap 的写以前会直接 scribble 堆）
+    let b: array<int> = [7, 8, 9];
+    if (b[0] + b[1] + b[2] == 24) { sum = sum + 64; }
+
+    // (3) 削减后的填充数组：界内直写正常，界外同样回 0 / 丢弃
+    let c: array<int> = [];
+    let i = 0;
+    while (i < 6) { c = array_push(c, i + 1); i = i + 1; }
+    if (len(c) == 6) { sum = sum + 128; }
+    if (c[0] + c[5] == 7) { sum = sum + 256; }
+    if (c[big] == 0) { sum = sum + 512; }
+    c[big] = 99;
+    c[neg] = 99;
+    if (c[big] == 0) { sum = sum + 2048; }    // 同上：写后同址读回仍是 0
+    if (c[0] == 1) { sum = sum + 1024; }
+
+    // (4) long 计数器的填充循环：容量在 64 位里算，下标不再被截成 int32
+    let L: array<int> = [];
+    let li: long = 3;
+    while (li < 9) { L = array_push(L, li as int); li = li + 1; }
+    if (len(L) == 6) { sum = sum + 4096; }
+    if (L[0] + L[5] == 11) { sum = sum + 8192; }
+    let lb: long = 5000;
+    if (L[lb] == 0) { sum = sum + 16384; }
+    L[lb] = 7;
+    if (L[lb] == 0) { sum = sum + 65536; }    // 64 位下标的写后读回
+    let lneg: long = -9;
+    L[lneg] = 7;
+    if (L[lneg] == 0) { sum = sum + 131072; } // 负 long 下标无符号化后仍是野值
+    if (L[3] == 6) { sum = sum + 32768; }
+
+    // (5) 运行时函数路径：基座是 any 时走 shadow_array_get_*/set_*（同样已加护栏）
+    let m = [10, 20, 30];
+    let u = m as any;
+    if ((u[1] as int) == 20) { sum = sum + 262144; }
+    u[big] = 4444;
+    if ((u[big] as int) == 0) { sum = sum + 524288; }
+
+    println(sum);
+    return 0;
+}

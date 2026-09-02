@@ -2904,13 +2904,39 @@ extern int32_t shadow_index_of_fast(void* s, void* needle) {
     }
 }
 
+/* 数组块分配的统一咽喉：把"请求 cap 个元素"变成硬保证 —— 要么拿到一块**物理上确实
+ * 装得下 cap 个元素**的内存，要么明确死掉。
+ * 原先各路径直接 `shadow_gc_alloc(12 + cap * es)`：整式在 int32 里算，cap 到 5.4 亿
+ * （es=4）就回绕，而 rt_alloc_impl 收到负数按 0 分配 —— 于是头里的 cap 远大于块能装的
+ * 元素数，之后任何一次按下标写都是成片堆越界写（GC 只看到一个小对象）。
+ * 编译器 v10_s18 的填充循环免检直写也依赖这条不变式：它按下标写而不再逐次问运行时。 */
+#define RT_ARRAY_MAX_BYTES 0x7FFFF000   /* < INT_MAX：留给头部与 8 字节对齐 */
+extern void shadow_panic_msg(const char* msg);
+static void* rt_array_block(int32_t cap, int32_t es) {
+    uint64_t need;
+    void* p;
+    if (cap < 0) cap = 0;
+    if (es < 4 || es > 8) es = 8;       /* 头被写坏时按最宽槽处理，宁可少装也不越界 */
+    need = 12ull + (uint64_t)(uint32_t)cap * (uint64_t)(uint32_t)es;
+    if (need > (uint64_t)RT_ARRAY_MAX_BYTES) {
+        shadow_panic_msg("array: capacity too large");
+        return NULL;
+    }
+    p = shadow_gc_alloc((int32_t)need, 2);
+    if (!p) {
+        shadow_panic_msg("array: out of memory");
+        return NULL;
+    }
+    return p;
+}
+
 /* 快速路径 array_push（shadow 层 C 布局数组，kind=2）：
  * 单次 C 调用完成 len/cap 读取 + 扩容 + 元素写入 + len 更新，
  * 消除 shadow 层每次 push 的多次 extern 调用。语义与 runtime_lib.shadow
  * 的 shadow_array_push_* 完全一致（含 null 首推、2x 倍增扩容、es 4/8 分派）。 */
 extern void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
     if (!array_ptr) {
-        void* na = shadow_gc_alloc(12 + 4 * 4, 2);
+        void* na = rt_array_block(4, 4);
         *(int32_t*)na = 1;
         *(int32_t*)((char*)na + 4) = 4;
         *(int32_t*)((char*)na + 8) = 4;
@@ -2924,7 +2950,7 @@ extern void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
     if (len >= cap) {
         int32_t nc = cap * 2;
         if (nc == 0) nc = 4;
-        na = shadow_gc_alloc(12 + nc * es, 2);
+        na = rt_array_block(nc, es);
         shadow_gc_root_set(&na, na);
         memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
         *(int32_t*)na = len;
@@ -2932,7 +2958,7 @@ extern void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
         *(int32_t*)((char*)na + 8) = es;
         array_ptr = na;
     }
-    int32_t off = 12 + len * es;
+    int64_t off = 12 + (int64_t)len * es;
     if (es == 4) *(int32_t*)((char*)array_ptr + off) = val;
     else *(int64_t*)((char*)array_ptr + off) = val;
     *(int32_t*)array_ptr = len + 1;
@@ -2941,7 +2967,7 @@ extern void* shadow_array_push_int_fast(void* array_ptr, int32_t val) {
 }
 extern void* shadow_array_push_long_fast(void* array_ptr, int64_t val) {
     if (!array_ptr) {
-        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        void* na = rt_array_block(4, 8);
         *(int32_t*)na = 1;
         *(int32_t*)((char*)na + 4) = 4;
         *(int32_t*)((char*)na + 8) = 8;
@@ -2955,7 +2981,7 @@ extern void* shadow_array_push_long_fast(void* array_ptr, int64_t val) {
     if (len >= cap) {
         int32_t nc = cap * 2;
         if (nc == 0) nc = 4;
-        na = shadow_gc_alloc(12 + nc * es, 2);
+        na = rt_array_block(nc, es);
         shadow_gc_root_set(&na, na);
         memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
         *(int32_t*)na = len;
@@ -2963,7 +2989,7 @@ extern void* shadow_array_push_long_fast(void* array_ptr, int64_t val) {
         *(int32_t*)((char*)na + 8) = es;
         array_ptr = na;
     }
-    int32_t off = 12 + len * es;
+    int64_t off = 12 + (int64_t)len * es;
     if (es == 4) *(int32_t*)((char*)array_ptr + off) = (int32_t)val;
     else *(int64_t*)((char*)array_ptr + off) = val;
     *(int32_t*)array_ptr = len + 1;
@@ -2972,7 +2998,7 @@ extern void* shadow_array_push_long_fast(void* array_ptr, int64_t val) {
 }
 extern void* shadow_array_push_float_fast(void* array_ptr, double val) {
     if (!array_ptr) {
-        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        void* na = rt_array_block(4, 8);
         *(int32_t*)na = 1;
         *(int32_t*)((char*)na + 4) = 4;
         *(int32_t*)((char*)na + 8) = 8;
@@ -2986,7 +3012,7 @@ extern void* shadow_array_push_float_fast(void* array_ptr, double val) {
     if (len >= cap) {
         int32_t nc = cap * 2;
         if (nc == 0) nc = 4;
-        na = shadow_gc_alloc(12 + nc * es, 2);
+        na = rt_array_block(nc, es);
         shadow_gc_root_set(&na, na);
         memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
         *(int32_t*)na = len;
@@ -2994,7 +3020,7 @@ extern void* shadow_array_push_float_fast(void* array_ptr, double val) {
         *(int32_t*)((char*)na + 8) = es;
         array_ptr = na;
     }
-    int32_t off = 12 + len * es;
+    int64_t off = 12 + (int64_t)len * es;
     if (es == 4) *(float*)((char*)array_ptr + off) = (float)val;
     else *(double*)((char*)array_ptr + off) = val;
     *(int32_t*)array_ptr = len + 1;
@@ -3003,7 +3029,7 @@ extern void* shadow_array_push_float_fast(void* array_ptr, double val) {
 }
 extern void* shadow_array_push_ptr_fast(void* array_ptr, void* val) {
     if (!array_ptr) {
-        void* na = shadow_gc_alloc(12 + 4 * 8, 2);
+        void* na = rt_array_block(4, 8);
         *(int32_t*)na = 1;
         *(int32_t*)((char*)na + 4) = 4;
         *(int32_t*)((char*)na + 8) = 8;
@@ -3017,7 +3043,7 @@ extern void* shadow_array_push_ptr_fast(void* array_ptr, void* val) {
     if (len >= cap) {
         int32_t nc = cap * 2;
         if (nc == 0) nc = 4;
-        na = shadow_gc_alloc(12 + nc * es, 2);
+        na = rt_array_block(nc, es);
         shadow_gc_root_set(&na, na);
         memcpy((char*)na + 12, (char*)array_ptr + 12, (size_t)len * es);
         *(int32_t*)na = len;
@@ -3025,7 +3051,7 @@ extern void* shadow_array_push_ptr_fast(void* array_ptr, void* val) {
         *(int32_t*)((char*)na + 8) = es;
         array_ptr = na;
     }
-    int32_t off = 12 + len * es;
+    int64_t off = 12 + (int64_t)len * es;
     if (es == 4) *(int32_t*)((char*)array_ptr + off) = (int32_t)(intptr_t)val;
     else *(void**)((char*)array_ptr + off) = val;
     *(int32_t*)array_ptr = len + 1;

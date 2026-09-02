@@ -1887,8 +1887,15 @@ kimo main_mod_in_src(idx: int) -> int {
 //   shadow_array_set_len 一次补上，于是 loop-carried 的 load len→store len+1 链消失、
 //   循环体可向量化。容量同步改准为 n-base（按下标写越过 cap 是堆越界，不再由扩容兜底）。
 //   旧 v10_s17 缓存 IR 仍是逐元素 append → 需整体失效。
+// v10_s19：数组按下标访问补上真正的运行时护栏。codegen 的直接 GEP 读写先前无条件下标，
+//   越界即成片堆读写；现在每条直读直写都过一遍 (0 <= idx < cap) 的无调用判定，不成立时
+//   落到一个 8 字节 private 全局（读回 0/null、写被丢弃），与 runtime_lib 的 get/set 越界
+//   语义一致。v10_s18 那批由变换自身证明在界内的存储以 MIR_STORE_INDEX.longval=1 免护栏，
+//   其成立前提（容量在 64 位里精确算出、界与计数器在体内不可动）也由同一批改动钉死；
+//   runtime 侧数组字节数算式改为 64 位并按硬上限判死，使头里的 cap 恒等于物理容量。
+//   旧 v10_s18 缓存 IR 不含护栏、对象容量约束也不同 → 需整体失效。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s18_" + main_hash_src(path);
+    return main_lu_base + "/v10_s19_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。

@@ -49,6 +49,8 @@ pub kimo rt_free(p: any) -> void {}
 @extern("rt_alloc_cap") kimo rt_alloc_cap(p: any) -> int { return 0; }
 @extern("shadow_string_char_at") kimo shadow_string_char_at(s: any, idx: int) -> int { return 0; }
 @extern("shadow_string_cache_set") kimo shadow_string_cache_set(p: any, len: int, cap: int) -> void {}
+// 提前声明：数组分配的尺寸硬上限判定要用它（见 shadow_array_new）。
+@extern("shadow_panic_msg") kimo rt_panic_msg(msg: any) -> void {}
 
 // === String operations ===
 pub kimo shadow_string_concat(s1: any, s2: any) -> any {
@@ -142,9 +144,16 @@ pub kimo shadow_float_to_str(v: double) -> any {
 // 布局: [len:int@0][cap:int@4][elem_size:int@8][data:bytes@12+]
 // GC 扫描：elem_size==8 时保守逐元素查对象表（值恰好为堆指针才追踪）
 pub kimo shadow_array_new(elem_size: int, cap: int) -> any {
-    let header: int = 12;
-    let total: int = header + cap * elem_size;
-    let p: any = shadow_gc_alloc(total, 2);
+    if (elem_size < 4 || elem_size > 8) { elem_size = 8; }
+    if (cap < 0) { cap = 0; }
+    // 字节数必须用 64 位算：旧式 `12 + cap * elem_size` 在 int32 里于 cap≥5.4 亿（es=4）
+    // 时回绕成小数，而分配器收到负数还会按 0 分配 —— 于是头里的 cap 远大于块真正装得下
+    // 的元素数，之后任何一次按下标写都是成片堆越界写（GC 只看见一个小对象，更无从发现）。
+    // 现在把"请求即所得"变成硬保证：要么给足 cap 个元素，要么明确死掉。
+    let total: long = 12 + (cap as long) * (elem_size as long);
+    if (total > 2147479552) { rt_panic_msg("array: capacity too large"); }
+    let p: any = shadow_gc_alloc(total as int, 2);
+    if (p == null) { rt_panic_msg("array: out of memory"); }
     rt_store_int(p, 0, 0);
     rt_store_int(p, 4, cap);
     rt_store_int(p, 8, elem_size);
@@ -157,6 +166,18 @@ pub kimo shadow_array_new(elem_size: int, cap: int) -> any {
 pub kimo shadow_array_prealloc(elem_size: int, cap: int) -> any {
     if (cap < 0) { cap = 0; }
     return shadow_array_new(elem_size, cap);
+}
+
+// 同上，但容量按 64 位给出（编译器 v10_s19 的填充循环削减发这条）。
+// 循环实际写入数 = n - base，这个减法在 int32 里会回绕：base = -15 亿、n = 12 亿
+// 时真值 27 亿回绕成负数，夹到 0 后只分配 12 字节，而削减出来的直写不带护栏，
+// 头几亿次写全落在对象外（GC 只看见一个 12 字节对象，绝不可能发现）。
+// 所以在算容量的一步就用 64 位判死：要么给足，要么明确 panic。
+pub kimo shadow_array_prealloc_l(elem_size: int, cap: long) -> any {
+    if (cap <= 0) { return shadow_array_new(elem_size, 0); }
+    let c: int = 2147483647;
+    if (cap < 2147483647) { c = cap as int; }
+    return shadow_array_new(elem_size, c);
 }
 
 // 填充循环计数存储削减（编译器 v10_s18）：循环体内按下标直写元素、len 留到循环出口一次
@@ -198,7 +219,6 @@ pub kimo shadow_array_grow(arr: any, new_cap: int) -> any {
 }
 
 @extern("shadow_throw_str") kimo rt_throw_str(msg: any) -> void {}
-@extern("shadow_panic_msg") kimo rt_panic_msg(msg: any) -> void {}
 @extern("shadow_exception_occurred") kimo rt_exception_occurred() -> int { return 0; }
 @extern("shadow_exception_clear") kimo rt_exception_clear() -> void {}
 
@@ -325,7 +345,18 @@ pub kimo shadow_array_pop(arr: any) -> any {
     return v;
 }
 
+// 下标是否落在对象内：负数与 idx >= cap 都算越界（读回零值、写丢弃）。
+// 判的是 cap 而不是 len —— 往 len 与 cap 之间的空槽写本来就合法且有用（预分配区、
+// 以及编译器 v10_s18 填充循环的"先直写、出口一次补 len"），判 len 会把它们整个拒掉。
+kimo shadow_array_idx_ok(arr: any, idx: int) -> int {
+    if (arr == null) { return 0; }
+    if (idx < 0) { return 0; }
+    if (idx >= rt_load_int(arr, 4)) { return 0; }
+    return 1;
+}
+
 pub kimo shadow_array_get_int(arr: any, idx: int) -> int {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return 0; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { return rt_load_int(arr, off); }
@@ -333,6 +364,7 @@ pub kimo shadow_array_get_int(arr: any, idx: int) -> int {
 }
 
 pub kimo shadow_array_get_long(arr: any, idx: int) -> long {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return 0; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { return rt_load_int(arr, off) as long; }
@@ -340,12 +372,14 @@ pub kimo shadow_array_get_long(arr: any, idx: int) -> long {
 }
 
 pub kimo shadow_array_get_float(arr: any, idx: int) -> double {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return 0.0; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     return rt_load_float(arr, off);
 }
 
 pub kimo shadow_array_get_ptr(arr: any, idx: int) -> any {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return null; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { return rt_load_int(arr, off) as any; }
@@ -353,6 +387,7 @@ pub kimo shadow_array_get_ptr(arr: any, idx: int) -> any {
 }
 
 pub kimo shadow_array_set_int(arr: any, idx: int, val: int) -> void {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { rt_store_int(arr, off, val); return; }
@@ -360,6 +395,7 @@ pub kimo shadow_array_set_int(arr: any, idx: int, val: int) -> void {
 }
 
 pub kimo shadow_array_set_long(arr: any, idx: int, val: long) -> void {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { rt_store_int(arr, off, val as int); return; }
@@ -367,12 +403,14 @@ pub kimo shadow_array_set_long(arr: any, idx: int, val: long) -> void {
 }
 
 pub kimo shadow_array_set_float(arr: any, idx: int, val: double) -> void {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     rt_store_float(arr, off, val);
 }
 
 pub kimo shadow_array_set_ptr(arr: any, idx: int, val: any) -> void {
+    if (shadow_array_idx_ok(arr, idx) == 0) { return; }
     let es: int = shadow_array_elem_size(arr);
     let off: int = 12 + idx * es;
     if (es == 4) { rt_store_int(arr, off, val as int); return; }

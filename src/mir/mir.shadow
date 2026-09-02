@@ -215,6 +215,29 @@ kimo mir_sred_body_ok(body: array<HirStmt>, slots: array<int>, i_slot: int) -> i
     return 1;
 }
 
+// 能否把这个类型安全地拓宽成 long（i64）？拓宽用于把"循环写入数"放到 64 位里算，
+// 所以必须是宽度确定的整型；类型缺失的一律拒（宁可不优化，也不能拿未知宽度当 64 位用）。
+kimo mir_sred_widen_ty_ok(ty: Type) -> int {
+    if ((ty as any) == 0) { return 0; }
+    let k = ty.kind;
+    if (k == TYPE_LONG || k == TYPE_INT || k == TYPE_CHAR || k == TYPE_SHORT ||
+        k == TYPE_BOOL || k == TYPE_ENUM || k == TYPE_DATE) { return 1; }
+    return 0;
+}
+
+// 发一条拓宽到 long 的转换；已是 TYPE_LONG 就原样返回。调用方必须先用
+// mir_sred_widen_ty_ok 验过类型，否则这里可能发出 sext i64→i64 这类畸形指令。
+kimo mir_sred_widen(r: int, ty: Type) -> int {
+    if (ty.kind == TYPE_LONG) { return r; }
+    let r2 = mir_new_reg();
+    let cv = mir_mk(MIR_CAST);
+    cv.dst = r2;
+    cv.arg1 = r;
+    cv.ty = mk_type(TYPE_LONG);
+    mir_emit(cv);
+    return r2;
+}
+
 // 判定 + 建上下文 + 把预分配容量改准为 n - base。返回 -1 表示不适用；否则返回装
 // "实际元素数"的寄存器 id（>0），调用方用它作为预分配容量。
 // 容量必须按"实际写入次数"给：base>0 时迭代数 = n - base < n，而按下标写 data 时
@@ -229,9 +252,13 @@ kimo mir_sred_begin(cond: HirExpr, body: array<HirStmt>, slots: array<int>,
     let i_h = bch[0];
     let ity = i_h.inferred_type;
     if ((ity as any) == 0) { return -1; }
-    // codegen 的直接 GEP 只对 int/long 下标启用；否则 a[k]=v 会退回运行时 set，
-    // 而运行时 set 对"index >= len"的写入是丢弃的 —— 静默少写元素。
+    // 下标只认 int/long：codegen 的直接 GEP 也仅此两者启用，其它类型会退回运行时
+    // set，而运行时 set 对"index >= cap"的写入是丢弃的 —— 静默少写元素。
     if (ity.kind != TYPE_INT && ity.kind != TYPE_LONG) { return -1; }
+    // 界变量的类型必须能安全拓宽到 long（容量要在 64 位里算，见下）。验不出来就
+    // 在这里放弃削减，且此刻还没发任何指令，回退是干净的。
+    let nty = bch[1].inferred_type;
+    if (mir_sred_widen_ty_ok(nty) == 0) { return -1; }
     let si = 0;
     while (si < len(slots)) {
         let s0 = slots[si];
@@ -243,13 +270,18 @@ kimo mir_sred_begin(cond: HirExpr, body: array<HirStmt>, slots: array<int>,
     if (mir_sred_body_ok(body, slots, i_h.slot) == 0) { return -1; }
     mir_sred_i_h = i_h;
     mir_sred_base_reg = mir_lower_expr(i_h);
+    // 迭代数 = n - base 必须在 64 位里算：int32 会回绕（base=-15 亿、n=12 亿 → 真值
+    // 27 亿回绕成负），而负容量被运行时夹成 0，于是削减出来的无护栏直写全部落在
+    // 12 字节对象之外 —— 那是成片堆越界写，GC 只看见一个小对象，绝查不出来。
     let cnt = mir_new_reg();
+    let n_w = mir_sred_widen(n_reg, nty);
+    let base_w = mir_sred_widen(mir_sred_base_reg, ity);
     let sb = mir_mk(MIR_BINOP);
     sb.dst = cnt;
-    sb.arg1 = n_reg;
-    sb.arg2 = mir_sred_base_reg;
+    sb.arg1 = n_w;
+    sb.arg2 = base_w;
     sb.longval = BIN_SUB;
-    sb.ty = ity;
+    sb.ty = mk_type(TYPE_LONG);
     mir_emit(sb);
     mir_sred_slots = slots;
     mir_sred_n = len(slots);
@@ -339,6 +371,16 @@ kimo mir_sred_try_store(lhs_slot: int, call_h: HirExpr) -> int {
     st.arg2 = idx;
     st.ty = args[0].inferred_type.elem_type;
     st.args = array_push([], v_reg);
+    // longval=1 告诉 codegen"这条下标恒在界内，免运行时护栏"。依据是四条合起来：
+    //   1) 预分配容量按 64 位精确算出（mir_sred_begin），要么给足要么 panic，所以
+    //      对象头里的 cap 就是物理容量（runtime 侧同一约束）；
+    //   2) 界是变量或字面量，且 mir_sred_body_ok 要求体内每条语句只能是目标的
+    //      append 或那次 i += 1 —— 界与下标在体内都不可能被动到；
+    //   3) 计数器从 base 起单调 +1，故 i - base 从 0 逐一到迭代数-1，且迭代数 ≤ 2^31
+    //      （否则第 1 条已经 panic），下标在 int32 里不会回绕；
+    //   4) adj 那条分支把"先自增后 append"的下标再减 1，取值区间与不调整时一致。
+    // 任何一条以后被放宽，这里就必须改成 0（护栏回来），否则分析出错会直接变成堆写坏。
+    st.longval = 1;
     mir_emit(st);
     return 1;
 }
@@ -1752,8 +1794,13 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             // v10_s18：形状条件更严时把逐元素 append 改成计数下标直写。按下标写一旦越过
             // cap 就是堆越界（原先由 push 的扩容接住），所以容量改准为实际写入数 n - base。
             let cap_reg = n_reg;
+            let cap_fn = "shadow_array_prealloc";
             let sred_cnt = mir_sred_begin(cond, h.body, pre_slots, n_reg);
-            if (sred_cnt >= 0) { cap_reg = sred_cnt; }
+            if (sred_cnt >= 0) {
+                cap_reg = sred_cnt;
+                // 削减启用后容量是 64 位精确计数（不在 int32 里回绕），走 _l 版本。
+                cap_fn = "shadow_array_prealloc_l";
+            }
             let pi = 0;
             while (pi < len(pre_slots)) {
                 let pslot = pre_slots[pi];
@@ -1773,7 +1820,7 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                 let r = mir_new_reg();
                 let call = mir_mk(MIR_CALL);
                 call.dst = r;
-                call.strval = "shadow_array_prealloc";
+                call.strval = cap_fn;
                 call.args = [es_reg, cap_reg];
                 call.ty = pty;
                 mir_emit(call);
