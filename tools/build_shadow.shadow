@@ -1,8 +1,8 @@
 // Shadow 0.5 — 自举构建脚本（Shadow 原生版，替代 build_shadow.sh）
 //
-// 自举接力：本文件由【上一轮自举产物 build/shadow.exe】编译为 build/build_shadow.exe
+// 自举接力：本文件由【冻结的 build/shadow.exe】编译为 build/build_shadow.exe
 // （鸡生蛋问题的标准解法：用上一轮的编译器编出本轮的构建工具）。运行时执行
-// 7 阶段自举：预编译 rt 对象 -> 上一轮自举产物 HOST 编 stage1 -> 逐级自举 stage2/3 ->
+// 7 阶段自举：预编译 rt 对象 -> 冻结 HOST 编 stage1 -> 逐级自举 stage2/3 ->
 // 固定点验证 -> 部署为 build/shadow.exe -> 编全部 rt/*.c -> 冒烟。
 //
 // 用法（仓库根执行）：
@@ -13,7 +13,7 @@
 //
 // 说明：
 //   - rt_sys_exec 由编译器作为内建提供（无需 @extern）；env_get 需显式声明。
-//   - 全程相对路径（cwd=仓库根），LLVM 路径与 rt/ 均不含空格。
+//   - 全程相对路径（cwd=仓库根），LLVM 路径与 bootstrap/ 均不含空格。
 //   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；用「产物是否非空 /
 //     字节比对」近似原 .sh 的 set -e 与 python verify_fixed_point.py 语义。
 
@@ -80,20 +80,20 @@ kimo main() -> int {
     rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
     // 用户程序 runtime 的辅助对象（main_link_exe 从 self_dir/rt/ 精确取这些名字）
-    // miniz：源与头均已入库（rt/miniz.c + rt/miniz.h），一律现编，绝不复制预编译 .o。
-    // 同时产出 build/rt/miniz.o —— [1/7]/[2/7] 的 stage 链接行直接引用该路径。
-    rt_sys_exec(clang_c + " -O1 -I " + boot + " -c " + boot + "/miniz.c -o "build/rt/miniz.o");
+    // miniz：源与头均已入库（bootstrap/miniz.c + miniz.h），一律现编，绝不复制预编译 .o。
+    // 同时产出 bootstrap/miniz.o —— [1/7]/[2/7] 的 stage 链接行直接引用该路径。
+    rt_sys_exec(clang_c + " -O1 -I " + boot + " -c " + boot + "/miniz.c -o " + " build/rt/miniz.o");
     rt_sys_exec(clang_c + " -O1 -I " + boot + " -c " + boot + "/miniz.c -o build/rt/miniz.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c " + boot + "/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
 
     // [0.4/7] patch runtime: CreateProcessA shadow_sys_exec
     println("[0.4/7] patch runtime: CreateProcessA shadow_sys_exec");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c " + boot + "/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
     // runtime_for_selfhost.o 一律从源码现编：它是下面 wk.o / user.o 的唯一母本。
     // 沿用已提交的 .o 会让 rt/ 的改动被静默忽略，而 fixed-point 只逐字节比 .ll、看不见 .o 漂移
     // （历史事故：c0819b2 源码正确、.o 陈旧，ex_gc_longrun 被误判为"修了没用"）。
-    // 不再需要 -I build/linux —— miniz.h 已经 rt/ 经 -I rt 解析。
-    rt_sys_exec(clang + " -O1 -c rt/linux/runtime_for_selfhost.cpp -o "build/rt/runtime_for_selfhost.o"
+    // 不再需要 -I build/linux —— miniz.h 已经 bootstrap/ 经 -I bootstrap 解析。
+    rt_sys_exec(clang + " -O1 -c rt/linux/runtime_for_selfhost.cpp -o " + " build/rt/runtime_for_selfhost.o"
         + " -I " + boot + " -I " + llvm + "/include -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w");
     // 运行时符号重命名：stage1.o 内含 shadow-lang 标准库实现（shadow_string_concat 等强符号），
     // runtime_for_selfhost.o 的 C++ 同名实现必须加 __cpp_ 前缀避免重复符号；shadow_sys_exec 走
@@ -130,7 +130,7 @@ kimo main() -> int {
         + " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list"
         + " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack"
         + " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack"
-        + " "build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
+        + " " + " build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o");
     // 用户程序专用 runtime（main_link_exe Windows 分支链接用，与 Linux 同源 cpp 实现）：
     // 用户产物内嵌 runtime_lib 的 define（shadow_array_len 等强符号）会与 C++ runtime 同名
     // 冲突 → 这些符号加 __cpp_ 前缀；GC 符号（gc_poll/gc_root_range/gc_register_type）保留
@@ -165,7 +165,7 @@ kimo main() -> int {
         + " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list"
         + " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack"
         + " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack"
-        + " "build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
+        + " " + " build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
     println("    wrote build/rt/runtime_for_selfhost_user.o (user-program runtime, GC kept)");
 
     // [1/7] stage1: HOST compile src/main.shadow
@@ -176,7 +176,7 @@ kimo main() -> int {
     // /Brepro：让 lld 写入内容派生的固定 TimeDateStamp 而非当前时间。
     // 否则每次自举 build/shadow.exe 都会差 1~2 字节（偏移 129 起的时间戳），
     // 在按字节比对的验证文化里制造假漂移（A/B 对照与 git 状态噪音）。
-    rt_sys_exec(clang + " -std=c++17 build/stage1.o build/rt/runtime_for_selfhost_wk.o "build/rt/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage1.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
+    rt_sys_exec(clang + " -std=c++17 build/stage1.o build/rt/runtime_for_selfhost_wk.o " + " build/rt/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage1.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
     println("    wrote build/shadow-stage1.exe");
 
     // [2/7] stage2: shadow-stage1 compile src/main.shadow
@@ -184,7 +184,7 @@ kimo main() -> int {
     rt_sys_exec("build/shadow-stage1.exe src/main.shadow -o build/stage2.ll");
     if (file_ok("build/stage2.ll") == 0) { println("[X] stage2.ll empty"); return 1; }
     rt_sys_exec(llc + " -O0 -filetype=obj build/stage2.ll -o build/stage2.o");
-    rt_sys_exec(clang + " -std=c++17 build/stage2.o build/rt/runtime_for_selfhost_wk.o "build/rt/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage2.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
+    rt_sys_exec(clang + " -std=c++17 build/stage2.o build/rt/runtime_for_selfhost_wk.o " + " build/rt/miniz.o build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o -o build/shadow-stage2.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 -lws2_32 -lLLVM-C -L" + rt_lib + " -Lpkg/shadow/llvm/crt");
     println("    wrote build/shadow-stage2.exe");
 
     // [3/7] stage3: shadow-stage2 compile src/main.shadow
