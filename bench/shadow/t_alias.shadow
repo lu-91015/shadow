@@ -1,9 +1,0 @@
-dsb t_alias;
-kimo main() -> int {
-    let x = "abc";
-    let z = x;
-    x = x + "d";
-    println(z);
-    println(x);
-    return 0;
-}

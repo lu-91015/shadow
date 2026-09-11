@@ -110,3 +110,6 @@ tools/_win_awfy_long.sh
 tools/_linux_awfy_long.sh
 tools/env.local.sh
 
+
+bench/*
+main_bak/*
