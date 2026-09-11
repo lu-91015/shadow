@@ -106,6 +106,7 @@ tools/_bench_short_linux.sh
 
 # 项目文档（不入库）
 开发原则.md
+W3_带内对象头方案.md
 tools/_win_awfy_long.sh
 tools/_linux_awfy_long.sh
 tools/env.local.sh
