@@ -13,7 +13,7 @@ shadow 是一个具备自举能力的编程语言及其编译器实现（当前�
 
 - `src/`：shadow 编译器源码（以 shadow 语言自身编写）
 - `rt/`：运行时（C）
-- `bootstrap/`：自举链种子宿主（冻结工件）
+- `build/shadow.exe`：自举 HOST，由 0.5.1 每轮自举 [5/7]（file_copy stage2 → build/shadow.exe）留下，作下一轮自举的编译器；已入库（CI 冷启动用）。运行时 C 源在 `rt/`。
 - `std/`：标准库
 - `pkg/`：打包与安装相关
 - `test/`：测试用例与回归运行器

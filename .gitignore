@@ -1,4 +1,4 @@
-# 构建产物（build/* 而非 build/：需例外跟踪 build/shadow.exe 种子宿主，见下）
+# 构建产物（build/* 而非 build/：需例外跟踪 build/shadow.exe，即 0.5.1 每轮自举 [5/7] 留下的产物，见下）
 build/*
 # Linux 自举构建产物（WSL：stage1.ll/.o、shadow 二进制、rt/ 运行时对象）
 linux_build/
@@ -11,7 +11,7 @@ linux_build/
 *.ilk
 *.lib
 *.exp
-# 例外：build/shadow.exe 种子宿主必须入库（CI 冷启动自举链 HOST，build_shadow.sh [1/7] 依赖）
+# 例外：build/shadow.exe 是 0.5.1 每轮自举 [5/7] 留下的产物（入库作 CI 冷启动自举链 HOST，build_shadow.sh [1/7] 依赖）
 !build/shadow.exe
 # 例外：build/run_tests.exe 预构建测试运行器入库（干净克隆可直接跑回归，无需从源码重建）
 !build/run_tests.exe
@@ -36,11 +36,9 @@ tmp_*
 _spk_extracted/
 *_spk_extracted/
 
-# bootstrap：仅自举链硬依赖（冻结工件）入库，其余源码不入库
-# 入库（自举链硬依赖，覆盖上方的 *.o / *.exe 忽略）：
-!bootstrap/s03.exe
-!bootstrap/runtime_clang.o
-# miniz.h/miniz.c 现在必须入库：rt/linux/runtime_for_selfhost.cpp 经 -I bootstrap 引 miniz.h，
+# 历史 bootstrap/ 已删除：其 4 个运行时 C 源（miniz.c/h、cxa_atexit_shim.c、sys_exec_cpa.c）
+# 已随 rt/ 入库，生成 .o 落到 build/rt/；s03.exe / runtime_clang.o（0.4 遗留死物）一并移除。
+# miniz.h/miniz.c 现在必须入库：rt/linux/runtime_for_selfhost.cpp 经 -I rt 引 miniz.h，
 # 而 runtime_for_selfhost.o / miniz.o 已改为每次自举从源码现编（不再提交二进制）。
 # 若 miniz.h 不入库，干净检出上 runtime 源码就编不出来 —— 正是当初退回冻结 .o 的原因。
 

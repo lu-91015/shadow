@@ -8,7 +8,7 @@ LLVM_HOME="${LLVM_HOME:-D:/llvm/clang+llvm-22.1.0-x86_64-pc-windows-msvc}"
 BIN="$LLVM_HOME/bin"
 RT_LIB="$LLVM_HOME/lib"
 RT=build/rt
-BOOT=bootstrap
+# BOOT=bootstrap  # 已废弃：runtime 源在 rt/，生成 .o 在 build/rt/
 
 echo "[1/3] shadow -> ll"
 build/shadow.exe "$SRC" -o "$BASE.ll"

@@ -1,6 +1,6 @@
 // Shadow 0.5 — 自举接力脚本（Shadow 原生版，替代 tools/build_resident.sh）
 //
-// 自举接力：本文件由【冻结的 build/shadow.exe】编译为 build/build_resident.exe
+// 自举接力：本文件由【上一轮自举产物 build/shadow.exe】编译为 build/build_resident.exe
 // （鸡生蛋问题的标准解法：用上一轮的编译器编出本轮的构建工具）。运行时假设
 // build/r_stage2.ll 已由现有 build/shadow.exe 编出，负责：链接 -> r.exe ->
 // stage3/4 自举固定点比对 -> 部署为 build/shadow.exe。
@@ -11,7 +11,7 @@
 //
 // 说明：
 //   - rt_sys_exec 由编译器作为内建提供（无需 @extern）；env_get 需显式声明。
-//   - 全程相对路径（cwd=仓库根），LLVM 路径与 bootstrap/ 均不含空格。
+//   - 全程相对路径（cwd=仓库根），LLVM 路径与 rt/ 均不含空格。
 //   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；故用「产物是否非空 /
 //     字节比对」近似原 .sh 的 cmp -s 与 set -e 语义。
 
@@ -80,7 +80,7 @@ kimo main() -> int {
     rt_sys_exec(llc + " -O0 -filetype=obj build/r_stage2.ll -o build/r.o");
     println("== [link] clang++ -> build/r.exe ==");
     rt_sys_exec(clang + " build/r.o" +
-        " bootstrap/runtime_for_selfhost.o bootstrap/miniz.o" +
+        " build/rt/runtime_for_selfhost.o build/rt/miniz.o" +
         " build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o build/rt/rt_proc_spawn.o" +
         " -o build/r.exe -Wl,/subsystem:console -lws2_32 -lLLVM-C -L" + rt_lib);
 

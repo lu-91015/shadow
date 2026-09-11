@@ -1,6 +1,6 @@
 // Shadow 0.5 — 构建脚本（Shadow 原生版，替代 tools/build_run_tests.sh）
 //
-// 自举接力：本文件由【冻结的 build/shadow.exe】编译为 build/build_run_tests.exe
+// 自举接力：本文件由【上一轮自举产物 build/shadow.exe】编译为 build/build_run_tests.exe
 // （鸡生蛋问题的标准解法：用上一轮的编译器编出本轮的构建工具），运行时再调用
 // build/shadow.exe 把 test/run_tests.shadow 编成 build/run_tests.exe。
 //
@@ -11,7 +11,7 @@
 // 说明：
 //   - 本程序是独立 Shadow 程序：rt_sys_exec 由编译器作为内建提供（无需 @extern）；
 //     env_get 需显式 @extern 声明（见下）。
-//   - 全程使用相对路径（cwd=仓库根），LLVM 路径与 bootstrap/ 均不含空格，
+//   - 全程使用相对路径（cwd=仓库根），LLVM 路径与 rt/ 均不含空格，
 //     天然避开 CreateProcessA 的空格路径坑（与 cpa 版 shadow_sys_exec 配合）。
 //   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；故失败判定靠「产物是否产生 /
 //     末尾用 run_tests.exe --list 冒烟」近似（等价于 .sh 的 set -e）。
@@ -32,7 +32,7 @@ kimo main() -> int {
     let clang = bin + "/clang++.exe";
     let llc = bin + "/llc.exe";
     let objcopy = bin + "/llvm-objcopy.exe";
-    let boot = "bootstrap";
+    let boot = "rt";
 
     println("build_run_tests (shadow): LLVM_HOME=" + llvm);
 
@@ -42,7 +42,7 @@ kimo main() -> int {
     rt_sys_exec(clang_c + " -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o");
     rt_sys_exec(clang_c + " -O0 -I " + boot + " -c rt/rt_test_par.c -o build/rt/rt_test_par.o");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c " + boot + "/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o");
 
     // [0.4] runtime patch：shadow_sys_exec 改用 CreateProcessA（含空格路径可启动）；
     // run_tests.exe 是普通 Shadow 程序，使用【用户态 runtime = user.o】：
@@ -51,9 +51,9 @@ kimo main() -> int {
     //   - GC 符号（gc_poll/gc_root_range/gc_register_type）保留原名 = 真 GC；
     //   - 不链接 shadow_gc_supplement.o（no-op GC，仅编译器 wk 版使用）；
     //   - sys_exec_cpa.o 提供 shadow_sys_exec，故 user.o 的 shadow_sys_exec 须改名让位。
-    // 依赖 bootstrap/runtime_for_selfhost.o（由 bootstrap.sh / rebuild_win_runtime.sh 产出）。
+    // 依赖 build/rt/runtime_for_selfhost.o（由 bootstrap.sh / rebuild_win_runtime.sh 产出）。
     println("[0.4] patch runtime: user.o (CreateProcessA shadow_sys_exec)");
-    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c bootstrap/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
+    rt_sys_exec(clang_c + " -O0 -I " + boot + " -c " + boot + "/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o");
     rt_sys_exec(objcopy +
         " --redefine-sym=shadow_sys_exec=__cpp_shadow_sys_exec" +
         " --redefine-sym=shadow_any_box_ptr=__cpp_shadow_any_box_ptr" +
@@ -83,9 +83,9 @@ kimo main() -> int {
         " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list" +
         " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack" +
         " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack" +
-        " " + boot + "/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
+        " "build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
 
-    // [1] 用冻结 HOST 编译 test/run_tests.shadow
+    // [1] 用上一轮自举产物 HOST 编译 test/run_tests.shadow
     println("[1] compile test/run_tests.shadow -> build/run_tests.ll");
     rt_sys_exec("build/shadow.exe test/run_tests.shadow -o build/run_tests.ll");
     // [2] llc -> .o
@@ -95,7 +95,7 @@ kimo main() -> int {
     //     不链 shadow_gc_supplement.o；-Lpkg/shadow/llvm/crt 提供 winhttp.lib 等）
     println("[3] clang++ link -> build/run_tests.exe");
     rt_sys_exec(clang + " -std=c++17 build/run_tests.o" +
-        " build/rt/runtime_for_selfhost_user.o " + boot + "/miniz.o" +
+        " build/rt/runtime_for_selfhost_user.o "build/rt/miniz.o" +
         " build/rt/rt_zip.o build/rt/shadow_index.o" +
         " build/rt/rt_proc_spawn.o build/rt/rt_test_par.o build/rt/sys_exec_cpa.o" +
         " build/rt/cxa_atexit_shim.o" +

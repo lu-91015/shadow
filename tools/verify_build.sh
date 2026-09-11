@@ -2,7 +2,7 @@
 # Shadow 0.5 —— 构建产物指纹校验（把"自举脚本"钉死成可验证的约束）
 #
 # 为什么需要：自举 fixed-point 只逐字节比 stage2.ll / stage3.ll，那是**编译器输出的 IR**。
-# 链接进 build/shadow.exe 的 runtime（rt/、bootstrap/ 的 .o）换了，IR 一个字不变、
+# 链接进 build/shadow.exe 的 runtime（rt/ 与 build/rt/ 的 .o）换了，IR 一个字不变、
 # fixed-point 照样 OK —— 这正是 c0819b2 事故的机理（源码修对、.o 陈旧、误判"修了没用"）。
 # 本脚本对最终二进制做 sha256 比对，补上这个盲区。
 #
@@ -12,7 +12,7 @@
 #   BUILD_ALLOW_DRIFT=1 bash tools/verify_build.sh   # 只报告不失败（换工具链/跨机器时用）
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
-MAN="bootstrap/build_manifest.sha256"
+MAN="tools/build_manifest.sha256"
 ARTIFACTS=(build/shadow.exe build/run_tests.exe)
 
 if [ "${1:-}" = "--update" ]; then
@@ -70,5 +70,5 @@ if [ "${BUILD_ALLOW_DRIFT:-0}" = "1" ]; then
   exit 0
 fi
 echo "    若改动是有意的：bash tools/verify_build.sh --update  然后提交 manifest。"
-echo "    若是非预期的：先查 rt/ 与 bootstrap/ 下的 .o 是否被换过（git diff HEAD -- rt bootstrap）。"
+echo "    若是非预期的：先查 build/rt/ 下的 .o 是否被换过（git diff HEAD -- rt tools/build_manifest.sha256）。"
 exit 1

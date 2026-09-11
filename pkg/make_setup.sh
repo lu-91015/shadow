@@ -6,7 +6,7 @@
 #   bin/shadow.exe            编译器本体
 #   bin/LLVM-C.dll            LLVM-C 运行时（与 exe 同目录，DLL 搜索第一优先）
 #   bin/rt/rt_*.o             9 个自研系统调用层对象（shadow -run 链接用）
-#   bin/bootstrap/miniz.o    压缩/自举辅助对象（shadow -run 链接用）
+#   bin/rt/miniz.o    压缩/自举辅助对象（shadow -run 链接用）
 #   src/main.shadow         编译器源码根标记（main_load_combined 用它校验
 #                            <root>/src 是真实源码根，进而稳定定位
 #                            <root>/src/runtime/runtime_lib.shadow；
@@ -40,13 +40,13 @@ PAY="$R/pkg/shadow"
 echo "[1/5] 建立载荷目录结构（bin/ src/）..."
 # 注：不用 rm -rf 清理旧载荷——部分环境下删除会被安全机制拦截导致脚本中断；
 # 改为 mkdir -p + cp -f 幂等覆盖，残留的未引用文件对链接/模块解析无害。
-mkdir -p "$PAY/bin/rt" "$PAY/bin/bootstrap" "$PAY/src/std" "$PAY/src/runtime"
+mkdir -p "$PAY/bin/rt" "$PAY/src/std" "$PAY/src/runtime"
 
 echo "[2/5] 复制编译器与运行时链接对象..."
 cp -f build/shadow.exe "$PAY/bin/shadow.exe"
 # shadow -run 链接所需的 runtime 对象（main_link_exe 精确列表）：
 # 统一用户程序 runtime（Windows 与 Linux 同源 cpp 实现）。
-# runtime_for_selfhost_user.o 由 bootstrap/runtime_for_selfhost.o 经 objcopy 生成
+# runtime_for_selfhost_user.o 由 build/rt/runtime_for_selfhost.o 经 objcopy 生成
 # （冲突符号加 __cpp_ 前缀、GC 保留原名），构建入口见 tools/build_shadow.shadow。
 for o in runtime_for_selfhost_user miniz sys_exec_cpa rt_proc_spawn rt_zip shadow_index cxa_atexit_shim; do
   cp -f "build/rt/$o.o" "$PAY/bin/rt/$o.o"

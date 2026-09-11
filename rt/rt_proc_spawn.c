@@ -3,7 +3,7 @@
  * 仅给编译器本体（LSP 异步编译 worker）使用：shadow_proc_launch/poll/reap。
  *
  * 与 rt_proc.c 故意分离：rt_proc.c 里的 shadow_sys_exec / shadow_exit /
- * shadow_env_get 已由 bootstrap/runtime_for_selfhost.o 提供，若把整个
+ * shadow_env_get 已由 build/rt/runtime_for_selfhost.o 提供，若把整个
  * rt_proc.o 链接进编译器会 duplicate symbol；本文件只含 LSP 需要、
  * runtime_for_selfhost 没有的 3 个符号，且不依赖 __rt_shadow_malloc，
  * 因此可安全链接进编译器本体（stage1/stage2 宿主）。

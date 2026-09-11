@@ -1,7 +1,7 @@
 /* ============================================================
  * Shadow 0.4 — rt_zip.c：SPK 打包/解包/列表（§3.8.4）
  * ------------------------------------------------------------
- * 基于 miniz（bootstrap/miniz.o，ZIP 容器）封装三个编译器 CLI 函数：
+ * 基于 miniz（build/rt/miniz.o，ZIP 容器）封装三个编译器 CLI 函数：
  *   shadow_zip_pack(src_dir, out_spk)  目录 → ZIP（STORE 模式）
  *   shadow_zip_unpack(spk, out_dir)    ZIP → 目录（幂等，覆盖）
  *   shadow_zip_list(spk)               列出条目（分号分隔，可解析）

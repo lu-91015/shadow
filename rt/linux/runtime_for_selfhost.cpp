@@ -404,7 +404,7 @@ static void sarena_release(ShadowArena* ar) {
 inline ShadowArena::~ShadowArena() { sarena_release(this); }
 
 // miniz: 用于 .spk 包的 DEFLATE 压缩（miniz.h 是 self-contained，会自动 include 它需要的一切）
-// 头与源均在 bootstrap/（miniz.h + miniz.c），经 -I bootstrap 解析；
+// 头与源均在 rt/（miniz.h + miniz.c），经 -I rt 解析；
 // 不得再引 build/linux/miniz-3.1.2/ —— build/ 被 gitignore，那会让本文件在干净检出上无法编译，
 // 只能退回链接预编译 .o（曾因此发生源码已修、.o 陈旧的误判）。
 #include "miniz.h"

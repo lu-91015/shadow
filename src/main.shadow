@@ -2345,7 +2345,7 @@ kimo main_link_exe(ir_path: string, obj_path: string, exe_path: string, self_dir
     let llc = llvm_home + "\\bin\\llc.exe";
     let clang = llvm_home + "\\bin\\clang++.exe";
     // 统一用户程序 runtime：Windows 与 Linux 共用同一套 cpp runtime 对象（同源实现）。
-    // runtime_for_selfhost_user.o 由 bootstrap/runtime_for_selfhost.o 经 objcopy 生成：
+    // runtime_for_selfhost_user.o 由 build/rt/runtime_for_selfhost.o 经 objcopy 生成：
     // 与用户程序内嵌 runtime_lib 冲突的符号加 __cpp_ 前缀，GC 符号（gc_poll/gc_root_range）
     // 保留原名（真 GC，对齐 Linux 用户产物）。不链接 shadow_gc_supplement.o（no-op GC）。
     let rt_dir = self_dir + "\\rt\\";

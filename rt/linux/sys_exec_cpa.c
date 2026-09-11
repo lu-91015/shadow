@@ -1,7 +1,7 @@
 /* ============================================================
  * shadow-0.5 bootstrap — shadow_sys_exec 的 POSIX 实现 (Linux)
  *
- * 背景：bootstrap/runtime_for_selfhost.o 里的 shadow_sys_exec 用
+ * 背景：build/rt/runtime_for_selfhost.o 里的 shadow_sys_exec 用
  * _popen(cmd, "r")（即 cmd.exe /c）启动子进程。cmd /c 对"以引号开头且
  * 程序路径含空格"的命令会剥错引号，导致仓库路径含空格（如 "TRAE SOLO CN"）
  * 时所有子进程启动失败。

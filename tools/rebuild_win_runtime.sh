@@ -12,8 +12,8 @@ STAGE="${1:-build/stage2.o}"
 [ -f "$STAGE" ] || { echo "[X] stage not found: $STAGE"; exit 1; }
 
 echo "[1] compile runtime_for_selfhost.cpp (Windows)"
-"$BIN/clang++.exe" -O1 -c rt/linux/runtime_for_selfhost.cpp -o bootstrap/runtime_for_selfhost.o \
-  -I bootstrap -I build/linux -I "$LLVM_HOME/include" -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w
+"$BIN/clang++.exe" -O1 -c rt/linux/runtime_for_selfhost.cpp -o build/rt/runtime_for_selfhost.o \
+  -I rt -I build/linux -I "$LLVM_HOME/include" -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w
 
 # wk.o：编译器本体 runtime（全部冲突符号加 __cpp_ 前缀，shadow_sys_exec → blob）
 WKREDEFS=""
@@ -29,7 +29,7 @@ for s in shadow_any_box_ptr shadow_any_box_string shadow_any_print shadow_any_to
 done
 echo "[2] generate wk.o (compiler runtime)"
 "$BIN/llvm-objcopy.exe" --redefine-sym=shadow_sys_exec=shadow_sys_exec_blob $WKREDEFS \
-  bootstrap/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o
+  build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_wk.o
 
 # user.o：用户程序 runtime（除 GC 三符号 gc_poll/root_range/register_type 外加前缀）
 USERREDEFS=""
@@ -44,13 +44,13 @@ for s in shadow_sys_exec shadow_any_box_ptr shadow_any_box_string shadow_any_pri
 done
 echo "[3] generate user.o (user-program runtime, GC kept)"
 "$BIN/llvm-objcopy.exe" $USERREDEFS \
-  bootstrap/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o
+  build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o
 
 echo "[4] relink build/shadow.exe"
 # /Brepro：内容派生的固定时间戳，重链产物才可逐字节比对；仅此次调用关闭 MSYS 路径转换
 # （否则 Git Bash 会把 /Brepro 改写成 D:/Git/Brepro）。
 MSYS2_ARG_CONV_EXCL='*' "$BIN/clang++.exe" -std=c++17 \
-  "$STAGE" build/rt/runtime_for_selfhost_wk.o bootstrap/miniz.o \
+  "$STAGE" build/rt/runtime_for_selfhost_wk.o build/rt/miniz.o \
   build/rt/shadow_gc_supplement.o build/rt/rt_zip.o build/rt/shadow_index.o \
   build/rt/rt_proc_spawn.o build/rt/sys_exec_cpa.o build/rt/cxa_atexit_shim.o \
   -o build/shadow.exe -Wl,/subsystem:console -Wl,/Brepro -Wl,/stack:8388608 \

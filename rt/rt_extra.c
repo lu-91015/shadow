@@ -437,7 +437,7 @@ extern int64_t shadow_set_at_int(void* set, int32_t idx) {
  * 0.4 重写 rt/ 层时遗漏了这批 @extern 目标，导致用户程序链接期报
  * "undefined symbol: shadow_putchar / shadow_abs / shadow_arena_create"。
  * 注意：本文件只进 rt_extra.o（用户程序链接行）；shadow.exe 自身链接的是
- * bootstrap/runtime_for_selfhost.o，不含本文件，故无 duplicate symbol 风险。
+ * build/rt/runtime_for_selfhost.o，不含本文件，故无 duplicate symbol 风险。
  * ============================================================ */
 
 extern int64_t shadow_abs(int64_t x) {
