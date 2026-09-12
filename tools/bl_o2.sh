@@ -1,6 +1,6 @@
 #!/bin/bash
-# 编译+链接单个 .shadow 基准（镜像 tools/build_shadow.shadow 的链接配方）
-# 用法： bl.sh bench/shadow/foo   （foo.shadow 必须存在；产物 foo.shadow.exe 与 foo.ll/foo.o）
+# 编译+链接单个 .shadow 基准（O2 优化；用户程序 runtime，真 GC，与 bl.sh 同链接配方仅优化级别不同）
+# 用法： bl_o2.sh bench/shadow/foo   （foo.shadow 必须存在；产物 foo.shadow.exe 与 foo.ll/foo.o）
 set -e
 SRC="$1.shadow"
 BASE="$1"
@@ -17,9 +17,8 @@ echo "[2/3] llc -> o"
 echo "[3/3] clang link -> exe"
 "$BIN/clang++.exe" -std=c++17 \
   "$BASE.o" \
-  "$RT/runtime_for_selfhost_wk.o" \
+  "$RT/runtime_for_selfhost_user.o" \
   "$BOOT/miniz.o" \
-  "$RT/shadow_gc_supplement.o" \
   "$RT/rt_zip.o" \
   "$RT/shadow_index.o" \
   "$RT/rt_proc_spawn.o" \

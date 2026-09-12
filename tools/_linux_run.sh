@@ -15,9 +15,10 @@ echo "LINUX_TESTS_RC=$?" >> build/_linux_tests.log
 
 echo "=== [2/2] Linux benchmarks (shadow --exe vs Go) ==="
 benches="sum_loop fib matmul str_concat array_push quicksort float_pi string_find prime_sieve ackermann str_reverse"
-# 编译 shadow 基准（--exe 默认 -O2）
+# 编译 shadow 基准（--exe 默认 -O2），并把 *.shadow.exe 改名为无后缀以便 Linux 直接执行
 for b in $benches; do
   "$SHADOW_EXE" "$ROOT/bench/shadow/$b.shadow" --exe >/dev/null 2>&1
+  [ -f "$ROOT/bench/shadow/$b.shadow.exe" ] && mv -f "$ROOT/bench/shadow/$b.shadow.exe" "$ROOT/bench/shadow/$b.linux"
 done
 # 编译 Go 基准
 cd "$ROOT/bench/go"
@@ -29,7 +30,7 @@ cd "$ROOT"
   for b in $benches; do
     # 定位 shadow 产出的可执行文件（命名可能因平台而异）
     EXE=""
-    for cand in "$ROOT/bench/shadow/$b.shadow.exe" "$ROOT/bench/shadow/$b" "$ROOT/bench/shadow/${b}.exe"; do
+    for cand in "$ROOT/bench/shadow/$b.linux" "$ROOT/bench/shadow/$b.shadow.exe" "$ROOT/bench/shadow/$b" "$ROOT/bench/shadow/${b}.exe"; do
       [ -x "$cand" ] && EXE="$cand" && break
     done
     [ -z "$EXE" ] && { echo "$b ERROR(no-shadow-exe)"; continue; }

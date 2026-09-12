@@ -21,6 +21,9 @@ SHADOW_ROOT_WIN="$ROOT"
 [ -f tools/env.local.sh ] && . tools/env.local.sh
 : "${LLVM_HOME:=${LLVM_HOME_WIN:-}}"
 export LLVM_HOME
+# 多目标编排：透传 BUILD_TARGETS 给驱动 build/build_shadow.exe（默认 windows，保持现状）。
+# 设 "windows,linux" / "linux" / "all" 会触发 [8] 经 WSL 构建 build/linux/shadow。
+export BUILD_TARGETS="${BUILD_TARGETS:-windows}"
 
 [ -n "${LLVM_HOME:-}" ] || { echo "[X] LLVM_HOME 未设置且 tools/env.local.sh 无默认值"; exit 1; }
 [ -x build/shadow.exe ] || { echo "[X] 0.5.1 自举产物 build/shadow.exe 缺失（需先完成一轮自举或恢复该文件）"; exit 1; }

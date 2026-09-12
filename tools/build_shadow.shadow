@@ -225,6 +225,29 @@ kimo main() -> int {
     println("[7/7] smoke --version");
     rt_sys_exec("build/shadow.exe --version");
 
+    // [8] 多目标：按 BUILD_TARGETS 构建额外平台（默认仅 windows，保持现状）
+    // 仅当显式含 linux/all 时，才经 WSL 调用 tools/routeA_linux.sh 把固定点 stage2.ll
+    // 交叉编译/链接为 build/linux/shadow（替代原 gitignored 的 _rebuild_routeA_stage2.sh）。
+    let t = env_get("BUILD_TARGETS");
+    if (len(t) == 0) { t = "windows"; }
+    println("[8] targets=" + t);
+    let do_linux = 0;
+    if (t == "linux") { do_linux = 1; }
+    if (t == "all") { do_linux = 1; }
+    if (t == "windows,linux") { do_linux = 1; }
+    if (t == "linux,windows") { do_linux = 1; }
+    if (do_linux == 1) {
+        println("    [8] build linux target via WSL (Route A)");
+        let distro = env_get("WSL_DISTRO");
+        if (len(distro) == 0) { distro = "Ubuntu"; }
+        let root_lin = env_get("SHADOW_ROOT_LIN");
+        if (len(root_lin) == 0) { root_lin = "/mnt/d/shadow/shadow-0.5"; }
+        let llvm_lin = env_get("LLVM_HOME_LIN");
+        if (len(llvm_lin) == 0) { llvm_lin = "/usr/lib/llvm-20"; }
+        // tools/routeA_linux.sh 是被跟踪的 POSIX 链接配方（LF 行尾），直接由 WSL 执行。
+        rt_sys_exec("wsl -d " + distro + " -- bash " + root_lin + "/tools/routeA_linux.sh " + root_lin + " " + llvm_lin);
+    }
+
     println("done");
     return 0;
 }

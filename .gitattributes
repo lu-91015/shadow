@@ -1,0 +1,7 @@
+# 在 WSL 内执行的脚本必须保持 LF 行尾：
+# Windows core.autocrlf=true 默认会把 checkout 的 .sh 转成 CRLF，
+# WSL bash 会把 \r 当路径/选项一部分（set: -: invalid option / cd ...\r）。
+# 仅钉死实际在 WSL 里跑的脚本；Windows 端（Git Bash）脚本保持默认即可。
+tools/_linux_run.sh        text eol=lf
+tools/_linux_bench_only.sh text eol=lf
+tools/routeA_linux.sh      text eol=lf
