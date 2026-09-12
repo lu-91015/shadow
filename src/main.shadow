@@ -1,4 +1,4 @@
-// Shadow 0.5.1 — 编译器主入口
+// Shadow 0.5.2 — 编译器主入口
 // ============================================================
 // 完整管线：读文件 → tokenize → parse → TC → HIR → MIR → Codegen → .ll
 //   shadow <file.shadow> -o <out.ll>    只生成 .ll
@@ -2493,7 +2493,7 @@ kimo main() -> int {
     }
     let arg1 = args[1] as string;
     if (str_eq(arg1, "--version") == 1) {
-        println("shadow 0.5.1");
+        println("shadow 0.5.2");
         return 0;
     }
     // ---- 统一扫描：--strict 任意位置生效（严格态唯一触发方式；查询/编译路径共用）----

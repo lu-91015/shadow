@@ -31,7 +31,7 @@ cd "$R"
 VERSION_RAW="$(build/shadow.exe --version 2>/dev/null | head -1)"
 VERSION="${VERSION_RAW#shadow }"
 VERSION="${VERSION%%[[:space:]]}"
-[ -z "$VERSION" ] && VERSION="0.5.1"
+[ -z "$VERSION" ] && VERSION="0.5.2"
 INSTALLER="shadow-${VERSION}-windows-x86_64.exe"
 echo "目标版本: $VERSION  ->  pkg/dist/$INSTALLER"
 

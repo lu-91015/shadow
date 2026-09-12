@@ -1,7 +1,7 @@
 #!/bin/bash
 # 自举引导脚本（CI / 本地通用）
 #
-# 用 0.5.1 每轮自举 [5/7] 留下的 build/shadow.exe（下一轮自举 HOST）把 tools/build_shadow.shadow（权威构建程序，Shadow 源码）
+# 用 0.5.2 每轮自举 [5/7] 留下的 build/shadow.exe（下一轮自举 HOST）把 tools/build_shadow.shadow（权威构建程序，Shadow 源码）
 # 先编成驱动 build/build_shadow.exe，再运行该驱动执行 7 阶段自举，
 # 最终部署出 build/shadow.exe（新鲜自托管编译器）+ 编译 rt/*.o。
 #
@@ -26,7 +26,7 @@ export LLVM_HOME
 export BUILD_TARGETS="${BUILD_TARGETS:-windows}"
 
 [ -n "${LLVM_HOME:-}" ] || { echo "[X] LLVM_HOME 未设置且 tools/env.local.sh 无默认值"; exit 1; }
-[ -x build/shadow.exe ] || { echo "[X] 0.5.1 自举产物 build/shadow.exe 缺失（需先完成一轮自举或恢复该文件）"; exit 1; }
+[ -x build/shadow.exe ] || { echo "[X] 0.5.2 自举产物 build/shadow.exe 缺失（需先完成一轮自举或恢复该文件）"; exit 1; }
 
 # 全新 .lu 函数级缓存（陈旧缓存会让 src/ 改动看起来完全无效）
 TS="$(date +%Y%m%d_%H%M%S)"; export SHADOW_TS="$TS"

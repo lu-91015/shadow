@@ -1,7 +1,7 @@
 name: build-setup
 
 # 触发：自托管编译器源码/构建链改动 push 自动构建验证；也可手动触发（workflow_dispatch）
-# 说明：本工作流只验证「从入库的 0.5.1 自举产物（build/shadow.exe）自举出 shadow 编译器」这一核心链路是否仍然可构建；
+# 说明：本工作流只验证「从入库的 0.5.2 自举产物（build/shadow.exe）自举出 shadow 编译器」这一核心链路是否仍然可构建；
 #       Windows 安装器打包（pkg/make_setup.sh 等）为本地操作，打包脚本有意不入库，不在 CI 进行。
 on:
   push:
@@ -54,7 +54,7 @@ jobs:
           echo "$LLVM_DIR/bin" >> "$GITHUB_PATH"
           "$LLVM_DIR/bin/llc.exe" --version | head -1
 
-      # 自举链：入库的 0.5.1 自举产物 build/shadow.exe（每轮自举 [5/7] 留下）把 tools/build_shadow.shadow 编成驱动
+      # 自举链：入库的 0.5.2 自举产物 build/shadow.exe（每轮自举 [5/7] 留下）把 tools/build_shadow.shadow 编成驱动
       # build/build_shadow.exe，再运行驱动执行 7 阶段自举，部署出 build/shadow.exe + rt/*.o。
       - name: Bootstrap shadow.exe (self-host)
         run: bash tools/bootstrap.sh
