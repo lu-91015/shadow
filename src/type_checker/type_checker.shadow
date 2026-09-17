@@ -4028,6 +4028,23 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                 }
             }
         }
+        // 内置名与 struct receiver 同名方法冲突时（如 trait ToString::to_string 被内置
+        // to_string 遮蔽），struct 上的方法应优先于内置。仅当首参已推断为 struct 且能
+        // 解析到同名 trait/inherent 方法才改走方法分发，复用 3a 的
+        // __impl__<type>__<trait>__<method> 符号链路；非 struct 调用零影响。
+        if (len(args) > 0) {
+            let r0t = args[0].inferred_type;
+            if ((r0t as any) != 0 && r0t.kind == TYPE_STRUCT && len(r0t.name) > 0) {
+                let recv_mangled = tc_impl_find_method(ctx, r0t.name, name);
+                if (len(recv_mangled) > 0) {
+                    let fd3 = tc_func_lookup(ctx, recv_mangled);
+                    if (tc_func_is_none(fd3) == 0) {
+                        e.str1 = recv_mangled;
+                        return tc_check_call_fd(ctx, e, env, fd3, args, arg_names);
+                    }
+                }
+            }
+        }
         // array_push 返回 array（元素类型保持调用侧推断）
         e.inferred_type = bt;
         return bt;

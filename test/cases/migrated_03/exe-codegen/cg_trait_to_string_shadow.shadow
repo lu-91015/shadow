@@ -1,7 +1,7 @@
 //@mode: exe
-//@desc: BUG — trait 方法名 to_string 与 runtime 内建重名，obj.to_string() 被内建遮蔽、不走 trait 静态分发
+//@desc: FIXED — trait 方法 to_string 与 runtime 内建重名时方法优先，obj.to_string() 正确走 trait 静态分发
 //@expect: Foo
-//@xfail: trait 方法 to_string 被 runtime 内建 to_string 遮蔽：f.to_string() 打印 0 而非 "Foo"（RC=0 无报错）。修复后应移除 //@xfail
+//@pos: 修复（2026-09-17）：内置名与 struct receiver 同名方法冲突时方法优先（tc_check_call 内置白名单分支内先做 receiver 方法分发）
 // 复现（2026-08-19 实证）：
 //   impl ToString for Foo { to_string(self:any)->string{ return "Foo"; } }
 //   println(f.to_string())  ->  实际输出 0（RC=0，无任何诊断）
