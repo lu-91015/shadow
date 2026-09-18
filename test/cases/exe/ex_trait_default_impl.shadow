@@ -1,0 +1,31 @@
+//@expect: Rex says ... default
+//@expect: Cat stays silent
+//@desc: 0.5.3 trait 默认实现：trait 方法可带默体，impl 未覆写时自动合成 __impl__<T>__<Tr>__<m>
+dsb ex_trait_default_impl;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+    kimo speak(self: Self) -> string {
+        return self.name() + " says ... default";
+    }
+}
+
+struct Dog { tag: string }
+struct Cat { tag: string }
+
+impl Speaker for Dog {
+    kimo name(self: Dog) -> string { return self.tag; }
+}
+
+impl Speaker for Cat {
+    kimo name(self: Cat) -> string { return self.tag; }
+    kimo speak(self: Cat) -> string { return "Cat stays silent"; }
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Rex" };
+    let c = Cat { tag: "Tom" };
+    println(d.speak());
+    println(c.speak());
+    return 0;
+}

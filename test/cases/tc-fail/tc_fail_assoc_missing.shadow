@@ -1,0 +1,19 @@
+//@mode: tc-fail
+//@desc: 0.5.3 关联类型缺失：trait 声明了 type Item 但 impl 未绑定 → 必须报 err
+dsb tc_fail_assoc_missing;
+
+trait Getter {
+    type Item;
+    kimo get(self: Self) -> Self::Item;
+}
+
+struct BoxI { v: int }
+
+impl Getter for BoxI {
+    kimo get(self: BoxI) -> int { return self.v; }
+}
+
+kimo main() -> int {
+    let b = BoxI { v: 1 };
+    return 0;
+}

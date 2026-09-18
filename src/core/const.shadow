@@ -147,6 +147,7 @@ pub let TOK_INC: int = 121;
 pub let TOK_DEC: int = 122;
 pub let TOK_TILDE: int = 123;
 pub let TOK_PERCENTEQ: int = 124;
+pub let TOK_WHERE: int = 125;
 
 // ============ 表达式种类 EXPR_* ============
 pub let EXPR_INT: int = 1;

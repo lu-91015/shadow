@@ -470,6 +470,16 @@ pub kimo parse_type() -> Type {
             ps_expect(TOK_IDENT, "namespace segment");
             ident = ident + "." + seg;
         }
+        // 关联类型引用：X::Item（X 为 Self / 类型参数 / 具体类型）。编码为 "X::Item" 命名类型，
+        // 由 type_checker 在单态化/签名校验时经 impl 绑定解析为具体类型。
+        if (ps_at(TOK_COLONCOLON) == 1) {
+            ps_adv();
+            let assoc = ps_cur_text();
+            ps_expect(TOK_IDENT, "associated type name");
+            ident = ident + "::" + assoc;
+            t = mk_named_type(TYPE_STRUCT, ident);
+            return t;
+        }
         if (str_eq(ident, "array") == 1) {
             t = mk_type(TYPE_ARRAY);
             if (ps_at(TOK_LT) == 1) {
@@ -2602,6 +2612,47 @@ pub kimo ps_type_const_name(t: Type) -> string {
     return "unknown";
 }
 
+// where 子句：把 `where T: B1 | B2, U: B3` 的约束追加到对应 type_params。
+// shadow 数组按值传递，这里返回追加约束后的新数组；无 where 时原样返回。
+pub kimo ps_parse_where(type_params: array<TypeParam>) -> array<TypeParam> {
+    if (ps_at(TOK_WHERE) != 1) { return type_params; }
+    ps_adv();
+    while (1 == 1) {
+        let tn = ps_cur_text();
+        ps_expect(TOK_IDENT, "where type parameter name");
+        ps_expect(TOK_COLON, ":");
+        let ct = parse_type();
+        let found = 0;
+        let i = 0;
+        let out: array<TypeParam> = [];
+        while (i < len(type_params)) {
+            let tp = type_params[i] as TypeParam;
+            if (str_eq(tp.name, tn) == 1) {
+                let cs = array_push(tp.constraints, ps_type_const_name(ct));
+                while (ps_at(TOK_OR) == 1 || ps_at(TOK_BITOR) == 1) {
+                    ps_adv();
+                    let ct2 = parse_type();
+                    cs = array_push(cs, ps_type_const_name(ct2));
+                }
+                let ntp = TypeParam { name: tp.name, constraints: cs };
+                out = array_push(out, ntp);
+                found = 1;
+                i = i + 1;
+                continue;
+            }
+            out = array_push(out, tp);
+            i = i + 1;
+        }
+        if (found == 0) {
+            ps_err("SH-PARSE002: Parse error at " + ps_file + ":" + int_to_str(ps_cur_line()) + ":" + int_to_str(ps_cur_col()) + ": where constrains undeclared type parameter '" + tn + "'");
+        }
+        type_params = out;
+        if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+        break;
+    }
+    return type_params;
+}
+
 // ============ 函数解析 ============
 pub kimo parse_function_inner(is_pub: int, extern_name: string, is_nogc: int) -> FuncDef {
     let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
@@ -2658,6 +2709,7 @@ pub kimo parse_function_inner(is_pub: int, extern_name: string, is_nogc: int) ->
     ps_check_variadic_last(params, "function");
     ps_expect(TOK_ARROW, "->");
     let ret_ty = parse_type();
+    type_params = ps_parse_where(type_params);
     let saved_ret_ty = ps_cur_fn_ret_ty;
     ps_cur_fn_ret_ty = ret_ty;
     let body = mk_stmt(STMT_BLOCK, loc);
@@ -2802,7 +2854,17 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
     }
     ps_expect(TOK_LBRACE, "{");
     let methods: array<FuncDef> = [];
+    let assoc_types: array<string> = [];
     while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+        // 关联类型声明：type Item;
+        if (ps_at(TOK_TYPE) == 1) {
+            ps_adv();
+            let an = ps_cur_text();
+            ps_expect(TOK_IDENT, "associated type name");
+            ps_expect(TOK_SEMICOLON, ";");
+            assoc_types = array_push(assoc_types, an);
+            continue;
+        }
         let m_pub = 0;
         if (ps_at(TOK_PUB) == 1) { ps_adv(); m_pub = 1; }
         if (ps_at(TOK_KIMO) == 1) {
@@ -2828,12 +2890,20 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
                 ps_adv();
                 ret_ty = parse_type();
             }
-            ps_expect(TOK_SEMICOLON, ";");
+            // 默认实现：方法后跟 { body }；仅签名则 `;`
+            let mbody: Stmt = 0 as Stmt;
+            if (ps_at(TOK_SEMICOLON) == 1) {
+                ps_adv();
+            } else {
+                let blk = mk_stmt(STMT_BLOCK, mloc);
+                blk.items = parse_block();
+                mbody = blk;
+            }
             let m = FuncDef {
                 name: mname,
                 params: params,
                 return_type: ret_ty,
-                body: 0 as Stmt,
+                body: mbody,
                 loc: mloc,
                 is_pub: m_pub,
                 is_extern: 0,
@@ -2849,7 +2919,7 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
         }
     }
     ps_expect(TOK_RBRACE, "}");
-    let td = TraitDef { name: name, methods: methods, loc: loc, is_pub: is_pub, type_params: type_params };
+    let td = TraitDef { name: name, methods: methods, assoc_types: assoc_types, loc: loc, is_pub: is_pub, type_params: type_params };
     return td;
 }
 
@@ -3180,8 +3250,21 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 ps_expect(TOK_IDENT, "type name");
                 ps_expect(TOK_LBRACE, "{");
                 let impl_methods: array<FuncDef> = [];
+                let impl_assoc: array<TypeAlias> = [];
                 let mangle_prefix = "__impl__" + type_name + "__" + trait_name + "__";
                 while (ps_at(TOK_RBRACE) != 1 && ps_at(TOK_EOF) != 1) {
+                    // 关联类型绑定：type Item = Concrete;
+                    if (ps_at(TOK_TYPE) == 1) {
+                        ps_adv();
+                        let an = ps_cur_text();
+                        let aloc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+                        ps_expect(TOK_IDENT, "associated type name");
+                        ps_expect(TOK_EQ, "=");
+                        let aty = parse_type();
+                        ps_expect(TOK_SEMICOLON, ";");
+                        impl_assoc = array_push(impl_assoc, TypeAlias { name: an, target: aty, loc: aloc, is_pub: 0 });
+                        continue;
+                    }
                     let impl_pub = 0;
                     if (ps_at(TOK_PUB) == 1) { ps_adv(); impl_pub = 1; }
                     if (ps_at(TOK_KIMO) == 1) {
@@ -3208,7 +3291,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                     }
                 }
                 ps_expect(TOK_RBRACE, "}");
-                let id = ImplDef { type_name: type_name, trait_name: trait_name, methods: impl_methods, loc: impl_loc };
+                let id = ImplDef { type_name: type_name, trait_name: trait_name, methods: impl_methods, assoc_types: impl_assoc, loc: impl_loc };
                 impls = array_push(impls, id);
                 continue;
             }
@@ -3227,7 +3310,7 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 }
             }
             ps_expect(TOK_RBRACE, "}");
-            let id2 = ImplDef { type_name: first_name, trait_name: "", methods: inh_methods, loc: impl_loc };
+            let id2 = ImplDef { type_name: first_name, trait_name: "", methods: inh_methods, assoc_types: [], loc: impl_loc };
             impls = array_push(impls, id2);
             continue;
         }

@@ -141,7 +141,8 @@ pub struct EnumDef {
 // trait 定义
 pub struct TraitDef {
     name: string;
-    methods: array<FuncDef>; // 仅签名
+    methods: array<FuncDef>; // 仅签名 / 带默认实现体（body 非空 = 默认实现）
+    assoc_types: array<string>; // 关联类型声明名（type Item;）
     loc: Location;
     is_pub: int;
     type_params: array<TypeParam>;
@@ -152,6 +153,7 @@ pub struct ImplDef {
     type_name: string;
     trait_name: string;  // 空 = inherent impl
     methods: array<FuncDef>;
+    assoc_types: array<TypeAlias>; // 关联类型绑定（type Item = Concrete;）
     loc: Location;
 }
 
