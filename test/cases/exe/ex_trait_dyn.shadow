@@ -1,0 +1,32 @@
+//@expect: Woof
+//@expect: Meow
+//@desc: 0.5.3 dyn Trait 动态分发：不同 struct 装箱为 dyn Speaker，经 vtable 运行时多态调用
+dsb ex_trait_dyn;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+}
+
+struct Dog { tag: string }
+struct Cat { tag: string }
+
+impl Speaker for Dog {
+    kimo name(self: Dog) -> string { return self.tag; }
+}
+
+impl Speaker for Cat {
+    kimo name(self: Cat) -> string { return self.tag; }
+}
+
+// 接收 dyn Speaker 对象，方法调用走 vtable 动态分发
+kimo speak(s: dyn Speaker) -> string {
+    return s.name();
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Woof" };
+    let c = Cat { tag: "Meow" };
+    println(speak(d));
+    println(speak(c));
+    return 0;
+}

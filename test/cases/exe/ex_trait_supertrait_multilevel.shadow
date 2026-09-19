@@ -1,0 +1,45 @@
+//@expect: C3 calls A1 and B2
+//@expect: 3
+//@expect: 2
+//@expect: 1
+//@desc: 0.5.3 supertrait 多层继承：trait C : B : A；子方法可调用祖父方法（递归查找）
+dsb ex_trait_supertrait_multilevel;
+
+trait A {
+    kimo a(self: Self) -> int;
+}
+
+trait B : A {
+    kimo b(self: Self) -> int;
+}
+
+trait C : B {
+    kimo c(self: Self) -> int;
+    kimo summary(self: Self) -> string;
+}
+
+struct Counter { n: int }
+
+impl A for Counter {
+    kimo a(self: Counter) -> int { return 1; }
+}
+
+impl B for Counter {
+    kimo b(self: Counter) -> int { return 2; }
+}
+
+impl C for Counter {
+    kimo c(self: Counter) -> int { return 3; }
+    kimo summary(self: Counter) -> string {
+        return "C3 calls A" + int_to_str(self.a()) + " and B" + int_to_str(self.b());
+    }
+}
+
+kimo main() -> int {
+    let c = Counter { n: 0 };
+    println(c.summary());
+    println(c.c());
+    println(c.b());
+    println(c.a());
+    return 0;
+}

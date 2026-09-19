@@ -32,6 +32,10 @@ pub kimo cg_sp_dbg_want() -> string {
     return cg_sp_dbg_name;
 }
 
+// dyn 装箱走桩开关（0=正常发射；1=直接发 NULL 对象，用于隔离装箱代码）
+let cg_dyn_box_stub: int = 0;
+pub kimo cg_dbg(msg: string) -> void {}
+
 @extern("LLVMContextCreate") kimo llvm_ctx_create() -> any { return 0 as any; }
 @extern("LLVMModuleCreateWithNameInContext") kimo llvm_mod_create(name: string, ctx: any) -> any { return 0 as any; }
 @extern("LLVMDisposeModule") kimo llvm_mod_dispose(m: any) -> void {}
@@ -427,6 +431,7 @@ pub kimo cg_is_ptr_kind(k: int) -> int {
     if (k == TYPE_FUNCTION) { return 1; }
     if (k == TYPE_OPAQUE) { return 1; }
     if (k == TYPE_ENUM_PAYLOAD) { return 1; }
+    if (k == TYPE_TRAIT_OBJECT) { return 1; }
     return 0;
 }
 
@@ -1503,6 +1508,10 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
     let mi = inst;
     let op = mi.op;
 
+    if (file_exists("build/.qdbg") == 1) {
+        cg_dbg("[qdbg] op=" + int_to_str(op));
+    }
+
     if (op == MIR_CONST_INT) {
         let k = cg_type_kind(mi.ty);
         let ty = cg_llvm_type(mi.ty);
@@ -1664,6 +1673,8 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             println("DBG MIR_CALL_IND pre reg1null=" + int_to_str(r1dn));
         }
         cg_gen_call_indirect(mi); return; }
+    if (op == MIR_MAKE_TRAITOBJ) { cg_gen_make_traitobj(mi); return; }
+    if (op == MIR_CALL_DYN) { cg_gen_call_dyn(mi); return; }
     if (op == MIR_SPAWN) { cg_gen_spawn(mi); return; }
     if (op == MIR_AWAIT) { cg_gen_await(mi); return; }
     if (op == MIR_CAST) { cg_gen_cast(mi); return; }
@@ -2222,6 +2233,7 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
         // - 用户函数：命中形参类型表，按形参类型精确拓宽（double 形参才 fpext）。
         // - 运行时/extern 函数：设计上数值形参均为 double，float 实参统一 fpext 到 double。
         let callee_pk = cg_user_func_param_kinds(mi.strval);
+        // [DBG-dyn] 稀疏日志：仅形参含 dyn 的调用（极低频，不干扰 GC 时序）
         if ((callee_pk as any) != 0) {
             let wn = len(args);
             let new_args: array<any> = [];
@@ -2542,6 +2554,160 @@ pub kimo cg_gen_call_indirect(mi: MirInst) -> void {
         cg_set_reg(mi.dst, result, ret_kind);
         return;
 
+}
+
+// ============ 0.5.3 dyn Trait 运行时多态 ============
+// 具体 struct → dyn Trait 对象 { data@0, vtable@8 }。vtable 为 GC 整数数组（函数地址槽），
+// 槽位顺序 = tc_dyn_flat_methods(trait)，各槽填 __impl__<S>__<owner>__<m> 的函数地址。
+pub kimo cg_gen_make_traitobj(mi: MirInst) -> void {
+    let trait_name = mi.strval;
+    let struct_name = mi.strval2;
+    if (cg_dyn_box_stub == 1) {
+        cg_set_reg(mi.dst, llvm_const_null(llvm_ptr_ty(llvm_i8(cg_ctx), 0)), TYPE_TRAIT_OBJECT);
+        return;
+    }
+    // [DBG-dyn] 定位崩溃点
+    cg_dbg("[make_start] trait=" + trait_name + " struct=" + struct_name);
+    // —— vtable：n 个函数地址槽
+    let methods = tc_dyn_flat_methods(trait_name);
+    cg_dbg("[flat] n=" + int_to_str(len(methods)));
+    let n = len(methods);
+    let vt_size = n * 8;
+    let vt_tid = cg_gc_type_get("__vtbl__" + struct_name + "__" + trait_name, vt_size, 0);
+    cg_dbg("[vt_tid]=" + int_to_str(vt_tid));
+    let vt_args: array<any> = [];
+    vt_args = array_push(vt_args, llvm_const_int(llvm_i32(cg_ctx), vt_size, 1));
+    vt_args = array_push(vt_args, llvm_const_int(llvm_i32(cg_ctx), vt_tid, 1));
+    let vtable = cg_call_named("rt_gc_alloc", TYPE_ANY, vt_args);
+    cg_dbg("[vtable_alloc] ok");
+    // vtable 在下面逐槽 store 的多个 call 之间没有其他根指向它，必须写入 sf
+    let vslot = cg_sf_intr_next();
+    if (vslot >= 0) { cg_sf_store(vslot, vtable, TYPE_ARRAY); }
+    let slot_i = 0;
+    while (slot_i < n) {
+        let mname = methods[slot_i] as string;
+        cg_dbg("[slot] i=" + int_to_str(slot_i) + " m=" + mname);
+        let owner = tc_dyn_method_owner(trait_name, mname);
+        let sym = tc_impl_symbol(struct_name, owner, mname);
+        cg_dbg("[slot] sym=" + sym);
+        let fnv = llvm_get_fn(cg_mod, sym);
+        cg_dbg("[slot] fnv is zero=" + int_to_str((fnv as any) == 0));
+        if ((fnv as any) == 0) {
+            // 理论上不可达（全函数预声明），兜底防 0
+            let dbg_pty = llvm_ptr_ty(llvm_i8(cg_ctx), 0);
+            let dbg_fnty = llvm_fn_ty(dbg_pty, 1, 0);
+            fnv = llvm_add_fn(cg_mod, sym, dbg_fnty);
+        }
+        let off = llvm_const_int(llvm_i32(cg_ctx), slot_i * 8, 1);
+        cg_dbg("[store] before rt_store_ptr");
+        let sa: array<any> = [];
+        sa = array_push(sa, vtable);
+        sa = array_push(sa, off);
+        sa = array_push(sa, fnv);
+        cg_call_named("rt_store_ptr", TYPE_VOID, sa);
+        cg_dbg("[store] after rt_store_ptr");
+        slot_i = slot_i + 1;
+    }
+    cg_dbg("[loop] done");
+    if (cg_dyn_box_stub == 2) {
+        cg_set_reg(mi.dst, llvm_const_null(llvm_ptr_ty(llvm_i8(cg_ctx), 0)), TYPE_TRAIT_OBJECT);
+        return;
+    }
+    // —— 对象块 { data@0, vtable@8 }：两槽皆可指向堆（位图 0b11=3）
+    cg_dbg("[obj] get tid");
+    let obj_tid = cg_gc_type_get("__dyn__" + struct_name + "__" + trait_name, 16, 3);
+    cg_dbg("[obj] tid=" + int_to_str(obj_tid));
+    let obj_args: array<any> = [];
+    obj_args = array_push(obj_args, llvm_const_int(llvm_i32(cg_ctx), 16, 1));
+    obj_args = array_push(obj_args, llvm_const_int(llvm_i32(cg_ctx), obj_tid, 1));
+    cg_dbg("[obj] before alloc");
+    let obj = cg_call_named("rt_gc_alloc", TYPE_ANY, obj_args);
+    cg_dbg("[obj] alloc ok");
+    let oslot = cg_sf_reg_slot[mi.dst];
+    cg_dbg("[obj] oslot=" + int_to_str(oslot));
+    if (oslot >= 0) { cg_sf_store(oslot, obj, TYPE_TRAIT_OBJECT); }
+    cg_dbg("[obj] sf stored");
+    if (cg_dyn_box_stub >= 3) {
+        cg_set_reg(mi.dst, obj, TYPE_TRAIT_OBJECT);
+        return;
+    }
+    cg_dbg("[tail] A data fetch kind=" + int_to_str(cg_get_reg_kind(mi.args[0])));
+    let data = cg_get_reg(mi.args[0]);
+    cg_dbg("[tail] data fetched raw=" + int_to_str((data as any) as int) + " isnull=" + int_to_str((data as any) == 0));
+    let d0 = llvm_const_int(llvm_i32(cg_ctx), 0, 1);
+    let da: array<any> = [];
+    da = array_push(da, obj);
+    da = array_push(da, d0);
+    da = array_push(da, data);
+    cg_dbg("[tail] da built");
+    cg_call_named("rt_store_ptr", TYPE_VOID, da);
+    cg_dbg("[tail] store data ok");
+    let d8 = llvm_const_int(llvm_i32(cg_ctx), 8, 1);
+    let va: array<any> = [];
+    va = array_push(va, obj);
+    va = array_push(va, d8);
+    va = array_push(va, vtable);
+    cg_dbg("[tail] va built");
+    cg_call_named("rt_store_ptr", TYPE_VOID, va);
+    cg_dbg("[tail] store vtable ok");
+    cg_set_reg(mi.dst, obj, TYPE_TRAIT_OBJECT);
+    cg_dbg("[tail] set_reg ok");
+    return;
+}
+
+// dyn Trait 方法调用：dyn 对象 → 载入 vtable/data，按方法槽位间接调用。
+pub kimo cg_gen_call_dyn(mi: MirInst) -> void {
+    let dyn_val = cg_get_reg(mi.arg1);
+    let trait_name = mi.strval;
+    let method = mi.strval2;
+    let off0 = llvm_const_int(llvm_i32(cg_ctx), 0, 1);
+    let off8 = llvm_const_int(llvm_i32(cg_ctx), 8, 1);
+    let la0: array<any> = [];
+    la0 = array_push(la0, dyn_val);
+    la0 = array_push(la0, off0);
+    let data = cg_call_named("rt_load_ptr", TYPE_ANY, la0);
+    let la8: array<any> = [];
+    la8 = array_push(la8, dyn_val);
+    la8 = array_push(la8, off8);
+    let vtable = cg_call_named("rt_load_ptr", TYPE_ANY, la8);
+    // 方法槽位：扁平方法列表中的下标（与 make_traitobj 打包同序，单点 tc_dyn_flat_methods）
+    let methods = tc_dyn_flat_methods(trait_name);
+    let slot_idx = -1;
+    let k = 0;
+    while (k < len(methods)) {
+        if (str_eq(methods[k] as string, method) == 1) { slot_idx = k; break; }
+        k = k + 1;
+    }
+    if (slot_idx < 0) { slot_idx = 0; }
+    let offs = llvm_const_int(llvm_i32(cg_ctx), slot_idx * 8, 1);
+    let ls: array<any> = [];
+    ls = array_push(ls, vtable);
+    ls = array_push(ls, offs);
+    let fn_ptr = cg_call_named("rt_load_ptr", TYPE_ANY, ls);
+    // 实参：self(data) + 剩余方法实参
+    let ret_kind = cg_type_kind(mi.ty);
+    let ret_ty = cg_llvm_type_kind(ret_kind);
+    let arg_vals: array<any> = [];
+    arg_vals = array_push(arg_vals, data);
+    let args = mi.args;
+    let ai = 0;
+    while (ai < len(args)) {
+        let reg = args[ai] as int;
+        arg_vals = array_push(arg_vals, cg_get_reg(reg));
+        ai = ai + 1;
+    }
+    buf_reset();
+    let bj = 0;
+    while (bj < len(arg_vals)) { buf_push(llvm_type_of(arg_vals[bj])); bj = bj + 1; }
+    let fn_ty = llvm_fn_ty(ret_ty, len(arg_vals), 0);
+    buf_reset();
+    let bj2 = 0;
+    while (bj2 < len(arg_vals)) { buf_push(arg_vals[bj2]); bj2 = bj2 + 1; }
+    let nm = "calltmp";
+    if (ret_kind == TYPE_VOID || ret_kind == TYPE_UNIT) { nm = ""; }
+    let result = llvm_call(cg_builder, fn_ty, fn_ptr, len(arg_vals), nm);
+    cg_set_reg(mi.dst, result, ret_kind);
+    return;
 }
 
 // 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
@@ -2877,13 +3043,13 @@ pub kimo cg_gen_enum_getpayload(mi: MirInst) -> void {
 // ============ §5.2.4 精确根集：活跃性预扫描（对标 Go stack map） ============
 // 安全点：该 MIR opcode 的 codegen 会生成 runtime 调用，可能触发 GC。
 pub kimo cg_safepoint_op(op: int) -> int {
-    if (op == MIR_CALL || op == MIR_CALL_INDIRECT) { return 1; }
+    if (op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_CALL_DYN) { return 1; }
     if (op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
     if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT) { return 1; }
     if (op == MIR_INDEX || op == MIR_MEMBER) { return 1; }
     if (op == MIR_BINOP || op == MIR_CAST) { return 1; }
     if (op == MIR_ENUM_CONSTRUCT || op == MIR_ENUM_GET_TAG || op == MIR_ENUM_GET_PAYLOAD) { return 1; }
-    if (op == MIR_MAKE_CLOSURE) { return 1; }
+    if (op == MIR_MAKE_CLOSURE || op == MIR_MAKE_TRAITOBJ) { return 1; }
     if (op == MIR_STORE_INDEX || op == MIR_STORE_MEMBER) { return 1; }
     return 0;
 }
@@ -3036,7 +3202,7 @@ pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) ->
         if (cg_may_collect_ready == 0) { return 1; }
         return cg_callee_may_collect(mi.strval);
     }
-    if (op == MIR_CALL_INDIRECT || op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
+    if (op == MIR_CALL_INDIRECT || op == MIR_CALL_DYN || op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
     return cg_safepoint_op(op);
 }
 
@@ -3044,7 +3210,7 @@ pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) ->
 // （array_lit 的 arr_ptr、struct_lit 的 obj_ptr、enum 的 buf、closure 的 env），
 // 只有指令结束才写入 dst reg —— 中途没有任何根指向它们，必须强制分配 sf 槽。
 pub kimo cg_force_slot_op(op: int) -> int {
-    if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT) { return 1; }
+    if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT || op == MIR_MAKE_TRAITOBJ) { return 1; }
     if (op == MIR_ENUM_CONSTRUCT || op == MIR_MAKE_CLOSURE) { return 1; }
     return 0;
 }
@@ -3052,6 +3218,7 @@ pub kimo cg_force_slot_op(op: int) -> int {
 // 需要额外内部临时槽的数量（每个独立中间指针一个槽）
 pub kimo cg_intr_slot_count(op: int, inst: MirInst) -> int {
     if (op == MIR_MAKE_CLOSURE || op == MIR_SPAWN) { return 1; }   // env
+    if (op == MIR_MAKE_TRAITOBJ) { return 1; }                     // vtable（中间指针）
     if (op == MIR_BINOP) {
         if (cg_type_kind(inst.ty) == TYPE_STRING) { return 2; }   // sl, sr
     }
@@ -3383,6 +3550,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         let n_blks = len(blocks_arg);
         if (n_blks == 0) { return; }
     }
+    cg_dbg("[func] " + mf.name);
     // §5.2.4：活跃性预扫描，确定 shadow frame 布局（需在分配 reg/slot 前）
     cg_sf_alloca = 0 as any;
     cg_sf_n = 0;
@@ -3627,6 +3795,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         }
         i = i + 1;
     }
+    cg_dbg("[func_end] " + mf.name);
 }
 
 // ============ 外部函数声明 codegen ============
@@ -3950,7 +4119,9 @@ pub kimo cg_gen_program(prog: Program, mfuncs: array<MirFunc>) -> string {
     cg_prog_has_threads = cg_scan_threads(mfuncs);
     let mod = llvm_mod_create("shadow_module", ctx);
     cg_gen_module(prog, mfuncs, ctx, mod);
+    cg_dbg("[finalize] single print_mod start, mfuncs=" + int_to_str(len(mfuncs)));
     let ir = llvm_print_mod(mod);
+    cg_dbg("[finalize] single print_mod done, len=" + int_to_str(len(ir)));
     llvm_del_builder(cg_builder);
     llvm_mod_dispose(mod);
     return ir;
@@ -3978,6 +4149,7 @@ pub kimo cg_gen_program_multi(modules: array<Program>, mfuncs_list: array<any>) 
         bi = bi + 1;
     }
     let ir = llvm_print_mod(final_mod);
+    cg_dbg("[finalize] multi print_mod done");
     llvm_del_builder(cg_builder);
     llvm_mod_dispose(final_mod);
     return ir;

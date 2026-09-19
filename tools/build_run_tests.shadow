@@ -83,7 +83,7 @@ kimo main() -> int {
         " --redefine-sym=shadow_zip_list=__cpp_shadow_zip_list" +
         " --redefine-sym=shadow_zip_pack=__cpp_shadow_zip_pack" +
         " --redefine-sym=shadow_zip_unpack=__cpp_shadow_zip_unpack" +
-        " "build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
+        " build/rt/runtime_for_selfhost.o build/rt/runtime_for_selfhost_user.o");
 
     // [1] 用上一轮自举产物 HOST 编译 test/run_tests.shadow
     println("[1] compile test/run_tests.shadow -> build/run_tests.ll");
@@ -95,7 +95,7 @@ kimo main() -> int {
     //     不链 shadow_gc_supplement.o；-Lpkg/shadow/llvm/crt 提供 winhttp.lib 等）
     println("[3] clang++ link -> build/run_tests.exe");
     rt_sys_exec(clang + " -std=c++17 build/run_tests.o" +
-        " build/rt/runtime_for_selfhost_user.o "build/rt/miniz.o" +
+        " build/rt/runtime_for_selfhost_user.o build/rt/miniz.o" +
         " build/rt/rt_zip.o build/rt/shadow_index.o" +
         " build/rt/rt_proc_spawn.o build/rt/rt_test_par.o build/rt/sys_exec_cpa.o" +
         " build/rt/cxa_atexit_shim.o" +

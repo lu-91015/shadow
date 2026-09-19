@@ -909,15 +909,57 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         }
         let arg_regs: array<int> = [];
         let args = h.children;
+        // 0.5.3 dyn Trait：接收者若为 trait 对象 → vtable 运行时动态分发
+        let is_dyn_call = 0;
+        let dyn_trait_name = "";
+        if (len(args) > 0) {
+            let r_t = args[0].inferred_type;
+            if (r_t.kind == TYPE_TRAIT_OBJECT && len(r_t.name) > 0) { is_dyn_call = 1; dyn_trait_name = r_t.name; }
+        }
+        // 0.5.3 dyn：该实参位置形参为 dyn Trait 且实参是本文件具体 struct → 装箱为 trait 对象
+        //（TC 扁平登记：按函数名+位置查 dyn trait 名，避免持久化 array<Type> 悬垂 AV）
+        let box_trait = "";
         let i = 0;
         while (i < len(args)) {
             let ar = mir_lower_expr(args[i]);
-            arg_regs = array_push(arg_regs, ar);
             // 传参：变量缓冲可能被 callee 保留/共享，清除所有权
             if (args[i].kind == EXPR_VAR) { mir_owned_clear(args[i].slot); }
+            let need_box = 0;
+            if (is_dyn_call == 0) {
+                box_trait = tc_dyn_trait_at(h.str1, i);
+                if (len(box_trait) > 0) { need_box = 1; }
+            }
+            if (need_box == 1) {
+                let box_ty = mk_named_type(TYPE_TRAIT_OBJECT, box_trait);
+                let mk = mir_new_reg();
+                let mi = mir_mk(MIR_MAKE_TRAITOBJ);
+                mi.dst = mk;
+                mi.strval = box_trait;              // trait 名
+                mi.strval2 = args[i].inferred_type.name; // 具体 struct 名
+                mi.args = array_push([], ar);
+                mi.ty = box_ty;
+                mir_emit(mi);
+                arg_regs = array_push(arg_regs, mk);
+            } else {
+                arg_regs = array_push(arg_regs, ar);
+            }
             i = i + 1;
         }
         let r = mir_new_reg();
+        if (is_dyn_call == 1) {
+            let inst = mir_mk(MIR_CALL_DYN);
+            inst.dst = r;
+            inst.arg1 = arg_regs[0];          // dyn 对象（数据指针 + vtable）
+            inst.strval = dyn_trait_name;     // trait 名
+            inst.strval2 = h.str1;            // 方法名
+            let rest_args: array<int> = [];
+            let ri = 1;
+            while (ri < len(arg_regs)) { rest_args = array_push(rest_args, arg_regs[ri]); ri = ri + 1; }
+            inst.args = rest_args;
+            inst.ty = callee_ty;              // 方法返回类型（dyn 化后）
+            mir_emit(inst);
+            return r;
+        }
         let inst = mir_mk(MIR_CALL);
         inst.dst = r;
         inst.strval = h.str1;

@@ -459,6 +459,27 @@ pub kimo parse_type() -> Type {
     else if (k == TOK_TIMESTAMP_TY) { t = mk_type(TYPE_TIMESTAMP); ps_adv(); }
     else if (k == TOK_NANOTIMESTAMP_TY) { t = mk_type(TYPE_NANOTIMESTAMP); ps_adv(); }
     else if (k == TOK_OPAQUE_TY) { t = mk_type(TYPE_OPAQUE); ps_adv(); }
+    else if (k == TOK_DYN) {
+        // 0.5.3 dyn Trait：trait 对象（运行时多态）。类型本身 = {数据指针, vtable 指针}。
+        ps_adv();
+        let dyn_name = ps_cur_text();
+        ps_expect(TOK_IDENT, "trait name after 'dyn'");
+        let dynt = mk_type(TYPE_TRAIT_OBJECT);
+        dynt.name = dyn_name;
+        // 可选泛型实参：dyn Trait<...>
+        if (ps_at(TOK_LT) == 1) {
+            ps_adv();
+            let dpts: array<Type> = [];
+            dpts = array_push(dpts, parse_type());
+            while (ps_at(TOK_COMMA) == 1) {
+                ps_adv();
+                dpts = array_push(dpts, parse_type());
+            }
+            ps_expect(TOK_GT, ">");
+            dynt.param_types = dpts;
+        }
+        return dynt;
+    }
     else if (k == TOK_IDENT) {
         let ident = ps_cur_text();
         ps_adv();
@@ -2852,6 +2873,18 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
         }
         ps_expect_gt(">");
     }
+    // 0.5.3 父 trait（supertrait 继承）：trait B : A1, A2 { ... }
+    let supertraits: array<string> = [];
+    if (ps_at(TOK_COLON) == 1) {
+        ps_adv();
+        while (1 == 1) {
+            let sn = ps_cur_text();
+            ps_expect(TOK_IDENT, "supertrait name");
+            supertraits = array_push(supertraits, sn);
+            if (ps_at(TOK_COMMA) == 1) { ps_adv(); continue; }
+            break;
+        }
+    }
     ps_expect(TOK_LBRACE, "{");
     let methods: array<FuncDef> = [];
     let assoc_types: array<string> = [];
@@ -2919,7 +2952,7 @@ pub kimo parse_trait_def(is_pub: int) -> TraitDef {
         }
     }
     ps_expect(TOK_RBRACE, "}");
-    let td = TraitDef { name: name, methods: methods, assoc_types: assoc_types, loc: loc, is_pub: is_pub, type_params: type_params };
+    let td = TraitDef { name: name, methods: methods, assoc_types: assoc_types, supertraits: supertraits, loc: loc, is_pub: is_pub, type_params: type_params };
     return td;
 }
 

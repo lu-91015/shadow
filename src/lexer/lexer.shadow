@@ -261,6 +261,7 @@ pub kimo lx_read_id() -> Token {
     else if (str_eq(text, "yield") == 1) { kind = TOK_YIELD; }
     else if (str_eq(text, "trait") == 1) { kind = TOK_TRAIT; }
     else if (str_eq(text, "where") == 1) { kind = TOK_WHERE; }
+    else if (str_eq(text, "dyn") == 1) { kind = TOK_DYN; }
     else if (str_eq(text, "interface") == 1) { kind = TOK_INTERFACE; }
     else if (str_eq(text, "do") == 1) { kind = TOK_DO; }
     // set 已解锁为普通标识符（支持 set<T> 语法），不作为关键字

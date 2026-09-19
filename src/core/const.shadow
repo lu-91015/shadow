@@ -31,6 +31,7 @@ pub let TYPE_ENUM_PAYLOAD: int = 21;
 pub let TYPE_TUPLE: int = 22;
 pub let TYPE_SET: int = 23;
 pub let TYPE_FUTURE: int = 24;
+pub let TYPE_TRAIT_OBJECT: int = 25; // dyn Trait 运行时多态值（数据指针 + vtable 指针）
 
 // ============ Token 种类 TOK_* ============
 pub let TOK_EOF: int = 0;
@@ -148,6 +149,7 @@ pub let TOK_DEC: int = 122;
 pub let TOK_TILDE: int = 123;
 pub let TOK_PERCENTEQ: int = 124;
 pub let TOK_WHERE: int = 125;
+pub let TOK_DYN: int = 126;
 
 // ============ 表达式种类 EXPR_* ============
 pub let EXPR_INT: int = 1;
@@ -284,6 +286,8 @@ pub let MIR_MAKE_CLOSURE: int = 26;
 pub let MIR_CALL_INDIRECT: int = 27;
 pub let MIR_SPAWN: int = 28;
 pub let MIR_AWAIT: int = 29;
+pub let MIR_MAKE_TRAITOBJ: int = 30; // 具体 struct -> dyn Trait 对象（vtable 打包）
+pub let MIR_CALL_DYN: int = 31;      // 经 vtable 的运行时动态分发调用
 
 // ============ .lu 缓存全局变量初始值标签 ============
 pub let LU_INIT_NONE: int = 0;

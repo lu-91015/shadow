@@ -1467,6 +1467,7 @@ pub kimo ty_display_name(t: Type) -> string {
     if (k == TYPE_TUPLE) { return "tuple"; }
     if (k == TYPE_SET) { return "set"; }
     if (k == TYPE_FUTURE) { return "future"; }
+    if (k == TYPE_TRAIT_OBJECT) { return "dyn " + t.name; }
     return "unknown";
 }
 
@@ -1489,6 +1490,14 @@ pub kimo tc_type_compat(ctx: CompileContext, declared: Type, actual: Type) -> in
     if (dk == TYPE_ANY) { return 1; }
     if (dk == TYPE_INFER) { return 1; }
     if (ak == TYPE_INFER) { return 1; }
+    // 0.5.3 dyn Trait：具体命名类型实现了该 trait（经 impl 表）即视为同一类型，可隐式装箱。
+    // 严格态 impl key 用 trait 注册名（mangled）——dyn 类型里是裸名，须经 trait 表解析（同 tc_satisfies_constraint）。
+    if (dk == TYPE_TRAIT_OBJECT && len(declared.name) > 0 && ak == TYPE_STRUCT) {
+        let vd = tc_mg_lookup_trait(ctx, declared.name);
+        if (tc_trait_is_none(vd) == 0) {
+            if (tc_type_impls_trait(ctx, actual.name, vd.name) == 1) { return 1; }
+        }
+    }
     // 类型相等（结构比较）
     if (type_eq(declared, actual) == 1) { return 1; }
     // 命名类型族（STRUCT/ENUM/ENUM_PAYLOAD/OPAQUE）同名即兼容：
@@ -1653,39 +1662,56 @@ pub kimo tc_tparam_generic_method(ctx: CompileContext, tname: string, method_nam
                 let c = tp.constraints[j] as string;
                 let td = tc_mg_lookup_trait(ctx, c);
                 if (tc_trait_is_none(td) == 0) {
-                    let k = 0;
-                    while (k < len(td.methods)) {
-                        let tm = td.methods[k] as FuncDef;
-                        if (str_eq(tm.name, method_name) == 1) {
-                            let rt = tm.return_type;
-                            if (type_is_none(rt) == 0) {
-                                // Self → 当前类型参数 tname（穿透模板时保持符号关联类型）
-                                if (str_eq(rt.name, "Self") == 1) {
-                                    return mk_named_type(rt.kind, tname);
-                                }
-                                // Self::Assoc / <tname>::Assoc → <tname>::Assoc
-                                let di = str_index_of(rt.name, "::");
-                                if (di >= 0) {
-                                    let base = substr2(rt.name, 0, di);
-                                    if (str_eq(base, "Self") == 1 || str_eq(base, tname) == 1) {
-                                        return mk_named_type(rt.kind, tname + "::" + substr2(rt.name, di + 2, len(rt.name)));
-                                    }
-                                    return rt; // 其他基础（具体类型）···保持原样
-                                }
-                                // 普通返回类型：非未绑定类型参数 → 直接返回
-                                if (tc_is_unbound_tparam(rt, tc_cur_tparams) == 0) {
-                                    return rt;
-                                }
-                            }
-                            return mk_type(TYPE_ANY);
-                        }
-                        k = k + 1;
-                    }
+                    // 0.5.3 supertrait：命中本 trait 或任一父 trait（递归）的方法即视为可调用
+                    let sr = tc_trait_super_method_ret(ctx, td, tname, method_name);
+                    if (sr.kind != TYPE_INFER) { return sr; }
                 }
                 j = j + 1;
             }
         }
         i = i + 1;
+    }
+    return mk_type(TYPE_INFER);
+}
+
+// 0.5.3 supertrait：在 trait 及其父 trait（递归）中查找方法返回类型。
+// 返回 mk_type(TYPE_INFER) 表示「本 trait 及其 supertrait 均未声明该方法」，
+// 其余返回值语义与 tc_tparam_generic_method 内部一致（Self/tname → tname 替换）。
+pub kimo tc_trait_super_method_ret(ctx: CompileContext, td: TraitDef, tname: string, method_name: string) -> Type {
+    let k = 0;
+    while (k < len(td.methods)) {
+        let tm = td.methods[k] as FuncDef;
+        if (str_eq(tm.name, method_name) == 1) {
+            let rt = tm.return_type;
+            if (type_is_none(rt) == 0) {
+                if (str_eq(rt.name, "Self") == 1) {
+                    return mk_named_type(rt.kind, tname);
+                }
+                let di = str_index_of(rt.name, "::");
+                if (di >= 0) {
+                    let base = substr2(rt.name, 0, di);
+                    if (str_eq(base, "Self") == 1 || str_eq(base, tname) == 1) {
+                        return mk_named_type(rt.kind, tname + "::" + substr2(rt.name, di + 2, len(rt.name)));
+                    }
+                    return rt;
+                }
+                if (tc_is_unbound_tparam(rt, tc_cur_tparams) == 0) {
+                    return rt;
+                }
+            }
+            return mk_type(TYPE_ANY);
+        }
+        k = k + 1;
+    }
+    let s = 0;
+    while (s < len(td.supertraits)) {
+        let st_raw = td.supertraits[s] as string;
+        let st_td = tc_mg_lookup_trait(ctx, st_raw);
+        if (tc_trait_is_none(st_td) == 0) {
+            let r = tc_trait_super_method_ret(ctx, st_td, tname, method_name);
+            if (r.kind != TYPE_INFER) { return r; }
+        }
+        s = s + 1;
     }
     return mk_type(TYPE_INFER);
 }
@@ -2608,6 +2634,195 @@ pub kimo tc_impl_find_method(ctx: CompileContext, type_name: string, method_name
     return "";
 }
 
+// ============ 0.5.3 dyn Trait 运行时多态 ============
+// 三个 TC 全局注册表（编译期填充，mir/codegen 无 ctx 时按名读取）：
+
+// (1) 被调函数的 dyn Trait 形参位置登记：(函数名, 形参位置, trait 名) 三条标量平行数组。
+//     仅持久化 string/int 标量。严禁持久化 array<Type>/嵌套容器——Type 含递归指针成员，
+//     作为数组元素在 GC 移动后悬垂 → AV（compile_api.shadow 同款教训）。mir 在实参处
+//     按 (函数名, 位置) 查到 trait 名即判需装箱。
+let tc_dyn_hkeys: array<string> = [];
+let tc_dyn_hpos: array<int> = [];
+let tc_dyn_hnames: array<string> = [];
+pub kimo tc_dyn_param_register(name: string, ptys: array<Type>) -> void {
+    let pi = 0;
+    while (pi < len(ptys)) {
+        let t = ptys[pi] as Type;
+        if (t.kind == TYPE_TRAIT_OBJECT && len(t.name) > 0) {
+            tc_dyn_hkeys = array_push(tc_dyn_hkeys, name);
+            tc_dyn_hpos = array_push(tc_dyn_hpos, pi);
+            tc_dyn_hnames = array_push(tc_dyn_hnames, t.name);
+        }
+        pi = pi + 1;
+    }
+}
+pub kimo tc_dyn_trait_at(name: string, pos: int) -> string {
+    let i = 0;
+    while (i < len(tc_dyn_hkeys)) {
+        if (str_eq(tc_dyn_hkeys[i] as string, name) == 1 && tc_dyn_hpos[i] == pos) {
+            return tc_dyn_hnames[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// (2) trait 名 → 扁平化方法名列表（自身 + supertrait 递归，去重，顺序即 vtable 槽位顺序）。
+//     vtable 打包与动态分发都用同一顺序，须单点生成。
+let tc_dyn_vkeys: array<string> = [];
+let tc_dyn_vvals: array<array<string>> = [];
+// (2b) trait 名 → 扁平方法各槽的声明者（owner）trait 名（与 (2) 同位并行，codegen 算 impl symbol 用）。
+let tc_dyn_okeys: array<string> = [];
+let tc_dyn_ovals: array<array<string>> = [];
+pub kimo tc_dyn_flat_methods(trait_name: string) -> array<string> {
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] flat_m lookup q=" + trait_name + " nvkeys=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] flat_m FOUND idx=" + int_to_str(i) + " n=" + int_to_str(len(tc_dyn_vvals[i] as array<string>)));
+            }
+            return tc_dyn_vvals[i] as array<string>;
+        }
+        i = i + 1;
+    }
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] flat_m MISS vkeys=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+    let empty: array<string> = [];
+    return empty;
+}
+// 返回 trait 继承图中声明 method 的 owner trait 名（codegen 经 tc_impl_symbol 定位 vtable 槽）。
+pub kimo tc_dyn_method_owner(trait_name: string, method: string) -> string {
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) {
+            let list = tc_dyn_vvals[i] as array<string>;
+            let owners = tc_dyn_ovals[i] as array<string>;
+            let j = 0;
+            while (j < len(list)) {
+                if (str_eq(list[j] as string, method) == 1) { return owners[j]; }
+                j = j + 1;
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+// 惰性填充：整个 trait 继承图扁平化。visited 阻止菱形/环重复。
+pub kimo tc_dyn_ensure_trait(ctx: CompileContext, trait_name: string) -> void {
+    let ok = 0;
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) { ok = 1; break; }
+        i = i + 1;
+    }
+    if (ok == 1) { return; }
+    let list: array<string> = [];
+    let owners: array<string> = [];
+    let visited: array<string> = [];
+    let visit: array<string> = [trait_name];
+    while (len(visit) > 0) {
+        let cur = array_pop(visit) as string;
+        // visited 去重
+        let seen = 0;
+        let vi = 0;
+        while (vi < len(visited)) {
+            if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+            vi = vi + 1;
+        }
+        if (seen == 1) { continue; }
+        visited = array_push(visited, cur);
+        let td = tc_mg_lookup_trait(ctx, cur);
+        if (tc_trait_is_none(td) == 1) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] ensure lookup_trait NONE cur=" + cur);
+            }
+            continue;
+        }
+        if (file_exists("build/.qdbg") == 1) {
+            println("[dyn] ensure got trait cur=" + cur + " nmethods=" + int_to_str(len(td.methods)));
+        }
+        let mj = 0;
+        while (mj < len(td.methods)) {
+            let tm = td.methods[mj] as FuncDef;
+            // 方法名去重（子类覆写同名时以先出现者为准）
+            let dup = 0;
+            let di = 0;
+            while (di < len(list)) {
+                if (str_eq(list[di] as string, tm.name) == 1) { dup = 1; break; }
+                di = di + 1;
+            }
+            if (dup == 0) {
+                list = array_push(list, tm.name);
+                owners = array_push(owners, cur);
+            }
+            mj = mj + 1;
+        }
+        let si = 0;
+        while (si < len(td.supertraits)) {
+            visit = array_push(visit, td.supertraits[si] as string);
+            si = si + 1;
+        }
+    }
+    tc_dyn_vkeys = array_push(tc_dyn_vkeys, trait_name);
+    tc_dyn_vvals = array_push(tc_dyn_vvals, list);
+    tc_dyn_okeys = array_push(tc_dyn_okeys, trait_name);
+    tc_dyn_ovals = array_push(tc_dyn_ovals, owners);
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] ensure done trait=" + trait_name + " nlist=" + int_to_str(len(list)) + " nvkeys_now=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+}
+// 解析 dyn 方法调用返回类型：在 trait 全继承图中找方法，Self→any / Self::X→any 擦除。
+// 返回 mk_type(TYPE_INFER) 表示未声明该方法（调用方据此报错或放行）。
+pub kimo tc_dyn_method_ret(ctx: CompileContext, trait_name: string, method: string) -> Type {
+    let list = tc_dyn_flat_methods(trait_name);
+    let mj = 0;
+    while (mj < len(list)) {
+        if (str_eq(list[mj] as string, method) == 1) {
+            let visited: array<string> = [];
+            let todo: array<string> = [trait_name];
+            while (len(todo) > 0) {
+                let cur = array_pop(todo) as string;
+                let seen = 0;
+                let vi = 0;
+                while (vi < len(visited)) {
+                    if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+                    vi = vi + 1;
+                }
+                if (seen == 1) { continue; }
+                visited = array_push(visited, cur);
+                let td = tc_mg_lookup_trait(ctx, cur);
+                if (tc_trait_is_none(td) == 1) { continue; }
+                let mk = 0;
+                while (mk < len(td.methods)) {
+                    let tm = td.methods[mk] as FuncDef;
+                    if (str_eq(tm.name, method) == 1) {
+                        let rt = tm.return_type;
+                        if (type_is_none(rt) == 1) { return mk_type(TYPE_ANY); }
+                        let rn = rt.name;
+                        if (str_eq(rn, "Self") == 1) { return mk_type(TYPE_ANY); }
+                        let di = str_index_of(rn, "::");
+                        if (di >= 0) { return mk_type(TYPE_ANY); }
+                        return rt;
+                    }
+                    mk = mk + 1;
+                }
+                let si = 0;
+                while (si < len(td.supertraits)) {
+                    todo = array_push(todo, td.supertraits[si] as string);
+                    si = si + 1;
+                }
+            }
+        }
+        mj = mj + 1;
+    }
+    return mk_type(TYPE_INFER);
+}
+
 // ============ trait 默认实现合成（0.5.3） ============
 // 对每个 trait impl，把 trait 声明了默认实现体（body 非空）但 impl 未覆写的方法，
 // 以 Self→具体类型 + 关联类型→impl 具体绑定的方式合成为 __impl__<T>__<Tr>__<m> 函数，
@@ -2947,6 +3162,21 @@ pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, typ
             }
             cj = cj + 1;
         }
+    }
+    // 0.5.3 supertrait 要求：trait B : A 意味着「impl B for X」必须有「impl A for X」。
+    // 父 trait 方法由父 trait 的 impl 提供（tc_impl_find_method 已跨 trait 扫描 receiver 类型），
+    // 此处只需保证父 impl 确实存在，否则调用父方法会静默 undefined。
+    let si = 0;
+    while (si < len(td.supertraits)) {
+        let st_raw = td.supertraits[si] as string;
+        let st_td = tc_mg_lookup_trait(ctx, st_raw);
+        if (tc_trait_is_none(st_td) == 0) {
+            if (tc_type_impls_trait(ctx, type_name, st_td.name) == 0) {
+                let m = "missing supertrait impl '" + st_raw + "' (trait '" + trait_name + "' requires it)";
+                errs = array_push(errs, m);
+            }
+        }
+        si = si + 1;
     }
     return errs;
 }
@@ -4360,6 +4590,10 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     let args = e.items;
     let arg_names = e.str_items;
 
+    if (file_exists("build/.qdbg") == 1 && str_index_of(name, "speak") >= 0) {
+        println("[DBG] tc_check_call name=" + name);
+    }
+
     // 1. 内置函数白名单
     let bt = tc_builtin_ret_type(name);
     if (type_is_none(bt) == 0) {
@@ -4610,6 +4844,30 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                     }
                 }
             }
+            // 0.5.3 dyn Trait：接收者是 trait 对象（dyn Foo.m()），走 vtable 动态分发。
+            else if (recv_t.kind == TYPE_TRAIT_OBJECT && len(recv_t.name) > 0) {
+                if (file_exists("build/.qdbg") == 1) {
+                    println("[dyn] SITE-4837 recv kind=" + int_to_str(recv_t.kind) + " name=" + recv_t.name + " method=" + name);
+                }
+                tc_dyn_ensure_trait(ctx, recv_t.name);
+                let dmlist = tc_dyn_flat_methods(recv_t.name);
+                let dmfound = 0;
+                let dmj = 0;
+                while (dmj < len(dmlist)) {
+                    if (str_eq(dmlist[dmj] as string, name) == 1) { dmfound = 1; break; }
+                    dmj = dmj + 1;
+                }
+                if (dmfound == 1) {
+                    let gi2 = 1;
+                    while (gi2 < len(args)) {
+                        tc_check_expr(ctx, args[gi2], env);
+                        gi2 = gi2 + 1;
+                    }
+                    e.str1 = name;
+                    e.inferred_type = tc_dyn_method_ret(ctx, recv_t.name, name);
+                    return e.inferred_type;
+                }
+            }
         }
         // 3b. payload enum 变体构造：Some(v) / Ok(v)
         let ed = tc_enum_find_variant_global(ctx, name);
@@ -4683,9 +4941,31 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
 // 函数调用（已找到 FuncDef）：参数处理 + 泛型推断 + 单态化
 pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, args: array<Expr>, arg_names: array<string>) -> Type {
     let loc = e.loc;
+    if (file_exists("build/.qdbg") == 1 && str_index_of(fd.name, "speak") >= 0) {
+        println("[DBG] tc_check_call_fd fd=" + fd.name);
+    }
     let params = fd.params;
     let nparams = len(params);
     let nargs = len(args);
+
+    // 0.5.3 dyn Trait：登记被调函数形参类型（mir 实参装箱用）；遇 dyn 形参惰性建 vtable 方法表。
+    let dyn_pty: array<Type> = [];
+    let dyn_pi = 0;
+    while (dyn_pi < nparams) {
+        let dyn_p = params[dyn_pi] as Param;
+        dyn_pty = array_push(dyn_pty, dyn_p.type_ref);
+        if (dyn_p.type_ref.kind == TYPE_TRAIT_OBJECT && len(dyn_p.type_ref.name) > 0) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] SITE-4940 callfd=" + fd.name + " pkind=" + int_to_str(dyn_p.type_ref.kind) + " pname=" + dyn_p.type_ref.name);
+            }
+            tc_dyn_ensure_trait(ctx, dyn_p.type_ref.name);
+        }
+        dyn_pi = dyn_pi + 1;
+    }
+    tc_dyn_param_register(fd.name, dyn_pty);
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] param_register called fd=" + fd.name + " npty=" + int_to_str(len(dyn_pty)));
+    }
 
     // 命名参数校验：arg_names[i] 必须存在于函数参数列表
     //（0.3 语义；tc-fail_named_param_wrong_name：f(x:1, nonexistent:2) 应拒绝）

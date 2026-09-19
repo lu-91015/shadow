@@ -1,0 +1,33 @@
+//@expect: Rex
+//@expect: Dog:Rex
+//@desc: 0.5.3 supertrait 继承：trait Named : Speaker；子 trait 的显式方法体内调用父 trait 方法 self.name()
+dsb ex_trait_supertrait;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+}
+
+trait Named : Speaker {
+    kimo label(self: Self) -> string;
+}
+
+struct Dog { tag: string }
+
+impl Speaker for Dog {
+    kimo name(self: Dog) -> string {
+        return self.tag;
+    }
+}
+
+impl Named for Dog {
+    kimo label(self: Dog) -> string {
+        return "Dog:" + self.name();
+    }
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Rex" };
+    println(d.name());
+    println(d.label());
+    return 0;
+}
