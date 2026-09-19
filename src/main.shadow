@@ -1833,15 +1833,59 @@ kimo main_mod_in_src(idx: int) -> int {
 }
 
 // .lu 缓存键：独立目录 build/lu_cache/（0.4 专用，与 s03 的源码旁 .lu(v8) 互不干扰）
-// 键 = <缓存语义版本>_<源文件路径 djb2>（路径变 → 新键 → 首次 miss 全量一次）
-// ⚠️ main_cache_sem 是正确性关键：任何改变 TC/codegen 语义的修改（新增检查、改类型推断、
-// 修 bug 改变接受/拒绝集合）都必须 bump 它，否则旧缓存命中会跳过函数体检查 → 漏报类型错误。
-// 当前值 = "v10_s2"。
-// ⚠️ 为什么从 v9_s6 跳到 v10_s1（必须跳，不是美观问题）：
-//   磁盘上遗留的 v9_s6_*.lu 是 **0.4 兼容态**写的——那时私有符号不按模块 mangle，
-//   MIR 里的函数名/调用名与 0.5 严格态（__mod_<ns>__<name>）完全不同族。
-//   0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
-//   大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
+// 键 = <缓存语义世代>_<源文件路径 djb2>（路径变 → 新键 → 首次 miss 全量一次）
+// 世代 = main_cache_sem（显式位）+ main_cache_autofp()（b2 自动位）。
+//
+// ⚠️ main_cache_sem = "当前值" 是**显式位**：仅当新读的 .lu 无法被旧值承载时才 bump，
+//   即发生「MIR 序列化格式 / MIR 版本号 / 符号族（mangle 世代）改变」。这类变化自动
+//   指纹感知不到（它们不改任何源码文件内容的字节），仍必须手工 bump。
+//   历史：
+//   ⚠️ 为什么从 v9_s6 跳到 v10_s1（必须跳，不是美观问题）：
+//     磁盘上遗留的 v9_s6_*.lu 是 **0.4 兼容态**写的——那时私有符号不按模块 mangle，
+//     MIR 里的函数名/调用名与 0.5 严格态（__mod_<ns>__<name>）完全不同族。
+//     0.5 若沿用同一键，会把 0.4 的缓存当成自己的命中 → 符号名全线错配 → link undefined。
+//     大版本位 v10 = "0.5 严格态 mangle 世代"，与 0.4 世代物理隔离。
+//
+// ⚠️ b2（自动位）接管「TC/codegen 语义变化」的失效：main_cache_autofp() 对
+//   codegen/type_checker/mir/mir_serialize 四个源码文件做内容哈希并入键。自 0.5 以来
+//   每次改 TC/codegen 都由人工 bump（v10_s2…v10_s21 全是这么来的）；b2 之后这类
+//   变化自动逐次失效，不再依赖记得 bump。**只有格式/符号族变化仍需手动 bump main_cache_sem。**
+let main_cache_sem: string = "v10";
+let main_g_lu_fp: string = "";
+
+// b2：TC/codegen/MIR 语义源码文件的自动指纹。源码树完整（四文件均在）→ 返回拼接哈希，
+// 使键随语义变化同步失效；任一文件缺失（发布/独立二进制）→ 返回 "" → 回落显式 sem。
+kimo main_cache_autofp() -> string {
+    let root = main_std_root;
+    if (len(root) == 0) { return ""; }
+    let paths: array<string> = [];
+    paths = array_push(paths, root + "\\codegen\\codegen.shadow");
+    paths = array_push(paths, root + "\\type_checker\\type_checker.shadow");
+    paths = array_push(paths, root + "\\mir\\mir.shadow");
+    paths = array_push(paths, root + "\\mir\\mir_serialize.shadow");
+    let acc = "";
+    let i = 0;
+    while (i < len(paths)) {
+        let p = paths[i] as string;
+        if (file_exists(p) == 1) {
+            acc = acc + main_hash_src(main_read_or_empty(p));
+        } else {
+            return "";  // 源码树不完整：不强加自动位（发布态）
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+// 缓存世代 = 显式位 + 自动位（惰性单算）。main_std_root 已被 main_load_combined 赋值。
+kimo main_cache_fp_build() -> string {
+    if (len(main_g_lu_fp) > 0) { return main_g_lu_fp; }
+    let fp = main_cache_sem;
+    let afp = main_cache_autofp();
+    if (len(afp) > 0) { fp = fp + "a" + afp; }
+    main_g_lu_fp = fp;
+    return fp;
+}
 // v10_s2：codegen 新增 typed push 分派（array<int>→shadow_array_push_int）与直接 GEP 优化，
 //   旧 v10_s1 缓存的 MIR 未携带数组元素类型 → 必须整体失效，否则新逻辑被旧缓存跳过。
 // v10_s3：codegen 免 GC 帧函数名单扩展（shadow_string_concat/subscript/schar），
@@ -1897,8 +1941,10 @@ kimo main_mod_in_src(idx: int) -> int {
 // v10_s21 曾把护栏判据折成一条 icmp ult，真产物 A/B 里 sieve +10.2%、list +6.0%（尽管机器码
 //   每条访问严格少 2 条），已整体回退到上面的有符号两侧式 → 生成的 IR 与 v10_s19 逐字节相同，
 //   故键**不动**： bump 只会白白失效全部已提交缓存，换不来任何区分度。
+// 以上 v10_s2…v10_s21 为 0.5 早期"人工失效账本"；b2 起这类 TC/codegen 语义变化统一由
+// main_cache_autofp() 自动接管，不再逐次手工 bump。世代 = 显式位 main_cache_sem + 自动位。
 kimo main_lu_key(path: string) -> string {
-    return main_lu_base + "/v10_s19_" + main_hash_src(path);
+    return main_lu_base + "/" + main_cache_fp_build() + "_" + main_hash_src(path);
 }
 
 // 编译开始：检查每模块 .lu 缓存有效性。
