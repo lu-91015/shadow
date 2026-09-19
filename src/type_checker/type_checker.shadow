@@ -5037,6 +5037,43 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         arg_names = new_names;
     }
 
+    // 默认参数展开：非变参函数缺参(nargs<nparams)且缺失形参全带默认值时，把每个缺失位置
+    // 的默认值**重建为全新字面量实参**（避免复用定义处大 Expr 子树；首版仅支持字面量默认值）。
+    // 写回 e.items 供 MIR 消费（与变参打包同引用语义）。
+    if (var_idx < 0 && nargs < nparams) {
+        let d_ok = 1;
+        let di = nargs;
+        while (di < nparams) {
+            let dp = params[di] as Param;
+            if (expr_is_none(dp.default_value) == 1) { d_ok = 0; }
+            di = di + 1;
+        }
+        if (d_ok == 1) {
+            let new_args: array<Expr> = [];
+            let dj = 0;
+            while (dj < nargs) {
+                new_args = array_push(new_args, args[dj]);
+                dj = dj + 1;
+            }
+            let dk = nargs;
+            while (dk < nparams) {
+                let dp2 = params[dk] as Param;
+                let dv = dp2.default_value;
+                let rebuilt = mk_expr(dv.kind, loc);
+                rebuilt.str1 = dv.str1;
+                rebuilt.str2 = dv.str2;
+                rebuilt.intval = dv.intval;
+                rebuilt.floatval = dv.floatval;
+                rebuilt.inferred_type = dv.inferred_type;
+                new_args = array_push(new_args, rebuilt);
+                dk = dk + 1;
+            }
+            args = new_args;
+            e.items = new_args;
+            nargs = len(new_args);
+        }
+    }
+
     // 泛型函数：先做类型实参推断与约束检查
     let tparams = fd.type_params;
     ctx.bind_names = [];

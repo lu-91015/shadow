@@ -1,5 +1,4 @@
 //@desc: default parameters fn f(x: int = 0, y: int = 1)
-//@xfail: default param not implemented in 0.4
 //@expect: 2\n7\n30\nhello world\nhello default
 dsb cg_default_param;
 
