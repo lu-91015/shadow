@@ -5029,113 +5029,104 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         if (pp0.is_variadic == 1) { var_idx = pv0; }
         pv0 = pv0 + 1;
     }
-    if (var_idx >= 0 && nargs >= var_idx) {
-        if (file_exists("build/.qdbg") == 1) {
-            println("DBG varargs PACK idx=" + int_to_str(var_idx) + " nargs=" + int_to_str(nargs));
-        }
-        let pack: array<Expr> = [];
-        let pi6 = var_idx;
-        while (pi6 < nargs) {
-            pack = array_push(pack, args[pi6]);
-            pi6 = pi6 + 1;
-        }
-        let new_args: array<Expr> = [];
-        let pi7 = 0;
-        while (pi7 < var_idx) {
-            new_args = array_push(new_args, args[pi7]);
-            pi7 = pi7 + 1;
-        }
-        let vp = params[var_idx] as Param;
-        let alit = mk_expr(EXPR_ARRAY_LIT, loc);
-        alit.items = pack;
-        alit.inferred_type = vp.type_ref;
-        new_args = array_push(new_args, alit);
-        e.items = new_args;
-        args = new_args;
-        nargs = len(new_args);
-        let new_names: array<string> = [];
-        let pi8 = 0;
-        while (pi8 < var_idx) {
-            let nn = "";
-            if (pi8 < len(arg_names)) { nn = arg_names[pi8] as string; }
-            new_names = array_push(new_names, nn);
-            pi8 = pi8 + 1;
-        }
-        new_names = array_push(new_names, "");
-        arg_names = new_names;
+    // 变参打包 + 具名参数映射 + 默认参数展开（统一处理）：
+    //   fixed_count = 需按位置/名称填写的固定参数个数（变参 = 固定前缀，非变参 = 全部形参）。
+    //   - 位置实参按序占最靠前的未占用固定槽；非变参溢出→报错，变参溢出→收进尾包。
+    //   - 具名实参按名匹配固定槽（变参尾包不可按名指定）；重复占用→报错。
+    //   - 未占用固定槽：带默认值→克隆默认值实参（tc_clone_expr）；无默认值→参数个数错误。
+    //   - 变参函数：收拢的尾包作为一个数组实参填到末位（EXPR_ARRAY_LIT）。
+    // 写回 e.items（引用语义，MIR 直接消费）。非变参且实参恰数与无具名时不进入（省开销）。
+    let fixed_count = (var_idx < 0) ? nparams : var_idx;
+    let has_named = 0;
+    let aq2 = 0;
+    while (aq2 < len(arg_names)) {
+        if (len(arg_names[aq2] as string) > 0) { has_named = 1; }
+        aq2 = aq2 + 1;
     }
-
-    // 具名参数映射 + 默认参数展开（非变参函数）：
-    //   - 具名实参(arg_names[i] 非空)按名匹配形参槽；位置实参按序占最靠前的未占用槽（可混用）。
-    //   - 重复占用同一形参 → 报错。未占用形参：带默认值→克隆默认值实参（tc_clone_expr 完整拷贝
-    //     子树，支持任意默认表达式）；无默认值→参数个数错误。
-    // 写回 e.items（引用语义，与变参打包一致，MIR 直接消费）。
-    if (var_idx < 0) {
-        let has_named = 0;
-        let aq2 = 0;
-        while (aq2 < len(arg_names)) {
-            if (len(arg_names[aq2] as string) > 0) { has_named = 1; }
-            aq2 = aq2 + 1;
-        }
-        if (has_named == 1 || nargs < nparams) {
-            let used_arg: array<int> = [];
-            let ua0 = 0;
-            while (ua0 < nparams) { used_arg = array_push(used_arg, 0); ua0 = ua0 + 1; }
-            let ord: array<Expr> = [];
-            let oo0 = 0;
-            while (oo0 < nparams) { ord = array_push(ord, mk_expr(EXPR_NULL, loc)); oo0 = oo0 + 1; }
-            let next_pos0 = 0;
-            let aa2 = 0;
-            while (aa2 < nargs) {
-                let nm = arg_names[aa2] as string;
-                let tslot = -1;
-                if (len(nm) == 0) {
-                    while (next_pos0 < nparams && used_arg[next_pos0] == 1) { next_pos0 = next_pos0 + 1; }
-                    if (next_pos0 >= nparams) {
-                        tc_error_at(ctx, loc, "function '" + fd.name + "' has too many positional arguments");
-                        tslot = nparams - 1;
-                    } else {
-                        tslot = next_pos0;
-                        next_pos0 = next_pos0 + 1;
-                    }
+    if (has_named == 1 || nargs < fixed_count || var_idx >= 0) {
+        let used_arg: array<int> = [];
+        let ua0 = 0;
+        while (ua0 < nparams) { used_arg = array_push(used_arg, 0); ua0 = ua0 + 1; }
+        let ord: array<Expr> = [];
+        let oo0 = 0;
+        while (oo0 < nparams) { ord = array_push(ord, mk_expr(EXPR_NULL, loc)); oo0 = oo0 + 1; }
+        let next_pos0 = 0;
+        let var_pack: array<Expr> = [];
+        let aa2 = 0;
+        while (aa2 < nargs) {
+            let nm = arg_names[aa2] as string;
+            let tslot = -1;
+            if (len(nm) == 0) {
+                while (next_pos0 < fixed_count && used_arg[next_pos0] == 1) { next_pos0 = next_pos0 + 1; }
+                if (next_pos0 < fixed_count) {
+                    tslot = next_pos0;
+                    next_pos0 = next_pos0 + 1;
+                } else if (var_idx >= 0) {
+                    var_pack = array_push(var_pack, args[aa2]);
                 } else {
-                    let tk2 = 0;
-                    while (tk2 < nparams) {
-                        if (str_eq((params[tk2] as Param).name, nm) == 1) { tslot = tk2; break; }
-                        tk2 = tk2 + 1;
-                    }
-                    if (tslot < 0) {
-                        tc_error_at(ctx, loc, "unknown named argument '" + nm + "' for function '" + fd.name + "'");
-                        tslot = 0;
-                    }
+                    tc_error_at(ctx, loc, "function '" + fd.name + "' has too many positional arguments");
+                    tslot = fixed_count - 1;
                 }
+            } else {
+                let tk2 = 0;
+                while (tk2 < nparams) {
+                    if (str_eq((params[tk2] as Param).name, nm) == 1) { tslot = tk2; break; }
+                    tk2 = tk2 + 1;
+                }
+                if (tslot < 0 || (var_idx >= 0 && tslot >= fixed_count)) {
+                    tc_error_at(ctx, loc, "unknown named argument '" + nm + "' for function '" + fd.name + "'");
+                    tslot = (var_idx >= 0) ? (fixed_count - 1) : 0;
+                    if (tslot < 0) { tslot = 0; }
+                }
+            }
+            if (tslot >= 0) {
                 if (used_arg[tslot] == 1) {
                     tc_error_at(ctx, loc, "argument for parameter '" + (params[tslot] as Param).name + "' specified more than once");
                 }
                 used_arg[tslot] = 1;
                 ord[tslot] = args[aa2];
-                aa2 = aa2 + 1;
             }
-            let ua1 = 0;
-            while (ua1 < nparams) {
-                if (used_arg[ua1] == 0) {
-                    let pd = params[ua1] as Param;
-                    if (expr_is_none(pd.default_value) == 1) {
-                        tc_error_at(ctx, loc, "function '" + fd.name + "' expects " + int_to_str(nparams) + " args but got " + int_to_str(nargs));
-                    } else {
-                        ord[ua1] = tc_clone_expr(pd.default_value);
-                    }
-                }
-                ua1 = ua1 + 1;
-            }
-            args = ord;
-            e.items = ord;
-            nargs = nparams;
-            let an2: array<string> = [];
-            let a3 = 0;
-            while (a3 < nparams) { an2 = array_push(an2, ""); a3 = a3 + 1; }
-            arg_names = an2;
+            aa2 = aa2 + 1;
         }
+        // 未占用的固定槽：默认值补齐 或 报参数个数错误
+        let miss = 0;
+        let ua1 = 0;
+        while (ua1 < fixed_count) {
+            if (used_arg[ua1] == 0) {
+                let pd = params[ua1] as Param;
+                if (expr_is_none(pd.default_value) == 1) {
+                    miss = 1;
+                } else {
+                    ord[ua1] = tc_clone_expr(pd.default_value);
+                    used_arg[ua1] = 1;
+                }
+            }
+            ua1 = ua1 + 1;
+        }
+        if (miss == 1) {
+            tc_error_at(ctx, loc, "function '" + fd.name + "' expects " + int_to_str(fixed_count) + " args but got " + int_to_str(nargs));
+            let uM = 0;
+            while (uM < fixed_count) {
+                if (used_arg[uM] == 0) { ord[uM] = mk_expr(EXPR_NULL, loc); used_arg[uM] = 1; }
+                uM = uM + 1;
+            }
+        }
+        // 变参函数：把尾包作为数组实参填到末位
+        if (var_idx >= 0) {
+            let vp = params[var_idx] as Param;
+            let alit = mk_expr(EXPR_ARRAY_LIT, loc);
+            alit.items = var_pack;
+            alit.inferred_type = vp.type_ref;
+            ord[var_idx] = alit;
+            used_arg[var_idx] = 1;
+        }
+        args = ord;
+        e.items = ord;
+        nargs = nparams;
+        let an2: array<string> = [];
+        let a3 = 0;
+        while (a3 < nparams) { an2 = array_push(an2, ""); a3 = a3 + 1; }
+        arg_names = an2;
     }
 
     // 泛型函数：先做类型实参推断与约束检查
@@ -5199,21 +5190,6 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         tc_error_at(ctx, loc, msg2);
         e.inferred_type = mk_type(TYPE_ANY);
         return mk_type(TYPE_ANY);
-    }
-    // 缺失参数：0.4 尚未实现默认参数展开（codegen 对缺参调用生成越界读 → 运行时 AV；
-    // 曾在 TC 调用处补默认值实参，但默认值 Expr 跨上下文复用触发 AST 大 struct 装箱崩溃）。
-    // 统一在 TC 拒绝：无默认值 → 参数数错误；有默认值 → 明确"未实现"（编译器自身源码/runtime 无默认参数，安全）。
-    let pi2 = nargs;
-    while (pi2 < nparams) {
-        let p = params[pi2] as Param;
-        if (expr_is_none(p.default_value) == 1) {
-            let msg3 = "function '" + fd.name + "' expects " + int_to_str(nparams) + " args but got " + int_to_str(nargs);
-            tc_error_at(ctx, loc, msg3);
-        } else {
-            let msg3b = "default parameter not implemented: '" + p.name + "' has default value";
-            tc_error_at(ctx, loc, msg3b);
-        }
-        break;
     }
     // 参数类型检查（已推断泛型）
     let pi3 = 0;
