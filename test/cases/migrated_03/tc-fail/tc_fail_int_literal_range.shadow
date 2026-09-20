@@ -1,0 +1,8 @@
+//@desc: suffix-less integer literal out of i32 range is rejected (no silent truncation)
+//@expect-stderr: integer literal out of range for 'int'
+dsb tc_fail_int_literal_range;
+kimo main() -> int {
+    let a = 4294967296;
+    let b = -2147483649;
+    return a + b;
+}

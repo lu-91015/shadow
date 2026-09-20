@@ -1223,6 +1223,10 @@ pub kimo parse_unary_inner() -> Expr {
     if (k == TOK_MINUS) {
         ps_adv();
         let e = parse_unary();
+        // 折叠 -<整型字面量> 为带符号字面量：让 -2147483648 合法，
+        // 且越界大正字面量（如 -9223372036854775808）能先被范围检查捕获，而非先按 i32 截断。
+        if (e.kind == EXPR_INT) { e.intval = -e.intval; return e; }
+        if (e.kind == EXPR_LONG) { e.intval = -e.intval; return e; }
         let r = mk_expr(EXPR_UNARY, loc);
         r.intval = UN_NEG;
         r.child1 = e;

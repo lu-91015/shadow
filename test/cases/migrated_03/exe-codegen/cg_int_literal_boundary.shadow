@@ -1,0 +1,20 @@
+//@desc: integer literal boundaries + long L suffix (no silent truncation)
+//@expect: mx=2147483647
+//@expect: mn=-2147483648
+//@expect: a=2147483648
+//@expect: b=-2147483649
+//@expect: c=9223372036854775807
+dsb cg_int_literal_boundary;
+kimo main() -> int {
+    let mx = 2147483647;                 // int max
+    let mn = -2147483648;                // int min（负号折叠后落在范围内）
+    let a: long = 2147483648L;           // 越 int-max 需 L 后缀
+    let b: long = -2147483649L;          // 越 int-min 需 L 后缀
+    let c: long = 9223372036854775807L;  // i64 max 完整保留
+    println("mx=" + int_to_str(mx));
+    println("mn=" + int_to_str(mn));
+    println("a=" + long_to_str(a));
+    println("b=" + long_to_str(b));
+    println("c=" + long_to_str(c));
+    return 0;
+}

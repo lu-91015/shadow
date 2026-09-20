@@ -3754,6 +3754,12 @@ pub kimo tc_check_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         let ik = it.kind;
         if (ik == TYPE_CHAR) { return it; }
         if (ik == TYPE_DATE) { return it; }
+        // 无后缀 int 字面量必须落在 i32 范围，否则常量物化会静默截断出错误值
+        if (e.intval > 2147483647 || e.intval < -2147483648) {
+            tc_error_at(ctx, loc, "integer literal out of range for 'int' (allowed -2147483648..2147483647); append 'L' suffix for 'long' (i64)");
+            if (e.intval > 2147483647) { e.intval = 2147483647; }
+            else { e.intval = -2147483648; }
+        }
         let t = mk_type(TYPE_INT);
         e.inferred_type = t;
         return t;
