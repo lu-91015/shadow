@@ -1,0 +1,14 @@
+//@desc: long literal i64 boundaries (decimal/hex/bin) accepted, no false reject
+//@expect: -1\n0\n-1\n-1
+dsb cg_long_literal_boundary;
+kimo main() -> int {
+    let a: long = 9223372036854775807L;        // i64 max
+    let b: long = -9223372036854775808L;       // i64 min
+    let c: long = 0x7fffffffffffffffL;         // 2^63-1
+    let d: long = 0b111111111111111111111111111111111111111111111111111111111111111L; // 63 ones
+    println(int_to_str(a as int));
+    println(int_to_str(b as int));
+    println(int_to_str(c as int));
+    println(int_to_str(d as int));
+    return 0;
+}

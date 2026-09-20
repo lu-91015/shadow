@@ -777,6 +777,52 @@ pub kimo parser_parse_radix_lit(txt: string) -> long {
     return parser_rt_parse_long(txt);
 }
 
+// long 字面量幅值溢出检测（纯文本，不涉 long 算术，兼容自举链 i32 降级）。
+// 只在幅值严格大于 2^63（=LONG_MIN 的可表示最大幅值）时报告溢出；
+// 恰好 2^63 留给 -9223372036854775808L / -0x8000000000000000L 作 LONG_MIN。
+pub kimo ps_digit_str_gt(a: string, b: string) -> int {
+    let i = 0;
+    let la = len(a);
+    while (i < la) {
+        let ca = char_to_int(a[i]);
+        let cb = char_to_int(b[i]);
+        if (ca > cb) { return 1; }
+        if (ca < cb) { return 0; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+pub kimo parser_long_lit_overflow(txt: string) -> int {
+    let n = len(txt);
+    if (n < 2) { return 0; }
+    let c0 = txt[0];
+    let c1 = txt[1];
+    if (c0 == "0" && (c1 == "x" || c1 == "X")) {
+        let d = n - 2;
+        if (d > 16) { return 1; }
+        if (d < 16) { return 0; }
+        return ps_digit_str_gt(txt, "0x8000000000000000");
+    }
+    if (c0 == "0" && (c1 == "b" || c1 == "B")) {
+        let start = 2;
+        while (start < n && txt[start] == "0") { start = start + 1; }
+        let bits = n - start;
+        if (bits > 64) { return 1; }
+        if (bits <= 63) { return 0; }
+        if (txt[start] == "1") {
+            let all0 = 1;
+            let k = start + 1;
+            while (k < n) { if (txt[k] != "0") { all0 = 0; } k = k + 1; }
+            if (all0 == 1) { return 0; }
+        }
+        return 1;
+    }
+    if (n > 19) { return 1; }
+    if (n < 19) { return 0; }
+    return ps_digit_str_gt(txt, "9223372036854775808");
+}
+
 pub kimo parse_primary_inner() -> Expr {
     let k = ps_cur_kind();
     let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
@@ -793,6 +839,10 @@ pub kimo parse_primary_inner() -> Expr {
 
     if (k == TOK_LONG_LIT) {
         let txt = ps_cur_text();
+        if (parser_long_lit_overflow(txt) == 1) {
+            ps_err("Parse error at " + ps_file + ":" + int_to_str(loc.line) + ":" + int_to_str(loc.col)
+                   + ": integer literal out of range for 'long' (i64) (allowed -9223372036854775808..9223372036854775807)");
+        }
         ps_adv();
         let v = parser_parse_radix_lit(txt);
         let e = mk_expr(EXPR_LONG, loc);
