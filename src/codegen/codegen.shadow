@@ -2927,10 +2927,18 @@ pub kimo cg_gen_cast(mi: MirInst) -> void {
             if (cg_is_float_kind(dst_k) == 1) {
                 cg_set_reg(mi.dst, llvm_sitofp(cg_builder, val, dst_ty, "casttmp"), dst_k);
             } else {
-                if (dst_k == TYPE_LONG) {
-                    cg_set_reg(mi.dst, llvm_sext(cg_builder, val, dst_ty, "casttmp"), dst_k);
-                } else {
+                if (dst_k == TYPE_BOOL && src_k != TYPE_BOOL) {
                     cg_set_reg(mi.dst, llvm_trunc(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                } else if (src_k == TYPE_BOOL && dst_k != TYPE_BOOL) {
+                    cg_set_reg(mi.dst, llvm_zext(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                } else {
+                    let src_w = cg_int_width(src_k);
+                    let dst_w = cg_int_width(dst_k);
+                    if (dst_w > src_w) {
+                        cg_set_reg(mi.dst, llvm_sext(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                    } else {
+                        cg_set_reg(mi.dst, llvm_trunc(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                    }
                 }
             }
         }

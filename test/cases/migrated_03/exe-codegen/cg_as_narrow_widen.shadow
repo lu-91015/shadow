@@ -1,0 +1,18 @@
+//@desc: `as` widening of narrow types (char/bool/short) uses sext/zext not trunc, b/c LLVM rejects trunc i8->i32
+//@expect: 97\n10\n1\n300\n-5\n120
+dsb cg_as_narrow_widen;
+kimo main() -> int {
+    let c: char = 'a';
+    println(int_to_str(c as int));           // 97  (sext i8->i32)
+    let n: char = '\n';
+    println(int_to_str(n as int));           // 10
+    let b: bool = true;
+    println(int_to_str(b as int));           // 1   (zext i1->i32)
+    let s: short = 300;
+    println(int_to_str(s as int));           // 300 (sext i16->i32)
+    let ns: short = -5;
+    println(int_to_str(ns as int));          // -5  (sign preserved)
+    let lit = 'x' as int;                    // 120
+    println(int_to_str(lit));
+    return 0;
+}
