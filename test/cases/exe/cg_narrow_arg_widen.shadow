@@ -1,0 +1,25 @@
+//@expect: 65\n122\n98\n65\n4464\n4464\n44\n-5
+//@timeout: 60
+// 回归：char(i8)/short(i16) 窄整型实参喂 int 形参函数（runtime + 用户函数）时
+// 未 sext 到 i32，高位填垃圾（int_to_str(c) 输出随机负大数病态值）。
+// 修复：cg_gen_call 实参拓宽由仅 bool 扩展为 bool/char/short（bool zext、char/short sext）。
+dsb cg_narrow_arg_widen;
+
+kimo id_int(x: int) -> int { return x; }
+
+kimo main() -> int {
+    let c = 'A';
+    println(int_to_str(c));            // 65:    char 变量 → int_to_str
+    let c2 = 'z';
+    println(int_to_str(c2));           // 122
+    let ca = 'a' + 1;
+    println(int_to_str(ca));           // 98:    char 算术结果
+    println(int_to_str(id_int(c)));    // 65:    char 实参喂用户函数 int 形参
+    let s = 70000 as short;
+    println(int_to_str(s));            // 4464:  short 变量 → int_to_str
+    println(int_to_str(id_int(s)));    // 4464:  short 实参喂用户函数 int 形参
+    println(int_to_str(300 as char));  // 44:    as char 截断 → i8 → sext
+    let cn = -5 as char;
+    println(int_to_str(cn));           // -5:    负 char sext 正确（错 zext 会得 251）
+    return 0;
+}

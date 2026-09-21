@@ -2250,9 +2250,11 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                 if (cg_is_float_kind(wvk) == 1 && wpk == TYPE_DOUBLE) {
                     wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
                 }
-                // bool(i1)→非 bool 整型形参：zext 到形参位宽，否则 i1 直接喂 i32 形参高位垃圾
-                else if (wvk == TYPE_BOOL && wpk != TYPE_BOOL && cg_is_int_kind(wpk) == 1) {
-                    wval = cg_cast_val(wval, TYPE_BOOL, wpk);
+                // bool/char/short 窄整型→更宽整型形参：bool zext、char/short sext，
+                // 否则 i1/i8/i16 直接喂 i32 形参时高位填垃圾（int_to_str(c) 输出随机大数）
+                else if ((wvk == TYPE_BOOL || wvk == TYPE_CHAR || wvk == TYPE_SHORT) &&
+                         wpk != wvk && cg_is_int_kind(wpk) == 1) {
+                    wval = cg_cast_val(wval, wvk, wpk);
                 }
                 new_args = array_push(new_args, wval);
                 wi = wi + 1;
@@ -2268,10 +2270,10 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                 if (cg_is_float_kind(wvk) == 1) {
                     wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
                 }
-                // 运行时/extern 数值形参均为 int/long/double：bool(i1) 需 zext 到 i32，
-                // 否则 i1 喂 i32 形参高位垃圾（如 int_to_str(c==0) 输出随机大数）。
-                else if (wvk == TYPE_BOOL) {
-                    wval = cg_cast_val(wval, TYPE_BOOL, TYPE_INT);
+                // 运行时/extern 数值形参均为 int/long/double：bool(i1) zext、char/short(i8/i16) sext
+                // 到 i32，否则窄类型喂 i32 形参高位垃圾（int_to_str(c) 输出随机大数）。
+                else if (wvk == TYPE_BOOL || wvk == TYPE_CHAR || wvk == TYPE_SHORT) {
+                    wval = cg_cast_val(wval, wvk, TYPE_INT);
                 }
                 new_args = array_push(new_args, wval);
                 wi = wi + 1;
