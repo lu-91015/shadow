@@ -1151,6 +1151,12 @@ pub kimo tc_main_module_end() -> int {
 let tc_g_valid_ns: array<string> = [];
 pub kimo tc_set_valid_ns(list: array<string>) -> void { tc_g_valid_ns = list; }
 
+// 缓存命中只跳过「前 TC 原始函数」的函数体检查：合成函数（如 __impl__ 默认实现）总是
+// fresh-lower（fi>=N0），若因其 loc.line 落在缓存有效模块内也被跳过，则表达式
+// inferred_type 不回填 → 生成 add ptr / sext ptr / call @裸符号 等错误 MIR。
+// 每次 tc_check_program 入口在合成默认实现之前捕获 parse 后的原始函数数。
+let tc_g_orig_func_count: int = 0;
+
 // 函数所在行所属模块是否在缓存命中集合内。
 //
 // ⚠️ 此处曾有一行无条件 `return 0;`（配合 main_g_lu_cache=0 的第二道硬闸），
@@ -6264,7 +6270,11 @@ pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
         let fd = prog.funcs[i] as FuncDef;
         if (len(fd.extern_name) == 0) {
             // Phase 11 增量缓存：函数所属模块缓存命中 → 跳过函数体检查（MIR 由 loader 从 .lu 加载）
-            if (tc_ns_is_valid(ctx, fd.loc.line) == 1) {
+            // 仅跳过前 TC 原始函数（i < tc_g_orig_func_count）：其 MIR 从 .lu 载入，inferred_type
+            // 无消费者。TC 期间合成的 __impl__ 默认实现函数（总 fresh-lower、fi>=N0）必须照常
+            // 检查函数体，否则其类型推断被跳过 → 生成 add ptr / call @裸符号 等错误 MIR
+            //（缓存反序列化 bug：ex_trait_default_impl / ex_trait_supertrait_default 热缓存失败）。
+            if (i < tc_g_orig_func_count && tc_ns_is_valid(ctx, fd.loc.line) == 1) {
                 i = i + 1;
                 continue;
             }
@@ -6437,6 +6447,9 @@ pub kimo tc_check_program(prog: Program) -> int {
     };
     ctx.graph = tc_mg_add(ctx.graph, pnode);
     // Pass 1：默认实现合成（必须早于符号注册，使合成的 mangled 函数进入注册循环）
+    // 先记录 parse 后的原始函数数：合成默认实现会追加 __impl__ 函数（fi>=N0，总 fresh-lower），
+    // 缓存命中的跳过判定必须排除它们，否则其函数体类型推断被跳过 → 错误 MIR。
+    tc_g_orig_func_count = len(prog.funcs);
     tc_synth_default_impls(prog);
     // Pass 2：声明收集
     tc_register_decls(ctx, prog);

@@ -914,7 +914,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         let dyn_trait_name = "";
         if (len(args) > 0) {
             let r_t = args[0].inferred_type;
-            if (r_t.kind == TYPE_TRAIT_OBJECT && len(r_t.name) > 0) { is_dyn_call = 1; dyn_trait_name = r_t.name; }
+            // 缓存命中跳过 TC 时接收者 inferred_type 可能为 null（未回填），勿解引用
+            if ((r_t as any) != 0 && r_t.kind == TYPE_TRAIT_OBJECT && len(r_t.name) > 0) { is_dyn_call = 1; dyn_trait_name = r_t.name; }
         }
         // 0.5.3 dyn：该实参位置形参为 dyn Trait 且实参是本文件具体 struct → 装箱为 trait 对象
         //（TC 扁平登记：按函数名+位置查 dyn trait 名，避免持久化 array<Type> 悬垂 AV）
