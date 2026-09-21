@@ -138,6 +138,9 @@ pub kimo cg_dbg(msg: string) -> void {}
 
 // ============ Codegen 全局状态 ============
 let cg_ctx: any = 0 as any;
+// cg_gen_module 持有的 Program（含 traits/impls）。dyn vtable 布局在缓存命中时
+// 直接据此重建，因 codegen 无 CompileContext（cg_ctx 是 LLVM 上下文）。
+let cg_prog: any = 0 as any;
 let cg_mod: any = 0 as any;
 let cg_builder: any = 0 as any;
 let cg_func: any = 0 as any;
@@ -2569,6 +2572,9 @@ pub kimo cg_gen_make_traitobj(mi: MirInst) -> void {
     // [DBG-dyn] 定位崩溃点
     cg_dbg("[make_start] trait=" + trait_name + " struct=" + struct_name);
     // —— vtable：n 个函数地址槽
+    // LU 磁盘缓存命中时 type-check 函数体被跳过，tc_dyn_* 全局表为空且无 CompileContext；
+    // 直接从 cg_prog.prog.traits 重建扁平布局，保证 vtable 槽位可得且与 TC 同序（幂等）。
+    tc_dyn_ensure_from_prog(cg_prog as Program, trait_name);
     let methods = tc_dyn_flat_methods(trait_name);
     cg_dbg("[flat] n=" + int_to_str(len(methods)));
     let n = len(methods);
@@ -2671,6 +2677,8 @@ pub kimo cg_gen_call_dyn(mi: MirInst) -> void {
     la8 = array_push(la8, off8);
     let vtable = cg_call_named("rt_load_ptr", TYPE_ANY, la8);
     // 方法槽位：扁平方法列表中的下标（与 make_traitobj 打包同序，单点 tc_dyn_flat_methods）
+    // 缓存命中同样可能使 tc_dyn_* 全局表为空，ensure 保证槽位列表可得（幂等）。
+    tc_dyn_ensure_from_prog(cg_prog as Program, trait_name);
     let methods = tc_dyn_flat_methods(trait_name);
     let slot_idx = -1;
     let k = 0;
@@ -3922,6 +3930,7 @@ pub kimo cg_emit_globals(globals: array<GlobalVar>) -> void {
 pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any) -> void {
     // 强引用根：防止 GC 中途回收 MirFunc.blocks（0.3 历史 workaround，保留）
     cg_all_blocks = [];
+    cg_prog = prog;   // dyn vtable 布局在缓存命中时据此重建
     let cgabi = 0;
     while (cgabi < len(mfuncs)) {
         let cgabmf = mfuncs[cgabi];

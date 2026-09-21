@@ -2776,6 +2776,67 @@ pub kimo tc_dyn_ensure_trait(ctx: CompileContext, trait_name: string) -> void {
         println("[dyn] ensure done trait=" + trait_name + " nlist=" + int_to_str(len(list)) + " nvkeys_now=" + int_to_str(len(tc_dyn_vkeys)));
     }
 }
+// codegen 专用：.lu 缓存命中时 type-check 函数体被跳过，tc_dyn_* 全局表为空，
+// 且 codegen 阶段没有可用的 CompileContext/模块图。此处改为直接从 prog.traits
+// （parse 产物，编解码缓存无关，缓存命中时仍完整可读）计算扁平方法布局并写入同一全局表。
+// 算法与 tc_dyn_ensure_trait 完全一致（BFS + visited 去重 + 方法名去重），
+// 保证 vtable 打包与动态分发槽位顺序单点。trait 名以 bare 名匹配，owner 存 bare 名
+// （tc_impl_symbol 内部 unmangle，mangled/bare 殊途同归）。
+pub kimo tc_dyn_ensure_from_prog(prog: Program, trait_name: string) -> void {
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) { return; }
+        i = i + 1;
+    }
+    let list: array<string> = [];
+    let owners: array<string> = [];
+    let visited: array<string> = [];
+    let visit: array<string> = [trait_name];
+    while (len(visit) > 0) {
+        let cur = array_pop(visit) as string;
+        let seen = 0;
+        let vi = 0;
+        while (vi < len(visited)) {
+            if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+            vi = vi + 1;
+        }
+        if (seen == 1) { continue; }
+        visited = array_push(visited, cur);
+        let td = 0 as TraitDef;
+        let tii = 0;
+        let cur_bare = tc_bare_name(cur);
+        while (tii < len(prog.traits)) {
+            let t = prog.traits[tii];
+            if (str_eq(tc_bare_name(t.name), cur_bare) == 1) { td = t; break; }
+            tii = tii + 1;
+        }
+        if (len(td.name) == 0) { continue; }   // 未找到（none TraitDef）
+        let mj = 0;
+        while (mj < len(td.methods)) {
+            let tm = td.methods[mj] as FuncDef;
+            let dup = 0;
+            let di = 0;
+            while (di < len(list)) {
+                if (str_eq(list[di] as string, tm.name) == 1) { dup = 1; break; }
+                di = di + 1;
+            }
+            if (dup == 0) {
+                list = array_push(list, tm.name);
+                owners = array_push(owners, cur_bare);
+            }
+            mj = mj + 1;
+        }
+        let si = 0;
+        while (si < len(td.supertraits)) {
+            visit = array_push(visit, td.supertraits[si] as string);
+            si = si + 1;
+        }
+    }
+    tc_dyn_vkeys = array_push(tc_dyn_vkeys, trait_name);
+    tc_dyn_vvals = array_push(tc_dyn_vvals, list);
+    tc_dyn_okeys = array_push(tc_dyn_okeys, trait_name);
+    tc_dyn_ovals = array_push(tc_dyn_ovals, owners);
+}
 // 解析 dyn 方法调用返回类型：在 trait 全继承图中找方法，Self→any / Self::X→any 擦除。
 // 返回 mk_type(TYPE_INFER) 表示未声明该方法（调用方据此报错或放行）。
 pub kimo tc_dyn_method_ret(ctx: CompileContext, trait_name: string, method: string) -> Type {
