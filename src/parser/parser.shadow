@@ -852,10 +852,20 @@ pub kimo parse_primary_inner() -> Expr {
 
     if (k == TOK_FLOAT_LIT) {
         let txt = ps_cur_text();
+        // 上溢诊断：strtod 对超界浮点字面量（如 1e999）静默返回 ±HUGE_VAL(inf)，无任何报错。
+        // 哨兵取 DBL_MAX（最大有限 double）：v > mx 仅在 +inf 时真、v < -mx 仅在 -inf 时真，
+        // 正常有限值（含恰好 DBL_MAX）不会被误报；自举链复编本源码时该哨兵字面量本身为有限值，
+        // 不会触发它自己的检查（strtod 恰好返回 DBL_MAX，v>mx 为假）。
+        let v = str_to_double(txt);
+        let mx = 1.7976931348623157e308;
+        if (v > mx || v < -mx) {
+            ps_err("Parse error at " + ps_file + ":" + int_to_str(loc.line) + ":" + int_to_str(loc.col)
+                   + ": float literal out of range (overflows the double range, silently became infinity; max is ~1.7976931348623157e308)");
+        }
         ps_adv();
         let e = mk_expr(EXPR_FLOAT, loc);
         e.str1 = txt;
-        e.floatval = str_to_double(txt);
+        e.floatval = v;
         return e;
     }
 

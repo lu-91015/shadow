@@ -1,0 +1,14 @@
+//@desc: float literal within double range accepted, no false reject
+//@expect: 1\n1\n1\n1
+dsb cg_float_literal_boundary;
+kimo main() -> int {
+    let a = 1.7976931348623157e308;    // DBL_MAX（最大有限 double）
+    let b = -1.7976931348623157e308;   // -DBL_MAX
+    let c = 1e308;                     // 大的有限值
+    let d = 1e-308;                    // 小的次正规值
+    println(int_to_str((a > 0.0) ? 1 : 0));   // 1：有限正，非 inf
+    println(int_to_str((b < 0.0) ? 1 : 0));   // 1：有限负
+    println(int_to_str((a == 1.7976931348623157e308) ? 1 : 0)); // 1：round-trip 一致
+    println(int_to_str((c > 0.0) ? 1 : 0));   // 1
+    return 0;
+}
