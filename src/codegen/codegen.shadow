@@ -1802,6 +1802,15 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             let i1_ty = llvm_i1(cg_ctx);
             result = llvm_trunc(cg_builder, result, i1_ty, "booltrunc");
         }
+        // char/short 字段读出须收窄到 i8/i16：cg_load_fn(fk) 一律返回 i32，
+        // 若以 i32 值登记 CHAR 寄存器，二元运算与其 i8 字面量操作数类型不匹配
+        // （sub i32, i8 非法 IR）。与 cg_gen_array_load 对窄数组元素的收窄一致。
+        else if (fk == TYPE_CHAR) {
+            result = llvm_trunc(cg_builder, result, llvm_i8(cg_ctx), "chtrunc");
+        }
+        else if (fk == TYPE_SHORT) {
+            result = llvm_trunc(cg_builder, result, llvm_i16(cg_ctx), "shtrunc");
+        }
         cg_set_reg(mi.dst, result, fk);
         return;
     }
