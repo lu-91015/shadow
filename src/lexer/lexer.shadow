@@ -298,7 +298,10 @@ pub kimo lx_read_str() -> Token {
             else if (esc == "r") { text = text + "\r"; }
             else if (esc == "\\") { text = text + "\\"; }
             else if (esc == "\"") { text = text + "\""; }
-            else if (esc == "0") { text = text + "\0"; }
+            // 字符串是 NUL 结尾 C 串（len 用 strlen），无法承载内嵌 \0 字节：
+            // 若在此拼入 "\0"，会因 strlen("\0")==0 被后续拼接静默丢弃（"a\0b"→"ab"，数据丢失）。
+            // 退化为字面量反斜杠-0，往返无损、可见可查；字符字面量 '\0' 则仍是标量 0（见下）。
+            else if (esc == "0") { text = text + "\\" + "0"; }
             else { text = text + esc; }
             lx_adv();
         } else {
