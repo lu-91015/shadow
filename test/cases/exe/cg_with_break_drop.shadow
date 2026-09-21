@@ -1,0 +1,75 @@
+//@expect: 1\n1\n1\n1\n1\n1
+//@timeout: 60
+// 回归：with 块确定性 Drop——break/continue 跳出【外层】循环时必须先 drop，
+// 否则末尾的 name.drop() 被跳过，资源只剩 GC 终结器兜底（确定性释放保证被破坏）。
+// with 内【嵌套】循环的 break 只退出内层、不得提前 drop，且整个 with 只 drop 一次。
+dsb cg_with_break_drop;
+
+trait Drop {
+    kimo drop(self: Self) -> void;
+}
+struct Lock {
+    id: int;
+}
+let locked: int = 0;        // 0=未释放 1=已释放
+let drop_total: int = 0;    // drop 总次数
+impl Drop for Lock {
+    kimo drop(self: Lock) -> void {
+        locked = 1;
+        drop_total = drop_total + 1;
+    }
+}
+kimo reset() -> void { locked = 0; }
+
+kimo main() -> int {
+    // (A) 普通退出：with 末尾确定性 drop
+    reset();
+    with lk = Lock { id: 1 } {
+        let _x = 0; _x = _x + 1;
+    }
+    println(int_to_str(locked));   // 期望 1
+
+    // (B) break 跳出外层循环：break 前必须 drop
+    reset();
+    let i = 0;
+    while (i < 10) {
+        with lk = Lock { id: 2 } {
+            if (i == 5) { break; }
+        }
+        reset();
+        i = i + 1;
+    }
+    println(int_to_str(locked));   // 期望 1（break 轮已 drop）
+
+    // (C) continue 跳出外层循环（用 for，避免 i++ 被跳过死循环）：continue 前必须 drop
+    reset();
+    let j = 0;
+    for (_j in 0..4) {
+        with lk = Lock { id: 3 } {
+            if (_j == 2) { continue; }
+        }
+        reset();
+    }
+    println(int_to_str(locked));   // 期望 1（continue 轮已 drop）
+
+    // (D) with 内【嵌套】循环的 break：只退出内层，不得提前 drop；
+    //     落到 with 末尾 drop 恰好一次
+    reset();
+    drop_total = 0;
+    with lk = Lock { id: 4 } {
+        let k = 0;
+        while (k < 4) {
+            if (k == 2) { break; }   // 仅退出内层 while，with 仍存活
+            k = k + 1;
+        }
+        // 到达这里说明内层 break 未提前 drop 整个 with
+    }
+    println(int_to_str(locked));    // 期望 1（with 末尾 drop）
+    println(int_to_str(drop_total));// 期望 1（整个 with 只 drop 一次）
+
+    // (E) with 内 return：既有行为仍应 drop（回归保护）
+    reset();
+    with lk = Lock { id: 5 } {
+        return 0;
+    }
+}

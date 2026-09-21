@@ -2089,7 +2089,7 @@ pub kimo ps_parse_with_stmt() -> Stmt {
     }
     ps_expect(TOK_RBRACE, "}");
     // 重写 body 中 return → drop + return
-    ps_rewrite_returns_in_with(body, name, loc);
+    ps_rewrite_returns_in_with(body, name, loc, 0);
     let stmts: array<Stmt> = [];
     let let_stmt = mk_stmt(STMT_LET, loc);
     let_stmt.str1 = name;
@@ -2117,7 +2117,13 @@ pub kimo ps_parse_with_stmt() -> Stmt {
 }
 
 // 递归重写 with body 中的 STMT_RETURN → STMT_BLOCK([drop(), STMT_RETURN])
-pub kimo ps_rewrite_returns_in_with(stmts: array<Stmt>, name: string, drop_loc: Location) -> void {
+// loop_depth：with 块自身是不是一层循环（进入内层循环 body 时 +1）。
+// break/continue 只会跳出「最近的一层循环」——若它落在 with 以内、任何嵌套
+// 循环之外（loop_depth==0），则是跳出包围 with 的外层循环 → 必须先 drop 再跳，
+// 否则末尾的确定性 name.drop() 会被 break/continue 跳过，资源要等到 GC 终结器
+// 兜底（确定性释放保证被破坏）。而 with 内嵌套循环里的 break/continue 只退出
+// 内层循环，with 资源仍在作用域内，不得提前 drop → 保持原样。
+pub kimo ps_rewrite_returns_in_with(stmts: array<Stmt>, name: string, drop_loc: Location, loop_depth: int) -> void {
     let i = 0;
     while (i < len(stmts)) {
         let s = stmts[i] as Stmt;
@@ -2141,23 +2147,41 @@ pub kimo ps_rewrite_returns_in_with(stmts: array<Stmt>, name: string, drop_loc: 
             let blk = mk_stmt(STMT_BLOCK, s.loc);
             blk.items = blk_stmts;
             stmts[i] = blk;
+        } else if (k == STMT_BREAK || k == STMT_CONTINUE) {
+            if (loop_depth == 0) {
+                let drop_call = mk_expr(EXPR_CALL, drop_loc);
+                drop_call.str1 = "drop";
+                let recv_var = mk_expr(EXPR_VAR, drop_loc);
+                recv_var.str1 = name;
+                let drop_args: array<Expr> = [];
+                drop_args = array_push(drop_args, recv_var);
+                drop_call.items = drop_args;
+                let drop_stmt = mk_stmt(STMT_EXPR, drop_loc);
+                drop_stmt.expr1 = drop_call;
+                let blk_stmts: array<Stmt> = [];
+                blk_stmts = array_push(blk_stmts, drop_stmt);
+                blk_stmts = array_push(blk_stmts, s);
+                let blk = mk_stmt(STMT_BLOCK, s.loc);
+                blk.items = blk_stmts;
+                stmts[i] = blk;
+            }
         } else if (k == STMT_BLOCK) {
-            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+            ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth);
         } else if (k == STMT_IF) {
-            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+            ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth);
             if (len(s.items2) > 0) {
-                ps_rewrite_returns_in_with(s.items2, name, drop_loc);
+                ps_rewrite_returns_in_with(s.items2, name, drop_loc, loop_depth);
             }
         } else if (k == STMT_WHILE) {
-            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+            ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth + 1);
         } else if (k == STMT_FOR) {
-            ps_rewrite_returns_in_with(s.items, name, drop_loc);
+            ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth + 1);
         } else if (k == STMT_MATCH) {
             let mb = s.items;
             let mi = 0;
             while (mi < len(mb)) {
                 let arm = mb[mi] as Stmt;
-                ps_rewrite_returns_in_with(arm.items, name, drop_loc);
+                ps_rewrite_returns_in_with(arm.items, name, drop_loc, loop_depth);
                 mi = mi + 1;
             }
         }
