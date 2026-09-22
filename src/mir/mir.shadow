@@ -78,6 +78,69 @@ pub kimo mir_empty_set(slot: int, v: int) -> void {
     }
 }
 
+// === 空数组字面量分配位置跟踪（删除无谓的 12B 空对象分配）===
+// `let a = []` 会在当前块发一条 MIR_ARRAY_LIT + MIR_STORE_VAR，真实分配一个 12 字节的
+// 空数组；若紧随其后是填充循环预分配（mir_sred_begin），该对象立刻被 prealloc 覆盖成孤儿，
+// 每热迭代都白费一次分配 + 一次 GC 清扫（sieve/queens 实测百万级 12B 孤儿）。
+// 这里记录这两条指令的下标；预分配触发时若证实时机安全（同一块、分配后无读取）则整体删除。
+// mir_empty_alloc_block 记下记录点的块序号，跨块（分支）时与当前块不一致则保守跳过删除。
+let mir_empty_alloc_start: array<int> = [];
+let mir_empty_alloc_block: array<int> = [];
+let mir_block_serial: int = 1;
+
+kimo mir_empty_alloc_ensure(slot: int) -> void {
+    while (len(mir_empty_alloc_start) <= slot) {
+        mir_empty_alloc_start = array_push(mir_empty_alloc_start, -1);
+        mir_empty_alloc_block = array_push(mir_empty_alloc_block, -1);
+    }
+}
+
+// 删除 pslot 在"空数组字面量分配处"的两条指令（MIR_ARRAY_LIT + STORE_VAR）。前提：
+//   1) 仍记录在**当前块**（块序号一致），避免跨块时下标漂移；实测形状必须恰是空字面量；
+//   2) 自该分配以来，当前块内没有任何对 pslot 或数组值寄存器的读取 —— 否则留原始分配。
+// 任何一条不满足就原样保留（保守，零语义变化）。删除后同一块内仍待删的其它空分配下标 -= 2。
+kimo mir_sred_drop_empty(pslot: int) -> int {
+    if (pslot < 0 || pslot >= len(mir_empty_alloc_start)) { return 0; }
+    if (mir_empty_alloc_start[pslot] < 0) { return 0; }
+    if (mir_empty_alloc_block[pslot] != mir_block_serial) { return 0; }
+    let s = mir_empty_alloc_start[pslot];
+    if (s < 0 || (s + 1) >= len(mir_cur_insts)) { return 0; }
+    let a0 = mir_cur_insts[s];
+    let a1 = mir_cur_insts[s + 1];
+    if (a0.op != MIR_ARRAY_LIT || len(a0.args) != 0) { return 0; }
+    if (a1.op != MIR_STORE_VAR || a1.arg1 != a0.dst || a1.arg2 != pslot) { return 0; }
+    let r = a0.dst;
+    let j = s + 2;
+    while (j < len(mir_cur_insts)) {
+        let ins = mir_cur_insts[j];
+        if (ins.op == MIR_LOAD_VAR && ins.arg1 == pslot) { return 0; }
+        if (ins.arg1 == r || ins.arg2 == r || ins.dst == r) { return 0; }
+        let ka = 0;
+        while (ka < len(ins.args)) {
+            if (ins.args[ka] == r) { return 0; }
+            ka = ka + 1;
+        }
+        j = j + 1;
+    }
+    let nb: array<MirInst> = [];
+    let i = 0;
+    while (i < len(mir_cur_insts)) {
+        if (i != s && i != (s + 1)) { nb = array_push(nb, mir_cur_insts[i]); }
+        i = i + 1;
+    }
+    mir_cur_insts = nb;
+    mir_empty_alloc_start[pslot] = -1;
+    mir_empty_alloc_block[pslot] = -1;
+    let k = 0;
+    while (k < len(mir_empty_alloc_start)) {
+        if (mir_empty_alloc_start[k] > s && mir_empty_alloc_block[k] == mir_block_serial) {
+            mir_empty_alloc_start[k] = mir_empty_alloc_start[k] - 2;
+        }
+        k = k + 1;
+    }
+    return 1;
+}
+
 // === 填充循环计数存储强度削减（v10_s18）===
 // 适用形状（循环体除下列语句外不得有任何别的东西）：
 //     let a: array<T> = [];                        // mir_empty_is(a)=1
@@ -569,6 +632,8 @@ pub kimo mir_seal_and_begin(new_label: string) -> void {
     mir_cur_label = new_label;
     mir_cur_insts = [];
     mir_cur_terminator = 0 as MirInst;
+    // 空数组分配位置是相对 mir_cur_insts 下标的，跨块必须全部作废（嫌脏累加）
+    mir_block_serial = mir_block_serial + 1;
 }
 
 // 仅封存当前块（用于函数末尾）
@@ -1542,12 +1607,22 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
 
     if (k == STMT_LET) {
         if ((h.child as any) != 0) {
+            let empty_alloc_idx = -1;
+            let initk = h.child.kind;
+            if (initk == EXPR_ARRAY_LIT && len(h.child.children) == 0) {
+                empty_alloc_idx = len(mir_cur_insts);
+            }
             let rhs_reg = mir_lower_expr(h.child);
             let inst = mir_mk(MIR_STORE_VAR);
             inst.arg1 = rhs_reg;
             inst.arg2 = h.slot;
             inst.ty = h.inferred_type;
             mir_emit(inst);
+            if (empty_alloc_idx >= 0) {
+                mir_empty_alloc_ensure(h.slot);
+                mir_empty_alloc_start[h.slot] = empty_alloc_idx;
+                mir_empty_alloc_block[h.slot] = mir_block_serial;
+            }
             // 所有权：let x = y（变量复制）→ 共享缓冲，源与目标均不唯一持有；
             // let x = 字面量/二元运算 → 新缓冲，唯一持有；
             // let x = 调用/索引/成员/闭包 → 结果可能逃逸/共享，不唯一持有。
@@ -1866,6 +1941,9 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             while (pi < len(pre_slots)) {
                 let pslot = pre_slots[pi];
                 let pty: Type = pre_tys[pi];
+                // 预分配会立即覆盖 pslot 的空数组 → 整体删掉那次无谓的空分配（每热迭代省
+                // 一次 12B 分配 + GC 清扫；仅在证实时机安全时删，否则保留原始分配）。
+                mir_sred_drop_empty(pslot);
                 let es = 8;
                 if ((pty as any) != 0 && (pty.elem_type as any) != 0) {
                     let ek = pty.elem_type.kind;
@@ -2531,6 +2609,9 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
         mir_owned = array_push(mir_owned, 0);
         oi = oi + 1;
     }
+    mir_empty_alloc_start = [];
+    mir_empty_alloc_block = [];
+    mir_block_serial = 1;
     mir_slot_empty = [];
     let ei = 0;
     while (ei < mir_n_slots) {
