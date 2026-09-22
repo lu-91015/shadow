@@ -1,0 +1,33 @@
+//@expect: 10\n3:30\n2:20\nabc\n255\n99\np=30
+//@timeout: 60
+// 回归+功能：const 不可变绑定。
+// const x: T = init; —— 声明后不可再赋值（对 const 变量/其字段/其元素再赋值均在类型
+// 检查期报错，见 tc-fail/tc_fail_const_assign.shadow）；但可读、可参与运算、可作初值。
+// 注：刻意回避"用户函数 + 多个引用局部变量"组合触发的既有 codegen 栈帧 bug（与 const 无关）。
+dsb cg_const;
+
+struct Point { x: int; y: int; }
+
+kimo main() -> int {
+    // 基本 const：可读、可参与运算
+    const c: int = 10;
+    println(int_to_str(c));
+
+    // const 数组：读下标、len、切片
+    const arr: array<int> = [10, 20, 30];
+    println(int_to_str(len(arr)) + ":" + int_to_str(arr[2]));
+    println(int_to_str(len(arr[1:])) + ":" + int_to_str(arr[1:][0]));
+
+    // const 字符串：直接读
+    const name: string = "abc";
+    println(name);
+
+    // const 结构体：只读字段
+    const p = Point { x: 255, y: 99 };
+    println(int_to_str(p.x));
+    println(int_to_str(p.y));
+
+    // const 作运算/字段参与
+    println("p=" + int_to_str(p.x - 225));
+    return 0;
+}

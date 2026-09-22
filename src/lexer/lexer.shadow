@@ -248,6 +248,7 @@ pub kimo lx_read_id() -> Token {
     else if (str_eq(text, "match") == 1) { kind = TOK_MATCH; }
     else if (str_eq(text, "new") == 1) { kind = TOK_NEW; }
     else if (str_eq(text, "mut") == 1) { kind = TOK_MUT; }
+    else if (str_eq(text, "const") == 1) { kind = TOK_CONST; }
     else if (str_eq(text, "impl") == 1) { kind = TOK_IMPL; }
     else if (str_eq(text, "try") == 1) { kind = TOK_TRY; }
     else if (str_eq(text, "catch") == 1) { kind = TOK_CATCH; }

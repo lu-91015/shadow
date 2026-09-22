@@ -137,6 +137,7 @@ pub let TOK_WITH: int = 112;
 pub let TOK_DSB: int = 113;
 pub let TOK_DEFER: int = 114;
 pub let TOK_COLONCOLON: int = 115;
+pub let TOK_CONST: int = 127;
 
 // ============ 位运算 / 自增自减 token（0.5 增量） ============
 pub let TOK_BITAND: int = 116;

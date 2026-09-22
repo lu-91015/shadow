@@ -327,6 +327,9 @@ pub kimo ps_is_path_component() -> int {
     if (k == TOK_ANY_TY) { return 1; }
     if (k == TOK_CHAR_TY) { return 1; }
     if (k == TOK_SHORT_TY) { return 1; }
+    // 关键字亦可作模块/名字路径组件（如 core.const / core.mut 这类以关键字命名的模块）
+    if (k == TOK_CONST) { return 1; }
+    if (k == TOK_MUT) { return 1; }
     return 0;
 }
 
@@ -2325,8 +2328,11 @@ pub kimo parse_statement_inner() -> Stmt {
         return ps_parse_match_stmt();
     }
 
-    if (k == TOK_LET) {
+    if (k == TOK_LET || k == TOK_CONST) {
         ps_adv();
+        // const 一律不可变；let 允许 mut 前缀（语义：let mut = 显式可变，默认不可变）
+        let is_const = 0;
+        if (k == TOK_CONST) { is_const = 1; }
         if (ps_at(TOK_MUT) == 1) { ps_adv(); }
         // 元组解构 let (a, b, ...) = expr; 去糖为 STMT_BLOCK
         if (ps_at(TOK_LPAREN) == 1) {
@@ -2355,6 +2361,7 @@ pub kimo parse_statement_inner() -> Stmt {
                 let nm = names[idx] as string;
                 let let_elem = mk_stmt(STMT_LET, loc);
                 let_elem.str1 = nm;
+                let_elem.intval = is_const;
                 let fld = mk_expr(EXPR_MEMBER, loc);
                 let base = mk_expr(EXPR_VAR, loc);
                 base.str1 = tmp_name;
@@ -2390,6 +2397,7 @@ pub kimo parse_statement_inner() -> Stmt {
         let s = mk_stmt(STMT_LET, loc);
         s.str1 = name;
         s.type1 = ty;
+        s.intval = is_const;
         if (expr_is_none(injected_new) == 0) {
             s.expr1 = injected_new;
         } else if (has_init == 1) {
@@ -2422,6 +2430,7 @@ pub kimo parse_statement_inner() -> Stmt {
                 let s2 = mk_stmt(STMT_LET, loc);
                 s2.str1 = nm;
                 s2.type1 = ty2;
+                s2.intval = is_const;
                 if (expr_is_none(inj2) == 0) {
                     s2.expr1 = inj2;
                 } else if (has_init2 == 1) {

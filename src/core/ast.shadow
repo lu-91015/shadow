@@ -274,6 +274,7 @@ pub struct CompileContext {
 pub struct TEnv {
     names: array<string>;
     types: array<Type>;
+    conflags: array<int>;   // 并行于 names/types：1 = 变量声明为 const（不可再赋值），0 = 可变
 }
 
 // 结构化诊断（LSP-6；TC 错误与 ps 诊断同构）

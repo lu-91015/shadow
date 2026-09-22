@@ -1402,7 +1402,7 @@ pub kimo tc_error_at(ctx: CompileContext, loc: Location, msg: string) -> void {
 
 // ============ 类型环境 TEnv ============
 pub kimo tc_env_new() -> TEnv {
-    return TEnv { names: [], types: [] };
+    return TEnv { names: [], types: [], conflags: [] };
 }
 
 pub kimo tc_env_find(env: TEnv, name: string) -> int {
@@ -1430,16 +1430,51 @@ pub kimo tc_env_set(env: TEnv, name: string, t: Type) -> void {
     } else {
         env.names = array_push(env.names, name);
         env.types = array_push(env.types, t);
+        env.conflags = array_push(env.conflags, 0);
     }
+}
+
+// 登记/改写变量的 const 标志（0 = 可变，1 = const 不可再赋值）
+pub kimo tc_env_set_const(env: TEnv, name: string, is_const: int) -> void {
+    let i = tc_env_find(env, name);
+    if (i >= 0) {
+        env.conflags[i] = is_const;
+    }
+}
+
+pub kimo tc_env_is_const(env: TEnv, name: string) -> int {
+    let i = tc_env_find(env, name);
+    if (i < 0) { return 0; }
+    return env.conflags[i] as int;
+}
+
+// 解析赋值目标表达式（EXPR_VAR / 经 .field / [i] 链左值）最左端的根变量名。
+// 仅 EXPR_VAR 或合法左值链（成员/下标/切片）可解析出根；其余（如函数调用）返回 ""。
+pub kimo tc_assign_target_root_name(e: Expr) -> string {
+    if (expr_is_none(e) == 1) { return ""; }
+    if (e.kind == EXPR_VAR) { return e.str1; }
+    if (e.kind == EXPR_MEMBER || e.kind == EXPR_INDEX || e.kind == EXPR_SLICE) {
+        return tc_assign_target_root_name(e.child1);
+    }
+    return "";
+}
+
+// 赋值目标是否为 const 冻结：先解析根变量名，再查 env 的 const 标志。
+// 根变量不存在或非 const 均返回 0。
+pub kimo tc_assign_target_is_const(e: Expr, env: TEnv) -> int {
+    let root = tc_assign_target_root_name(e);
+    if (str_eq(root, "") == 1) { return 0; }
+    return tc_env_is_const(env, root);
 }
 
 // 克隆 env（match 臂作用域）
 pub kimo tc_env_clone(env: TEnv) -> TEnv {
-    let ne = TEnv { names: [], types: [] };
+    let ne = TEnv { names: [], types: [], conflags: [] };
     let i = 0;
     while (i < len(env.names)) {
         ne.names = array_push(ne.names, env.names[i]);
         ne.types = array_push(ne.types, env.types[i]);
+        ne.conflags = array_push(ne.conflags, env.conflags[i]);
         i = i + 1;
     }
     return ne;
@@ -5926,6 +5961,8 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
         // 回填 final 类型到 stmt（MIR_STORE_VAR 依赖）
         let final_ty = tc_env_get(env, name);
         s.inferred_type = final_ty;
+        // const 标志：const x = ... 声明后禁止再赋值
+        tc_env_set_const(env, name, s.intval);
         return;
     }
 
@@ -6064,6 +6101,13 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
     }
 
     if (k == STMT_ASSIGN) {
+        // const 不可变绑定：目标变量的根（EXPR_VAR，或经 .field / [i] 链）若是 const 声明，
+        // 则整个对象冻结，禁止任何再赋值（含字段/元素写入）。
+        if (tc_assign_target_is_const(s.expr1, env) == 1) {
+            let tname = tc_assign_target_root_name(s.expr1);
+            let msgc = "cannot assign to const variable '" + tname + "'";
+            tc_error_at(ctx, loc, msgc);
+        }
         let lhs_t = tc_check_expr(ctx, s.expr1, env);
         let rhs_t = tc_check_expr(ctx, s.expr2, env);
         // 赋值给 array<T> 时回填元素类型到数组字面量（空 [] 的 elem_type 是 TYPE_NONE）
