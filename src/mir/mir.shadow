@@ -1051,6 +1051,24 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         return r;
     }
 
+    if (k == EXPR_SLICE) {
+        let children = h.children;
+        let base = mir_lower_expr(children[0]);
+        let lo = mir_lower_expr(children[1]);
+        let hi = mir_lower_expr(children[2]);
+        let r = mir_new_reg();
+        let inst = mir_mk(MIR_SLICE);
+        inst.dst = r;
+        inst.arg1 = base;
+        let arglist: array<int> = [];
+        arglist = array_push(arglist, lo);
+        arglist = array_push(arglist, hi);
+        inst.args = arglist;
+        inst.ty = h.inferred_type;
+        mir_emit(inst);
+        return r;
+    }
+
     if (k == EXPR_MEMBER) {
         let children = h.children;
         let obj = mir_lower_expr(children[0]);

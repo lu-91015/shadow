@@ -1786,6 +1786,30 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         return;
     }
 
+    // MIR_SLICE: a[lo:hi] → 新子数组/子串（复制）。基为 string → shadow_substr；
+    // 基为 array → shadow_array_slice（不限元素 kind，运行时按 elem_size 原样复制）。
+    if (op == MIR_SLICE) {
+        let base_kind = cg_get_reg_kind(mi.arg1);
+        let base_reg = cg_get_reg(mi.arg1);
+        let st_reg = cg_get_reg(mi.args[0]);
+        let en_reg = cg_get_reg(mi.args[1]);
+        let arg_vals: array<any> = [];
+        arg_vals = array_push(arg_vals, base_reg);
+        arg_vals = array_push(arg_vals, st_reg);
+        arg_vals = array_push(arg_vals, en_reg);
+        let fn_name = "shadow_substr";
+        let rk = TYPE_STRING;
+        let ret_kind = TYPE_STRING;
+        if (base_kind == TYPE_ARRAY) {
+            fn_name = "shadow_array_slice";
+            ret_kind = TYPE_ANY;
+            rk = TYPE_ARRAY;
+        }
+        let result = cg_call_named(fn_name, ret_kind, arg_vals);
+        cg_set_reg(mi.dst, result, rk);
+        return;
+    }
+
     // MIR_MEMBER: obj.field → dst（每字段 8 字节，offset = field_idx * 8）
     if (op == MIR_MEMBER) {
         let obj_val = cg_get_reg(mi.arg1);

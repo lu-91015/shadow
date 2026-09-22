@@ -4294,6 +4294,45 @@ pub kimo tc_check_index(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     return mk_type(TYPE_ANY);
 }
 
+// ============ EXPR_SLICE ============
+pub kimo tc_check_slice(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let base_t = tc_check_expr(ctx, e.child1, env);
+    let lo_t = tc_check_expr(ctx, e.child2, env);
+    let hi_t = tc_check_expr(ctx, e.child3, env);
+    let loc = e.loc;
+    if ((lo_t.kind == TYPE_INT || lo_t.kind == TYPE_LONG || lo_t.kind == TYPE_ANY) && (hi_t.kind == TYPE_INT || hi_t.kind == TYPE_LONG || hi_t.kind == TYPE_ANY)) {
+        // bounds ok
+    } else {
+        let msg = "slice bounds must be int, got '" + ty_display_name(lo_t) + "' and '" + ty_display_name(hi_t) + "'";
+        tc_error_at(ctx, loc, msg);
+    }
+    let bk = base_t.kind;
+    if (bk == TYPE_ARRAY) {
+        let et = base_t.elem_type;
+        if (et.kind == TYPE_INFER) { et = mk_type(TYPE_ANY); }
+        let rt = mk_type(TYPE_ARRAY);
+        rt.elem_type = et;
+        e.inferred_type = rt;
+        return rt;
+    }
+    if (bk == TYPE_STRING) {
+        let st = mk_type(TYPE_STRING);
+        e.inferred_type = st;
+        return st;
+    }
+    // any 基按字符串/数组中的哪一种切是不确定的，禁止静默切错 —— 显式 cast 后再切。
+    if (bk == TYPE_ANY) {
+        let msg = "cannot slice 'any' value; cast it to array or string first";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    let msg2 = "cannot slice non-array/string type '" + ty_display_name(base_t) + "'";
+    tc_error_at(ctx, loc, msg2);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
 // 在所有已知 struct 定义中按字段名查找字段索引（供 any 成员访问使用）。
 // any 值擦除了具体 struct 类型，但字段布局统一（每字段 8 字节，offset=idx*8），
 // 故按字段名在结构体表中定位第一个匹配的字段索引。找不到返回 0。
@@ -5824,6 +5863,7 @@ pub kimo tc_check_expr(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     if (k == EXPR_UNARY) { return tc_check_unary(ctx, e, env); }
     if (k == EXPR_CALL) { return tc_check_call(ctx, e, env); }
     if (k == EXPR_INDEX) { return tc_check_index(ctx, e, env); }
+    if (k == EXPR_SLICE) { return tc_check_slice(ctx, e, env); }
     if (k == EXPR_MEMBER) { return tc_check_member(ctx, e, env); }
     if (k == EXPR_CAST) { return tc_check_cast(ctx, e, env); }
     if (k == EXPR_ARRAY_LIT) { return tc_check_array_lit(ctx, e, env); }
@@ -5957,7 +5997,14 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
             let bind_t = mk_type(TYPE_INT);
             if (ik == TYPE_ARRAY) { bind_t = iter_t.elem_type; }
             else if (ik == TYPE_STRING) { bind_t = mk_type(TYPE_CHAR); }
-            else if (ik == TYPE_DICT) { bind_t = iter_t.key_type; }
+            else if (ik == TYPE_DICT) {
+                bind_t = iter_t.key_type;
+                // hashmap_new() 返回裸 dict（key_type=TYPE_NONE）；单变量迭代的键
+                // 由 shadow_dict_key_at 固定返回 string。缺此回退会以 TYPE_NONE 登记
+                // 循环变量 → 用户用 k 时报 "undefined variable"。与下方双变量 dict
+                // 分支已有的 none->string 回退保持一致。
+                if (type_is_none(bind_t) == 1) { bind_t = mk_type(TYPE_STRING); }
+            }
             else if (ik == TYPE_SET) { bind_t = iter_t.elem_type; }
             else if (ik == TYPE_ANY) { bind_t = mk_type(TYPE_ANY); }
             tc_env_set(env, parts[0] as string, bind_t);

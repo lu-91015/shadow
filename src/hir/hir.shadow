@@ -99,7 +99,7 @@ pub kimo hir_lower_expr(e: Expr, env: HirEnv) -> HirExpr {
         return h;
     }
 
-    if (k == EXPR_BINARY || k == EXPR_UNARY || k == EXPR_INDEX || k == EXPR_MEMBER || k == EXPR_CAST || k == EXPR_ASSIGN) {
+    if (k == EXPR_BINARY || k == EXPR_UNARY || k == EXPR_INDEX || k == EXPR_SLICE || k == EXPR_MEMBER || k == EXPR_CAST || k == EXPR_ASSIGN) {
         let children: array<HirExpr> = [];
         if (expr_is_none(e.child1) == 0) { children = array_push(children, hir_lower_expr(e.child1, env)); }
         if (expr_is_none(e.child2) == 0) { children = array_push(children, hir_lower_expr(e.child2, env)); }

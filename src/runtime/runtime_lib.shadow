@@ -417,6 +417,29 @@ pub kimo shadow_array_set_ptr(arr: any, idx: int, val: any) -> void {
     rt_store_ptr(arr, off, val);
 }
 
+// 切片 arr[lo:hi) — 复制出新子数组，元素类型尺寸与源一致。边界语义：
+//   负界按 Python 回绕（-1→last），越界 clamp 到 [0, n]，n<lo 或 lo>=hi 退化为空数组。
+// 编译器对省略结束界传 INT_MAX（a[lo:] / a[:]），此处 clamp 到长度即"到末尾"。
+pub kimo shadow_array_slice(arr: any, lo: int, hi: int) -> any {
+    if (arr == null) { return shadow_array_new(8, 0); }
+    let n: int = shadow_array_len(arr);
+    let es: int = shadow_array_elem_size(arr);
+    let st: int = lo;
+    if (st < 0) { st = st + n; if (st < 0) { st = 0; } }
+    if (st > n) { st = n; }
+    let en: int = hi;
+    if (en < 0) { en = en + n; if (en < 0) { en = 0; } }
+    if (en > n) { en = n; }
+    if (en < st) { st = en; }   // lo>hi → 空切片
+    let cnt: int = en - st;
+    let out: any = shadow_array_new(es, cnt);
+    if (cnt > 0) {
+        rt_memcpy_at(out, 12, arr, 12 + st * es, cnt * es);
+        rt_store_int(out, 0, cnt);
+    }
+    return out;
+}
+
 // === Any operations (tagged union) ===
 // 布局: [magic:int32@0][tag:int32@4][value:int64@8]（0.3 AnyBox；codegen GET_TAG 读 @4 / GET_PAYLOAD 读 @8）
 // tag: 0=int 1=long 2=float 3=string 4=bool 5=ptr 6=null

@@ -1123,16 +1123,11 @@ pub kimo parse_primary_inner() -> Expr {
             e.str_items = arg_names;
             return e;
         }
-        // 数组索引
+        // 数组索引 / 切片 a[i] 或 a[lo:hi]
         if (ps_at(TOK_LBRACKET) == 1) {
-            ps_adv();
-            let idx = parse_expr();
-            ps_expect(TOK_RBRACKET, "]");
-            let e = mk_expr(EXPR_INDEX, loc);
             let base = mk_expr(EXPR_VAR, name_loc);
             base.str1 = name;
-            e.child1 = base;
-            e.child2 = idx;
+            let e = ps_parse_index_or_slice(base, loc);
             // §12 F2：索引后允许继续接成员链（arr[i].field、m[k].f()、g[i][j].x）。
             // parse_member_chain 在下一个 token 非 `.`/`[` 时原样返回，是安全的 no-op。
             return parse_member_chain(e, loc);
@@ -1204,6 +1199,58 @@ pub kimo parse_primary_inner() -> Expr {
     return mk_expr(EXPR_INT, loc);
 }
 
+// 构造整型字面量表达式（用于省略切片界时的默认 0 / INT_MAX）
+pub kimo mk_int_lit(val: long) -> Expr {
+    let loc = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    let e = mk_expr(EXPR_INT, loc);
+    e.intval = val;
+    return e;
+}
+
+// 解析切片结束界：紧跟 ']'（a[lo:]）表示省略到末尾 → INT_MAX；否则解析结束表达式。
+// 调用前已消费掉 ':'，当前 token 要么是 ']' 要么是结束表达式首 token。
+pub kimo ps_parse_slice_bound() -> Expr {
+    if (ps_at(TOK_RBRACKET) == 1) {
+        return mk_int_lit(2147483647);
+    }
+    return parse_expr();
+}
+
+// 解析 '[' 开头的一元下标/切片：当前 token 必须是 '[',调用后消费至 ']'。
+//   a[i]          → EXPR_INDEX，child2=i
+//   a[lo:hi]      → EXPR_SLICE，child2=lo，child3=hi
+//   a[:hi]        → EXPR_SLICE，child2=0，child3=hi
+//   a[lo:] / a[:] → 结束界省略 → child3=INT_MAX（运行时 clamp 到长度）
+pub kimo ps_parse_index_or_slice(base: Expr, loc: Location) -> Expr {
+    ps_adv();  // consume '['
+    let e = mk_expr(EXPR_INDEX, loc);
+    e.child1 = base;
+    if (ps_at(TOK_COLON) == 1) {
+        // 省略起始 a[:hi] / a[:]
+        ps_adv();
+        let end = ps_parse_slice_bound();
+        ps_expect(TOK_RBRACKET, "]");
+        e.kind = EXPR_SLICE;
+        e.child2 = mk_int_lit(0);
+        e.child3 = end;
+        return e;
+    }
+    let first = parse_expr();
+    if (ps_at(TOK_COLON) == 1) {
+        // a[lo:hi] / a[lo:]
+        ps_adv();
+        let end = ps_parse_slice_bound();
+        ps_expect(TOK_RBRACKET, "]");
+        e.kind = EXPR_SLICE;
+        e.child2 = first;
+        e.child3 = end;
+        return e;
+    }
+    ps_expect(TOK_RBRACKET, "]");
+    e.child2 = first;
+    return e;
+}
+
 // 解析成员访问链：.field, [idx], .method(args)
 pub kimo parse_member_chain(base: Expr, loc: Location) -> Expr {
     let result = base;
@@ -1260,13 +1307,7 @@ pub kimo parse_member_chain(base: Expr, loc: Location) -> Expr {
                 }
             }
         } else if (ps_at(TOK_LBRACKET) == 1) {
-            ps_adv();
-            let idx = parse_expr();
-            ps_expect(TOK_RBRACKET, "]");
-            let e = mk_expr(EXPR_INDEX, loc);
-            e.child1 = result;
-            e.child2 = idx;
-            result = e;
+            result = ps_parse_index_or_slice(result, loc);
         } else if (ps_at(TOK_INC) == 1 || ps_at(TOK_DEC) == 1) {
             // 后缀自增/自减 x++ / x--
             let is_inc = 0;

@@ -187,6 +187,8 @@ pub let EXPR_SPAWN: int = 25;
 pub let EXPR_AWAIT: int = 26;
 // 自增/自减 ++/--：intval=0 增 1 减；str1="pre"/"post" 前缀/后缀；child1=目标
 pub let EXPR_INCDEC: int = 27;
+// 切片 a[lo:hi]：child1=基（数组/字符串），child2=起始（省略=0），child3=结束（省略=INT_MAX）
+pub let EXPR_SLICE: int = 28;
 
 // ============ 语句种类 STMT_* ============
 pub let STMT_LET: int = 1;
@@ -288,6 +290,7 @@ pub let MIR_SPAWN: int = 28;
 pub let MIR_AWAIT: int = 29;
 pub let MIR_MAKE_TRAITOBJ: int = 30; // 具体 struct -> dyn Trait 对象（vtable 打包）
 pub let MIR_CALL_DYN: int = 31;      // 经 vtable 的运行时动态分发调用
+pub let MIR_SLICE: int = 32;         // a[lo:hi]：arg1=基，args[0]=start，args[1]=end
 
 // ============ .lu 缓存全局变量初始值标签 ============
 pub let LU_INIT_NONE: int = 0;
