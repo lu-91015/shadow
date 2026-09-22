@@ -2330,7 +2330,7 @@ pub kimo parse_statement_inner() -> Stmt {
 
     if (k == TOK_LET || k == TOK_CONST) {
         ps_adv();
-        // const 一律不可变；let 允许 mut 前缀（语义：let mut = 显式可变，默认不可变）
+        // const 一律不可变；let 默认可变。`mut` 作为向后兼容前缀被接受但不改变任何语义（等价于 let）。
         let is_const = 0;
         if (k == TOK_CONST) { is_const = 1; }
         if (ps_at(TOK_MUT) == 1) { ps_adv(); }
