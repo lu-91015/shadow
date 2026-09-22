@@ -883,7 +883,8 @@ pub kimo parse_primary_inner() -> Expr {
         }
         let e = mk_expr(EXPR_STRING, loc);
         e.str1 = txt;
-        return e;
+        // 字符串字面量后允许接成员链/切片："abc".f、"abc"[i]、"abc"[1:2]。
+        return parse_member_chain(e, loc);
     }
 
     if (k == TOK_CHAR_LIT) {
@@ -1121,7 +1122,9 @@ pub kimo parse_primary_inner() -> Expr {
             e.str1 = name;
             e.items = args;
             e.str_items = arg_names;
-            return e;
+            // §12 F2：调用结果后允许继续接成员链 f().a、f()[i]、f()[lo:hi]、f().m()。
+            // parse_member_chain 在下一个 token 非 `.`/`[`/`++`/`--` 时是安全的 no-op。
+            return parse_member_chain(e, loc);
         }
         // 数组索引 / 切片 a[i] 或 a[lo:hi]
         if (ps_at(TOK_LBRACKET) == 1) {
