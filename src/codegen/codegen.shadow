@@ -1750,13 +1750,22 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
                 dict_fn = "shadow_dict_get_int";
             } else if (ek == TYPE_LONG || ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) {
                 dict_fn = "shadow_dict_get_int";
+            } else if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) {
+                dict_fn = "shadow_dict_get_float";
             } else if (ek == TYPE_STRING) {
                 dict_fn = "shadow_dict_get_string";
             }
             let arg_vals: array<any> = [];
             arg_vals = array_push(arg_vals, arr_val);
             arg_vals = array_push(arg_vals, idx_val);
-            let result = cg_call_named(dict_fn, ek, arg_vals);
+            // shadow_dict_get_float 返回 double；float 静态元素类型需按 double 调用（对齐
+            // C 真实返回类型），再 fptrunc 回 float，避免 ABI 低位读取错位。
+            let ret_kind = ek;
+            if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { ret_kind = TYPE_DOUBLE; }
+            let result = cg_call_named(dict_fn, ret_kind, arg_vals);
+            if (ek == TYPE_FLOAT) {
+                result = cg_cast_val(result, TYPE_DOUBLE, TYPE_FLOAT);
+            }
             if (ek == TYPE_BOOL) {
                 let i1_ty = llvm_i1(cg_ctx);
                 result = llvm_trunc(cg_builder, result, i1_ty, "booltrunc");
@@ -2424,11 +2433,26 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                     new_args = array_push(new_args, ext_val);
                     arg_vals = new_args;
                 }
+            } else if (vk != TYPE_STRING && cg_is_ptr_kind(vk) == 1) {
+                // struct/引用值 → 指针变体（键=指针地址十六进制串，指针同一性语义）。
+                // string 元素仍走默认字符串变体（by 内容）。
+                if (str_eq(mi.strval, "set_add") == 1) { resolved_name = "shadow_set_add_ptr"; }
+                else if (str_eq(mi.strval, "set_contains") == 1) { resolved_name = "shadow_set_contains_ptr"; }
+                else { resolved_name = "shadow_set_remove_ptr"; }
             }
         }
         if (len(args) == 3 && str_eq(mi.strval, "hashmap_insert") == 1) {
+            // 按第 3 实参的类型分派：int 族→insert_int，float/double→insert_float，
+            // 引用族（数组/结构/dict/any/指针）→insert_ptr（否则会被当作 const char*
+            // 以 strdup 截断到首个 NUL，丢失对象数据）。string 保持默认 insert（tag=2）。
             let hvk = cg_get_reg_kind(args[2] as int);
-            if (hvk == TYPE_INT || hvk == TYPE_LONG || hvk == TYPE_DATE
+            let his_ref = 0;
+            // 非 string 的引用族（array/dict/set/struct/any/function/opaque/enum_payload/
+            // trait_object）走 ptr 变体；字符串仍走默认 string 变体（tag=2）。
+            if (hvk != TYPE_STRING && cg_is_ptr_kind(hvk) == 1) { his_ref = 1; }
+            if (his_ref == 1) {
+                resolved_name = "shadow_hashmap_insert_ptr";
+            } else if (hvk == TYPE_INT || hvk == TYPE_LONG || hvk == TYPE_DATE
                 || hvk == TYPE_TIMESTAMP || hvk == TYPE_NANOTIMESTAMP
                 || hvk == TYPE_BOOL) {
                 resolved_name = "shadow_hashmap_insert_int";
@@ -2437,6 +2461,16 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                     let hnew_args: array<any> = [arg_vals[0]];
                     hnew_args = array_push(hnew_args, arg_vals[1]);
                     hnew_args = array_push(hnew_args, hext_val);
+                    arg_vals = hnew_args;
+                }
+            } else if (hvk == TYPE_FLOAT || hvk == TYPE_DOUBLE) {
+                // float/double → insert_float（double 变体，tag==3）。float 需先 fpext 成 double。
+                resolved_name = "shadow_hashmap_insert_float";
+                if (hvk == TYPE_FLOAT) {
+                    let hf_val = cg_cast_val(arg_vals[2], TYPE_FLOAT, TYPE_DOUBLE);
+                    let hnew_args: array<any> = [arg_vals[0]];
+                    hnew_args = array_push(hnew_args, arg_vals[1]);
+                    hnew_args = array_push(hnew_args, hf_val);
                     arg_vals = hnew_args;
                 }
             }

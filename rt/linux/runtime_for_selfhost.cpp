@@ -1011,6 +1011,23 @@ extern "C" void shadow_hashmap_insert_int(void* map, const char* key, int64_t va
     sdict_set(m, key, DictValue(value));
 }
 
+// dict<K, float/double> 的 hashmap_insert 变体。值以 double 变体存放，
+// 否则 float 会被当作 const char* 以 strdup 截断（与 insert_int 同类问题）。
+extern "C" void shadow_hashmap_insert_float(void* map, const char* key, double value) {
+    if (!map || !key) return;
+    ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
+    sdict_set(m, key, DictValue(value));
+}
+
+// dict<K, array/struct/dict/any/ptr> 的 hashmap_insert 变体。
+// 值以指针变体（tag==4）原样存放（shadow_dict_get 会按其 type_tag 还原嵌套容器），
+// 不做 strdup —— 否则数组等堆对象会被当作 C 字符串截断到首个 NUL，元素全部丢失。
+extern "C" void shadow_hashmap_insert_ptr(void* map, const char* key, void* value) {
+    if (!map || !key) return;
+    ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
+    sdict_set(m, key, DictValue((void*)value));
+}
+
 extern "C" const char* shadow_hashmap_get(void* map, const char* key) {
     if (!map || !key) return dup_str("");
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
@@ -1110,6 +1127,34 @@ extern "C" int shadow_set_remove_int(void* set, int64_t value) {
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    return sset_erase(s, buf);
+}
+
+// 值/指针元素版本（struct / 引用）：以指针地址的十六进制串为键存储，
+// 与 int 版本同构（set 仍统一以字符串为键），语义为指针同一性。
+// add/contains/remove 用同一格式，保证往返一致。
+extern "C" int shadow_set_add_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
+    sset_add(s, buf);
+    return 0;
+}
+
+extern "C" int shadow_set_contains_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
+    return sset_lookup(s, buf, sdict_hash(buf)) != nullptr ? 1 : 0;
+}
+
+extern "C" int shadow_set_remove_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
     return sset_erase(s, buf);
 }
 
@@ -3218,6 +3263,16 @@ extern "C" const char* shadow_dict_get_string(void* dict_ptr, const char* key) {
     if (v && v->tag == 2)
         return strdup(v->val.s);
     return nullptr;
+}
+
+// ── shadow_dict_get_float ───────────────────────────────────────────
+extern "C" double shadow_dict_get_float(void* dict_ptr, const char* key) {
+    if (!dict_ptr || !key) return 0.0;
+    ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
+    DictValue* v = sdict_get(d, key);
+    if (v && v->tag == 1)
+        return v->val.d;
+    return 0.0;
 }
 
 // Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ

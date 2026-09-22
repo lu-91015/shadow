@@ -1,0 +1,91 @@
+//@expect: 3\n9\n2\n99\n4\n22\n2\n1\n0\n1\n1\n1\n1\n100\n6\n3\n33
+//@desc: 复杂容器×结构体全矩阵 ——
+//   A struct-in-struct（Line 内含两个 Point）
+//   B array<struct>（读字段 / 下标写字段 / 覆盖）
+//   C array<struct 含 struct>（多级字段链）
+//   D array<array<struct>> 二维矩阵（嵌套下标）
+//   E set<struct>（新增指针变体：指针同一性去重 / contains / remove）
+//   F array<set<struct>>（set 再入数组）
+//   G dict<string, set<struct>>（set 经 hashmap_insert_ptr 入 dict 再还原）
+//   H array<dict<string,int>>（数组内嵌 dict）
+//   I array<dict<string, array<int>>>（更深的 dict 值再嵌套）
+dsb cg_struct_container_mesh;
+
+struct Point { x: int; y: int; }
+struct Line { a: Point; b: Point; }
+
+kimo main() -> int {
+    // ---------- A) struct-in-struct ----------
+    let pa = Point { x: 1, y: 2 };
+    let pb = Point { x: 3, y: 4 };
+    let l = Line { a: pa, b: pb };
+    println(l.b.x);                    // 3
+
+    // ---------- B) array<struct>：字段读 + 下标字段写 ----------
+    let pts: array<Point> = [];
+    pts = array_push(pts, Point { x: 5, y: 6 });
+    pts = array_push(pts, Point { x: 7, y: 8 });
+    pts[0].y = 9;                      // 覆盖字段
+    println(pts[0].y);                 // 9
+    println(int_to_str(len(pts)));     // 2
+
+    // ---------- C) array<struct 含 struct>：多级字段链 ----------
+    let lines: array<Line> = [];
+    lines = array_push(lines, l);
+    lines = array_push(lines, Line { a: Point { x: 10, y: 11 }, b: Point { x: 12, y: 13 } });
+    lines[1].b.x = 99;                 // 深字段写
+    println(lines[1].b.x);             // 99
+    println(lines[0].b.y);             // 4
+
+    // ---------- D) array<array<struct>>：二维嵌套下标 ----------
+    let inner: array<Point> = [];
+    inner = array_push(inner, Point { x: 20, y: 21 });
+    inner = array_push(inner, Point { x: 22, y: 23 });
+    let grid: array<array<Point>> = [];
+    grid = array_push(grid, inner);
+    println(grid[0][1].x);             // 22
+
+    // ---------- E) set<struct>：指针同一性去重/包含/删除 ----------
+    let sp = set_new();
+    let p1 = Point { x: 1, y: 2 };
+    let p2 = Point { x: 3, y: 4 };
+    set_add(sp, p1);
+    set_add(sp, p2);
+    set_add(sp, p1);                   // 重复（同指针）→ 去重
+    println(set_size(sp));             // 2
+    println(set_contains(sp, p1));     // 1
+    set_remove(sp, p2);
+    println(set_contains(sp, p2));     // 0
+    println(set_size(sp));             // 1
+
+    // ---------- F) array<set<struct>>：set 再入数组 ----------
+    let sps: array<set<Point>> = [];
+    sps = array_push(sps, sp);
+    println(set_size(sps[0]));         // 1
+
+    // ---------- G) dict<string, set<struct>>：set 经 ptr 入 dict 再还原 ----------
+    let dsp: dict<string, set<Point>> = hashmap_new();
+    hashmap_insert(dsp, "s", sp);
+    println(set_size(dsp["s"]));       // 1
+    println(set_contains(dsp["s"], p1)); // 1
+
+    // ---------- H) array<dict<string,int>>：数组内嵌 dict ----------
+    let ad: array<dict<string, int>> = [];
+    let d1: dict<string, int> = hashmap_new();
+    hashmap_insert(d1, "k", 100);
+    ad = array_push(ad, d1);
+    println(ad[0]["k"]);               // 100
+
+    // ---------- I) array<dict<string, array<int>>>：dict 值再嵌数组 ----------
+    let ddeep: dict<string, array<int>> = hashmap_new();
+    let rowv: array<int> = [4, 5, 6];
+    hashmap_insert(ddeep, "row", rowv);
+    let deeper: array<dict<string, array<int>>> = [];
+    deeper = array_push(deeper, ddeep);
+    println(deeper[0]["row"][2]);      // 6
+    println(int_to_str(len(deeper[0]["row"]))); // 3
+
+    // ---------- 汇总校验：总结构体实例数（强 GC 压力） ----------
+    println(int_to_str(pts[1].x * 1 + l.a.x + grid[0][0].y + p2.y)); // 7+1+21+4=33
+    return 0;
+}

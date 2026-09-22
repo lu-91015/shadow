@@ -1,0 +1,66 @@
+//@expect: 10,4\n2\n7,8\n2\n100\n37\n2\n1\n2\n1
+//@desc: 混合容器深层嵌套 —— 在既有嵌套泛型覆盖之上，新增：
+//   struct 入 array/dict（值+字段读写/覆盖）、数组内嵌 dict、枚举载荷(ADT) 存 array + match 解构、
+//   dict<string, array<set<int>>> 三层嵌套。验证 hashmap_insert 的引用族 ptr 分派在
+//   结构体/枚举载荷/深层容器场景同样正确（不截断、可还原）。
+dsb cg_mixed_container_deep;
+
+struct Point { x: int; y: int; }
+
+enum Shape { Circle(int); Rect(int, int); }
+
+kimo main() -> int {
+    // ---------- A) array<struct>：push + 下标读字段 + 字段写 ----------
+    let pts: array<Point> = [];
+    pts = array_push(pts, Point { x: 1, y: 2 });
+    pts = array_push(pts, Point { x: 3, y: 4 });
+    pts[1].x = 10;                                 // 覆盖字段
+    println(int_to_str(pts[1].x) + "," + int_to_str(pts[1].y)); // 10,4
+    println(int_to_str(len(pts)));                              // 2
+
+    // ---------- B) dict<string, struct>：insert + 下标读字段 ----------
+    let dm: dict<string, Point> = hashmap_new();
+    hashmap_insert(dm, "a", Point { x: 5, y: 6 });
+    hashmap_insert(dm, "b", Point { x: 7, y: 8 });
+    println(int_to_str(dm["b"].x) + "," + int_to_str(dm["b"].y)); // 7,8
+    println(int_to_str(hashmap_size(dm)));                       // 2
+
+    // ---------- C) array<dict<string,int>>：数组里嵌 dict ----------
+    let ad: array<dict<string, int>> = [];
+    let d1: dict<string, int> = hashmap_new();
+    hashmap_insert(d1, "k", 100);
+    ad = array_push(ad, d1);
+    println(ad[0]["k"]);                          // 100
+
+    // ---------- D) enum 载荷存 array + match 解构求面积 ----------
+    let shapes: array<Shape> = [];
+    shapes = array_push(shapes, Shape.Circle(3));
+    shapes = array_push(shapes, Shape.Rect(2, 5));
+    let area = 0;
+    for (s in shapes) {
+        match s {
+            Shape.Circle(r) => { area = area + r * r * 3; }   // 27
+            Shape.Rect(w, h) => { area = area + w * h; }      // 10
+        }
+    }
+    println(area);                                // 37
+
+    // ---------- E) dict<string, array<set<int>>>：三层嵌套 ----------
+    let s1 = set_new();
+    set_add(s1, 1);
+    set_add(s1, 2);
+    let s2 = set_new();
+    set_add(s2, 5);
+    set_add(s2, 6);
+    let sets: array<set<int>> = [];
+    sets = array_push(sets, s1);
+    sets = array_push(sets, s2);
+    println(set_size(sets[0]));                   // 2
+    println(set_contains(sets[1], 6));           // 1
+    let ds: dict<string, array<set<int>>> = hashmap_new();
+    hashmap_insert(ds, "e", sets);
+    println(set_size(ds["e"][0]));                // 2
+    println(set_contains(ds["e"][1], 5));         // 1
+
+    return 0;
+}
