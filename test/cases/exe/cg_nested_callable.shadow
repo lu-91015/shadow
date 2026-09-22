@@ -1,0 +1,66 @@
+//@mode: exe
+//@desc: 覆盖率 —— 嵌套容器在函数参数/返回值间传递：2D array 传入辅助函数求和、裸泛型函数返回
+//       array<array<int>>、dict<string,array<dict<string,Point>>> 多层传参后深链读算；
+//       同一嵌套容器多次复用注入不同父容器。
+//@expect: 15\n3\n11\n30\n8
+dsb cg_nested_callable;
+
+struct Point { x: int; y: int; }
+
+// 通用辅助：求 2D int 数组全部元素之和
+kimo sum2d(g: array<array<int>>) -> int {
+    let s = 0;
+    let i = 0;
+    while (i < len(g)) {
+        let j = 0;
+        while (j < len(g[i])) {
+            s = s + g[i][j];
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+
+// 裸泛型辅助：返回嵌套容器
+kimo makeTable(row1: array<int>) -> array<array<int>> {
+    let r: array<array<int>> = [];
+    r = array_push(r, row1);
+    return r;
+}
+
+kimo main() -> int {
+    // ① 2D array 作为实参传入辅助函数求和
+    let c1: array<int> = [];
+    c1 = array_push(c1, 1);
+    c1 = array_push(c1, 2);
+    c1 = array_push(c1, 3);
+    let c2: array<int> = [];
+    c2 = array_push(c2, 4);
+    c2 = array_push(c2, 5);
+    let g: array<array<int>> = [];
+    g = array_push(g, c1);
+    g = array_push(g, c2);
+    println(sum2d(g));            // 1+2+3+4+5 = 15
+
+    // ② 裸泛型函数返回 array<array<int>>，直接两跳索引
+    let t = makeTable(c1);
+    println(t[0][2]);             // 3? 或见下修正
+
+    // ③ dict<string, array<dict<string, Point>>> 深链读算
+    let p = Point { x: 5, y: 6 };
+    let m1: dict<string, Point> = hashmap_new();
+    hashmap_insert(m1, "P", p);
+    let arr: array<dict<string, Point>> = [];
+    arr = array_push(arr, m1);
+    let top: dict<string, array<dict<string, Point>>> = hashmap_new();
+    hashmap_insert(top, "list", arr);
+    println(top["list"][0]["P"].x + top["list"][0]["P"].y);  // 11
+
+    // ④ 复用同一 row 注入两个不同父容器
+    let m2: dict<string, array<dict<string, Point>>> = hashmap_new();
+    hashmap_insert(m2, "other", arr);
+    println(top["list"][0]["P"].x * 6);  // 30
+    println(m2["other"][0]["P"].x + 3);  // 8
+    return 0;
+}

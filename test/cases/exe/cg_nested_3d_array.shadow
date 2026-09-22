@@ -1,0 +1,56 @@
+//@mode: exe
+//@desc: 覆盖率 —— 3D int 数组 a[i][j][k] 读写、2D 数组内嵌 struct、struct 内嵌 2D 数组、
+//       标量改写整链、嵌套遍历聚合求和。
+//@expect: 3\n9\n7\n42\n4\n7
+dsb cg_nested_3d_array;
+
+struct Point { x: int; y: int; }
+struct Grid { name: string; rows: array<array<Point>>; }
+
+kimo main() -> int {
+    // ① 3D int 数组：a[i][j][k] 读 + 标量写
+    let a: array<array<array<int>>> = [];
+    let c1: array<int> = [];
+    c1 = array_push(c1, 1);
+    c1 = array_push(c1, 2);
+    let c2: array<int> = [];
+    c2 = array_push(c2, 3);
+    c2 = array_push(c2, 4);
+    let r1: array<array<int>> = [];
+    r1 = array_push(r1, c1);
+    r1 = array_push(r1, c2);
+    a = array_push(a, r1);
+    println(a[0][1][0]);          // 3
+    a[0][0][1] = 9;
+    println(a[0][0][1]);          // 9
+
+    // ② 2D 数组内嵌 struct：a[i][j].field 读 + 深链改写
+    let g: array<array<Point>> = [];
+    let row: array<Point> = [];
+    row = array_push(row, Point { x: 5, y: 6 });
+    row = array_push(row, Point { x: 7, y: 8 });
+    g = array_push(g, row);
+    println(g[0][1].x);           // 7
+    g[0][1].x = 42;
+    println(g[0][1].x);           // 42
+
+    // ③ struct 内嵌 2D 数组 + 遍历聚合求和
+    let inner: array<Point> = [];
+    inner = array_push(inner, Point { x: 3, y: 4 });
+    let mat: array<array<Point>> = [];
+    mat = array_push(mat, inner);
+    let grid = Grid { name: "g", rows: mat };
+    println(grid.rows[0][0].y);   // 4
+    let sum = 0;
+    let i = 0;
+    while (i < len(grid.rows)) {
+        let j = 0;
+        while (j < len(grid.rows[i])) {
+            sum = sum + grid.rows[i][j].x + grid.rows[i][j].y;
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    println(sum);                 // 3 + 4 = 7
+    return 0;
+}

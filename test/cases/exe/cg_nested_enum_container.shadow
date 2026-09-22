@@ -1,0 +1,40 @@
+//@mode: exe
+//@desc: 覆盖率 —— enum 携带 array 载荷 + match 绑定解构求和；struct 携带 dict<string,array<int>>
+//       放入 array<Node2> 遍历读取；多个父对象共享同一 dict 时的引用别名（改一处视图同步）。
+//@expect: 6\n2\n3\n9
+dsb cg_nested_enum_container;
+
+enum Payload { One(array<int>); Pair(array<int>, array<int>); }
+
+struct Node2 { id: string; hist: dict<string, array<int>>; }
+
+kimo main() -> int {
+    // ① enum 的 array 载荷 + match 绑定解构
+    let v: array<int> = [];
+    v = array_push(v, 1);
+    v = array_push(v, 2);
+    v = array_push(v, 3);
+    let e = Payload.One(v);
+    let s1 = 0;
+    match e {
+        Payload.One(x) => { s1 = x[0] + x[1] + x[2]; }
+        Payload.Pair(a, b) => { s1 = 0; }
+    }
+    println(s1);                  // 1+2+3 = 6
+
+    // ② struct 携带 dict<string,array<int>>，放入 array<Node2>，遍历读深链
+    let h: dict<string, array<int>> = hashmap_new();
+    hashmap_insert(h, "seq", v);
+    let n1 = Node2 { id: "a", hist: h };
+    let n2 = Node2 { id: "b", hist: h };   // 共享同一 dict（引用别名）
+    let ns: array<Node2> = [];
+    ns = array_push(ns, n1);
+    ns = array_push(ns, n2);
+    println(ns[0].hist["seq"][1]);  // 2
+    println(ns[1].hist["seq"][2]);  // 3
+
+    // ③ 深链改写：经 ns[0].hist 改嵌套数组元素，共享 dict 的 ns[1] 视图同步
+    ns[0].hist["seq"][0] = 9;
+    println(ns[1].hist["seq"][0]);  // 9
+    return 0;
+}
