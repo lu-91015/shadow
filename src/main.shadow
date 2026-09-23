@@ -2128,6 +2128,23 @@ kimo main_compile_source(source: string, file: string) -> string {
     }
     let N0 = n_funcs_pre_tc;   // TC 前原始函数数（编译器源码无泛型 → TC 不追加特化；追加段总是重编）
     let t4 = c_clock();
+    // 跨调用数组护栏消除：hit → 两遍 lowering。
+    // pass1 照旧逐函数 lower，同时经 mir_xc_collect 建立跨调用容量登记表（被调数组形参
+    // cap == 另一实参值）。若确有配对容量事实（mir_xc_used==1），pass2 按源码序重 lower
+    // 全部 live（非缓存命中）函数，使被调函数在登记表齐备后播种容量事实，从而 codegen
+    // 阶段免发数组下标护栏。缓存命中（.lu 加载）的 MIR 保持 pass1 结果不动。
+    let pb_live: array<int> = [];
+    let pb_hf: array<any> = [];
+    let pb_idx: array<int> = [];
+    let pb_mf: array<any> = [];
+    let pbi = 0;
+    while (pbi < len(prog.funcs)) {
+        pb_live = array_push(pb_live, 0);
+        pb_hf = array_push(pb_hf, 0 as any);
+        pb_idx = array_push(pb_idx, -1);
+        pb_mf = array_push(pb_mf, 0 as any);
+        pbi = pbi + 1;
+    }
     let fi = 0;
     while (fi < len(prog.funcs)) {
         let fd = prog.funcs[fi] as FuncDef;
@@ -2153,11 +2170,15 @@ kimo main_compile_source(source: string, file: string) -> string {
         if (use_cache == 1) {
             let mf = main_take_cached_mir(idx, queues, cpos);
             mfuncs = array_push(mfuncs, mf);
+            pb_mf[fi] = mf;
         } else {
             let hf = hir_lower_func(fd);
             hfuncs = array_push(hfuncs, hf);
             let mf = mir_lower_func(hf);
             mfuncs = array_push(mfuncs, mf);
+            pb_live[fi] = 1;
+            pb_hf[fi] = hf;
+            pb_idx[fi] = idx;
             if (idx >= 0 && idx < len(new_mirs)) {
                 let ml = new_mirs[idx] as array<MirFunc>;
                 ml = array_push(ml, mf);
@@ -2165,6 +2186,35 @@ kimo main_compile_source(source: string, file: string) -> string {
             }
         }
         fi = fi + 1;
+    }
+    if (mir_xc_used_check() == 1) {
+        // pass2：登记表齐备后按源码序重 lower 全部 live 函数（被调函数入口播种容量事实）。
+        // 缓存命中函数的 MIR 从 pass1 原样复用（不重复 lower，也不重推进 cpos）。
+        mfuncs = [];
+        hfuncs = [];
+        let ni2 = 0;
+        while (ni2 < len(tc_mod_ns)) { new_mirs[ni2] = []; ni2 = ni2 + 1; }
+        let fi2 = 0;
+        while (fi2 < len(prog.funcs)) {
+            let fd2 = prog.funcs[fi2] as FuncDef;
+            if (len(fd2.extern_name) > 0 || len(fd2.type_params) > 0) { fi2 = fi2 + 1; continue; }
+            if (pb_live[fi2] != 1) {
+                mfuncs = array_push(mfuncs, pb_mf[fi2] as MirFunc);
+                fi2 = fi2 + 1;
+                continue;
+            }
+            let hf2 = pb_hf[fi2] as HirFunc;
+            let mf2 = mir_lower_func(hf2);
+            mfuncs = array_push(mfuncs, mf2);
+            hfuncs = array_push(hfuncs, hf2);
+            let ix = pb_idx[fi2];
+            if (ix >= 0 && ix < len(new_mirs)) {
+                let ml2 = new_mirs[ix] as array<MirFunc>;
+                ml2 = array_push(ml2, mf2);
+                new_mirs[ix] = ml2;
+            }
+            fi2 = fi2 + 1;
+        }
     }
     // 闭包 MIR 补取：缓存命中时 TC bodies 跳过 → lambda 不提升 → __closure_<n> fd 不在
     // prog.funcs → 循环不消费其 MIR，闭包定义留在队列尾部 → link undefined symbol: __closure_0。

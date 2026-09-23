@@ -1780,7 +1780,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         // 静态类型标量数组 → 直接 GEP+load，绕过运行时函数
         let ik = cg_get_reg_kind(mi.arg2);
         if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
-            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek, 0);
+            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek, mi.longval);
             return;
         }
         let arg_vals: array<any> = [];

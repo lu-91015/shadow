@@ -78,67 +78,278 @@ pub kimo mir_empty_set(slot: int, v: int) -> void {
     }
 }
 
-// === 空数组字面量分配位置跟踪（删除无谓的 12B 空对象分配）===
-// `let a = []` 会在当前块发一条 MIR_ARRAY_LIT + MIR_STORE_VAR，真实分配一个 12 字节的
-// 空数组；若紧随其后是填充循环预分配（mir_sred_begin），该对象立刻被 prealloc 覆盖成孤儿，
-// 每热迭代都白费一次分配 + 一次 GC 清扫（sieve/queens 实测百万级 12B 孤儿）。
-// 这里记录这两条指令的下标；预分配触发时若证实时机安全（同一块、分配后无读取）则整体删除。
-// mir_empty_alloc_block 记下记录点的块序号，跨块（分支）时与当前块不一致则保守跳过删除。
-let mir_empty_alloc_start: array<int> = [];
-let mir_empty_alloc_block: array<int> = [];
-let mir_block_serial: int = 1;
+// === 数组下标护栏消除：跨调用容量 + 循环界 + 整数下界（v10_s23）===
+// 目标：codegen 对 array get/set 每次访问都发 load-cap + cmp + cmov 钳位护栏；
+// 若 MIR 已能证明 `0 <= idx < cap(a)`，就标记 inb=1 整条免掉。证明由三件套叠出：
+//   (1) 容量事实 cap_lb[arr]=src：arr 的 cap == src 槽的当前值。仅在数组由可数构造
+//       （预分配/下标填充循环）建立、且 src 槽只写入一次（constish）时记录。
+//   (2) 循环上界：while(cv<B)/while(cv<=B) 把计数变量 cv 的上界压入帧栈。
+//   (3) 整数下界 vmin[slot]：slot 值的保守最小下界，经 常量/复制/加法/乘法 传播；
+//       再加"cv 在体内单调不减"约束，可证 idx=cv-C >= 0。
+// 上界：idx=cv-C，cv<=B，cap==B → idx < B == cap。
+// 下界：cv 的循环入口下界 >= C 且 cv 单调不减 → idx >= 0 恒成立。
+// 安全纪律：任一条证不出就返回 0（护栏保留）。宁漏证，不冒险——证错会直接堆越界写坏。
+let mir_cap_lb_slot: array<int> = [];  // [数组槽]=容量来源槽（值==cap），仅 ok 位为 1 时有效
+let mir_cap_lb_ok: array<int> = [];    // 1=该槽的容量事实已确立
+let mir_constish: array<int> = [];     // 1=该槽只被写入过一次（let 后未被赋值），可当常量
+let mir_vmin_known: array<int> = [];   // 1=vmin[slot] 有效
+let mir_vmin: array<int> = [];         // [slot]=保守最小下界
+// while 循环界帧栈（并行数组，深度 mir_lf_n）：
+let mir_lf_slot: array<int> = [];      // 计数变量槽
+let mir_lf_bound: array<int> = [];     // 上界源槽（-1 表示用 bval 常量）
+let mir_lf_bval: array<int> = [];      // 上界常量值（bound==-1 时有效）
+let mir_lf_inc: array<int> = [];       // 1=<=（含等），0=<（不含）
+let mir_lf_mono: array<int> = [];      // 1=计数变量在体内单调不减
+let mir_lf_cvmin: array<int> = [];     // 循环入口计数变量的最小下界
+let mir_lf_n: int = 0;
 
-kimo mir_empty_alloc_ensure(slot: int) -> void {
-    while (len(mir_empty_alloc_start) <= slot) {
-        mir_empty_alloc_start = array_push(mir_empty_alloc_start, -1);
-        mir_empty_alloc_block = array_push(mir_empty_alloc_block, -1);
+// 跨调用容量事实登记表：调用点发现 "形如 cap(实参 a) == 另一实参 b" 时登记
+// (fname, a 的形参位, b 的形参位)，被调函数 lowering 前据此把容量播种到形参槽。
+// 依赖 LLVM 内联消函数边界：证明在 callee 局部 slot 上进行，靠调用点把 caller
+// 侧建立的容量事实（sieve 的 flags 容量==size 即此类）带进 callee 形参槽。
+let mir_xc_fn: array<string> = [];
+let mir_xc_arr: array<int> = [];
+let mir_xc_src: array<int> = [];
+let mir_xc_used: int = 0;
+let mir_pi_dbg: int = 0;
+
+// main.shadow 两遍 lowering 据此判断是否需要 pass2（跨文件读非 pub 全局的桥）
+pub kimo mir_xc_used_check() -> int { return mir_xc_used; }
+
+kimo mir_vmin_unknown() -> int { return -1000000000; }
+
+// 求 HIR 表达式的保守最小下界；无法建模返回未知哨兵。
+kimo mir_vmin_hir(h: HirExpr) -> int {
+    if ((h as any) == 0) { return mir_vmin_unknown(); }
+    let k = h.kind;
+    if (k == EXPR_INT) { return h.intval as int; }
+    if (k == EXPR_VAR) {
+        let s = h.slot;
+        if (s >= 0 && s < len(mir_vmin_known) && mir_vmin_known[s] == 1) { return mir_vmin[s]; }
+        return mir_vmin_unknown();
+    }
+    if (k == EXPR_BINARY) {
+        let op = h.op;
+        let ch = h.children;
+        if (len(ch) == 2 && (op == BIN_ADD || op == BIN_MUL)) {
+            let a = mir_vmin_hir(ch[0]);
+            let b = mir_vmin_hir(ch[1]);
+            if (a == mir_vmin_unknown() || b == mir_vmin_unknown()) { return mir_vmin_unknown(); }
+            if (op == BIN_ADD) { return a + b; }
+            if (a >= 0 && b >= 0) { return a * b; }
+            return mir_vmin_unknown();
+        }
+    }
+    return mir_vmin_unknown();
+}
+
+kimo mir_vmin_set(slot: int, rhs_h: HirExpr) -> void {
+    if (slot >= 0 && slot < len(mir_vmin_known)) {
+        let v = mir_vmin_hir(rhs_h);
+        if (v != mir_vmin_unknown()) { mir_vmin_known[slot] = 1; mir_vmin[slot] = v; }
+        else { mir_vmin_known[slot] = 0; }
     }
 }
 
-// 删除 pslot 在"空数组字面量分配处"的两条指令（MIR_ARRAY_LIT + STORE_VAR）。前提：
-//   1) 仍记录在**当前块**（块序号一致），避免跨块时下标漂移；实测形状必须恰是空字面量；
-//   2) 自该分配以来，当前块内没有任何对 pslot 或数组值寄存器的读取 —— 否则留原始分配。
-// 任何一条不满足就原样保留（保守，零语义变化）。删除后同一块内仍待删的其它空分配下标 -= 2。
-kimo mir_sred_drop_empty(pslot: int) -> int {
-    if (pslot < 0 || pslot >= len(mir_empty_alloc_start)) { return 0; }
-    if (mir_empty_alloc_start[pslot] < 0) { return 0; }
-    if (mir_empty_alloc_block[pslot] != mir_block_serial) { return 0; }
-    let s = mir_empty_alloc_start[pslot];
-    if (s < 0 || (s + 1) >= len(mir_cur_insts)) { return 0; }
-    let a0 = mir_cur_insts[s];
-    let a1 = mir_cur_insts[s + 1];
-    if (a0.op != MIR_ARRAY_LIT || len(a0.args) != 0) { return 0; }
-    if (a1.op != MIR_STORE_VAR || a1.arg1 != a0.dst || a1.arg2 != pslot) { return 0; }
-    let r = a0.dst;
-    let j = s + 2;
-    while (j < len(mir_cur_insts)) {
-        let ins = mir_cur_insts[j];
-        if (ins.op == MIR_LOAD_VAR && ins.arg1 == pslot) { return 0; }
-        if (ins.arg1 == r || ins.arg2 == r || ins.dst == r) { return 0; }
-        let ka = 0;
-        while (ka < len(ins.args)) {
-            if (ins.args[ka] == r) { return 0; }
-            ka = ka + 1;
-        }
-        j = j + 1;
+// 容量事实：cap(arr_slot) == src_slot 的当前值（要求 src 只写一次，否则其值可能已变）。
+kimo mir_cap_set(arr_slot: int, src_slot: int) -> void {
+    if (arr_slot < 0 || arr_slot >= len(mir_cap_lb_slot)) { return; }
+    if (src_slot < 0 || src_slot >= len(mir_constish)) { return; }
+    if (mir_constish[src_slot] == 1) {
+        mir_cap_lb_slot[arr_slot] = src_slot;
+        mir_cap_lb_ok[arr_slot] = 1;
+    } else {
+        mir_cap_lb_ok[arr_slot] = 0;
     }
-    let nb: array<MirInst> = [];
+}
+
+// 槽被复写：作废其类常量/容量来源状态，并清理所有指向它的容量事实。
+kimo mir_mark_reassigned(slot: int) -> void {
+    if (slot < 0 || slot >= len(mir_constish)) { return; }
+    mir_constish[slot] = 0;
+    if (slot < len(mir_cap_lb_ok) && mir_cap_lb_ok[slot] == 1) { mir_cap_lb_ok[slot] = 0; }
     let i = 0;
-    while (i < len(mir_cur_insts)) {
-        if (i != s && i != (s + 1)) { nb = array_push(nb, mir_cur_insts[i]); }
+    while (i < len(mir_cap_lb_slot)) {
+        if (mir_cap_lb_ok[i] == 1 && mir_cap_lb_slot[i] == slot) { mir_cap_lb_ok[i] = 0; }
         i = i + 1;
     }
-    mir_cur_insts = nb;
-    mir_empty_alloc_start[pslot] = -1;
-    mir_empty_alloc_block[pslot] = -1;
-    let k = 0;
-    while (k < len(mir_empty_alloc_start)) {
-        if (mir_empty_alloc_start[k] > s && mir_empty_alloc_block[k] == mir_block_serial) {
-            mir_empty_alloc_start[k] = mir_empty_alloc_start[k] - 2;
+}
+
+// 循环界帧入栈/出栈。push 复用已被 pop 腾出的槽位，避免数组无限增长。
+kimo mir_lf_push(cv_slot: int, bound_slot: int, bval: int, inc: int) -> void {
+    let cvmin = mir_vmin_unknown();
+    if (cv_slot >= 0 && cv_slot < len(mir_vmin_known) && mir_vmin_known[cv_slot] == 1) {
+        cvmin = mir_vmin[cv_slot];
+    }
+    if (mir_lf_n < len(mir_lf_slot)) {
+        mir_lf_slot[mir_lf_n] = cv_slot;
+        mir_lf_bound[mir_lf_n] = bound_slot;
+        mir_lf_bval[mir_lf_n] = bval;
+        mir_lf_inc[mir_lf_n] = inc;
+        mir_lf_mono[mir_lf_n] = 1;
+        mir_lf_cvmin[mir_lf_n] = cvmin;
+    } else {
+        mir_lf_slot = array_push(mir_lf_slot, cv_slot);
+        mir_lf_bound = array_push(mir_lf_bound, bound_slot);
+        mir_lf_bval = array_push(mir_lf_bval, bval);
+        mir_lf_inc = array_push(mir_lf_inc, inc);
+        mir_lf_mono = array_push(mir_lf_mono, 1);
+        mir_lf_cvmin = array_push(mir_lf_cvmin, cvmin);
+    }
+    mir_lf_n = mir_lf_n + 1;
+}
+
+kimo mir_lf_pop() -> void {
+    if (mir_lf_n > 0) { mir_lf_n = mir_lf_n - 1; }
+}
+
+// 循环体内对计数变量 cv 的所有赋值是否单调不减（只允许 cv = cv + rhs，rhs 下界>=0；
+// 或 cv = cv * rhs，两者>0）。递归进 if/block。任何别的赋值 → 不单调。
+kimo mir_loop_cv_monotone(cv_slot: int, stmts: array<HirStmt>) -> int {
+    let i = 0;
+    while (i < len(stmts)) {
+        let st = stmts[i];
+        let k = st.kind;
+        if (k == STMT_ASSIGN && (st.child as any) != 0 && (st.rhs as any) != 0) {
+            let lhs = st.child;
+            let rhs = st.rhs;
+            if (lhs.kind == EXPR_VAR && lhs.slot == cv_slot) {
+                if (rhs.kind == EXPR_BINARY && (rhs.op == BIN_ADD || rhs.op == BIN_MUL)) {
+                    let ch = rhs.children;
+                    if (len(ch) == 2 && ch[0].kind == EXPR_VAR && ch[0].slot == cv_slot) {
+                        let ov = mir_vmin_hir(ch[1]);
+                        if (ov == mir_vmin_unknown()) { return 0; }
+                        if (rhs.op == BIN_ADD) {
+                            if (ov < 0) { return 0; }
+                        } else {
+                            // cv = cv * rhs：需 rhs>=1 且 cv>=0 才单调不减
+                            if (ov < 1) { return 0; }
+                            if (cv_slot >= len(mir_vmin_known) || mir_vmin_known[cv_slot] != 1 ||
+                                mir_vmin[cv_slot] < 0) { return 0; }
+                        }
+                    } else { return 0; }
+                } else { return 0; }
+            }
+        } else if (k == STMT_BLOCK) {
+            if (mir_loop_cv_monotone(cv_slot, st.body) == 0) { return 0; }
+        } else if (k == STMT_IF) {
+            if (mir_loop_cv_monotone(cv_slot, st.body) == 0) { return 0; }
+            if (mir_loop_cv_monotone(cv_slot, st.else_body) == 0) { return 0; }
+        } else if (k == STMT_WHILE || k == STMT_FOR) {
+            // 嵌套循环体内对 cv 的赋值也必须单调（否则外层界证明不安全）：继续递归
+            if (mir_loop_cv_monotone(cv_slot, st.body) == 0) { return 0; }
+        } else if (k == STMT_MATCH) {
+            let blocks = st.arm_blocks;
+            let b = 0;
+            while (b < len(blocks)) {
+                if (mir_loop_cv_monotone(cv_slot, blocks[b].stmts) == 0) { return 0; }
+                b = b + 1;
+            }
         }
-        k = k + 1;
+        i = i + 1;
     }
     return 1;
+}
+
+// 核心证明器：能否证 `0 <= idx_hir < cap(base_hir)`。
+// 仅在最简单的形状（base=变量；idx=变量 或 变量-常量C）上工作。
+kimo mir_prove_in_bounds(base_h: HirExpr, idx_h: HirExpr) -> int {
+    if ((base_h as any) == 0 || base_h.kind != EXPR_VAR) { return 0; }
+    if ((idx_h as any) == 0) { return 0; }
+    let base_slot = base_h.slot;
+    if (base_slot < 0 || base_slot >= len(mir_cap_lb_ok) || mir_cap_lb_ok[base_slot] != 1) { if (mir_pi_dbg == 1) { println("PI fail base cap base_slot=" + int_to_str(base_slot)); } return 0; }
+    // 解析 idx = cv - C。
+    let cv_slot = -1;
+    let Cc = 0;
+    let ik = idx_h.kind;
+    if (ik == EXPR_VAR) { cv_slot = idx_h.slot; Cc = 0; }
+    else if (ik == EXPR_BINARY && idx_h.op == BIN_SUB) {
+        let ch = idx_h.children;
+        if (len(ch) == 2 && ch[0].kind == EXPR_VAR && ch[1].kind == EXPR_INT) {
+            cv_slot = ch[0].slot; Cc = ch[1].intval as int;
+        } else { if (mir_pi_dbg == 1) { println("PI fail idxshape"); } return 0; }
+        if (Cc < 0) { if (mir_pi_dbg == 1) { println("PI fail Cc<0"); } return 0; }
+    } else { if (mir_pi_dbg == 1) { println("PI fail idxkind"); } return 0; }
+    // 找含该计数变量的最内层循环帧。
+    let f = -1;
+    let j = mir_lf_n - 1;
+    while (j >= 0) {
+        if (mir_lf_slot[j] == cv_slot) { f = j; j = -1; }
+        else { j = j - 1; }
+    }
+    if (f < 0) { if (mir_pi_dbg == 1) { println("PI fail noframe cv_slot=" + int_to_str(cv_slot)); } return 0; }
+    if (mir_lf_mono[f] != 1) { if (mir_pi_dbg == 1) { println("PI fail nmono"); } return 0; }
+    // 上界：cap(base) == 帧的上界值。
+    let cap_src = mir_cap_lb_slot[base_slot];
+    let do_upper = 0;
+    if (mir_lf_bound[f] >= 0 && mir_lf_bound[f] == cap_src) { do_upper = 1; }
+    if (do_upper == 0) { if (mir_pi_dbg == 1) { println("PI fail bound slot=" + int_to_str(base_slot) + " cap_src=" + int_to_str(cap_src) + " bound=" + int_to_str(mir_lf_bound[f])); } return 0; }
+    if (mir_lf_inc[f] == 1 && Cc == 0) { if (mir_pi_dbg == 1) { println("PI fail inc0"); } return 0; }
+    let cmin = mir_lf_cvmin[f];
+    if (cmin == mir_vmin_unknown() || cmin < Cc) { if (mir_pi_dbg == 1) { println("PI fail cmin cmin=" + int_to_str(cmin) + " Cc=" + int_to_str(Cc)); } return 0; }
+    if (mir_pi_dbg == 1) { println("PI OK base=" + int_to_str(base_slot) + " cv=" + int_to_str(cv_slot) + " Cc=" + int_to_str(Cc)); }
+    return 1;
+}
+
+// 登记跨函数容量事实：fname 的第 arr_pos 个形参数组，其容量 == 第 src_pos 个形参的值。
+// 去重（同一函数同一位置登记一次即可）。
+kimo mir_xc_record(fname: string, arr_pos: int, src_pos: int) -> void {
+    let i = 0;
+    while (i < len(mir_xc_fn)) {
+        if (str_eq(mir_xc_fn[i], fname) == 1 && mir_xc_arr[i] == arr_pos &&
+            mir_xc_src[i] == src_pos) { return; }
+        i = i + 1;
+    }
+    mir_xc_fn = array_push(mir_xc_fn, fname);
+    mir_xc_arr = array_push(mir_xc_arr, arr_pos);
+    mir_xc_src = array_push(mir_xc_src, src_pos);
+    mir_xc_used = 1;
+}
+
+// 普通调用点：若某实参是变量且容量事实对应本调用另一实参（cap(a)==另一实参值），登记。
+// 只在被调侧播种（callee 形参槽）时兑现；对 array_push 等内建函数登记后会被播种侧过滤掉。
+kimo mir_xc_collect(fname: string, args: array<HirExpr>) -> void {
+    let i = 0;
+    while (i < len(args)) {
+        let a = args[i];
+        if (a.kind == EXPR_VAR && a.slot >= 0 && a.slot < len(mir_cap_lb_ok) &&
+            mir_cap_lb_ok[a.slot] == 1) {
+            let src = mir_cap_lb_slot[a.slot];
+            let j = 0;
+            let found = 0;
+            while (j < len(args)) {
+                let b = args[j];
+                if (j != i && b.kind == EXPR_VAR && b.slot == src) { found = 1; break; }
+                j = j + 1;
+            }
+            if (found == 1) { if (mir_pi_dbg == 1) { println("PI collect " + fname + " arr=" + int_to_str(i) + " src=" + int_to_str(j)); } mir_xc_record(fname, i, j); }
+        }
+        i = i + 1;
+    }
+}
+
+// 被调函数入口：形参由调用点赋一次值，视为类常量；再按登记表把容量播种到数组形参槽。
+kimo mir_xc_seed_params(hf: HirFunc) -> void {
+    if (mir_pi_dbg == 1) { println("PI seedfn " + hf.name + " reg=" + int_to_str(len(mir_xc_fn))); }
+    let params = hf.params;
+    let j = 0;
+    while (j < len(params)) {
+        let pslot = params[j].slot;
+        if (pslot >= 0 && pslot < len(mir_constish)) { mir_constish[pslot] = 1; }
+        j = j + 1;
+    }
+    let i = 0;
+    while (i < len(mir_xc_fn)) {
+        if (str_eq(mir_xc_fn[i], hf.name) == 1) {
+            let ap = mir_xc_arr[i];
+            let sp = mir_xc_src[i];
+            if (ap >= 0 && ap < len(params) && sp >= 0 && sp < len(params)) {
+                if (mir_pi_dbg == 1) { println("PI seed " + hf.name + " arr=" + int_to_str(ap) + " src=" + int_to_str(sp)); }
+                mir_cap_set(params[ap].slot, params[sp].slot);
+            }
+        }
+        i = i + 1;
+    }
 }
 
 // === 填充循环计数存储强度削减（v10_s18）===
@@ -632,8 +843,6 @@ pub kimo mir_seal_and_begin(new_label: string) -> void {
     mir_cur_label = new_label;
     mir_cur_insts = [];
     mir_cur_terminator = 0 as MirInst;
-    // 空数组分配位置是相对 mir_cur_insts 下标的，跨块必须全部作废（嫌脏累加）
-    mir_block_serial = mir_block_serial + 1;
 }
 
 // 仅封存当前块（用于函数末尾）
@@ -930,6 +1139,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
             st.arg2 = idx_reg;
             st.ty = target.inferred_type;  // 数组元素类型：codegen 据此决定直接 GEP 还是运行时函数
             st.args = array_push([], new_reg);
+            let tch = target.children;
+            st.longval = mir_prove_in_bounds(tch[0], tch[1]);
             mir_emit(st);
         } else if (target_kind == EXPR_MEMBER) {
             let st = mir_mk(MIR_STORE_MEMBER);
@@ -1030,6 +1241,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         inst.dst = r;
         inst.strval = h.str1;
         inst.args = arg_regs;
+        // 跨调用容量：cap(实参 a)==另一实参 → 登记，供被调侧播种（sieve 的 flags 容量==size）
+        mir_xc_collect(h.str1, args);
         // array_push：携带第一个实参的数组类型（保留 elem_type），
         // codegen 据此分派 typed push（array<int>→shadow_array_push_int），
         // 使静态类型数组以 4/8 字节槽存储，与直接 GEP 优化一致。
@@ -1112,6 +1325,8 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
         inst.arg1 = arr;
         inst.arg2 = idx;
         inst.ty = h.inferred_type;
+        // 循环界+容量可证 0<=idx<cap → 免 OOB 护栏（codegen cg_gen_array_load_direct 读 longval）
+        inst.longval = mir_prove_in_bounds(children[0], children[1]);
         mir_emit(inst);
         return r;
     }
@@ -1606,23 +1821,23 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
     let k = h.kind;
 
     if (k == STMT_LET) {
-        if ((h.child as any) != 0) {
-            let empty_alloc_idx = -1;
-            let initk = h.child.kind;
-            if (initk == EXPR_ARRAY_LIT && len(h.child.children) == 0) {
-                empty_alloc_idx = len(mir_cur_insts);
+        // 数组护栏分析：let 是一次定义 → 该槽类常量（后续未被赋值则保持）；记录下界。
+        if (h.slot >= 0 && h.slot < len(mir_constish)) {
+            mir_constish[h.slot] = 1;
+            let cli = 0;
+            while (cli < len(mir_cap_lb_slot)) {
+                if (mir_cap_lb_ok[cli] == 1 && mir_cap_lb_slot[cli] == h.slot) { mir_cap_lb_ok[cli] = 0; }
+                cli = cli + 1;
             }
+        }
+        if ((h.child as any) != 0) { mir_vmin_set(h.slot, h.child); }
+        if ((h.child as any) != 0) {
             let rhs_reg = mir_lower_expr(h.child);
             let inst = mir_mk(MIR_STORE_VAR);
             inst.arg1 = rhs_reg;
             inst.arg2 = h.slot;
             inst.ty = h.inferred_type;
             mir_emit(inst);
-            if (empty_alloc_idx >= 0) {
-                mir_empty_alloc_ensure(h.slot);
-                mir_empty_alloc_start[h.slot] = empty_alloc_idx;
-                mir_empty_alloc_block[h.slot] = mir_block_serial;
-            }
             // 所有权：let x = y（变量复制）→ 共享缓冲，源与目标均不唯一持有；
             // let x = 字面量/二元运算 → 新缓冲，唯一持有；
             // let x = 调用/索引/成员/闭包 → 结果可能逃逸/共享，不唯一持有。
@@ -1941,9 +2156,6 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             while (pi < len(pre_slots)) {
                 let pslot = pre_slots[pi];
                 let pty: Type = pre_tys[pi];
-                // 预分配会立即覆盖 pslot 的空数组 → 整体删掉那次无谓的空分配（每热迭代省
-                // 一次 12B 分配 + GC 清扫；仅在证实时机安全时删，否则保留原始分配）。
-                mir_sred_drop_empty(pslot);
                 let es = 8;
                 if ((pty as any) != 0 && (pty.elem_type as any) != 0) {
                     let ek = pty.elem_type.kind;
@@ -1969,7 +2181,32 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
                 st.ty = pty;
                 mir_emit(st);
                 mir_empty_set(pslot, 0);
+                // 预分配后 cap(a)==bound：bound 为类常量槽时建立容量事实（供循环界证明/跨调用传达）
+                if (pre_bound.kind == EXPR_VAR) { mir_cap_set(pslot, pre_bound.slot); }
                 pi = pi + 1;
+            }
+        }
+        // 循环界帧：while(cv < B) / while(cv <= B) 且 cv 在体内单调不减 → 压栈，
+        // 供数组访问证明 0 <= cv-C < cap(==B)。bound 可为变量槽或常量。
+        let lf_cv_slot = -1;
+        let lf_bound_slot = -1;
+        let lf_bval = 0;
+        let lf_inc = 0;
+        let lf_pushed = 0;
+        let lf_cond = h.child;
+        if ((lf_cond as any) != 0 && lf_cond.kind == EXPR_BINARY &&
+            (lf_cond.op == BIN_LT || lf_cond.op == BIN_LE) && len(lf_cond.children) == 2 &&
+            lf_cond.children[0].kind == EXPR_VAR) {
+            let lf_cv = lf_cond.children[0];
+            let lf_c1 = lf_cond.children[1];
+            let lf_okb = 0;
+            if (lf_c1.kind == EXPR_VAR) { lf_bound_slot = lf_c1.slot; lf_okb = 1; }
+            else if (lf_c1.kind == EXPR_INT) { lf_bound_slot = -1; lf_bval = lf_c1.intval as int; lf_okb = 1; }
+            if (lf_okb == 1 && mir_loop_cv_monotone(lf_cv.slot, h.body) == 1) {
+                lf_cv_slot = lf_cv.slot;
+                if (lf_cond.op == BIN_LE) { lf_inc = 1; }
+                mir_lf_push(lf_cv_slot, lf_bound_slot, lf_bval, lf_inc);
+                lf_pushed = 1;
             }
         }
         // 循环入口：体内别名操作会让变量在下一次迭代被共享，清除所有权禁用就地追加
@@ -1999,9 +2236,17 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         mir_pop_loop();
         mir_emit_br(cond_label);
 
+        if (lf_pushed == 1) { mir_lf_pop(); }
+
         mir_seal_and_begin(exit_label);
         // v10_s18：出口一次性把各目标的 len 补成实际写入数（未启用削减时是空操作）。
         mir_sred_finish();
+        // 填充循环出口：预分配保证 cap(a)>=bound，且循环体对 a 的 push 复写会清掉 cap 事实
+        // （mir_mark_reassigned），此处重建 cap(a)==bound 供紧随其后的调用/访问证明使用。
+        if ((pre_bound as any) != 0 && pre_bound.kind == EXPR_VAR) {
+            let pj = 0;
+            while (pj < len(pre_slots)) { mir_cap_set(pre_slots[pj], pre_bound.slot); pj = pj + 1; }
+        }
         return;
     }
 
@@ -2028,6 +2273,9 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
         let rhs_h = h.rhs;
 
         if (lhs.kind == EXPR_VAR) {
+            // 数组护栏分析：这是对该槽的又一次写入 → 不再类常量；更新下界。
+            mir_mark_reassigned(lhs.slot);
+            if ((rhs_h as any) != 0) { mir_vmin_set(lhs.slot, rhs_h); }
             // 空数组字面量 [] → 标记空（供填充循环预分配检测）；其他写入清 0
             if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_ARRAY_LIT && len(rhs_h.children) == 0) {
                 mir_empty_set(lhs.slot, 1);
@@ -2143,6 +2391,8 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             inst.arg2 = idx_reg;
             inst.ty = lhs.inferred_type;  // 数组元素类型：codegen 据此决定直接 GEP 还是运行时函数
             inst.args = array_push([], rhs_reg);
+            // 循环界+容量可证 0<=idx<cap → 免 OOB 护栏（codegen cg_gen_array_store_direct 读 longval）
+            inst.longval = mir_prove_in_bounds(lhs_children[0], lhs_children[1]);
             mir_emit(inst);
             // 存储到数组：RHS 变量缓冲被数组共享，不再唯一持有
             if ((rhs_h as any) != 0 && rhs_h.kind == EXPR_VAR) { mir_owned_clear(rhs_h.slot); }
@@ -2609,21 +2859,42 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
         mir_owned = array_push(mir_owned, 0);
         oi = oi + 1;
     }
-    mir_empty_alloc_start = [];
-    mir_empty_alloc_block = [];
-    mir_block_serial = 1;
     mir_slot_empty = [];
     let ei = 0;
     while (ei < mir_n_slots) {
         mir_slot_empty = array_push(mir_slot_empty, 0);
         ei = ei + 1;
     }
+    mir_cap_lb_slot = [];
+    mir_cap_lb_ok = [];
+    mir_constish = [];
+    mir_vmin_known = [];
+    mir_vmin = [];
+    let kfi = 0;
+    while (kfi < mir_n_slots) {
+        mir_cap_lb_slot = array_push(mir_cap_lb_slot, -1);
+        mir_cap_lb_ok = array_push(mir_cap_lb_ok, 0);
+        mir_constish = array_push(mir_constish, 0);
+        mir_vmin_known = array_push(mir_vmin_known, 0);
+        mir_vmin = array_push(mir_vmin, 0);
+        kfi = kfi + 1;
+    }
+    mir_lf_slot = [];
+    mir_lf_bound = [];
+    mir_lf_bval = [];
+    mir_lf_inc = [];
+    mir_lf_mono = [];
+    mir_lf_cvmin = [];
+    mir_lf_n = 0;
     mir_sred_n = 0;
     mir_sred_slots = [];
     mir_sred_adj = [];
     mir_sred_arr_h = [];
     mir_sred_i_h = 0 as HirExpr;
     mir_sred_base_reg = -1;
+
+    // 跨调用容量播种：把调用点登记的 cap(数组形参)==另一形参 落到形参槽上
+    mir_xc_seed_params(hf);
 
     let body = hf.body;
     let i = 0;
@@ -2665,14 +2936,29 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
 
 // --- 程序 lowering：返回 array<MirFunc>（跳过 extern 函数）---
 pub kimo mir_lower_program(hfuncs: array<HirFunc>) -> array<MirFunc> {
+    // 两遍：第一遍按源码序 lowering 生成本会建立跨调用容量登记表（调用侧在 callee 之后
+    // lowering，callee 第一遍拿不到容量播种）；若确有跨调用容量则重走一遍，让所有 callee
+    // 都在登记表齐备后播种，消除数组下标护栏。无跨调用事实时只跑一遍，不做多余工作。
+    mir_xc_fn = [];
+    mir_xc_arr = [];
+    mir_xc_src = [];
+    mir_xc_used = 0;
     let mfuncs: array<MirFunc> = [];
     let i = 0;
     while (i < len(hfuncs)) {
         let hf = hfuncs[i];
-        if (len(hf.extern_name) == 0) {
-            mfuncs = array_push(mfuncs, mir_lower_func(hf));
-        }
+        if (len(hf.extern_name) == 0) { mfuncs = array_push(mfuncs, mir_lower_func(hf)); }
         i = i + 1;
+    }
+    if (mir_pi_dbg == 1) { println("PI pass1 done used=" + int_to_str(mir_xc_used)); }
+    if (mir_xc_used == 1) {
+        mfuncs = [];
+        let j = 0;
+        while (j < len(hfuncs)) {
+            let hf = hfuncs[j];
+            if (len(hf.extern_name) == 0) { mfuncs = array_push(mfuncs, mir_lower_func(hf)); }
+            j = j + 1;
+        }
     }
     return mfuncs;
 }
