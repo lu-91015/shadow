@@ -55,7 +55,7 @@ pub kimo hir_mk_expr(kind: int) -> HirExpr {
 }
 
 pub kimo hir_mk_stmt(kind: int) -> HirStmt {
-    let s = HirStmt { id: 0, kind: kind, str1: "", int1: 0, slot: -1,
+    let s = HirStmt { id: 0, line: 0, kind: kind, str1: "", int1: 0, slot: -1,
                       child: 0 as HirExpr, body: [], else_body: [], rhs: 0 as HirExpr,
                       extra_slots: [], pats: [], arm_blocks: [], inferred_type: 0 as Type };
     return s;
@@ -331,6 +331,7 @@ pub kimo hir_type_of_hir_expr(h: HirExpr) -> Type {
 pub kimo hir_lower_stmt(s: Stmt, env: HirEnv) -> HirStmt {
     let k = s.kind;
     let h = hir_mk_stmt(k);
+    h.line = s.loc.line;
     // 0.4 Stmt 无 NodeId（typemap 已废），HirStmt.id 固定 0
     h.str1 = s.str1;
     h.int1 = s.intval as int;

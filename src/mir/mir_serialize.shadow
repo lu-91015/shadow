@@ -24,7 +24,7 @@ import core.utils;
 
 let MIR_SER_MAGIC0: int = 76;   // 'L'
 let MIR_SER_MAGIC1: int = 85;   // 'U'
-let MIR_SER_VERSION: int = 10;   // v10：MirFunc 序列化增加 is_nogc 字段（@nogc 免 GC 帧）——拒绝旧 v9 缓存
+let MIR_SER_VERSION: int = 11;   // v11：MirInst 增加 line 字段（debug 元数据）→ 拒绝旧 v10 缓存
 let MIR_SER_BUF_SIZE: int = 4194304;  // 4MB 初始 buffer（不足时自动按精确尺寸重分配）
 
 let mir_ser_buf: any = 0 as any;
@@ -333,6 +333,7 @@ pub kimo mir_ser_read_type(buf: any, off: int) -> Type {
 // --- 辅助：写入 MirInst ---
 pub kimo mir_ser_write_inst(buf: any, off: int, inst: MirInst) -> int {
     off = leb_enc_uint(buf, off, inst.op);
+    off = leb_enc_int(buf, off, inst.line);
     off = leb_enc_int(buf, off, inst.dst);
     off = leb_enc_int(buf, off, inst.arg1);
     off = leb_enc_int(buf, off, inst.arg2);
@@ -360,6 +361,8 @@ pub kimo mir_ser_read_inst(buf: any, off: int) -> MirInst {
     off = mir_ser_off;
     let op = mir_ser_val;
     leb_dec_int(buf, off); off = mir_ser_off;
+    let line = mir_ser_val;
+    leb_dec_int(buf, off); off = mir_ser_off;
     let dst = mir_ser_val;
     leb_dec_int(buf, off); off = mir_ser_off;
     let arg1 = mir_ser_val;
@@ -385,7 +388,7 @@ pub kimo mir_ser_read_inst(buf: any, off: int) -> MirInst {
         i = i + 1;
     }
     mir_ser_off = off;
-    let inst = MirInst { op: op, ty: ty, dst: dst, arg1: arg1, arg2: arg2,
+    let inst = MirInst { op: op, line: line, ty: ty, dst: dst, arg1: arg1, arg2: arg2,
                          longval: longval, floatval: floatval,
                          strval: strval, strval2: strval2, args: args };
     return inst;

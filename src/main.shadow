@@ -2596,6 +2596,10 @@ kimo main() -> int {
     let i_st = 1;
     while (i_st < n_args) {
         if (str_eq(args[i_st] as string, "--strict") == 1) { tc_set_strict(1); }
+        // -g/--debug：发射 DWARF 行表（编译产物带 !dbg），供 addr2line 反汇编与源码行对齐。
+        if (str_eq(args[i_st] as string, "-g") == 1 || str_eq(args[i_st] as string, "--debug") == 1) {
+            cg_set_debug(1);
+        }
         i_st = i_st + 1;
     }
     // ---- Phase 14：LSP/查询类 CLI（flag 可在 args[1] 或文件之后）----
@@ -2704,11 +2708,11 @@ kimo main() -> int {
     }
     // 文件参数：arg1 若为 flag（如 `shadow --strict foo.shadow`），取第一个非 flag 参数
     let main_file = arg1;
-    if (str_starts_with(main_file, "--") == 1) {
+    if (str_starts_with(main_file, "--") == 1 || str_eq(main_file, "-g") == 1) {
         let i_f2 = 2;
         while (i_f2 < n_args) {
             let a_f2 = args[i_f2] as string;
-            if (str_starts_with(a_f2, "--") == 0 && str_eq(a_f2, "-o") == 0) { main_file = a_f2; break; }
+            if (str_starts_with(a_f2, "--") == 0 && str_eq(a_f2, "-o") == 0 && str_eq(a_f2, "-g") == 0) { main_file = a_f2; break; }
             i_f2 = i_f2 + 1;
         }
     }

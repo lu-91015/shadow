@@ -36,6 +36,10 @@ let mir_loop_break_labels: array<string> = [];
 let mir_loop_continue_labels: array<string> = [];
 let mir_n_slots: int = 0;
 
+// 当前正在 lower 的语句行号：mir_lower_stmt 每进入一条语句置位，
+// mir_mk 据此给每条 MirInst 盖上 line（供 codegen debug 元数据用）。
+let mir_cur_line: int = 0;
+
 // 就地追加优化所有权跟踪：mir_owned[slot] = 1 表示该 slot 唯一持有其字符串缓冲
 // （无其他活引用），可安全就地追加。保守数据流（仅 1→0，不会误判安全）：
 //   - let x = 字面量/二元运算 → 新缓冲，owned=1
@@ -815,7 +819,7 @@ pub kimo mir_new_label() -> string {
 }
 
 pub kimo mir_mk(op: int) -> MirInst {
-    let i = MirInst { op: op, ty: 0 as Type, dst: -1, arg1: -1, arg2: -1,
+    let i = MirInst { op: op, line: mir_cur_line, ty: 0 as Type, dst: -1, arg1: -1, arg2: -1,
                       longval: 0, floatval: 0.0, strval: "", strval2: "", args: [] };
     return i;
 }
@@ -1818,6 +1822,7 @@ pub kimo mir_lower_expr(h: HirExpr) -> int {
 
 // --- 语句 lowering ---
 pub kimo mir_lower_stmt(h: HirStmt) -> void {
+    mir_cur_line = h.line;
     let k = h.kind;
 
     if (k == STMT_LET) {
@@ -2848,6 +2853,7 @@ pub kimo mir_lower_func(hf: HirFunc) -> MirFunc {
     mir_cur_label = "entry";
     mir_cur_insts = [];
     mir_cur_terminator = 0 as MirInst;
+    mir_cur_line = 0;
     mir_n_regs = 0;
     mir_label_counter = 0;
     mir_loop_break_labels = [];

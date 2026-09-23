@@ -313,6 +313,7 @@ pub struct HirExpr {
 pub struct HirStmt {
     id: int;            // NodeId：从对应 Stmt.id 继承
     kind: int;          // 复用 STMT_*
+    line: int;          // 来源源码行号（0 = 未知/合成）
     str1: string;
     int1: int;          // for 隐藏索引变量 slot
     slot: int;          // 目标变量 slot
@@ -344,6 +345,7 @@ pub struct HirFunc {
 // 空引用：ty/terminator 用 `0 as Type` / `0 as MirInst`。
 pub struct MirInst {
     op: int;            // MIR_OP_*
+    line: int;          // 来源源码行号（供 debug 元数据；0 = 未知）
     ty: Type;           // 结果类型（0 as Type = 无/void）
     dst: int;           // 目标寄存器编号（-1 = 无）
     arg1: int;          // 源寄存器/slot

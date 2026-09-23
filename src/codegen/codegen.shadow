@@ -135,6 +135,12 @@ pub kimo cg_dbg(msg: string) -> void {}
 // 给函数加 alwaysinline 属性（热点运行时函数强制内联）
 @extern("shadow_llvm_set_alwaysinline") kimo llvm_set_alwaysinline(ctx: any, fn: any) -> void {}
 @extern("shadow_llvm_set_tls") kimo shadow_llvm_set_tls(g: any) -> void {}
+@extern("shadow_llvm_di_begin") kimo llvm_di_begin(mod: any, ctx: any, dirname: string, filename: string, is_opt: int) -> any { return 0 as any; }
+@extern("shadow_llvm_di_subprogram") kimo llvm_di_subprogram(func: any, name: string, file: any) -> any { return 0 as any; }
+@extern("shadow_llvm_di_loc")   kimo llvm_di_loc(line: int, col: int, scope: any) -> any { return 0 as any; }
+@extern("shadow_llvm_di_set")   kimo llvm_di_set(b: any, loc: any) -> void {}
+@extern("shadow_llvm_di_reset") kimo llvm_di_reset(b: any) -> void {}
+@extern("shadow_llvm_di_end")   kimo llvm_di_end(scope: any) -> void {}
 
 // ============ Codegen 全局状态 ============
 let cg_ctx: any = 0 as any;
@@ -144,6 +150,16 @@ let cg_prog: any = 0 as any;
 let cg_mod: any = 0 as any;
 let cg_builder: any = 0 as any;
 let cg_func: any = 0 as any;
+// debug 元数据：cg_di_file=模块级 DIFile；cg_di_scope=当前函数 DISubprogram（即
+// 指令 DILocation 的合法 scope）；cg_di_last_line 记录已发射行号供 cg_gen_inst 设 !dbg。
+let cg_di_file: any = 0 as any;
+let cg_di_scope: any = 0 as any;
+let cg_di_last_line: int = -1;
+// 调试开关：0 默认不发射 !dbg（产物体积/可复现性不变）；1 由 `shadow -g` 打开，
+// 每模块建 DICompileUnit 并给指令挂行号，llc 才会生成 DWARF .debug_line。
+let cg_enable_debug: int = 0;
+
+pub kimo cg_set_debug(on: int) -> void { cg_enable_debug = on; }
 let cg_cur_ret_kind: int = 0;
 let cg_cur_ret_default: any = 0 as any;
 let cg_cur_ret_is_void: int = 0;
@@ -1510,6 +1526,16 @@ pub kimo cg_i64_to_val(val: any, k: int) -> any {
 pub kimo cg_gen_inst(inst: MirInst) -> void {
     let mi = inst;
     let op = mi.op;
+
+    // debug 元数据：行号变化时更新 builder 的当前 debug location，后续指令挂上 !dbg。
+    // cg_di_scope==0（多模块路径未开 debug）时整体跳过。
+    if (mi.line != cg_di_last_line && (cg_di_scope as any) != 0) {
+        cg_di_last_line = mi.line;
+        if (mi.line > 0) {
+            let _l = llvm_di_loc(mi.line, 0, cg_di_scope);
+            llvm_di_set(cg_builder, _l);
+        }
+    }
 
     if (file_exists("build/.qdbg") == 1) {
         cg_dbg("[qdbg] op=" + int_to_str(op));
@@ -3723,6 +3749,19 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         cg_func = llvm_add_fn(cg_mod, mf.name, fn_ty);
     }
     cg_maybe_alwaysinline(cg_func, mf.name);
+    // debug：为本函数建立 DISubprogram 作 DILocation scope（仅 -g 开启且已启动 DIBuilder）。
+    if ((cg_di_file as any) != 0) {
+        cg_di_scope = llvm_di_subprogram(cg_func, mf.name, cg_di_file);
+        // 清空并打底：prologue（frame/gc alloca、set_args 等非块内 call）inlinable call
+        // 若缺 !dbg 会让 LLVM 丢弃整个模块 debug info，故 reset 后立即设 line=0 的
+        // DILocation，使 prologue 指令带合法 !dbg；cg_gen_inst 遇真实行号再覆盖。
+        llvm_di_reset(cg_builder);
+        cg_di_last_line = 0;
+        let _l0 = llvm_di_loc(0, 0, cg_di_scope);
+        llvm_di_set(cg_builder, _l0);
+    } else {
+        cg_di_scope = 0 as any;
+    }
 
     cg_block_labels = [];
     cg_block_ptrs = [];
@@ -4018,6 +4057,16 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
     cg_ctx = ctx;
     cg_mod = mod;
     cg_builder = llvm_new_builder(cg_ctx);
+    // 模块级 debug 元数据：DIBuilder 启动，返回模块级 DIFile。仅 cg_enable_debug(-g)
+    // 打开时启动；is_optimized=0（DWARF 行表仍照常生成）。真正作指令 DILocation scope
+    // 的 DISubprogram 在每个函数创建处建立（见 cg_gen_func）。
+    if (cg_enable_debug == 1) {
+        cg_di_file = llvm_di_begin(cg_mod, cg_ctx, "", prog.module_name + ".shadow", 0);
+    } else {
+        cg_di_file = 0 as any;
+    }
+    cg_di_scope = 0 as any;
+    cg_di_last_line = -1;
     cg_str_keys = [];
     cg_str_vals = [];
     cg_extern_names = [];
@@ -4200,6 +4249,13 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
         }
         i = i + 1;
     }
+
+    // 收尾：finalize 把 !llvm.dbg.cu 挂回模块并生成 .debug_line 所需元数据。
+    if ((cg_di_file as any) != 0) {
+        llvm_di_end(cg_di_file);
+        cg_di_file = 0 as any;
+    }
+    cg_di_scope = 0 as any;
 
 }
 
