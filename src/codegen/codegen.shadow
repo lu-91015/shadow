@@ -3356,6 +3356,199 @@ pub kimo cg_ana_blk_index(label: string, blocks: array<MirBlock>, n: int) -> int
     return -1;
 }
 
+// 精确计算每个基本块是否属于某个循环体。回边判定沿用 §liveness 的"跳转目标下标 <
+// 当前块下标"约定（结构化 MIR 按序发射）。对每个循环头 h（存在回边 s→h，s>h），
+// 循环体 = h 自身 ∪ { 从某回边源 s 出发、沿入边回溯、不穿过 h、且位于 h 正向可达集
+// 内的所有块 } —— 即"一次迭代会再次执行的块"，不含病态的外层绕行（那些可能绕经其它
+// 循环头与回边源，若用前后象可达性会把循环外的预头/出口块误算入循环体，导致把非循环
+// 块里的 STORE_VAR 错当"循环内写"，使 root_loop 优化失效）。返回 in_loop[]（长度 n）。
+pub kimo cg_compute_loop_members(blocks: array<MirBlock>, n: int) -> array<int> {
+    let in_loop: array<int> = [];
+    let i0 = 0;
+    while (i0 < n) {
+        in_loop = array_push(in_loop, 0);
+        i0 = i0 + 1;
+    }
+    // 正向邻接 succ[b] 与反向邻接 pred[b]
+    let succ: array<array<int>> = [];
+    let pred: array<array<int>> = [];
+    let b0 = 0;
+    while (b0 < n) {
+        succ = array_push(succ, ([] as array<int>));
+        pred = array_push(pred, ([] as array<int>));
+        b0 = b0 + 1;
+    }
+    let s = 0;
+    while (s < n) {
+        let tm = blocks[s].terminator;
+        if ((tm as any) != 0 && (tm.op == MIR_BR || tm.op == MIR_CONDBR)) {
+            let ta = cg_ana_blk_index(tm.strval, blocks, n);
+            let tb = cg_ana_blk_index(tm.strval2, blocks, n);
+            if (ta >= 0) {
+                let a = succ[s];
+                a = array_push(a, ta);
+                succ[s] = a;
+                let p = pred[ta];
+                p = array_push(p, s);
+                pred[ta] = p;
+            }
+            if (tb >= 0 && tb != ta) {
+                let b2 = succ[s];
+                b2 = array_push(b2, tb);
+                succ[s] = b2;
+                let p2 = pred[tb];
+                p2 = array_push(p2, s);
+                pred[tb] = p2;
+            }
+        }
+        s = s + 1;
+    }
+    // 为每个块求正向可达掩码（存成 reachM[i][j]，避免重复算）
+    let reachM: array<array<int>> = [];
+    let i = 0;
+    while (i < n) {
+        let mask: array<int> = [];
+        let j0 = 0;
+        while (j0 < n) {
+            mask = array_push(mask, 0);
+            j0 = j0 + 1;
+        }
+        let work: array<int> = [i];
+        mask[i] = 1;
+        let wi = 0;
+        while (wi < len(work)) {
+            let cur = work[wi];
+            let cl = succ[cur];
+            let k = 0;
+            while (k < len(cl)) {
+                let nx = cl[k];
+                if (mask[nx] == 0) {
+                    mask[nx] = 1;
+                    work = array_push(work, nx);
+                }
+                k = k + 1;
+            }
+            wi = wi + 1;
+        }
+        reachM = array_push(reachM, mask);
+        i = i + 1;
+    }
+    // 回边源列表 srcs[h]（使 h 成为循环头的回边源）
+    let srcs: array<array<int>> = [];
+    let b1 = 0;
+    while (b1 < n) {
+        srcs = array_push(srcs, ([] as array<int>));
+        b1 = b1 + 1;
+    }
+    s = 0;
+    while (s < n) {
+        let tm2 = blocks[s].terminator;
+        if ((tm2 as any) != 0 && (tm2.op == MIR_BR || tm2.op == MIR_CONDBR)) {
+            let ta2 = cg_ana_blk_index(tm2.strval, blocks, n);
+            let tb2 = cg_ana_blk_index(tm2.strval2, blocks, n);
+            if (ta2 >= 0 && ta2 < s) {
+                let a2 = srcs[ta2];
+                a2 = array_push(a2, s);
+                srcs[ta2] = a2;
+            }
+            if (tb2 >= 0 && tb2 < s && tb2 != ta2) {
+                let b3 = srcs[tb2];
+                b3 = array_push(b3, s);
+                srcs[tb2] = b3;
+            }
+        }
+        s = s + 1;
+    }
+    let h = 0;
+    while (h < n) {
+        let hs = srcs[h];
+        if (len(hs) == 0) {
+            h = h + 1;
+            continue;
+        }
+        // 循环体 = h ∪ 从回边源反向 BFS（仅穿行 h 的正向可达块，不穿过 h）
+        in_loop[h] = 1;
+        let body: array<int> = [];
+        let vis: array<int> = [];
+        let v0 = 0;
+        while (v0 < n) {
+            vis = array_push(vis, 0);
+            v0 = v0 + 1;
+        }
+        let wi2 = 0;
+        while (wi2 < len(hs)) {
+            let src0 = hs[wi2];
+            if (vis[src0] == 0) {
+                vis[src0] = 1;
+                body = array_push(body, src0);
+            }
+            wi2 = wi2 + 1;
+        }
+        let wj = 0;
+        while (wj < len(body)) {
+            let cur2 = body[wj];
+            let pl = pred[cur2];
+            let kk = 0;
+            while (kk < len(pl)) {
+                let px = pl[kk];
+                if (vis[px] == 0 && px != h && reachM[h][px] == 1) {
+                    vis[px] = 1;
+                    body = array_push(body, px);
+                }
+                kk = kk + 1;
+            }
+            wj = wj + 1;
+        }
+        let wk = 0;
+        while (wk < len(body)) {
+            in_loop[body[wk]] = 1;
+            wk = wk + 1;
+        }
+        h = h + 1;
+    }
+    return in_loop;
+}
+
+// 精确"跨安全点存活"判定（W7）：指针 reg 是否在任一真安全点仍存活，须为其分配
+// root-spill 槽。逐 def 区间分析——某 def d 的值在该 reg 下一次重定义（next_def）前
+// 一直持有；若某个安全点 S（d < S < next_def）在其后仍有读取该值的使用 u（S ≤ u <
+// next_def），则该值在 S 上存活 → 返回 0（需 spill）。反之，值在到达任何安全点前
+// 已死亡 → 返回 1（可安全免除 spill 槽）。
+//
+// 安全性：保守启发（safepoint_after_def / first_use<last_def）会把"reg 号被循环内
+// 迭代复用的纯载入"（如 sieve 内层循环里 `load fslot -> 直写数组 -> 死在回边前`）
+// 误判为跨安全点存活，从而每迭代发出一趟多余的 root-spill 栈写。本判定只在这些
+// 载入的值确实在任何安全点都不再被读取时才豁免，绝不漏掉（调用实参的使用 seq 与
+// CALL 安全点同 seq，恒满足 u ≥ S，始终保留）。
+pub kimo cg_ptr_dead_at_all_sp(r: int, def_seqs: array<array<int>>, use_seqs: array<array<int>>, sp_seqs: array<int>) -> int {
+    let ds = def_seqs[r];
+    let us = use_seqs[r];
+    if (len(ds) == 0 || len(us) == 0 || len(sp_seqs) == 0) { return 1; }
+    let di = 0;
+    while (di < len(ds)) {
+        let d = ds[di];
+        let nd = 2000000000;                        // 区间上界（下一次重定义 / ∞）
+        if (di + 1 < len(ds)) { nd = ds[di + 1]; }
+        let min_sp = -1;
+        let si = 0;
+        while (si < len(sp_seqs)) {
+            let s = sp_seqs[si];
+            if (s > d && s < nd) { min_sp = s; break; }
+            si = si + 1;
+        }
+        if (min_sp >= 0) {
+            let uj = 0;
+            while (uj < len(us)) {
+                let u = us[uj];
+                if (u >= min_sp && u < nd) { return 0; }
+                uj = uj + 1;
+            }
+        }
+        di = di + 1;
+    }
+    return 1;
+}
+
 // 预扫描函数 MIR：计算哪些指针 reg 跨越安全点需要保活 + 内部临时槽。
 // 返回 shadow frame 槽总数；填充 cg_sf_reg_slot（reg→槽，-1=无）、cg_sf_intr_seq。
 //
@@ -3402,9 +3595,17 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     if (total_slots > 256) { total_slots = 256; }
     let ptrmap = cg_scan_ptr_slots(mf, blocks_arg, total_slots);
     let rootable: array<int> = [];
+    // W6 循环内直根槽：指针型局部槽，其所有写点都在非循环块（循环内恒定不换）。
+    // 循环体内对该槽的载入在循环任一回边/调用安全点仍被帧覆盖 → 免 spill。
+    let root_loop: array<int> = [];
+    let write_cnt: array<int> = [];
+    let write_in_loop: array<int> = [];
     let ri0 = 0;
     while (ri0 < total_slots) {
         rootable = array_push(rootable, 0);
+        root_loop = array_push(root_loop, 0);
+        write_cnt = array_push(write_cnt, 0);
+        write_in_loop = array_push(write_in_loop, 0);
         ri0 = ri0 + 1;
     }
     let pa = 0;
@@ -3428,6 +3629,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         }
         pa = pa + 1;
     }
+    // 统计各槽写入：root_loop 需"所有写点都在非循环块"；循环内任一次写即逐出资格。
+    let member = cg_compute_loop_members(blocks, n_blks);
     let sb = 0;
     while (sb < n_blks) {
         let sblk = blocks[sb];
@@ -3436,17 +3639,30 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         while (sj < len(sinsts)) {
             let smi = sinsts[sj];
             if (smi.op == MIR_STORE_VAR && smi.arg2 >= 0 && smi.arg2 < total_slots) {
-                rootable[smi.arg2] = 0;
+                let wc = smi.arg2;
+                rootable[wc] = 0;
+                write_cnt[wc] = write_cnt[wc] + 1;
+                if (member[sb] == 1) { write_in_loop[wc] = 1; }
             }
             sj = sj + 1;
         }
         let stm = sblk.terminator;
         if ((stm as any) != 0) {
             if (stm.op == MIR_STORE_VAR && stm.arg2 >= 0 && stm.arg2 < total_slots) {
-                rootable[stm.arg2] = 0;
+                let wc2 = stm.arg2;
+                rootable[wc2] = 0;
+                write_cnt[wc2] = write_cnt[wc2] + 1;
+                if (member[sb] == 1) { write_in_loop[wc2] = 1; }
             }
         }
         sb = sb + 1;
+    }
+    let ro = 0;
+    while (ro < total_slots) {
+        if (ptrmap[ro] == 1 && write_cnt[ro] >= 1 && write_in_loop[ro] == 0) {
+            root_loop[ro] = 1;
+        }
+        ro = ro + 1;
     }
     let alias: array<int> = [];
     ri0 = 0;
@@ -3454,6 +3670,21 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         alias = array_push(alias, 1);               // 1 = 迄今所有 def 都是直根载入
         ri0 = ri0 + 1;
     }
+    // W7 精确"跨安全点存活"分析：逐 def 区间判定每个 reg 是否在任一安全点仍存活。
+    // 保守启发（safepoint_after_def || first_use<last_def）对"reg 号被循环内重复定义"
+    // 的载入会误判为跨安全点存活（如 sieve 内层循环里 `load fslot`，其值仅在单次迭代
+    // 内使用、死在回边安全点之前），导致每迭代一次多余的 root-spill 栈写。这里用精确的
+    // def/use/安全点序列，仅对"确实在某个 def 区间内跨过安全点、且安全点之后仍需该值"
+    // 的 reg 判存活；非存活则免除其 spill 槽。
+    let def_seqs: array<array<int>> = [];
+    let use_seqs: array<array<int>> = [];
+    ri0 = 0;
+    while (ri0 < n_regs) {
+        def_seqs = array_push(def_seqs, ([] as array<int>));
+        use_seqs = array_push(use_seqs, ([] as array<int>));
+        ri0 = ri0 + 1;
+    }
+    let sp_seqs: array<int> = [];
     let sp_dbg = 0;
     let dbg_want = cg_sp_dbg_want();
     if (len(dbg_want) > 0) {
@@ -3472,10 +3703,16 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mi.arg1 >= 0 && mi.arg1 < n_regs) {
                 has_use[mi.arg1] = 1;
                 if (first_use[mi.arg1] < 0) { first_use[mi.arg1] = seq; }
+                let wu = use_seqs[mi.arg1];
+                wu = array_push(wu, seq);
+                use_seqs[mi.arg1] = wu;
             }
             if (mi.arg2 >= 0 && mi.arg2 < n_regs) {
                 has_use[mi.arg2] = 1;
                 if (first_use[mi.arg2] < 0) { first_use[mi.arg2] = seq; }
+                let wu2 = use_seqs[mi.arg2];
+                wu2 = array_push(wu2, seq);
+                use_seqs[mi.arg2] = wu2;
             }
             let ai = 0;
             while (ai < len(mi.args)) {
@@ -3483,12 +3720,18 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (ar >= 0 && ar < n_regs) {
                     has_use[ar] = 1;
                     if (first_use[ar] < 0) { first_use[ar] = seq; }
+                    let wu3 = use_seqs[ar];
+                    wu3 = array_push(wu3, seq);
+                    use_seqs[ar] = wu3;
                 }
                 ai = ai + 1;
             }
             // defs
             if (mi.dst >= 0 && mi.dst < n_regs) {
                 last_def[mi.dst] = seq;
+                let wd = def_seqs[mi.dst];
+                wd = array_push(wd, seq);
+                def_seqs[mi.dst] = wd;
                 let pk = cg_def_kind_predict(mi);
                 if (pk >= 0) { kinds[mi.dst] = pk; }
                 trust[mi.dst] = cg_def_kind_trusted(mi);
@@ -3496,6 +3739,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 let direct = 0;
                 if (mi.op == MIR_LOAD_VAR && mi.arg1 >= 0 && mi.arg1 < total_slots) {
                     if (rootable[mi.arg1] == 1) { direct = 1; }
+                    else if (root_loop[mi.arg1] == 1 && member[bi] == 1) { direct = 1; }
                 }
                 if (direct == 0) { alias[mi.dst] = 0; }
             }
@@ -3513,6 +3757,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (sp == 1) {
                 has_sp = 1;
                 if (mi.op != MIR_CALL) { self_sp = 1; }
+                sp_seqs = array_push(sp_seqs, seq);
                 let ri = 0;
                 while (ri < n_regs) {
                     if (last_def[ri] >= 0) { safepoint_after_def[ri] = 1; }
@@ -3528,10 +3773,16 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mt.arg1 >= 0 && mt.arg1 < n_regs) {
                 has_use[mt.arg1] = 1;
                 if (first_use[mt.arg1] < 0) { first_use[mt.arg1] = seq; }
+                let wu4 = use_seqs[mt.arg1];
+                wu4 = array_push(wu4, seq);
+                use_seqs[mt.arg1] = wu4;
             }
             if (mt.arg2 >= 0 && mt.arg2 < n_regs) {
                 has_use[mt.arg2] = 1;
                 if (first_use[mt.arg2] < 0) { first_use[mt.arg2] = seq; }
+                let wu5 = use_seqs[mt.arg2];
+                wu5 = array_push(wu5, seq);
+                use_seqs[mt.arg2] = wu5;
             }
             let ai2 = 0;
             while (ai2 < len(mt.args)) {
@@ -3539,17 +3790,24 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (ar2 >= 0 && ar2 < n_regs) {
                     has_use[ar2] = 1;
                     if (first_use[ar2] < 0) { first_use[ar2] = seq; }
+                    let wu6 = use_seqs[ar2];
+                    wu6 = array_push(wu6, seq);
+                    use_seqs[ar2] = wu6;
                 }
                 ai2 = ai2 + 1;
             }
             if (mt.dst >= 0 && mt.dst < n_regs) {
                 last_def[mt.dst] = seq;
+                let wd2 = def_seqs[mt.dst];
+                wd2 = array_push(wd2, seq);
+                def_seqs[mt.dst] = wd2;
                 if ((mt.ty as any) != 0) { kinds[mt.dst] = mt.ty.kind; }
                 trust[mt.dst] = cg_def_kind_trusted(mt);
                 if (cg_force_slot_op(mt.op) == 1) { forced[mt.dst] = 1; }
                 let direct_t = 0;
                 if (mt.op == MIR_LOAD_VAR && mt.arg1 >= 0 && mt.arg1 < total_slots) {
                     if (rootable[mt.arg1] == 1) { direct_t = 1; }
+                    else if (root_loop[mt.arg1] == 1 && member[bi] == 1) { direct_t = 1; }
                 }
                 if (direct_t == 0) { alias[mt.dst] = 0; }
             }
@@ -3580,6 +3838,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 // 终止指令（回边 poll / main 的 RET）不是调用，但同样是 collect 可能
                 // 落地的点 —— 别的线程举旗后就在这里停住并被扫根，故必须计入 self_sp。
                 self_sp = 1;
+                sp_seqs = array_push(sp_seqs, seq);
                 let ri2 = 0;
                 while (ri2 < n_regs) {
                     if (last_def[ri2] >= 0) { safepoint_after_def[ri2] = 1; }
@@ -3608,7 +3867,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         } else if (alias[r] == 1 && last_def[r] >= 0) {
             need = 0;                       // W5：值恒被帧内参数槽直根，寄存器 spill 冗余
         } else if (cg_is_ptr_kind(kinds[r]) == 1 && has_use[r] == 1 && last_def[r] >= 0) {
-            if (safepoint_after_def[r] == 1 || first_use[r] < last_def[r]) {
+            if ((safepoint_after_def[r] == 1 || first_use[r] < last_def[r])
+                    && cg_ptr_dead_at_all_sp(r, def_seqs, use_seqs, sp_seqs) == 0) {
                 need = 1;
             }
         }
@@ -3654,10 +3914,17 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         bi2 = bi2 + 1;
     }
     if (sp_dbg == 1) {
-        println("SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
+        let sdp = "SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
             + " nparams=" + int_to_str(len(mf.params)) + " nblk=" + int_to_str(n_blks)
             + " has_sp=" + int_to_str(has_sp) + " self_sp=" + int_to_str(self_sp)
-            + " sf_n=" + int_to_str(slot));
+            + " sf_n=" + int_to_str(slot);
+        let sdi = 0;
+        while (sdi < total_slots) {
+            sdp = sdp + " s" + int_to_str(sdi) + ":p" + int_to_str(ptrmap[sdi]) + "w" + int_to_str(write_cnt[sdi])
+                + "l" + int_to_str(write_in_loop[sdi]) + "R" + int_to_str(root_loop[sdi]) + "r" + int_to_str(rootable[sdi]);
+            sdi = sdi + 1;
+        }
+        println(sdp);
     }
     cg_ana_has_safepoint = has_sp;
     cg_ana_self_sp = self_sp;
