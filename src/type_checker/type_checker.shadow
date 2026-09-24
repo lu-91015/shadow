@@ -6007,7 +6007,7 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
         return;
     }
 
-    if (k == STMT_WHILE) {
+    if (k == STMT_WHILE || k == STMT_DO_WHILE) {
         let cond_t2 = tc_check_expr(ctx, s.expr1, env);
         let ck2 = cond_t2.kind;
         if (ck2 != TYPE_BOOL && ck2 != TYPE_ANY && ck2 != TYPE_INT && ck2 != TYPE_LONG) {

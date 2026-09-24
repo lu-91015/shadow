@@ -183,11 +183,18 @@ pub struct MacroDef {
     body: Expr;
     loc: Location;
     is_pub: int;
+    arms: array<MacroArm>;   // 声名式多臂：macro name { (pat)=>{trans}; ... }；非空时走 token 匹配展开
 }
 
 pub struct MacroParam {
     name: string;
     kind: string;        // expr | ident | tt
+}
+
+// 声名式宏臂：模式/转录体各保存为原始 Token 序列（含 $ 元变量与 $( )* 重复组）
+pub struct MacroArm {
+    pat: array<Token>;
+    trans: array<Token>;
 }
 
 // 程序根

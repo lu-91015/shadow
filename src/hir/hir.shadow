@@ -376,7 +376,7 @@ pub kimo hir_lower_stmt(s: Stmt, env: HirEnv) -> HirStmt {
         return h;
     }
 
-    if (k == STMT_WHILE) {
+    if (k == STMT_WHILE || k == STMT_DO_WHILE) {
         if (expr_is_none(s.expr1) == 0) { h.child = hir_lower_expr(s.expr1, env); }
         let body: array<HirStmt> = [];
         let body_block = s.items;

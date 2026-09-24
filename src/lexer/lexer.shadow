@@ -479,6 +479,7 @@ pub kimo tokenize_with_offset(source: string, file: string, line_offset: int) ->
         }
         else if (c == ";") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_SEMICOLON, ";")); }
         else if (c == "@") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_AT, "@")); }
+        else if (c == "$") { lx_adv(); tokens = array_push(tokens, lx_make_tok(TOK_DOLLAR, "$")); }
         else if (c == ".") {
             lx_adv();
             // range 字面量 `..`（半开区间 a..b）

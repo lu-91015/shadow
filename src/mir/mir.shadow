@@ -239,7 +239,7 @@ kimo mir_loop_cv_monotone(cv_slot: int, stmts: array<HirStmt>) -> int {
         } else if (k == STMT_IF) {
             if (mir_loop_cv_monotone(cv_slot, st.body) == 0) { return 0; }
             if (mir_loop_cv_monotone(cv_slot, st.else_body) == 0) { return 0; }
-        } else if (k == STMT_WHILE || k == STMT_FOR) {
+        } else if (k == STMT_WHILE || k == STMT_DO_WHILE || k == STMT_FOR) {
             // 嵌套循环体内对 cv 的赋值也必须单调（否则外层界证明不安全）：继续递归
             if (mir_loop_cv_monotone(cv_slot, st.body) == 0) { return 0; }
         } else if (k == STMT_MATCH) {
@@ -746,7 +746,7 @@ pub kimo mir_scan_aliases_stmt(h: HirStmt, aliased: array<int>) -> void {
         while (j < len(eb)) { mir_scan_aliases_stmt(eb[j], aliased); j = j + 1; }
         return;
     }
-    if (k == STMT_WHILE) {
+    if (k == STMT_WHILE || k == STMT_DO_WHILE) {
         if ((h.child as any) != 0) { mir_scan_aliases_expr(h.child, aliased); }
         let wb = h.body;
         let i = 0;
@@ -2252,6 +2252,39 @@ pub kimo mir_lower_stmt(h: HirStmt) -> void {
             let pj = 0;
             while (pj < len(pre_slots)) { mir_cap_set(pre_slots[pj], pre_bound.slot); pj = pj + 1; }
         }
+        return;
+    }
+
+    if (k == STMT_DO_WHILE) {
+        // do { body } while (cond); —— 先执行体，出口判条件。
+        // 结构：body_label(body → br cond) → cond_label(cond ? body : exit) → exit。
+        // continue → cond_label（重判条件），break → exit_label。
+        mir_clear_loop_aliases(h.body);
+        let body_label = mir_new_label();
+        let cond_label = mir_new_label();
+        let exit_label = mir_new_label();
+
+        mir_emit_br(body_label);
+        mir_seal_and_begin(body_label);
+        mir_push_loop(exit_label, cond_label);
+        let d_body = h.body;
+        let d_i = 0;
+        while (d_i < len(d_body)) {
+            mir_lower_stmt(d_body[d_i]);
+            d_i = d_i + 1;
+        }
+        mir_pop_loop();
+        mir_emit_br(cond_label);
+
+        mir_seal_and_begin(cond_label);
+        let d_cond_reg = mir_lower_expr(h.child);
+        let d_condbr = mir_mk(MIR_CONDBR);
+        d_condbr.arg1 = d_cond_reg;
+        d_condbr.strval = body_label;
+        d_condbr.strval2 = exit_label;
+        mir_set_term(d_condbr);
+
+        mir_seal_and_begin(exit_label);
         return;
     }
 

@@ -43,6 +43,13 @@ let ps_last_arg_name: string = "";
 let ps_macros: array<MacroDef> = [];     // 新语法宏注册表
 let ps_macro_hyg_counter: int = 0;
 
+// ====== 声名式（token 匹配）宏展开状态：单次展开内累积 ======
+struct MBind { name: string; frags: array<array<Token>>; }   // 元变量 → 若干碎片（重复组一次迭代一个碎片）
+let mg_binds: array<MBind> = [];     // 当前展开的绑定表
+let mg_kinds: array<string> = [];    // 与 mg_binds 并行：元变量捕获的 kind
+let mg_out: array<Token> = [];       // 转录输出缓冲
+let mg_hyg: string = "";             // 当前展开卫生后缀（__hN）
+
 // defer 条目（0.4 具体类型，替代 0.3 的 [depth, body] any 元组）
 pub struct DeferEntry { depth: int; body: array<Stmt> }
 
@@ -1094,6 +1101,11 @@ pub kimo parse_primary_inner() -> Expr {
             let mn = mdef.name;
             if (len(mn) > 0) {
                 ps_adv();
+                // 声名式多臂宏：捕获原始 token 序列做模式匹配（不走表达式预解析）
+                if (len(mdef.arms) > 0) {
+                    let argtoks = ps_capture_call_toks();
+                    return ps_macro_expand_declarative(mdef, argtoks);
+                }
                 let margs: array<Expr> = [];
                 if (ps_at(TOK_RPAREN) != 1) {
                     margs = array_push(margs, parse_expr());
@@ -1681,7 +1693,7 @@ pub kimo ps_macro_lookup(name: string) -> MacroDef {
         if (str_eq(m.name, name) == 1) { return m; }
         i = i + 1;
     }
-    let md = MacroDef { name: "", params: [], body: mk_expr(EXPR_INT, mk_loc(ps_file, 0, 0)), loc: mk_loc(ps_file, 0, 0), is_pub: 0 };
+    let md = MacroDef { name: "", params: [], body: mk_expr(EXPR_INT, mk_loc(ps_file, 0, 0)), loc: mk_loc(ps_file, 0, 0), is_pub: 0, arms: [] };
     return md;
 }
 
@@ -1801,6 +1813,406 @@ pub kimo ps_macro_expand(mdef: MacroDef, args: array<Expr>) -> Expr {
         pi = pi + 1;
     }
     return ps_macro_subst(mdef.body, pnames, args, hyg_suffix);
+}
+
+// ============ 声名式 token 宏：捕获 / 匹配 / 转录 / 重解析 ============
+
+// 消费 open 定界符并收集直到匹配的 close（嵌套深度 +1）。返回内部 token（不含两个定界符）。
+pub kimo ps_capture_delimited(open_kind: int, close_kind: int) -> array<Token> {
+    let out: array<Token> = [];
+    ps_adv();
+    let depth = 1;
+    while (depth > 0 && ps_cur_kind() != TOK_EOF) {
+        let t = ps_tokens[ps_idx] as Token;
+        let k = t.kind;
+        if (k == open_kind) { depth = depth + 1; out = array_push(out, t); ps_adv(); }
+        else if (k == close_kind) {
+            depth = depth - 1;
+            if (depth > 0) { out = array_push(out, t); }
+            ps_adv();
+        } else {
+            out = array_push(out, t);
+            ps_adv();
+        }
+    }
+    return out;
+}
+
+kimo mac_tok_copy(t: Token) -> Token {
+    let nt = Token { kind: t.kind, text: t.text, line: t.line, col: t.col, end_line: t.end_line, end_col: t.end_col };
+    return nt;
+}
+
+// 捕获宏调用实参的原始 token 序列（不含外括号）。调用点已 ps_adv 越过调用 `(`，
+// 此处从当前 token 开始捕获并消费配对的 `)`。深拷贝 token，防别名污染。
+kimo ps_capture_call_toks() -> array<Token> {
+    let out: array<Token> = [];
+    let depth = 0;
+    while (ps_cur_kind() != TOK_EOF) {
+        let t = ps_tokens[ps_idx] as Token;
+        let k = t.kind;
+        if (depth == 0 && k == TOK_RPAREN) { ps_adv(); break; }
+        out = array_push(out, mac_tok_copy(t));
+        if (k == TOK_LPAREN || k == TOK_LBRACKET || k == TOK_LBRACE) { depth = depth + 1; }
+        else if (k == TOK_RPAREN || k == TOK_RBRACKET || k == TOK_RBRACE) {
+            if (depth > 0) { depth = depth - 1; }
+        }
+        ps_adv();
+    }
+    return out;
+}
+
+kimo mg_find_bind(name: string) -> int {
+    let i = 0;
+    while (i < len(mg_binds)) {
+        let b = mg_binds[i] as MBind;
+        if (str_eq(b.name, name) == 1) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+kimo mg_bind_begin(name: string) -> int {
+    let i = mg_find_bind(name);
+    if (i >= 0) { return i; }
+    let b = MBind { name: name, frags: [] };
+    mg_binds = array_push(mg_binds, b);
+    mg_kinds = array_push(mg_kinds, "");
+    return len(mg_binds) - 1;
+}
+
+kimo mg_bind_frag_count(name: string) -> int {
+    let i = mg_find_bind(name);
+    if (i < 0) { return 0; }
+    let b = mg_binds[i] as MBind;
+    return len(b.frags);
+}
+
+kimo mg_bind_add(name: string, frag: array<Token>, kind: string) -> void {
+    let i = mg_bind_begin(name);
+    let b = mg_binds[i] as MBind;
+    mg_kinds[i] = kind;
+    b.frags = array_push(b.frags, frag);
+    mg_binds[i] = b;
+}
+
+kimo mac_is_term(k: int) -> int {
+    if (k == TOK_COMMA || k == TOK_RPAREN || k == TOK_RBRACKET || k == TOK_RBRACE ||
+        k == TOK_SEMICOLON || k == TOK_EOF) { return 1; }
+    return 0;
+}
+
+// 找 `$(` 于 ts[i]（i 指向 TOK_DOLLAR）的匹配右括号下标。
+kimo mac_match_paren(ts: array<Token>, i: int) -> int {
+    let depth = 1;
+    let j = i + 2;
+    while (j < len(ts)) {
+        let k = (ts[j] as Token).kind;
+        if (k == TOK_LPAREN) { depth = depth + 1; }
+        else if (k == TOK_RPAREN) {
+            depth = depth - 1;
+            if (depth == 0) { return j; }
+        }
+        j = j + 1;
+    }
+    return -1;
+}
+
+// 子区间是否含顶层元变量（跳过嵌套 $( ... ) 组）。
+kimo mac_sub_has_mvar(ts: array<Token>, s: int, e: int) -> int {
+    let i = s;
+    while (i < e) {
+        let k = (ts[i] as Token).kind;
+        if (k == TOK_DOLLAR) {
+            if (i + 1 < e && (ts[i + 1] as Token).kind == TOK_LPAREN) {
+                let close = mac_match_paren(ts, i);
+                i = close + 1;
+            } else if (i + 1 < e && (ts[i + 1] as Token).kind == TOK_IDENT) {
+                return 1;
+            } else { i = i + 1; }
+        } else { i = i + 1; }
+    }
+    return 0;
+}
+
+// 匹配 pat[s..e) 于 toks，从 ti 开始。成功返回 toks 内已消费终点；失败 -1。
+kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -> int {
+    if (s >= e) { return ti; }
+    let pk = (pat[s] as Token).kind;
+    if (pk == TOK_DOLLAR) {
+        if (s + 1 < e) {
+            let nk = (pat[s + 1] as Token).kind;
+            if (nk == TOK_LPAREN) {
+                let close = mac_match_paren(pat, s);
+                if (close < 0) { return -1; }
+                let substart = s + 2;
+                let subend = close;
+                let qpos = close + 1;
+                let sep_kind = -1;
+                if (qpos < e) {
+                    let qk = (pat[qpos] as Token).kind;
+                    if (qk != TOK_STAR && qk != TOK_PLUS && qk != TOK_QUESTION) {
+                        sep_kind = qk;
+                        qpos = qpos + 1;
+                    }
+                }
+                let quant = TOK_STAR;
+                if (qpos < e) {
+                    let q2 = (pat[qpos] as Token).kind;
+                    if (q2 == TOK_STAR || q2 == TOK_PLUS || q2 == TOK_QUESTION) { quant = q2; }
+                }
+                let has_mvar = mac_sub_has_mvar(pat, substart, subend);
+                if (quant == TOK_QUESTION) {
+                    let once0 = mac_match(pat, substart, subend, toks, ti);
+                    if (once0 >= 0) { return once0; }
+                    return ti;
+                }
+                if (has_mvar == 0) {
+                    // 纯字面量组（如 $(, )*）：只尝试一次匹配
+                    let once = mac_match(pat, substart, subend, toks, ti);
+                    if (once >= 0) { return once; }
+                    if (quant == TOK_PLUS) { return -1; }
+                    return ti;
+                }
+                // 有元变量：反复匹配 "元素"，元素间若声明了分隔符则 "分隔符+元素" 为一轮。
+                let count = 0;
+                let cur = ti;
+                let first = mac_match(pat, substart, subend, toks, cur);
+                if (first < 0) {
+                    if (quant == TOK_PLUS) { return -1; }
+                    return ti;
+                }
+                count = 1;
+                cur = first;
+                if (sep_kind >= 0) {
+                    while (true) {
+                        if (cur >= len(toks)) { break; }
+                        let ck = (toks[cur] as Token).kind;
+                        if (ck != sep_kind) { break; }
+                        let p = mac_match(pat, substart, subend, toks, cur + 1);
+                        if (p < 0) { break; }
+                        count = count + 1;
+                        cur = p;
+                    }
+                } else {
+                    while (true) {
+                        let p = mac_match(pat, substart, subend, toks, cur);
+                        if (p < 0) { break; }
+                        count = count + 1;
+                        cur = p;
+                    }
+                }
+                if (quant == TOK_PLUS && count < 1) { return -1; }
+                return cur;
+            }
+            if (nk == TOK_IDENT) {
+                let nm = (pat[s + 1] as Token).text;
+                let kind = "expr";
+                let adv = 2;   // 该元变量在 pattern 中占用的 token 数（$x 或 $x:kind）
+                let nxt = s + 2;
+                if (nxt < e && (pat[nxt] as Token).kind == TOK_COLON) {
+                    if (nxt + 1 < e) { kind = (pat[nxt + 1] as Token).text; }
+                    adv = 4;
+                }
+                if (ti >= len(toks)) { return -1; }
+                let tk = (toks[ti] as Token).kind;
+                if (str_eq(kind, "ident") == 1) {
+                    if (tk != TOK_IDENT) { return -1; }
+                    let frag: array<Token> = [];
+                    frag = array_push(frag, mac_tok_copy(toks[ti] as Token));
+                    mg_bind_add(nm, frag, "ident");
+                    return mac_match(pat, s + adv, e, toks, ti + 1);
+                }
+                if (str_eq(kind, "tt") == 1) {
+                    let frag2: array<Token> = [];
+                    frag2 = array_push(frag2, mac_tok_copy(toks[ti] as Token));
+                    mg_bind_add(nm, frag2, "tt");
+                    return mac_match(pat, s + adv, e, toks, ti + 1);
+                }
+                if (str_eq(kind, "int") == 1) {
+                    if (tk != TOK_INT_LIT && tk != TOK_LONG_LIT) { return -1; }
+                    let frag3: array<Token> = [];
+                    frag3 = array_push(frag3, mac_tok_copy(toks[ti] as Token));
+                    mg_bind_add(nm, frag3, "int");
+                    return mac_match(pat, s + adv, e, toks, ti + 1);
+                }
+                if (str_eq(kind, "str") == 1) {
+                    if (tk != TOK_STRING_LIT && tk != TOK_CHAR_LIT) { return -1; }
+                    let frag4: array<Token> = [];
+                    frag4 = array_push(frag4, mac_tok_copy(toks[ti] as Token));
+                    mg_bind_add(nm, frag4, "str");
+                    return mac_match(pat, s + adv, e, toks, ti + 1);
+                }
+                // expr（默认）：捕获平衡 token 序列，停在顶层终止符
+                let frag5: array<Token> = [];
+                let depth = 0;
+                let j = ti;
+                while (j < len(toks)) {
+                    let kk = (toks[j] as Token).kind;
+                    if (depth == 0 && mac_is_term(kk) == 1) { break; }
+                    if (kk == TOK_LPAREN || kk == TOK_LBRACKET || kk == TOK_LBRACE) { depth = depth + 1; }
+                    else if (kk == TOK_RPAREN || kk == TOK_RBRACKET || kk == TOK_RBRACE) {
+                        if (depth == 0) { break; }
+                        depth = depth - 1;
+                    }
+                    frag5 = array_push(frag5, mac_tok_copy(toks[j] as Token));
+                    j = j + 1;
+                }
+                if (len(frag5) == 0) { return -1; }
+                mg_bind_add(nm, frag5, "expr");
+                return mac_match(pat, s + adv, e, toks, j);
+            }
+        }
+        return -1;
+    }
+    if (ti >= len(toks)) { return -1; }
+    let pt = pat[s] as Token;
+    let tt = toks[ti] as Token;
+    if (str_eq(pt.text, tt.text) == 0) { return -1; }
+    return mac_match(pat, s + 1, e, toks, ti + 1);
+}
+
+// 转录侧重复组迭代次数：取组内第一个已绑定元变量的碎片数；无则 1。
+kimo mac_rep_count(ts: array<Token>, s: int, e: int) -> int {
+    let i = s;
+    while (i < e) {
+        let k = (ts[i] as Token).kind;
+        if (k == TOK_DOLLAR && i + 1 < e) {
+            if ((ts[i + 1] as Token).kind == TOK_LPAREN) {
+                let close = mac_match_paren(ts, i);
+                i = close + 1;
+            } else if ((ts[i + 1] as Token).kind == TOK_IDENT) {
+                let nm = (ts[i + 1] as Token).text;
+                let c = mg_bind_frag_count(nm);
+                if (c > 0) { return c; }
+                i = i + 2;
+            } else { i = i + 1; }
+        } else { i = i + 1; }
+    }
+    return 1;
+}
+
+kimo mac_append_hyg(idt: Token) -> void {
+    let nt = mac_tok_copy(idt);
+    nt.text = idt.text + mg_hyg;
+    mg_out = array_push(mg_out, nt);
+}
+
+// 转录 ts[s..e) 到 mg_out。iter=-1 顶层（标量元变量取第 0 碎片）；否则为所在重复组迭代下标。
+kimo mac_transcribe(ts: array<Token>, s: int, e: int, iter: int) -> void {
+    let i = s;
+    while (i < e) {
+        let t = ts[i] as Token;
+        let k = t.kind;
+        if (k == TOK_DOLLAR && i + 1 < e) {
+            if ((ts[i + 1] as Token).kind == TOK_LPAREN) {
+                let close = mac_match_paren(ts, i);
+                let substart = i + 2;
+                let subend = close;
+                let qpos = close + 1;
+                let sep_kind = -1;
+                if (qpos < e) {
+                    let qk = (ts[qpos] as Token).kind;
+                    if (qk != TOK_STAR && qk != TOK_PLUS && qk != TOK_QUESTION) {
+                        sep_kind = qk;
+                        qpos = qpos + 1;
+                    }
+                }
+                let quant = TOK_STAR;
+                if (qpos < e) {
+                    let q2 = (ts[qpos] as Token).kind;
+                    if (q2 == TOK_STAR || q2 == TOK_PLUS || q2 == TOK_QUESTION) { quant = q2; }
+                }
+                let n = mac_rep_count(ts, substart, subend);
+                if (quant == TOK_QUESTION) { n = 1; }
+                let j = 0;
+                while (j < n) {
+                    mac_transcribe(ts, substart, subend, j);
+                    if (sep_kind >= 0 && j + 1 < n) {
+                        mg_out = array_push(mg_out, mac_tok_copy(ts[qpos - 1] as Token));
+                    }
+                    j = j + 1;
+                }
+                i = qpos + 1;
+                continue;
+            }
+            if ((ts[i + 1] as Token).kind == TOK_IDENT) {
+                let nm = (ts[i + 1] as Token).text;
+                let bi = mg_find_bind(nm);
+                let idx = iter;
+                if (idx < 0) { idx = 0; }
+                if (bi >= 0) {
+                    let b = mg_binds[bi] as MBind;
+                    let fc = len(b.frags);
+                    if (fc > 0) {
+                        let fidx = idx;
+                        if (fidx >= fc) { fidx = fc - 1; }
+                        let fr = b.frags[fidx];
+                        let fi = 0;
+                        while (fi < len(fr)) {
+                            mg_out = array_push(mg_out, mac_tok_copy(fr[fi] as Token));
+                            fi = fi + 1;
+                        }
+                    }
+                }
+                i = i + 2;
+                continue;
+            }
+        }
+        if (k == TOK_IDENT) {
+            let tx = t.text;
+            let is_hyg = 0;
+            if (len(tx) >= 2) {
+                let c0 = tx[0];
+                let c1 = tx[1];
+                if (str_eq(c0, "_") == 1 && str_eq(c1, "_") == 1) { is_hyg = 1; }
+            }
+            if (is_hyg == 1) { mac_append_hyg(t); }
+            else { mg_out = array_push(mg_out, mac_tok_copy(t)); }
+        } else {
+            mg_out = array_push(mg_out, mac_tok_copy(t));
+        }
+        i = i + 1;
+    }
+}
+
+// 把转录产物 token 序列重新解析为表达式（交换 ps_tokens/ps_idx，parse 后恢复）。
+kimo ps_reparse_expr(toks: array<Token>) -> Expr {
+    let save_toks = ps_tokens;
+    let save_idx = ps_idx;
+    let save_gt = ps_gt_pending;
+    ps_tokens = toks;
+    ps_idx = 0;
+    ps_gt_pending = 0;
+    let e = parse_expr();
+    ps_tokens = save_toks;
+    ps_idx = save_idx;
+    ps_gt_pending = save_gt;
+    return e;
+}
+
+// 声名式宏主入口：对调用实参 token 序列做多臂匹配 + 转录 + 重解析为表达式。
+pub kimo ps_macro_expand_declarative(mdef: MacroDef, argtoks: array<Token>) -> Expr {
+    let n = ps_macro_hyg_counter;
+    ps_macro_hyg_counter = ps_macro_hyg_counter + 1;
+    mg_hyg = "__h" + int_to_str(n);
+    let ai = 0;
+    while (ai < len(mdef.arms)) {
+        let arm = mdef.arms[ai] as MacroArm;
+        mg_binds = [];
+        mg_kinds = [];
+        let ti = mac_match(arm.pat, 0, len(arm.pat), argtoks, 0);
+        if (ti == len(argtoks)) {
+            mg_out = [];
+            mac_transcribe(arm.trans, 0, len(arm.trans), -1);
+            return ps_reparse_expr(mg_out);
+        }
+        ai = ai + 1;
+    }
+    let msg = "Macro error: '" + mdef.name + "' matched no arm for these arguments; expected one of the declared patterns";
+    ps_err(msg);
+    let loc_ph = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+    return mk_expr(EXPR_INT, loc_ph);
 }
 
 // ============ 语句块与去糖辅助 ============
@@ -2225,7 +2637,7 @@ pub kimo ps_rewrite_returns_in_with(stmts: array<Stmt>, name: string, drop_loc: 
             if (len(s.items2) > 0) {
                 ps_rewrite_returns_in_with(s.items2, name, drop_loc, loop_depth);
             }
-        } else if (k == STMT_WHILE) {
+        } else if (k == STMT_WHILE || k == STMT_DO_WHILE) {
             ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth + 1);
         } else if (k == STMT_FOR) {
             ps_rewrite_returns_in_with(s.items, name, drop_loc, loop_depth + 1);
@@ -2296,7 +2708,7 @@ pub kimo ps_rewrite_returns_for_defer(stmts: array<Stmt>, deferred: array<DeferE
                 let ni2 = ps_rewrite_returns_for_defer(s.items2, deferred);
                 s.items2 = ni2;
             }
-        } else if (k == STMT_WHILE) {
+        } else if (k == STMT_WHILE || k == STMT_DO_WHILE) {
             let nw = ps_rewrite_returns_for_defer(s.items, deferred);
             s.items = nw;
         } else if (k == STMT_FOR) {
@@ -2491,6 +2903,21 @@ pub kimo parse_statement_inner() -> Stmt {
         ps_expect(TOK_RPAREN, ")");
         let body = parse_block();
         let s = mk_stmt(STMT_WHILE, loc);
+        s.expr1 = cond;
+        s.items = body;
+        return s;
+    }
+
+    // do { body } while (cond); —— 先执行一次体，出口判条件
+    if (k == TOK_DO) {
+        ps_adv();
+        let body = parse_block();
+        ps_expect(TOK_WHILE, "while");
+        ps_expect(TOK_LPAREN, "(");
+        let cond = parse_expr();
+        ps_expect(TOK_RPAREN, ")");
+        if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+        let s = mk_stmt(STMT_DO_WHILE, loc);
         s.expr1 = cond;
         s.items = body;
         return s;
@@ -3526,9 +3953,25 @@ pub kimo parse(tokens: array<Token>, file: string) -> Program {
                 ps_expect(TOK_LBRACE, "{");
                 let mbody = parse_expr();
                 ps_expect(TOK_RBRACE, "}");
-                let mdef = MacroDef { name: mname, params: mparams, body: mbody, loc: mloc, is_pub: is_pub };
+                let mdef = MacroDef { name: mname, params: mparams, body: mbody, loc: mloc, is_pub: is_pub, arms: [] };
                 ps_macros = array_push(ps_macros, mdef);
                 macros = array_push(macros, mdef);
+                continue;
+            }
+            // 声名式多臂：macro name { (pat)=> {trans}; ... }
+            if (ps_at(TOK_LBRACE) == 1 && (ps_tokens[ps_idx + 1] as Token).kind == TOK_LPAREN) {
+                ps_adv();
+                let mdef2 = MacroDef { name: mname, params: [], body: mk_expr(EXPR_INT, mloc), loc: mloc, is_pub: is_pub, arms: [] };
+                while (ps_at(TOK_RBRACE) != 1) {
+                    let mpat = ps_capture_delimited(TOK_LPAREN, TOK_RPAREN);
+                    ps_expect(TOK_FATARROW, "=>");
+                    let mtrans = ps_capture_delimited(TOK_LBRACE, TOK_RBRACE);
+                    mdef2.arms = array_push(mdef2.arms, MacroArm { pat: mpat, trans: mtrans });
+                    if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+                }
+                ps_expect(TOK_RBRACE, "}");
+                ps_macros = array_push(ps_macros, mdef2);
+                macros = array_push(macros, mdef2);
                 continue;
             }
             // 旧语法：macro name { param => body; } — desugar 为函数

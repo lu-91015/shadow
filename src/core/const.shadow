@@ -138,6 +138,7 @@ pub let TOK_DSB: int = 113;
 pub let TOK_DEFER: int = 114;
 pub let TOK_COLONCOLON: int = 115;
 pub let TOK_CONST: int = 127;
+pub let TOK_DOLLAR: int = 128;   // `$` 宏元变量前缀 / 重复组 $( )*（仅宏定义内出现）
 
 // ============ 位运算 / 自增自减 token（0.5 增量） ============
 pub let TOK_BITAND: int = 116;
@@ -211,6 +212,7 @@ pub let STMT_TRY: int = 16;
 pub let STMT_THROW: int = 17;
 pub let STMT_WITH: int = 18;
 pub let STMT_DEFER: int = 19;
+pub let STMT_DO_WHILE: int = 20;
 
 // ============ 二元操作符 BIN_* ============
 pub let BIN_ADD: int = 0;

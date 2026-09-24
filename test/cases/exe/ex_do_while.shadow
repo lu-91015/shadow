@@ -1,0 +1,70 @@
+//@mode: exe
+//@desc: do...while —— 先执行体再判条件；至少执行一次；break/continue 语义
+//@expect: dwo init0=1 sums: 0 1 3 6 10 15 exit_after_break=5 skipped=2 nested=45
+//@timeout: 120
+// ex_do_while.shadow — 验证 do-while 核心语义：
+//   ① 条件初始为假时体仍执行一次（先执行后判条件）；
+//   ② 正常出口迭代计数；
+//   ③ break 提前退出；
+//   ④ continue 跳到条件判断（跳过体尾部）；
+//   ⑤ 嵌套 do-while。
+dsb ex_do_while;
+
+kimo main() -> int {
+    // ① 条件初始为假：体仍应执行一次 —— do 至少执行一次
+    let init0 = 0;
+    do {
+        init0 = init0 + 1;
+    } while (false);
+    // ② 正常出口：0+1+... 三角数累加
+    let sums: array<string> = [];
+    let total = 0;
+    let i = 0;
+    do {
+        total = total + i;
+        sums = array_push(sums, int_to_str(total));
+        i = i + 1;
+    } while (i <= 5);
+    let sums_txt = "";
+    let si = 0;
+    while (si < len(sums)) {
+        sums_txt = sums_txt + (if (si == 0) { "" } else { " " }) + sums[si];
+        si = si + 1;
+    }
+    // ③ break：i 从 0 到 4 后 break 跳出
+    let cnt_break = 0;
+    let j = 0;
+    do {
+        cnt_break = cnt_break + 1;
+        j = j + 1;
+        if (j >= 5) { break; }
+    } while (true);
+    let after_break = j;
+    // ④ continue：跳过体尾部的自增，只累加偶数；奇数跳过
+    let cnt_skip = 0;
+    let kk = 0;
+    let skip_times = 0;
+    do {
+        kk = kk + 1;
+        if (kk % 2 == 1) { continue; }  // 奇数：跳到条件判断，跳过累加
+        cnt_skip = cnt_skip + 1;
+        skip_times = skip_times + 1;
+    } while (kk < 5);
+    // ⑤ 嵌套 do-while
+    let nested = 0;
+    let a = 0;
+    do {
+        let b = 0;
+        do {
+            nested = nested + 1;
+            b = b + 1;
+        } while (b < 5);
+        a = a + 1;
+    } while (a < 9);
+
+    println("dwo init0=" + int_to_str(init0) + " sums: " + sums_txt +
+            " exit_after_break=" + int_to_str(after_break) +
+            " skipped=" + int_to_str(cnt_skip) +
+            " nested=" + int_to_str(nested));
+    return 0;
+}
