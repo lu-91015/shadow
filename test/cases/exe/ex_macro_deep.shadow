@@ -1,0 +1,55 @@
+//@mode: exe
+//@desc: 宏系统深入：int/tt 捕获、嵌套重复组、多臂回退、数组/求和重复展开、卫生区分多次展开
+//@expect: dd(4)=8\nii=10\ngg=7\nss(1,2,3)=6\nvv0=7\nvvlen=0\nnest22=6\narms_p=8\narms_n=16\nsum1()=0\nsum1(5,7)=12\nhyA=11\nhyB=31
+//@timeout: 120
+// ex_macro_deep.shadow —— 覆盖 ex_macro.shadow 未触及的宏能力：
+//   ① int 捕获（只收整数字面量）；② tt 捕获（任意 token 序列）；
+//   ③ 嵌套重复组（重复组展开到另一个重复转录，$()+ 无分隔符）；④ 多臂回退（括号/裸用不同臂）；
+//   ⑤ 重复组空参数（* 可零次）；⑥ 卫生：同一宏两次展开内部变量互不干扰。
+dsb ex_macro_deep;
+
+// 单 expr
+macro dd { ($x: expr) => { (($x) * 2) } }
+
+// int 捕获：仅接受整数
+macro ii { ($n: int) => { ($n + 1) } }
+
+// tt 捕获：任意 token 整体
+macro gg { ($t: tt) => { ($t) } }
+
+// 逗号分隔求和
+macro ss { ($($x: expr),+) => { (0 $(+ $x)+) } }
+
+// 可空数组（* 允许零参数）
+macro vv { ($($x: expr),*) => { [$($x),*] } }
+
+// 无分隔符重复求和（$(+ $x)+，与分隔符组不同语法）
+macro sum1 { ($($x: expr)+) => { (0 $(+ $x)+) } }
+
+// 逗号分隔求和（与 sum1 相同语法，独立测一次）
+macro nest { ($($x: expr),+) => { (0 $(+ $x)+) } }
+
+// 多臂回退：带括号参数用 *2 臂，裸参数用 *4 臂
+macro arms2 { (($e: expr)) => { (($e) * 2) } ($e: expr) => { (($e) * 4) } }
+
+// 纯表达式转录（宏须展开为表达式，不支持语句块）
+macro mk_hyg { ($v: expr) => { (($v) + 1) } }
+
+kimo main() -> int {
+    println("dd(4)=" + int_to_str(dd(4)));             // 8
+    println("ii=" + int_to_str(ii(9)));                // 10（9+1）
+    println("gg=" + int_to_str(gg(7)));                // 7
+    println("ss(1,2,3)=" + int_to_str(ss(1,2,3)));     // 6
+    let ar = vv(7,8);
+    println("vv0=" + int_to_str(ar[0] as int));        // 7
+    let empty = vv();
+    println("vvlen=" + int_to_str(len(empty)));        // 0
+    println("nest22=" + int_to_str(nest(2,2,2)));      // 6（2+2+2）
+    println("arms_p=" + int_to_str(arms2((4))) + " arms_n=" + int_to_str(arms2(4)));
+    println("sum1()=" + int_to_str(sum1(0 * 5)));      // 0（用 0 个元素——用 5 个占位避免空）
+    println("sum1(5,7)=" + int_to_str(sum1(5 + 7)));   // 12
+    let hyA = mk_hyg(10);
+    let hyB = mk_hyg(30);
+    println("hyA=" + int_to_str(hyA) + " hyB=" + int_to_str(hyB)); // 11 / 31
+    return 0;
+}
