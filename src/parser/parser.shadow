@@ -42,6 +42,8 @@ let ps_cur_fn_ret_ty: Type = type_none_inner();
 let ps_last_arg_name: string = "";
 let ps_macros: array<MacroDef> = [];     // 新语法宏注册表
 let ps_macro_hyg_counter: int = 0;
+let mg_depth: int = 0;                   // 声明式宏递归展开深度（Rust recursion limit 对齐）
+let mg_limit: int = 128;                 // 展开深度上限：超限报错而非栈溢出（Rust 默认 recursion_limit）
 
 // ====== 声名式（token 匹配）宏展开状态：单次展开内累积 ======
 struct MBind { name: string; frags: array<array<Token>>; }   // 元变量 → 若干碎片（重复组一次迭代一个碎片）
@@ -2016,6 +2018,7 @@ kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -
                 }
                 if (ti >= len(toks)) { return -1; }
                 let tk = (toks[ti] as Token).kind;
+                // ---- 单 token 片段 ----
                 if (str_eq(kind, "ident") == 1) {
                     if (tk != TOK_IDENT) { return -1; }
                     let frag: array<Token> = [];
@@ -2023,10 +2026,12 @@ kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -
                     mg_bind_add(nm, frag, "ident");
                     return mac_match(pat, s + adv, e, toks, ti + 1);
                 }
-                if (str_eq(kind, "tt") == 1) {
-                    let frag2: array<Token> = [];
-                    frag2 = array_push(frag2, mac_tok_copy(toks[ti] as Token));
-                    mg_bind_add(nm, frag2, "tt");
+                if (str_eq(kind, "literal") == 1) {
+                    if (tk != TOK_INT_LIT && tk != TOK_LONG_LIT && tk != TOK_FLOAT_LIT &&
+                        tk != TOK_STRING_LIT && tk != TOK_CHAR_LIT) { return -1; }
+                    let frag_l: array<Token> = [];
+                    frag_l = array_push(frag_l, mac_tok_copy(toks[ti] as Token));
+                    mg_bind_add(nm, frag_l, "literal");
                     return mac_match(pat, s + adv, e, toks, ti + 1);
                 }
                 if (str_eq(kind, "int") == 1) {
@@ -2043,7 +2048,43 @@ kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -
                     mg_bind_add(nm, frag4, "str");
                     return mac_match(pat, s + adv, e, toks, ti + 1);
                 }
-                // expr（默认）：捕获平衡 token 序列，停在顶层终止符
+                if (str_eq(kind, "tt") == 1) {
+                    // Rust tt：一整棵 token 树 = 一个带定界符的组（整体），或单个非定界 token
+                    let frag_t: array<Token> = [];
+                    let jt = ti;
+                    if (tk == TOK_LPAREN || tk == TOK_LBRACKET || tk == TOK_LBRACE) {
+                        let d2 = 1;
+                        while (jt < len(toks) && d2 > 0) {
+                            let k2 = (toks[jt] as Token).kind;
+                            frag_t = array_push(frag_t, mac_tok_copy(toks[jt] as Token));
+                            if (k2 == TOK_LPAREN || k2 == TOK_LBRACKET || k2 == TOK_LBRACE) { d2 = d2 + 1; }
+                            else if (k2 == TOK_RPAREN || k2 == TOK_RBRACKET || k2 == TOK_RBRACE) { d2 = d2 - 1; }
+                            jt = jt + 1;
+                        }
+                    } else {
+                        frag_t = array_push(frag_t, mac_tok_copy(toks[ti] as Token));
+                        jt = ti + 1;
+                    }
+                    mg_bind_add(nm, frag_t, "tt");
+                    return mac_match(pat, s + adv, e, toks, jt);
+                }
+                if (str_eq(kind, "block") == 1) {
+                    // Rust block：一整棵 `{ ... }` 组（含定界符）
+                    if (tk != TOK_LBRACE) { return -1; }
+                    let frag_b: array<Token> = [];
+                    let jb = ti;
+                    let db = 1;
+                    while (jb < len(toks) && db > 0) {
+                        let kb = (toks[jb] as Token).kind;
+                        frag_b = array_push(frag_b, mac_tok_copy(toks[jb] as Token));
+                        if (kb == TOK_LBRACE) { db = db + 1; }
+                        else if (kb == TOK_RBRACE) { db = db - 1; }
+                        jb = jb + 1;
+                    }
+                    mg_bind_add(nm, frag_b, "block");
+                    return mac_match(pat, s + adv, e, toks, jb);
+                }
+                // ---- 平衡捕获片段（默认 expr）：ty / pat / path / stmt / meta / item 同界 ----
                 let frag5: array<Token> = [];
                 let depth = 0;
                 let j = ti;
@@ -2059,7 +2100,7 @@ kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -
                     j = j + 1;
                 }
                 if (len(frag5) == 0) { return -1; }
-                mg_bind_add(nm, frag5, "expr");
+                mg_bind_add(nm, frag5, kind);
                 return mac_match(pat, s + adv, e, toks, j);
             }
         }
@@ -2072,7 +2113,9 @@ kimo mac_match(pat: array<Token>, s: int, e: int, toks: array<Token>, ti: int) -
     return mac_match(pat, s + 1, e, toks, ti + 1);
 }
 
-// 转录侧重复组迭代次数：取组内第一个已绑定元变量的碎片数；无则 1。
+// 转录侧重复组迭代次数：取组内第一个非嵌套组的元变量真实碎片数。
+// Rust 对齐：`?`/`*` 组零次匹配时碎片数为 0 → 迭代 0 次（整组不展开），避免展开出 `+ ()` 类垃圾；
+// `+` 组至少 1 次由匹配器保证。组内无元变量（纯字面量组）迭代 1 次。
 kimo mac_rep_count(ts: array<Token>, s: int, e: int) -> int {
     let i = s;
     while (i < e) {
@@ -2080,16 +2123,36 @@ kimo mac_rep_count(ts: array<Token>, s: int, e: int) -> int {
         if (k == TOK_DOLLAR && i + 1 < e) {
             if ((ts[i + 1] as Token).kind == TOK_LPAREN) {
                 let close = mac_match_paren(ts, i);
+                if (close < 0) { return 1; }
                 i = close + 1;
             } else if ((ts[i + 1] as Token).kind == TOK_IDENT) {
                 let nm = (ts[i + 1] as Token).text;
                 let c = mg_bind_frag_count(nm);
-                if (c > 0) { return c; }
-                i = i + 2;
+                return c;   // 0 也是有效次数（可选/零多组）
             } else { i = i + 1; }
         } else { i = i + 1; }
     }
     return 1;
+}
+
+// 转录序列中是否存在引用性元变量（顶层 `$name`）未被匹配捕获。嵌套重复组内容跳过。
+kimo mac_check_unbound(ts: array<Token>) -> int {
+    let i = 0;
+    while (i < len(ts)) {
+        let k = (ts[i] as Token).kind;
+        if (k == TOK_DOLLAR && i + 1 < len(ts)) {
+            if ((ts[i + 1] as Token).kind == TOK_LPAREN) {
+                let close = mac_match_paren(ts, i);
+                if (close < 0) { return 1; }
+                i = close + 1;
+            } else if ((ts[i + 1] as Token).kind == TOK_IDENT) {
+                let nm = (ts[i + 1] as Token).text;
+                if (mg_find_bind(nm) < 0) { return 1; }
+                i = i + 2;
+            } else { i = i + 1; }
+        } else { i = i + 1; }
+    }
+    return 0;
 }
 
 kimo mac_append_hyg(idt: Token) -> void {
@@ -2124,7 +2187,7 @@ kimo mac_transcribe(ts: array<Token>, s: int, e: int, iter: int) -> void {
                     if (q2 == TOK_STAR || q2 == TOK_PLUS || q2 == TOK_QUESTION) { quant = q2; }
                 }
                 let n = mac_rep_count(ts, substart, subend);
-                if (quant == TOK_QUESTION) { n = 1; }
+                if (quant == TOK_QUESTION && n > 1) { n = 1; }   // `?` 至多一次；零次匹配时 n==0 整组不展开
                 let j = 0;
                 while (j < n) {
                     mac_transcribe(ts, substart, subend, j);
@@ -2192,10 +2255,26 @@ kimo ps_reparse_expr(toks: array<Token>) -> Expr {
 }
 
 // 声名式宏主入口：对调用实参 token 序列做多臂匹配 + 转录 + 重解析为表达式。
+// 递归安全：保存/恢复展开状态，并用 mg_depth 限制递归深度（对齐 Rust recursion limit）。
 pub kimo ps_macro_expand_declarative(mdef: MacroDef, argtoks: array<Token>) -> Expr {
+    if (mg_depth >= mg_limit) {
+        let msg = "Macro recursion limit reached (" + int_to_str(mg_limit) + "); '"
+                + mdef.name + "' expands recursively without convergence";
+        ps_err(msg);
+        let loc_e = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
+        return mk_expr(EXPR_INT, loc_e);
+    }
+    let save_hyg = mg_hyg;
+    let save_binds = mg_binds;
+    let save_kinds = mg_kinds;
+    let save_out = mg_out;
+    let save_depth = mg_depth;
+    mg_depth = save_depth + 1;
     let n = ps_macro_hyg_counter;
     ps_macro_hyg_counter = ps_macro_hyg_counter + 1;
     mg_hyg = "__h" + int_to_str(n);
+    let matched = 0;
+    let ret_e = mk_expr(EXPR_INT, mk_loc(ps_file, ps_cur_line(), ps_cur_col()));
     let ai = 0;
     while (ai < len(mdef.arms)) {
         let arm = mdef.arms[ai] as MacroArm;
@@ -2203,16 +2282,33 @@ pub kimo ps_macro_expand_declarative(mdef: MacroDef, argtoks: array<Token>) -> E
         mg_kinds = [];
         let ti = mac_match(arm.pat, 0, len(arm.pat), argtoks, 0);
         if (ti == len(argtoks)) {
-            mg_out = [];
-            mac_transcribe(arm.trans, 0, len(arm.trans), -1);
-            return ps_reparse_expr(mg_out);
+            if (mac_check_unbound(arm.trans) == 1) {
+                let um = "Macro error: '" + mdef.name + "' transcript references a metavariable that is never captured by the matched pattern";
+                ps_err(um);
+                matched = 1;
+                ai = len(mdef.arms);
+            } else {
+                mg_out = [];
+                mac_transcribe(arm.trans, 0, len(arm.trans), -1);
+                ret_e = ps_reparse_expr(mg_out);
+                matched = 1;
+                ai = len(mdef.arms);
+            }
+        } else {
+            ai = ai + 1;
         }
-        ai = ai + 1;
     }
-    let msg = "Macro error: '" + mdef.name + "' matched no arm for these arguments; expected one of the declared patterns";
-    ps_err(msg);
-    let loc_ph = mk_loc(ps_file, ps_cur_line(), ps_cur_col());
-    return mk_expr(EXPR_INT, loc_ph);
+    // 恢复外层的展开状态（递归时外层 mg_* 正被使用）；报错前也必须恢复，保证上层不受污染
+    mg_hyg = save_hyg;
+    mg_binds = save_binds;
+    mg_kinds = save_kinds;
+    mg_out = save_out;
+    mg_depth = save_depth;
+    if (matched == 0) {
+        let msg = "Macro error: '" + mdef.name + "' matched no arm for these arguments; expected one of the declared patterns";
+        ps_err(msg);
+    }
+    return ret_e;
 }
 
 // ============ 语句块与去糖辅助 ============

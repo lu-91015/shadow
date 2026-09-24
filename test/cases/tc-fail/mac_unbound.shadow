@@ -1,0 +1,9 @@
+//@desc: 宏负面：转录引用模式未捕获的元变量 → 编译拒绝
+//@expect: never captured by the matched pattern
+//@mode: tc-fail
+dsb mac_unbound;
+macro u { ($x: expr) => { ($y) } }
+kimo main() -> int {
+    let r = u(1);
+    return r;
+}

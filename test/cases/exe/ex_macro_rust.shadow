@@ -1,0 +1,42 @@
+//@mode: exe
+//@desc: Rust 对齐宏补全：literal/ty/path/block 片段、tt 整树捕获、重复组零展开
+//@expect: lit1=7\nlit2=11\nsum=6\nsum0=0\nsum2=12\nty=5\npath=9\nblk=0\ntwig=7
+//@timeout: 120
+dsb ex_macro_rust;
+
+// literal 片段：仅接受字面量，原样放回
+macro widen { ($l: literal) => { (($l)) } }
+
+// 逗号分隔 `+` 重复求和
+macro sumall { ($($x: expr),+) => { (0 $(+ $x)+) } }
+
+// 无分隔符 `*` 组：空输入时 $x 零碎片 → 整组不展开 → 0
+macro sumstar { ($($x: expr)*) => { (0 $(+ $x)*) } }
+
+// 逗号分隔 `*` 组：空→0，多个 4,8 → 0+4+8=12
+macro sumstar2 { ($($x: expr),*) => { (0 $(+ $x)*) } }
+
+// ty 片段 + expr
+macro typed { ($v: expr, $t: ty) => { (($v)) } }
+
+// path 片段
+macro pathy { ($p: path) => { (int_to_str(9)) } }
+
+// block 片段：捕获整棵 { ... } 组（含定界符）
+macro blok { ($b: block) => { (0) } }
+
+// tt 整树捕获：把含定界符组整体作为一棵 token 树
+macro twig { ($t: tt) => { ($t) } }
+
+kimo main() -> int {
+    println("lit1=" + int_to_str(widen(7)));        // 7
+    println("lit2=" + int_to_str(widen(11)));       // 11
+    println("sum=" + int_to_str(sumall(1,2,3)));    // 6
+    println("sum0=" + int_to_str(sumstar()));       // 0（空组整组不展开）
+    println("sum2=" + int_to_str(sumstar2(4,8)));   // 12
+    println("ty=" + int_to_str(typed(5, int)));     // 5
+    println("path=" + pathy(foo::bar));             // 9
+    println("blk=" + int_to_str(blok({ 3 })));      // 0
+    println("twig=" + int_to_str(twig((7))));       // ((7)) === 7
+    return 0;
+}
