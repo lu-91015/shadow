@@ -14,7 +14,7 @@ Write-Output "[1] compile -> build\$base.ll"
 if (-not (Test-Path "build\$base.ll")) { Write-Output "COMPILE_FAIL"; exit 1 }
 
 Write-Output "[2] llc -> build\$base.o"
-& "$bin\llc.exe" -O0 -filetype=obj "build\$base.ll" -o "build\$base.o"
+& "$bin\llc.exe" -O2 -filetype=obj "build\$base.ll" -o "build\$base.o"
 if ($LASTEXITCODE -ne 0) { Write-Output "LLC_FAIL"; exit 1 }
 
 Write-Output "[3] link -> build\$base.exe"

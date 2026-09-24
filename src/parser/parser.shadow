@@ -2239,12 +2239,24 @@ kimo mac_transcribe(ts: array<Token>, s: int, e: int, iter: int) -> void {
     }
 }
 
+// 转录产物 token 序列常没有 EOF 哨兵；ps_adv() 在 len-1 处钳制（ps_idx < len-1 才前移），
+// 若缺 EOF，ps_cur_kind() 永远取不到 TOK_EOF → 重解析循环(last real token)死循环。
+// 重解析前统一补一条 TOK_EOF。深拷贝返回新数组，不改动调用侧的 mg_out。
+kimo mac_toks_with_eof(toks: array<Token>) -> array<Token> {
+    let work: array<Token> = [];
+    let i = 0;
+    while (i < len(toks)) { work = array_push(work, toks[i] as Token); i = i + 1; }
+    let eof = Token { kind: TOK_EOF, text: "", line: 0, col: 0, end_line: 0, end_col: 0 };
+    work = array_push(work, eof);
+    return work;
+}
+
 // 把转录产物 token 序列重新解析为表达式（交换 ps_tokens/ps_idx，parse 后恢复）。
 kimo ps_reparse_expr(toks: array<Token>) -> Expr {
     let save_toks = ps_tokens;
     let save_idx = ps_idx;
     let save_gt = ps_gt_pending;
-    ps_tokens = toks;
+    ps_tokens = mac_toks_with_eof(toks);
     ps_idx = 0;
     ps_gt_pending = 0;
     let e = parse_expr();
@@ -2311,7 +2323,79 @@ pub kimo ps_macro_expand_declarative(mdef: MacroDef, argtoks: array<Token>) -> E
     return ret_e;
 }
 
-// ============ 语句块与去糖辅助 ============
+// 把转录产物 token 序列重新解析为一串语句（语句位置宏用）。交换 ps_tokens/ps_idx，解析后恢复。
+kimo ps_reparse_stmts(toks: array<Token>) -> array<Stmt> {
+    let save_toks = ps_tokens;
+    let save_idx = ps_idx;
+    let save_gt = ps_gt_pending;
+    ps_tokens = mac_toks_with_eof(toks);
+    ps_idx = 0;
+    ps_gt_pending = 0;
+    let stmts: array<Stmt> = [];
+    while (ps_cur_kind() != TOK_EOF) {
+        stmts = array_push(stmts, parse_statement());
+    }
+    ps_tokens = save_toks;
+    ps_idx = save_idx;
+    ps_gt_pending = save_gt;
+    return stmts;
+}
+
+// 声名式宏的语句位置变体：匹配 + 转录后把 mg_out 重解析为语句序列（可含多语句）。
+// 递归/状态管理与表达式变体一致。
+kimo ps_macro_expand_declarative_stmts(mdef: MacroDef, argtoks: array<Token>) -> array<Stmt> {
+    if (mg_depth >= mg_limit) {
+        let msg = "Macro recursion limit reached (" + int_to_str(mg_limit) + "); '"
+                + mdef.name + "' expands recursively without convergence";
+        ps_err(msg);
+        let empty_ret: array<Stmt> = [];
+        return empty_ret;
+    }
+    let save_hyg = mg_hyg;
+    let save_binds = mg_binds;
+    let save_kinds = mg_kinds;
+    let save_out = mg_out;
+    let save_depth = mg_depth;
+    mg_depth = save_depth + 1;
+    let n = ps_macro_hyg_counter;
+    ps_macro_hyg_counter = ps_macro_hyg_counter + 1;
+    mg_hyg = "__h" + int_to_str(n);
+    let matched = 0;
+    let ret_stmts: array<Stmt> = [];
+    let ai = 0;
+    while (ai < len(mdef.arms)) {
+        let arm = mdef.arms[ai] as MacroArm;
+        mg_binds = [];
+        mg_kinds = [];
+        let ti = mac_match(arm.pat, 0, len(arm.pat), argtoks, 0);
+        if (ti == len(argtoks)) {
+            if (mac_check_unbound(arm.trans) == 1) {
+                let um = "Macro error: '" + mdef.name + "' transcript references a metavariable that is never captured by the matched pattern";
+                ps_err(um);
+                matched = 1;
+                ai = len(mdef.arms);
+            } else {
+                mg_out = [];
+                mac_transcribe(arm.trans, 0, len(arm.trans), -1);
+                ret_stmts = ps_reparse_stmts(mg_out);
+                matched = 1;
+                ai = len(mdef.arms);
+            }
+        } else {
+            ai = ai + 1;
+        }
+    }
+    mg_hyg = save_hyg;
+    mg_binds = save_binds;
+    mg_kinds = save_kinds;
+    mg_out = save_out;
+    mg_depth = save_depth;
+    if (matched == 0) {
+        let msg = "Macro error: '" + mdef.name + "' matched no arm for these arguments; expected one of the declared patterns";
+        ps_err(msg);
+    }
+    return ret_stmts;
+}
 pub kimo parse_block() -> array<Stmt> {
     ps_expect(TOK_LBRACE, "{");
     let stmts: array<Stmt> = [];
@@ -3150,6 +3234,24 @@ pub kimo parse_statement_inner() -> Stmt {
         let blk = mk_stmt(STMT_BLOCK, loc);
         blk.items = block_stmts;
         return blk;
+    }
+
+    // 语句位置宏：`ident(...)` 且该名是声明式多臂宏时，展开为语句序列（可含多语句）。
+    // 在表达式回退之前拦截；transcript 内联其分号。源调用后若跟 `;` 一并消费。
+    if (k == TOK_IDENT) {
+        let mname = ps_cur_text();
+        let mdef_l = ps_macro_lookup(mname);
+        if (len(mdef_l.name) > 0 && len(mdef_l.arms) > 0 &&
+            (ps_tokens[ps_idx + 1] as Token).kind == TOK_LPAREN) {
+            ps_adv();
+            ps_adv();
+            let argtoks = ps_capture_call_toks();
+            let mstmts = ps_macro_expand_declarative_stmts(mdef_l, argtoks);
+            if (ps_at(TOK_SEMICOLON) == 1) { ps_adv(); }
+            let blk = mk_stmt(STMT_BLOCK, loc);
+            blk.items = mstmts;
+            return blk;
+        }
     }
 
     // 表达式语句或赋值

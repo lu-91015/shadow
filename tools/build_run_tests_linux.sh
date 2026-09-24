@@ -29,11 +29,11 @@ if ! "$L/shadow" "$ROOT/test/run_tests.shadow" -o "$L/rtests.ll" 2>"$ROOT/build/
 fi
 
 echo "[2/3] llc rtests.ll -> rtests.o"
-"$LLC" -O0 -mtriple=x86_64-unknown-linux-gnu -filetype=obj -o "$L/rtests.o" "$L/rtests.ll" || exit 1
+"$LLC" -O2 -mtriple=x86_64-unknown-linux-gnu -filetype=obj -o "$L/rtests.o" "$L/rtests.ll" || exit 1
 
 echo "[3/3] compile rt_test_par.c + link rtests"
-clang -c "$ROOT/rt/rt_test_par.c" -o "$L/rt_test_par.o" -I"$ROOT/rt" -std=c11 -fPIC -O1 || exit 1
-clang++ -no-pie -O1 -fPIC -rdynamic \
+clang -c "$ROOT/rt/rt_test_par.c" -o "$L/rt_test_par.o" -I"$ROOT/rt" -std=c11 -fPIC -O2 || exit 1
+clang++ -no-pie -O2 -fPIC -rdynamic \
   "$L/rtests.o" "$L/runtime_for_selfhost.o" "$L/miniz.o" "$L/sys_exec_cpa.o" \
   "$L/rt_proc_spawn.o" "$L/shadow_index.o" "$L/rt_test_par.o" "$L/shadow_gc_supplement.o" \
   -o "$L/rtests" \

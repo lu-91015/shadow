@@ -12,7 +12,7 @@ STAGE="${1:-build/stage2.o}"
 [ -f "$STAGE" ] || { echo "[X] stage not found: $STAGE"; exit 1; }
 
 echo "[1] compile runtime_for_selfhost.cpp (Windows)"
-"$BIN/clang++.exe" -O1 -c rt/linux/runtime_for_selfhost.cpp -o build/rt/runtime_for_selfhost.o \
+"$BIN/clang++.exe" -O2 -c rt/linux/runtime_for_selfhost.cpp -o build/rt/runtime_for_selfhost.o \
   -I rt -I build/linux -I "$LLVM_HOME/include" -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w
 
 # wk.o：编译器本体 runtime（全部冲突符号加 __cpp_ 前缀，shadow_sys_exec → blob）

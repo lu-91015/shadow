@@ -21,7 +21,7 @@ rt_lib="$LLVM_HOME/lib"
 echo "[1] compile src/main.shadow -> build/stage1.ll (fresh)"
 build/shadow.exe src/main.shadow -o build/stage1.ll || { echo "[X] compile failed"; exit 1; }
 echo "[2] llc -> build/stage1.o"
-"$bin/llc.exe" -O0 -filetype=obj build/stage1.ll -o build/stage1.o || { echo "[X] llc failed"; exit 1; }
+"$bin/llc.exe" -O2 -filetype=obj build/stage1.ll -o build/stage1.o || { echo "[X] llc failed"; exit 1; }
 echo "[3] clang++ link -> build/shadow.exe"
 MSYS2_ARG_CONV_EXCL='*' "$bin/clang++.exe" -std=c++17 \
   build/stage1.o build/rt/runtime_for_selfhost_wk.o build/rt/miniz.o \

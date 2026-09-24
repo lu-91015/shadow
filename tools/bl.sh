@@ -13,7 +13,7 @@ RT=build/rt
 echo "[1/3] shadow -> ll"
 build/shadow.exe "$SRC" -o "$BASE.ll"
 echo "[2/3] llc -> o"
-"$BIN/llc.exe" -O0 -filetype=obj "$BASE.ll" -o "$BASE.o"
+"$BIN/llc.exe" -O2 -filetype=obj "$BASE.ll" -o "$BASE.o"
 echo "[3/3] clang link -> exe"
 # 用户程序 runtime：与 main_link_exe Windows 分支同配方（统一 cpp runtime）。
 # runtime_for_selfhost_user.o（真 GC 保留 + runtime_lib 冲突符号加前缀）

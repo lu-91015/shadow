@@ -1,0 +1,32 @@
+//@mode: exe
+//@desc: 语句位置宏：宏在语句位置展开为多语句序列（transcript 自带分号）
+//@expect: init=2\ninc=3\nsq=9\nboth=7\nl=50
+//@timeout: 120
+dsb ex_macro_stmt;
+
+// 多语句宏：赋值 + 打印（transcript 自带分号）
+macro bump { ($v: expr) => { $v = $v + 1; println("inc=" + int_to_str($v)); } }
+
+// 单语句赋值宏（return 一个值验证展开后作用域外的值传递）
+macro sq { ($v: expr) => { $v = $v * $v; } }
+
+// 双参双语句宏
+macro two { ($v: expr, $w: expr) => { $v = $v + $w; $w = $w * 2; } }
+
+// 元变量在语句中可重复引用，且产生新 let
+macro mklet { ($n: ident, $v: expr) => { let $n = $v * 10; println("l=" + int_to_str($n)); } }
+
+kimo main() -> int {
+    let a = 2;
+    println("init=" + int_to_str(a));       // init=2
+    bump(a);                                // a=3; 打印 inc=3
+    sq(a);                                  // a=9
+    println("sq=" + int_to_str(a));         // sq=9
+    let x = 3;
+    let y = 4;
+    two(x, y);                              // x=7; y=8
+    println("both=" + int_to_str(x));       // both=7
+    // mklet 生成 let 局部于其展开的语句块；块内引用自身 $n
+    mklet(tmpv, 5);                         // let tmpv=50; println l=50（块内）
+    return 0;
+}
