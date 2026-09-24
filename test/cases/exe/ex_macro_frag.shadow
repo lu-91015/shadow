@@ -1,0 +1,33 @@
+//@mode: exe
+//@desc: 片段分类符精确匹配：ty/path/pat/stmt 分类器接受合法输入
+//@expect: t1=1\nt2=1\nt3=1\nt4=1\np1=2\np2=2\nm1=3\nm2=3\nm3=3\ns1=4
+//@timeout: 120
+dsb ex_macro_frag;
+
+// ty 分类符：接受基础类型 / 泛型容器 / 路径类型
+macro tyc { ($t: ty) => { (1) } }
+
+// path 分类符：接受 :: 与 . 分隔路径
+macro pathc { ($p: path) => { (2) } }
+
+// pat 分类符：接受字面量 / 裸 ident / 变体模式
+macro patc { ($p: pat) => { (3) } }
+
+// stmt 分类符：接受块语句 / 带分号语句
+macro stmtc { ($s: stmt) => { (4) } }
+
+struct Pair { a: int, b: int }
+
+kimo main() -> int {
+    println("t1=" + int_to_str(tyc(int)));
+    println("t2=" + int_to_str(tyc(array<int>)));
+    println("t3=" + int_to_str(tyc(dict<string, int>)));
+    println("t4=" + int_to_str(tyc(Pair)));
+    println("p1=" + int_to_str(pathc(foo::bar)));
+    println("p2=" + int_to_str(pathc(a.b)));
+    println("m1=" + int_to_str(patc(42)));
+    println("m2=" + int_to_str(patc(somevar)));
+    println("m3=" + int_to_str(patc(Some(v))));
+    println("s1=" + int_to_str(stmtc({ let z = 1; })));
+    return 0;
+}

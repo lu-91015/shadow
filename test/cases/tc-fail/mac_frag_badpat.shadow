@@ -1,0 +1,12 @@
+//@mode: tc-fail
+//@desc: pat 分类符精确匹配：非法模式实参导致无臂匹配（编译失败）
+//@expect: matched no arm for these arguments
+//@timeout: 120
+dsb mac_frag_badpat;
+
+macro patc { ($p: pat) => { (3) } }
+
+kimo main() -> int {
+    let a = patc(1 + 2);   // 1 + 2 不是合法模式 → 臂不匹配 → 报错
+    return a;
+}

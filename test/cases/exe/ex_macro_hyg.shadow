@@ -1,0 +1,46 @@
+//@mode: exe
+//@desc: 宏卫生：转录内 let/for 绑定一致改名，调用方同名变量不受污染；__ 前缀保留
+//@expect: body=100\nbody=100\nbody=100\nafter=100\nu=100\nu=100\nacc=99\nsum=6\nt=5\ns=12
+//@timeout: 120
+dsb ex_macro_hyg;
+
+// 卫生①：宏内 `let i` 循环拼入调用方 $body，$body 引用调用方同名 i → 不受宏内绑定污染
+//   $body: stmt 捕获调用方块语句（块后直接接语句，Shadow 语法不允许块后加分号）
+macro loopi { ($n: expr, $body: stmt) => {
+    let i = 0; while (i < $n) { $body i = i + 1; }
+} }
+
+// 卫生②：__ 前缀标识符强制改名（语义与 loopi 等价）
+macro loopu { ($n: expr, $body: stmt) => {
+    let __j = 0; while (__j < $n) { $body __j = __j + 1; }
+} }
+
+// 卫生③：for 循环变量 + let 绑定一致改名；$out 接收结果，调用方同名变量不受污染
+macro sumfor { ($arr: expr, $out: ident) => {
+    let acc = 0; for (k in $arr) { acc = acc + k; } $out = acc;
+} }
+
+// 卫生④：let 绑定名与调用方变量同名不冲突（宏内自用，值来自调用方 $v）
+macro letc { ($v: expr, $out: ident) => {
+    let t = $v + 1; $out = t * 2;
+} }
+
+kimo main() -> int {
+    let i = 100;
+    loopi(3, { println("body=" + int_to_str(i)); });   // 三次 body=100
+    println("after=" + int_to_str(i));                  // 100：调用方 i 未被污染
+    let u = 100;
+    loopu(2, { println("u=" + int_to_str(u)); });       // 两次 u=100
+    let arr = [1, 2, 3];
+    let acc = 99;
+    let sum = 0;
+    sumfor(arr, sum);                                   // 宏内 acc 改名，调用方 acc 不受影响
+    println("acc=" + int_to_str(acc));                  // 99
+    println("sum=" + int_to_str(sum));                  // 1+2+3=6
+    let t = 5;
+    let s = 0;
+    letc(t, s);                                         // 宏内 t 改名，不遮蔽传入值
+    println("t=" + int_to_str(t));                      // 5：调用方 t 未被污染
+    println("s=" + int_to_str(s));                      // (5+1)*2=12
+    return 0;
+}

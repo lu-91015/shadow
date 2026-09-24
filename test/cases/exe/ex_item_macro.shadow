@@ -1,0 +1,41 @@
+//@mode: exe
+//@desc: 条目位置宏：模块级展开为 fn/struct/global/嵌套条目宏（Rust 对齐）
+//@expect: f=11\ns=5\nbase=3\nnest=21
+//@timeout: 120
+dsb ex_item_macro;
+
+// 展开函数（ident + expr 捕获）
+macro mkfn { ($n: ident, $v: expr) => { kimo $n() -> int { return $v; } } }
+
+// 展开结构体
+macro mkstruct { ($n: ident) => { struct $n { x: int, y: int } } }
+
+// 展开全局变量
+macro mkglobal { ($n: ident, $v: expr) => { let $n: int = $v; } }
+
+// 嵌套条目宏：转录体内再调用内层条目宏（递归展开）
+macro mkpair { ($a: ident, $b: ident, $va: expr, $vb: expr) => {
+    mkfn($a, $va);
+    mkfn($b, $vb);
+} }
+
+// —— 模块级条目宏调用（Rust 语义：条目宏仅在 item 位置）——
+mkfn(fa, 11);
+mkstruct(Point);
+mkglobal(gbase, 3);
+mkpair(fx, fy, 7, 14);
+
+kimo main() -> int {
+    let r1 = fa();
+    println("f=" + int_to_str(r1));
+
+    let p = Point { x: 2, y: 3 };
+    println("s=" + int_to_str(p.x + p.y));
+
+    println("base=" + int_to_str(gbase));
+
+    let r2 = fx() + fy();
+    println("nest=" + int_to_str(r2));
+
+    return 0;
+}

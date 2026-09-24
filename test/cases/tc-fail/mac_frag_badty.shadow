@@ -1,0 +1,12 @@
+//@mode: tc-fail
+//@desc: ty 分类符精确匹配：非法类型实参导致无臂匹配（编译失败）
+//@expect: matched no arm for these arguments
+//@timeout: 120
+dsb mac_frag_badty;
+
+macro tyc { ($t: ty) => { (1) } }
+
+kimo main() -> int {
+    let a = tyc(1 + 2);   // 1 + 2 不是类型 → 臂不匹配 → 报错
+    return a;
+}
