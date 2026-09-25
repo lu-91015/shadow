@@ -31,6 +31,7 @@ pub let TYPE_ENUM_PAYLOAD: int = 21;
 pub let TYPE_TUPLE: int = 22;
 pub let TYPE_SET: int = 23;
 pub let TYPE_FUTURE: int = 24;
+pub let TYPE_TRAIT_OBJECT: int = 25; // dyn Trait 运行时多态值（数据指针 + vtable 指针）
 
 // ============ Token 种类 TOK_* ============
 pub let TOK_EOF: int = 0;
@@ -136,6 +137,8 @@ pub let TOK_WITH: int = 112;
 pub let TOK_DSB: int = 113;
 pub let TOK_DEFER: int = 114;
 pub let TOK_COLONCOLON: int = 115;
+pub let TOK_CONST: int = 127;
+pub let TOK_DOLLAR: int = 128;   // `$` 宏元变量前缀 / 重复组 $( )*（仅宏定义内出现）
 
 // ============ 位运算 / 自增自减 token（0.5 增量） ============
 pub let TOK_BITAND: int = 116;
@@ -147,6 +150,8 @@ pub let TOK_INC: int = 121;
 pub let TOK_DEC: int = 122;
 pub let TOK_TILDE: int = 123;
 pub let TOK_PERCENTEQ: int = 124;
+pub let TOK_WHERE: int = 125;
+pub let TOK_DYN: int = 126;
 
 // ============ 表达式种类 EXPR_* ============
 pub let EXPR_INT: int = 1;
@@ -184,6 +189,8 @@ pub let EXPR_SPAWN: int = 25;
 pub let EXPR_AWAIT: int = 26;
 // 自增/自减 ++/--：intval=0 增 1 减；str1="pre"/"post" 前缀/后缀；child1=目标
 pub let EXPR_INCDEC: int = 27;
+// 切片 a[lo:hi]：child1=基（数组/字符串），child2=起始（省略=0），child3=结束（省略=INT_MAX）
+pub let EXPR_SLICE: int = 28;
 
 // ============ 语句种类 STMT_* ============
 pub let STMT_LET: int = 1;
@@ -205,6 +212,7 @@ pub let STMT_TRY: int = 16;
 pub let STMT_THROW: int = 17;
 pub let STMT_WITH: int = 18;
 pub let STMT_DEFER: int = 19;
+pub let STMT_DO_WHILE: int = 20;
 
 // ============ 二元操作符 BIN_* ============
 pub let BIN_ADD: int = 0;
@@ -283,6 +291,9 @@ pub let MIR_MAKE_CLOSURE: int = 26;
 pub let MIR_CALL_INDIRECT: int = 27;
 pub let MIR_SPAWN: int = 28;
 pub let MIR_AWAIT: int = 29;
+pub let MIR_MAKE_TRAITOBJ: int = 30; // 具体 struct -> dyn Trait 对象（vtable 打包）
+pub let MIR_CALL_DYN: int = 31;      // 经 vtable 的运行时动态分发调用
+pub let MIR_SLICE: int = 32;         // a[lo:hi]：arg1=基，args[0]=start，args[1]=end
 
 // ============ .lu 缓存全局变量初始值标签 ============
 pub let LU_INIT_NONE: int = 0;

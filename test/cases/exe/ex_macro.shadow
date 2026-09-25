@@ -1,0 +1,38 @@
+dsb ex_macro;
+//@mode: exe
+//@desc: 宏系统 —— 声明式多臂 + 重复组展开 + ident 捕获 + 卫生性
+//@expect: sq(5)=25\ndbl(4)=8\ntwice(4)=12\ntwice((4))=8\nsum(4,5,6)=15\nlen(vec)=3\nvec[0]=7\nget(x)=42\nrefit(__secret)=77
+//@timeout: 120
+// 宏系统回归用例：声明式多臂宏 + 重复组展开 + ident 捕获 + 卫生性
+//   单臂算术：macro sq { ($x: expr) => { (($x) * ($x)) } }
+//   多臂分派：macro twice { (($e: expr))=>{($e)*2}; ($e: expr)=>{($e)*3} }
+//   重复组累加：macro sum { ($($x: expr),+) => { (0 $(+ $x)+) } }
+//   重复组数组：macro vec { ($($x: expr),*) => { [$($x),*] } }
+//   ident 捕获：macro get { ($v: ident) => { ($v) } }
+//   卫生性：调用方 `__` 变量经捕获后原样保留
+
+macro sq { ($x: expr) => { (($x) * ($x)) } }
+macro dbl { ($x: expr) => { (2 * ($x)) } }
+macro twice {
+    (($e: expr)) => { (($e) * 2) }
+    ($e: expr) => { (($e) * 3) }
+}
+macro sum { ($($x: expr),+) => { (0 $(+ $x)+) } }
+macro vec { ($($x: expr),*) => { [$($x),*] } }
+macro get { ($v: ident) => { ($v) } }
+
+kimo main() -> int {
+    println("sq(5)=" + int_to_str(sq(5)));           // 25
+    println("dbl(4)=" + int_to_str(dbl(4)));         // 8
+    println("twice(4)=" + int_to_str(twice(4)));     // 12：多臂第二臂 ×3
+    println("twice((4))=" + int_to_str(twice((4)))); // 8：多臂第一臂 ×2（额外括号）
+    println("sum(4,5,6)=" + int_to_str(sum(4, 5, 6))); // 15：重复组累加
+    let arr = vec(7, 8, 9);
+    println("len(vec)=" + int_to_str(len(arr)));     // 3
+    println("vec[0]=" + int_to_str(arr[0] as int));  // 7
+    let x = 42;
+    println("get(x)=" + int_to_str(get(x)));         // 42
+    let __secret = 77;
+    println("refit(__secret)=" + int_to_str(get(__secret))); // 77：卫生性保留调用方 __ 名
+    return 0;
+}

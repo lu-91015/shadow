@@ -1,0 +1,12 @@
+//@desc: 宏负面① int 捕获元变量收到 expr 实参 → 无臂匹配，编译拒绝
+//@expect: matched no arm for these arguments
+//@mode: tc-fail
+// 验证：int 元变量 $n: int 只接受整数字面量；实参传非整数字面量（变量名）时
+// 所有臂都无法匹配，宏展开报 "matched no arm"。
+dsb mac_noarm_int;
+macro only_int { ($n: int) => { ($n + 1) } }
+kimo main() -> int {
+    let v = 3;
+    let r = only_int(v);   // expr 实参，不是 int 字面量 -> 匹配失败
+    return r;
+}

@@ -1,0 +1,11 @@
+//@desc: 宏负面② 多臂宏调用实参对任何臂都不匹配（实参个数不符）→ 编译拒绝
+//@expect: matched no arm for these arguments
+//@mode: tc-fail
+// 验证：声明了 (a,b) 与 (a) 两个臂，但调用传三个实参，全部臂匹配失败，
+// 宏系统给出 "matched no arm" 诊断而非静默/崩溃。
+dsb mac_noarm_arity;
+macro twoarms { ($a: expr, $b: expr) => { ($a + $b) } ($a: expr) => { ($a * 2) } }
+kimo main() -> int {
+    let r = twoarms(1, 2, 3);   // 3 参数：与任一臂的形参集合都不匹配
+    return r;
+}

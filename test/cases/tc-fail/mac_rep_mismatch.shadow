@@ -1,0 +1,12 @@
+//@desc: 宏负面：并列重复组碎片数不一致（$x 2 次 vs $y 3 次）→ 编译拒绝
+//@expect: in this repetition
+//@mode: tc-fail
+// 验证：pattern 里 ($($x),+; $($y),+) 两个独立重复组实参碎片数不同（2 vs 3），
+// 转录把它们并进同一个 $(+ $x + $y)+ 组 → 碎片数不一致，报错而非静默钳制（对齐 Rust
+// "meta-variable repeats N times" 诊断）。
+dsb mac_rep_mismatch;
+macro bad { ($($x: expr),+; $($y: expr),+) => { (0 $(+ $x + $y)+) } }
+kimo main() -> int {
+    let r = bad(1,2; 3,4,5);
+    return r;
+}

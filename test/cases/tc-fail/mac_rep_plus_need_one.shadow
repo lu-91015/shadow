@@ -1,0 +1,11 @@
+//@desc: 宏负面③ 重复组 `$()+` 至少一次，却传了零个元素 → 编译拒绝
+//@expect: matched no arm for these arguments
+//@mode: tc-fail
+// 验证：`$($x: expr)+` 要求至少一个元素被捕获；调用 `sumall()` 提供零个，
+// 重复组匹配因不足一次（quant==PLUS 且 count<1）而失败。
+dsb mac_rep_plus_need_one;
+macro sumall { ($($x: expr)+) => { (0 $(+ $x)+) } }
+kimo main() -> int {
+    let r = sumall();
+    return r;
+}

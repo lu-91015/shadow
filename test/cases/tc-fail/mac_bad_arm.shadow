@@ -1,0 +1,11 @@
+//@desc: 宏负面④ 宏定义臂语法错误（缺 => 或转录体）→ 解析阶段拒绝
+//@expect: expected
+//@mode: tc-fail
+// 验证：臂定义书写格式错误（打开 ( 后没有 => 就直接匹配 body）会让宏定义解析失败。
+// 这里用一个残缺的臂触发 parser 的 "expected ..." 诊断。
+dsb mac_bad_arm;
+macro broken { ($x: expr) => { ($x) } ($y: expr { ($y) } }   // 第二臂缺 =>，构造语法错
+kimo main() -> int {
+    let r = broken(3);
+    return r;
+}

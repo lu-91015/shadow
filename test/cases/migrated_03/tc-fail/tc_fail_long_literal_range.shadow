@@ -1,0 +1,8 @@
+//@desc: long literal out of i64 range is rejected (no silent truncation/wrap)
+//@expect-stderr: integer literal out of range for 'long'
+dsb tc_fail_long_literal_range;
+kimo main() -> int {
+    let b: long = 9223372036854775808L;        // i64 max+1 -> must reject
+    let d: long = -9223372036854775809L;       // i64 min-1 -> must reject (magnitude 2^63+1)
+    return (b + d) as int;
+}

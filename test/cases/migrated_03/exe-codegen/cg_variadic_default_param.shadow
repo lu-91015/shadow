@@ -1,0 +1,43 @@
+//@desc: variadic params with default-valued fixed prefix
+//@expect: 0\n10\n10\nhello bob\nhi
+dsb cg_variadic_default_param;
+
+// 固定前缀带默认值 + 变参收尾
+kimo sum(start: int = 0, step: int = 1, ...nums: int) -> int {
+    let total = start;
+    let i = 0;
+    while (i < len(nums)) {
+        total = total + (step * nums[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+kimo greet(prefix: string = "hi", ...names: string) -> string {
+    let r = prefix;
+    let i = 0;
+    while (i < len(names)) {
+        r = r + " " + names[i];
+        i = i + 1;
+    }
+    return r;
+}
+
+kimo main() -> int {
+    // 全缺省：start=0, step=1, rest=[] -> 0
+    println(int_to_str(sum()));
+
+    // 只给固定前缀：start=10, step=1, rest=[] -> 10
+    println(int_to_str(sum(10)));
+
+    // 固定前缀+变参：start=1, step=1, rest=[2,3,4] -> 1+2+3+4=10
+    println(int_to_str(sum(1, 1, 2, 3, 4)));
+
+    // 固定前缀+变参：prefix="hello", rest=["bob"] -> "hello bob"
+    println(greet("hello", "bob"));
+
+    // 全缺省：prefix="hi"(default), rest=[] -> "hi"
+    println(greet());
+
+    return 0;
+}

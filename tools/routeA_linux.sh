@@ -33,7 +33,7 @@ else
 fi
 
 echo "=== [1] 交叉编译 build/stage2.ll -> stage2.o (固定点) ==="
-"$LLC" -O0 -mtriple=x86_64-unknown-linux-gnu -filetype=obj -o "$L/stage2.o" "$ROOT/build/stage2.ll"
+"$LLC" -O2 -mtriple=x86_64-unknown-linux-gnu -filetype=obj -o "$L/stage2.o" "$ROOT/build/stage2.ll"
 echo "llc_rc=$?  ($(stat -c%s "$L/stage2.o") bytes)"
 nm "$L/stage2.o" 2>/dev/null | grep -E 'shadow_array_prealloc|shadow_string_concat_inplace'
 
@@ -41,12 +41,12 @@ echo
 echo "=== [2] 全部 runtime .o 从源码现编（源仅在 rt/）==="
 clang++ -c "$ROOT/rt/linux/runtime_for_selfhost.cpp" -o "$L/runtime_for_selfhost.o" -I"$ROOT/rt" -I"$LLVM_HOME/include" -std=c++17 -fPIC -O2
 objcopy --weaken "$L/runtime_for_selfhost.o"
-clang -c "$ROOT/rt/miniz.c" -o "$L/miniz.o" -I"$ROOT/rt" -D_GNU_SOURCE -std=c11 -fPIC -O1
-clang -c "$ROOT/rt/rt_zip.c" -o "$L/rt_zip.o" -I"$ROOT/rt" -D_GNU_SOURCE -std=c11 -fPIC -O1
-clang -c "$ROOT/rt/linux/sys_exec_cpa.c" -o "$L/sys_exec_cpa.o" -I"$ROOT/rt" -std=c11 -fPIC -O1
-clang -c -D_GNU_SOURCE "$ROOT/rt/rt_proc_spawn.c" -o "$L/rt_proc_spawn.o" -I"$ROOT/rt" -std=c11 -fPIC -O1
-clang -c -D_GNU_SOURCE "$ROOT/rt/shadow_index.c" -o "$L/shadow_index.o" -I"$ROOT/rt" -std=c11 -fPIC -O1
-clang -c "$ROOT/rt/shadow_gc_supplement.c" -o "$L/shadow_gc_supplement.o" -I"$ROOT/rt" -std=c11 -fPIC -O1
+clang -c "$ROOT/rt/miniz.c" -o "$L/miniz.o" -I"$ROOT/rt" -D_GNU_SOURCE -std=c11 -fPIC -O2
+clang -c "$ROOT/rt/rt_zip.c" -o "$L/rt_zip.o" -I"$ROOT/rt" -D_GNU_SOURCE -std=c11 -fPIC -O2
+clang -c "$ROOT/rt/linux/sys_exec_cpa.c" -o "$L/sys_exec_cpa.o" -I"$ROOT/rt" -std=c11 -fPIC -O2
+clang -c -D_GNU_SOURCE "$ROOT/rt/rt_proc_spawn.c" -o "$L/rt_proc_spawn.o" -I"$ROOT/rt" -std=c11 -fPIC -O2
+clang -c -D_GNU_SOURCE "$ROOT/rt/shadow_index.c" -o "$L/shadow_index.o" -I"$ROOT/rt" -std=c11 -fPIC -O2
+clang -c "$ROOT/rt/shadow_gc_supplement.c" -o "$L/shadow_gc_supplement.o" -I"$ROOT/rt" -std=c11 -fPIC -O2
 echo "rt objects ready: $(ls "$L"/*.o | tr '\n' ' ')"
 
 # 同步「用户产物」runtime 目录：main.shadow 的 Linux 分支按 self_dir/rt/ 取 .o 链接用户 exe，
@@ -58,7 +58,7 @@ echo "user-product runtime 已同步 -> $L/rt ($(ls -1 "$L/rt"/*.o | wc -l) 个 
 
 echo
 echo "=== [3] 链接 build/linux/shadow（stage2 固定点） ==="
-clang++ -no-pie -O1 -fPIC -rdynamic \
+clang++ -no-pie -O2 -fPIC -rdynamic \
   "$L/stage2.o" "$L/runtime_for_selfhost.o" "$L/miniz.o" "$L/sys_exec_cpa.o" \
   "$L/rt_proc_spawn.o" "$L/shadow_index.o" "$L/shadow_gc_supplement.o" \
   -o "$L/shadow" \
@@ -76,9 +76,9 @@ echo
 echo "=== [5] 端到端链接+运行 matmul（验证 prealloc 不再 undefined reference） ==="
 "$L/shadow" "$ROOT/bench/shadow/matmul.shadow" -o "$L/matmul.ll" 2>/dev/null
 echo "compile_rc=$?"
-"$LLC" -O0 -filetype=obj -o "$L/matmul.o" "$L/matmul.ll"
+"$LLC" -O2 -filetype=obj -o "$L/matmul.o" "$L/matmul.ll"
 echo "llc_rc=$?"
-clang++ -no-pie -O1 -fPIC -rdynamic \
+clang++ -no-pie -O2 -fPIC -rdynamic \
   "$L/matmul.o" "$L/runtime_for_selfhost.o" "$L/miniz.o" "$L/sys_exec_cpa.o" \
   "$L/rt_proc_spawn.o" "$L/shadow_index.o" "$L/shadow_gc_supplement.o" \
   -o "$L/matmul_exe" \

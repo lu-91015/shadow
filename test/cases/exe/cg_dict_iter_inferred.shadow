@@ -1,0 +1,52 @@
+//@expect: 1\n1\n2\n1\n1\n0\n1
+//@timeout: 60
+// 回归：for-in-dict 单变量迭代在 map 类型经 hashmap_new() 推断（裸 dict，
+// key_type=TYPE_NONE）时，循环变量以 TYPE_NONE 登记 → 使用 k 报 "undefined variable"。
+// 数组迭代能推断元素类型、显式 dict<string,string> 也能推断，唯独单变量裸 dict 分支
+// 缺 none->string 回退（双变量 dict 分支已有该回退）。修复：bind_t 若为 TYPE_NONE
+// 则回退为 string（shadow_dict_key_at 固定返回 string 键）。
+dsb cg_dict_iter_inferred;
+
+kimo main() -> int {
+    // 裸 dict（hashmap_new 推断），无显式类型标注
+    let m = hashmap_new();
+    hashmap_insert(m, "hello", "world");
+    hashmap_insert(m, "foo", "bar");
+
+    // 单变量迭代：累积全部 key，并验证都能作为 string 使用
+    let acc = "";
+    for (k in m) { acc = acc + k; }
+    println(int_to_str(str_contains(acc, "hello"))); // 1
+    println(int_to_str(str_contains(acc, "foo")));   // 1
+
+    // 循环变量参与函数调用（str_eq/len）与嵌套 if
+    let count = 0;
+    for (k1 in m) {
+        if (len(k1) > 2) { count = count + 1; }
+    }
+    println(int_to_str(count)); // 2（hello、foo 均 >2）
+
+    // 双变量（本已支持，作为对照保持不退化）
+    let v_acc = "";
+    for (k2, v2 in m) { v_acc = v_acc + v2; }
+    println(int_to_str(str_contains(v_acc, "world"))); // 1
+    println(int_to_str(str_contains(v_acc, "bar")));   // 1
+
+    // 空裸 dict 单变量迭代：0 次
+    let e = hashmap_new();
+    let e_count = 0;
+    for (ke in e) { e_count = e_count + 1; }
+    println(int_to_str(e_count)); // 0
+
+    // 由拼接产生 key/value 的裸 dict（键/值均非字面量路径）
+    let m2 = hashmap_new();
+    let i = 0;
+    while (i < 3) {
+        hashmap_insert(m2, "n" + int_to_str(i), "v" + int_to_str(i));
+        i = i + 1;
+    }
+    let n2 = 0;
+    for (kn in m2) { if (str_eq(kn, "n1") == 1) { n2 = n2 + 1; } }
+    println(int_to_str(n2)); // 1
+    return 0;
+}

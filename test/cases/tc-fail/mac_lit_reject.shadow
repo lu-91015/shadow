@@ -1,0 +1,10 @@
+//@desc: 宏负面：`literal` 片段收到非字面量实参（标识符）→ 无臂匹配
+//@expect: matched no arm for these arguments
+//@mode: tc-fail
+dsb mac_lit_reject;
+macro widen { ($l: literal) => { (($l)) } }
+kimo main() -> int {
+    let x = 3;
+    let r = widen(x);   // x 是标识符 expr，不是字面量
+    return r;
+}

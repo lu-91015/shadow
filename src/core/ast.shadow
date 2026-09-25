@@ -141,7 +141,9 @@ pub struct EnumDef {
 // trait 定义
 pub struct TraitDef {
     name: string;
-    methods: array<FuncDef>; // 仅签名
+    methods: array<FuncDef>; // 仅签名 / 带默认实现体（body 非空 = 默认实现）
+    assoc_types: array<string>; // 关联类型声明名（type Item;）
+    supertraits: array<string>; // 父 trait（裸名列表）：trait B : A1, A2
     loc: Location;
     is_pub: int;
     type_params: array<TypeParam>;
@@ -152,6 +154,7 @@ pub struct ImplDef {
     type_name: string;
     trait_name: string;  // 空 = inherent impl
     methods: array<FuncDef>;
+    assoc_types: array<TypeAlias>; // 关联类型绑定（type Item = Concrete;）
     loc: Location;
 }
 
@@ -180,11 +183,18 @@ pub struct MacroDef {
     body: Expr;
     loc: Location;
     is_pub: int;
+    arms: array<MacroArm>;   // 声名式多臂：macro name { (pat)=>{trans}; ... }；非空时走 token 匹配展开
 }
 
 pub struct MacroParam {
     name: string;
     kind: string;        // expr | ident | tt
+}
+
+// 声名式宏臂：模式/转录体各保存为原始 Token 序列（含 $ 元变量与 $( )* 重复组）
+pub struct MacroArm {
+    pat: array<Token>;
+    trans: array<Token>;
 }
 
 // 程序根
@@ -271,6 +281,7 @@ pub struct CompileContext {
 pub struct TEnv {
     names: array<string>;
     types: array<Type>;
+    conflags: array<int>;   // 并行于 names/types：1 = 变量声明为 const（不可再赋值），0 = 可变
 }
 
 // 结构化诊断（LSP-6；TC 错误与 ps 诊断同构）
@@ -309,6 +320,7 @@ pub struct HirExpr {
 pub struct HirStmt {
     id: int;            // NodeId：从对应 Stmt.id 继承
     kind: int;          // 复用 STMT_*
+    line: int;          // 来源源码行号（0 = 未知/合成）
     str1: string;
     int1: int;          // for 隐藏索引变量 slot
     slot: int;          // 目标变量 slot
@@ -340,6 +352,7 @@ pub struct HirFunc {
 // 空引用：ty/terminator 用 `0 as Type` / `0 as MirInst`。
 pub struct MirInst {
     op: int;            // MIR_OP_*
+    line: int;          // 来源源码行号（供 debug 元数据；0 = 未知）
     ty: Type;           // 结果类型（0 as Type = 无/void）
     dst: int;           // 目标寄存器编号（-1 = 无）
     arg1: int;          // 源寄存器/slot

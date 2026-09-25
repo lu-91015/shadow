@@ -1,13 +1,15 @@
 // Shadow 0.5 — 自举测试运行器（Shadow 原生实现）
 //
 // 用 Shadow 跑 Shadow 自己的测试用例：本程序由 build/shadow.exe 编译为
-// build/run_tests.exe，运行时再调用 build/shadow.exe 逐个编译+运行 test/cases 下
-// 的用例，并比对 //@expect。这是对 python test/run_tests.py 的等价移植，使测试
-// 基础设施也回归 Shadow 源码（不再依赖 .py）。
+// build/run_tests.exe（Windows）/ build/linux/rtests（Linux），运行时再调用
+// build/shadow.exe 逐个编译+运行 test/cases 下的用例，并比对 //@expect。
+// 这是 Shadow 原生版的测试运行器，使测试基础设施也回归 Shadow 源码；
+// Python 版 run_tests.py 已于 2026-09-18 移除，自举运行器为双平台唯一运行器。
 //
 // 用法（注意：build/shadow.exe X.shadow -o X.exe 只出 IR、不会自动链接 exe；
-//       链接用 tools/build_run_tests.sh 完成）：
-//   bash tools/build_run_tests.sh        # 编译 + 链接 -> build/run_tests.exe
+//       链接 Windows 用 tools/build_run_tests.shadow，Linux 用 tools/build_run_tests_linux.sh）：
+//   (Windows) rt_sys_exec 编译产物 build/run_tests.exe
+//   (Linux)   bash tools/build_run_tests_linux.sh   # 编译+链接 -> build/linux/rtests
 //   build/run_tests.exe                  # 全部用例（从仓库根启动）
 //   build/run_tests.exe -k struct        # 关键字过滤（路径子串）
 //   build/run_tests.exe -j 4             # 4 路并行（默认 1 = 串行）
@@ -16,7 +18,7 @@
 //   build/run_tests.exe --cases DIR --shadow-exe EXE   # 显式覆盖路径
 //
 // 说明：
-//   - 各模式语义与 run_tests.py 对齐（exe/codegen/check/ranges/diagjson/typeat/tc/tc-fail）。
+//   - 各模式语义（exe/codegen/check/ranges/diagjson/typeat/tc/tc-fail）见各判定分支。
 //   - rt_sys_exec 只回传 stdout+stderr、不回传退出码；故 tc/tc-fail 等依赖退出码的逻辑
 //     用「错误标记启发式」近似（输出含 error:/SH-/FATAL/undefined 等视为失败）。
 //   - 并行（-j N, N>1）：每个用例作为独立 shadow.exe 子进程启动（CreateProcessA，
@@ -91,7 +93,7 @@ struct Counters {
     skipped: int;
 }
 
-// 目录名 -> 测试模式（与 run_tests.py 的 FOLDER_MODE 对齐）
+// 目录名 -> 测试模式（与运行的目录布局约定对齐）
 kimo folder_mode(dn: string) -> string {
     if (str_eq(dn, "tc") == 1) { return "tc"; }
     if (str_eq(dn, "tc-fail") == 1) { return "tc-fail"; }
@@ -317,9 +319,9 @@ kimo judge(tc: TestCase, out: string, build_dir: string, idx: int, rc: int) -> R
         return expect_check(tc, out);
     }
     if (str_eq(mode, "tc") == 1) {
-        // 复刻 run_tests.py：tc = 编译通过（rc==0）。rt_sys_exec 不回传退出码，
+        // tc 语义 = 编译通过即判 PASS（rc==0）。rt_sys_exec 不回传退出码，
         // 用 has_error 启发式近似“编译无错”。//@expect: typecheck: 1 是遗留文档，
-        // 基线 py 在 tc 模式下本就忽略 //@expect，故此处直接以“无错即 PASS”判定。
+        // 基线实现（Python 版时期）在 tc 模式下本就忽略 //@expect，故此处直接以“无错即 PASS”判定。
         if (has_error(out) == 1) { return Result { status: "FAIL", msg: "compile error" }; }
         return Result { status: "PASS", msg: "" };
     }

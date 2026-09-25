@@ -1,0 +1,66 @@
+//@expect: 3:20,30,40\n3:0,20\n3:70\n10\n0\n7:90\nhello\nworld\nhello\n0\n3:2\ncdef\n5:1\n2:bbcc\n3\n3:1,2,3\n6\nbcd\nabcdef
+//@timeout: 60
+// 回归+功能：真正的 a[1:3] 切片语法（数组/字符串）。
+// 解析器在 '[' 后识别 ':'（含省略 a[:3]/a[3:]/a[:]），生成 EXPR_SLICE；
+// 类型检查按基类型推断：array<T>→array<T>，string→string，any 基报错；
+// MIR 降级为 MIR_SLICE（arg1=基，args=[lo,hi]），codegen 按基 kind 分发到
+// shadow_array_slice（数组，按 elem_size 复制）或 shadow_substr（字符串）。
+// 边界语义：负界回绕（-1→last）、越界 clamp、lo>=hi 或 lo>len 退化为空数组/空串。
+dsb cg_slice;
+
+struct Box { arr: array<int>; name: string; }
+
+kimo make_arr() -> array<int> {
+    let a: array<int> = [];
+    let i = 0;
+    while (i < 6) { a = array_push(a, i); i = i + 1; }
+    return a;
+}
+
+kimo main() -> int {
+    // ===== 数组切片 =====
+    let arr: array<int> = [];
+    let i = 0;
+    while (i < 10) { arr = array_push(arr, i * 10); i = i + 1; }
+    println(int_to_str(len(arr[2:5])) + ":" + int_to_str(arr[2:5][0]) + "," + int_to_str(arr[2:5][1]) + "," + int_to_str(arr[2:5][2]));
+    // 省略起始 / 省略结束 / 全缺
+    println(int_to_str(len(arr[:3])) + ":" + int_to_str(arr[:3][0]) + "," + int_to_str(arr[:3][2]));
+    println(int_to_str(len(arr[7:])) + ":" + int_to_str(arr[7:][0]));
+    println(int_to_str(len(arr[:])));
+    // 空切片（lo>hi）与越界 clamp
+    println(int_to_str(len(arr[8:2])));
+    println(int_to_str(len(arr[3:12])) + ":" + int_to_str(arr[3:12][6]));
+
+    // ===== 字符串切片 =====
+    let str = "hello world";
+    println(str[0:5]);
+    println(str[6:]);
+    println(str[:5]);
+    println(int_to_str(len(str[0:0])));
+
+    // ===== 成员访问 / 函数返回 / 再切片 / ptr 元素 =====
+    let b: Box = Box{ arr: make_arr(), name: "abcdef" };
+    println(int_to_str(len(b.arr[0:3])) + ":" + int_to_str(b.arr[0:3][2]));
+    println(b.name[2:]);
+    let r: array<int> = make_arr();
+    println(int_to_str(len(r[1:])) + ":" + int_to_str(r[1:][0]));
+
+    let strs: array<string> = [];
+    strs = array_push(strs, "aa");
+    strs = array_push(strs, "bb");
+    strs = array_push(strs, "cc");
+    println(int_to_str(len(strs[1:3])) + ":" + strs[1:3][0] + strs[1:3][1]);
+
+    // ===== 切片结果参与迭代 =====
+    let acc = 0;
+    for (v in r[1:3]) { acc = acc + v; }
+    println(int_to_str(acc));
+
+    // ===== 函数返回值 / 字符串字面量直接切片 =====
+    let d: array<int> = make_arr()[1:4];
+    println(int_to_str(len(d)) + ":" + int_to_str(d[0]) + "," + int_to_str(d[1]) + "," + int_to_str(d[2]));
+    println(int_to_str(len(make_arr())));
+    println("abcdef"[1:4]);
+    println("abcdef"[0:3] + "def");
+    return 0;
+}

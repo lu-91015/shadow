@@ -1,0 +1,98 @@
+//@expect: 42\nhi\n987654321\n30\n2:3:5\nx\ny\n2:x\n2\n2\n6\n1\n8\n1\n0\n1\n2\n1\n0\n0\n9\n4:7,7
+//@desc: 复杂泛型回归：泛型函数多类型实例化 + 嵌套容器（array<array<T>> 矩阵、
+//       dict<string,array<T>> / dict<string,set<int>> 嵌套）+ 读取(index/get)、
+//       修改(index写/覆盖)、删除(nremove/set_remove/切片重建) 全链路覆盖。
+// 类型：int, long, string 三种基类型嵌套；同一泛型 mk_grid/mk_row 多实例化。
+dsb cg_generic_nested_heavy;
+
+// ---------- 泛型工具函数（多类型实例化 + 返回嵌套 array<array<T>>） ----------
+kimo id<T>(x: T) -> T { return x; }
+
+kimo mk_row<T>(v: T, n: int) -> array<T> {
+    let r: array<T> = [];
+    let i = 0;
+    while (i < n) { r = array_push(r, v); i = i + 1; }
+    return r;
+}
+
+kimo mk_grid<T>(v: T, rows: int, cols: int) -> array<array<T>> {
+    let g: array<array<T>> = [];
+    let i = 0;
+    while (i < rows) { g = array_push(g, mk_row(v, cols)); i = i + 1; }
+    return g;
+}
+
+kimo grid_sum(g: array<array<int>>) -> int {
+    let s = 0;
+    for (row in g) { for (v in row) { s = s + v; } }
+    return s;
+}
+
+kimo build_even() -> array<int> {
+    let a: array<int> = [2, 4, 6];
+    return a;
+}
+
+kimo build_odd() -> array<int> {
+    let a: array<int> = [1, 3, 5];
+    return a;
+}
+
+kimo main() -> int {
+    // ================= 1) 泛型函数多类型实例化 =================
+    println(id(42));                        // 42          (int)
+    println(id("hi"));                      // hi          (string)
+    let lon2 = 987654321;                   // long（int 范围内）
+    println(int_to_str(id(lon2) as int));   // 987654321
+
+    // ================= 2) 泛型返回嵌套 array<array<T>>：int / string =================
+    let g: array<array<int>> = mk_grid(5, 2, 3);       // [[5,5,5],[5,5,5]]
+    println(grid_sum(g));                              // 30
+    println(int_to_str(len(g)) + ":" + int_to_str(len(g[0])) + ":" + int_to_str(g[1][2])); // 2:3:5
+
+    let gs: array<array<string>> = mk_grid("x", 2, 2); // [["x","x"],["x","x"]]
+    println(gs[1][1]);                                 // x          (嵌套 string 读)
+    gs[0][1] = "y";                                    // 嵌套 string 写
+    println(gs[0][1]);                                 // y
+    println(int_to_str(len(gs[0])) + ":" + gs[0][0]);  // 2:x
+
+    // ================= 3) dict<string, array<int>> 嵌套：增/读/覆盖/删 =================
+    let d: dict<string, array<int>> = hashmap_new();
+    hashmap_insert(d, "even", build_even());        // [2,4,6]
+    hashmap_insert(d, "odd", build_odd());          // [1,3,5]
+    println(hashmap_size(d));                       // 2
+    println(d["even"][0]);                          // 2    (dict 下标再数组下标)
+    println(d["even"][2]);                          // 6
+    println(hashmap_contains(d, "odd"));            // 1
+    hashmap_insert(d, "even", mk_row(8, 2));        // 覆盖 even -> [8,8]
+    println(d["even"][1]);                          // 8
+    hashmap_remove(d, "odd");                       // 删除 odd
+    println(hashmap_size(d));                       // 1
+    println(hashmap_contains(d, "odd"));            // 0
+
+    // ================= 4) dict<string, set<int>> 嵌套：去重 / 删除 =================
+    let sd: dict<string, set<int>> = hashmap_new();
+    let s1 = set_new();
+    set_add(s1, 10);
+    set_add(s1, 10);                          // 重复，去重
+    set_add(s1, 20);
+    hashmap_insert(sd, "s", s1);
+    println(hashmap_size(sd));                       // 1
+    println(set_size(sd["s"]));                     // 2    (10,20)
+    println(set_contains(sd["s"], 20));             // 1
+    set_remove(sd["s"], 20);                        // 删元素
+    println(set_contains(sd["s"], 20));             // 0
+    hashmap_remove(sd, "s");                        // 删整个键
+    println(hashmap_size(sd));                      // 0
+
+    // ================= 5) array 下标写 + 切片"删除中间"重建 =================
+    let arr = mk_row(7, 5);                   // [7,7,7,7,7]
+    arr[2] = 9;                               // [7,7,9,7,7]
+    println(arr[2]);                          // 9
+    let del: array<int> = [];
+    for (v in arr[0:2]) { del = array_push(del, v); }
+    for (v in arr[3:]) { del = array_push(del, v); } // [7,7,7,7]（删掉了中间的 9）
+    println(int_to_str(len(del)) + ":" + int_to_str(del[0]) + "," + int_to_str(del[2])); // 4:7,7
+
+    return 0;
+}

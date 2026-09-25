@@ -1,0 +1,9 @@
+//@desc: float literal out of double range rejected (no silent inf)
+//@expect-stderr: float literal out of range
+dsb tc_fail_float_literal_range;
+kimo main() -> int {
+    let a = 1e999;         // +inf overflow -> must reject
+    let b = -1e999;        // -inf overflow -> must reject
+    let c = 1e400;         // 更大溢出 -> must reject
+    return 0;
+}

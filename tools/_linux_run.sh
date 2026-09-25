@@ -9,8 +9,9 @@ ROOT=/mnt/d/shadow/shadow-0.5
 cd "$ROOT"
 SHADOW_EXE="$ROOT/build/linux/shadow"
 
-echo "=== [1/2] Linux basic tests (-j 8) ==="
-SHADOW_EXE="$SHADOW_EXE" python3 test/run_tests.py -j 8 > build/_linux_tests.log 2>&1
+echo "=== [1/2] Linux basic tests (-j 8, self-host run_tests) ==="
+bash tools/build_run_tests_linux.sh > build/_linux_tests.log 2>&1
+./build/linux/rtests --cases test/cases -j 8 --shadow-exe "$SHADOW_EXE" >> build/_linux_tests.log 2>&1
 echo "LINUX_TESTS_RC=$?" >> build/_linux_tests.log
 
 echo "=== [2/2] Linux benchmarks (shadow --exe vs Go) ==="

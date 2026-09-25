@@ -32,6 +32,10 @@ pub kimo cg_sp_dbg_want() -> string {
     return cg_sp_dbg_name;
 }
 
+// dyn 装箱走桩开关（0=正常发射；1=直接发 NULL 对象，用于隔离装箱代码）
+let cg_dyn_box_stub: int = 0;
+pub kimo cg_dbg(msg: string) -> void {}
+
 @extern("LLVMContextCreate") kimo llvm_ctx_create() -> any { return 0 as any; }
 @extern("LLVMModuleCreateWithNameInContext") kimo llvm_mod_create(name: string, ctx: any) -> any { return 0 as any; }
 @extern("LLVMDisposeModule") kimo llvm_mod_dispose(m: any) -> void {}
@@ -131,12 +135,31 @@ pub kimo cg_sp_dbg_want() -> string {
 // 给函数加 alwaysinline 属性（热点运行时函数强制内联）
 @extern("shadow_llvm_set_alwaysinline") kimo llvm_set_alwaysinline(ctx: any, fn: any) -> void {}
 @extern("shadow_llvm_set_tls") kimo shadow_llvm_set_tls(g: any) -> void {}
+@extern("shadow_llvm_di_begin") kimo llvm_di_begin(mod: any, ctx: any, dirname: string, filename: string, is_opt: int) -> any { return 0 as any; }
+@extern("shadow_llvm_di_subprogram") kimo llvm_di_subprogram(func: any, name: string, file: any) -> any { return 0 as any; }
+@extern("shadow_llvm_di_loc")   kimo llvm_di_loc(line: int, col: int, scope: any) -> any { return 0 as any; }
+@extern("shadow_llvm_di_set")   kimo llvm_di_set(b: any, loc: any) -> void {}
+@extern("shadow_llvm_di_reset") kimo llvm_di_reset(b: any) -> void {}
+@extern("shadow_llvm_di_end")   kimo llvm_di_end(scope: any) -> void {}
 
 // ============ Codegen 全局状态 ============
 let cg_ctx: any = 0 as any;
+// cg_gen_module 持有的 Program（含 traits/impls）。dyn vtable 布局在缓存命中时
+// 直接据此重建，因 codegen 无 CompileContext（cg_ctx 是 LLVM 上下文）。
+let cg_prog: any = 0 as any;
 let cg_mod: any = 0 as any;
 let cg_builder: any = 0 as any;
 let cg_func: any = 0 as any;
+// debug 元数据：cg_di_file=模块级 DIFile；cg_di_scope=当前函数 DISubprogram（即
+// 指令 DILocation 的合法 scope）；cg_di_last_line 记录已发射行号供 cg_gen_inst 设 !dbg。
+let cg_di_file: any = 0 as any;
+let cg_di_scope: any = 0 as any;
+let cg_di_last_line: int = -1;
+// 调试开关：0 默认不发射 !dbg（产物体积/可复现性不变）；1 由 `shadow -g` 打开，
+// 每模块建 DICompileUnit 并给指令挂行号，llc 才会生成 DWARF .debug_line。
+let cg_enable_debug: int = 0;
+
+pub kimo cg_set_debug(on: int) -> void { cg_enable_debug = on; }
 let cg_cur_ret_kind: int = 0;
 let cg_cur_ret_default: any = 0 as any;
 let cg_cur_ret_is_void: int = 0;
@@ -427,6 +450,7 @@ pub kimo cg_is_ptr_kind(k: int) -> int {
     if (k == TYPE_FUNCTION) { return 1; }
     if (k == TYPE_OPAQUE) { return 1; }
     if (k == TYPE_ENUM_PAYLOAD) { return 1; }
+    if (k == TYPE_TRAIT_OBJECT) { return 1; }
     return 0;
 }
 
@@ -1503,6 +1527,20 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
     let mi = inst;
     let op = mi.op;
 
+    // debug 元数据：行号变化时更新 builder 的当前 debug location，后续指令挂上 !dbg。
+    // cg_di_scope==0（多模块路径未开 debug）时整体跳过。
+    if (mi.line != cg_di_last_line && (cg_di_scope as any) != 0) {
+        cg_di_last_line = mi.line;
+        if (mi.line > 0) {
+            let _l = llvm_di_loc(mi.line, 0, cg_di_scope);
+            llvm_di_set(cg_builder, _l);
+        }
+    }
+
+    if (file_exists("build/.qdbg") == 1) {
+        cg_dbg("[qdbg] op=" + int_to_str(op));
+    }
+
     if (op == MIR_CONST_INT) {
         let k = cg_type_kind(mi.ty);
         let ty = cg_llvm_type(mi.ty);
@@ -1664,6 +1702,8 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             println("DBG MIR_CALL_IND pre reg1null=" + int_to_str(r1dn));
         }
         cg_gen_call_indirect(mi); return; }
+    if (op == MIR_MAKE_TRAITOBJ) { cg_gen_make_traitobj(mi); return; }
+    if (op == MIR_CALL_DYN) { cg_gen_call_dyn(mi); return; }
     if (op == MIR_SPAWN) { cg_gen_spawn(mi); return; }
     if (op == MIR_AWAIT) { cg_gen_await(mi); return; }
     if (op == MIR_CAST) { cg_gen_cast(mi); return; }
@@ -1736,13 +1776,22 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
                 dict_fn = "shadow_dict_get_int";
             } else if (ek == TYPE_LONG || ek == TYPE_TIMESTAMP || ek == TYPE_NANOTIMESTAMP) {
                 dict_fn = "shadow_dict_get_int";
+            } else if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) {
+                dict_fn = "shadow_dict_get_float";
             } else if (ek == TYPE_STRING) {
                 dict_fn = "shadow_dict_get_string";
             }
             let arg_vals: array<any> = [];
             arg_vals = array_push(arg_vals, arr_val);
             arg_vals = array_push(arg_vals, idx_val);
-            let result = cg_call_named(dict_fn, ek, arg_vals);
+            // shadow_dict_get_float 返回 double；float 静态元素类型需按 double 调用（对齐
+            // C 真实返回类型），再 fptrunc 回 float，避免 ABI 低位读取错位。
+            let ret_kind = ek;
+            if (ek == TYPE_FLOAT || ek == TYPE_DOUBLE) { ret_kind = TYPE_DOUBLE; }
+            let result = cg_call_named(dict_fn, ret_kind, arg_vals);
+            if (ek == TYPE_FLOAT) {
+                result = cg_cast_val(result, TYPE_DOUBLE, TYPE_FLOAT);
+            }
             if (ek == TYPE_BOOL) {
                 let i1_ty = llvm_i1(cg_ctx);
                 result = llvm_trunc(cg_builder, result, i1_ty, "booltrunc");
@@ -1757,7 +1806,7 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         // 静态类型标量数组 → 直接 GEP+load，绕过运行时函数
         let ik = cg_get_reg_kind(mi.arg2);
         if (base_kind == TYPE_ARRAY && cg_array_direct_ok(ek) == 1 && (ik == TYPE_INT || ik == TYPE_LONG)) {
-            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek, 0);
+            cg_gen_array_load_direct(mi.dst, arr_val, idx_val, ik, ek, mi.longval);
             return;
         }
         let arg_vals: array<any> = [];
@@ -1769,6 +1818,30 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
             result = llvm_trunc(cg_builder, result, i1_ty, "booltrunc");
         }
         cg_set_reg(mi.dst, result, ek);
+        return;
+    }
+
+    // MIR_SLICE: a[lo:hi] → 新子数组/子串（复制）。基为 string → shadow_substr；
+    // 基为 array → shadow_array_slice（不限元素 kind，运行时按 elem_size 原样复制）。
+    if (op == MIR_SLICE) {
+        let base_kind = cg_get_reg_kind(mi.arg1);
+        let base_reg = cg_get_reg(mi.arg1);
+        let st_reg = cg_get_reg(mi.args[0]);
+        let en_reg = cg_get_reg(mi.args[1]);
+        let arg_vals: array<any> = [];
+        arg_vals = array_push(arg_vals, base_reg);
+        arg_vals = array_push(arg_vals, st_reg);
+        arg_vals = array_push(arg_vals, en_reg);
+        let fn_name = "shadow_substr";
+        let rk = TYPE_STRING;
+        let ret_kind = TYPE_STRING;
+        if (base_kind == TYPE_ARRAY) {
+            fn_name = "shadow_array_slice";
+            ret_kind = TYPE_ANY;
+            rk = TYPE_ARRAY;
+        }
+        let result = cg_call_named(fn_name, ret_kind, arg_vals);
+        cg_set_reg(mi.dst, result, rk);
         return;
     }
 
@@ -1787,6 +1860,15 @@ pub kimo cg_gen_inst(inst: MirInst) -> void {
         if (fk == TYPE_BOOL) {
             let i1_ty = llvm_i1(cg_ctx);
             result = llvm_trunc(cg_builder, result, i1_ty, "booltrunc");
+        }
+        // char/short 字段读出须收窄到 i8/i16：cg_load_fn(fk) 一律返回 i32，
+        // 若以 i32 值登记 CHAR 寄存器，二元运算与其 i8 字面量操作数类型不匹配
+        // （sub i32, i8 非法 IR）。与 cg_gen_array_load 对窄数组元素的收窄一致。
+        else if (fk == TYPE_CHAR) {
+            result = llvm_trunc(cg_builder, result, llvm_i8(cg_ctx), "chtrunc");
+        }
+        else if (fk == TYPE_SHORT) {
+            result = llvm_trunc(cg_builder, result, llvm_i16(cg_ctx), "shtrunc");
         }
         cg_set_reg(mi.dst, result, fk);
         return;
@@ -2222,6 +2304,7 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
         // - 用户函数：命中形参类型表，按形参类型精确拓宽（double 形参才 fpext）。
         // - 运行时/extern 函数：设计上数值形参均为 double，float 实参统一 fpext 到 double。
         let callee_pk = cg_user_func_param_kinds(mi.strval);
+        // [DBG-dyn] 稀疏日志：仅形参含 dyn 的调用（极低频，不干扰 GC 时序）
         if ((callee_pk as any) != 0) {
             let wn = len(args);
             let new_args: array<any> = [];
@@ -2234,6 +2317,12 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                 let wval = arg_vals[wi];
                 if (cg_is_float_kind(wvk) == 1 && wpk == TYPE_DOUBLE) {
                     wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
+                }
+                // bool/char/short 窄整型→更宽整型形参：bool zext、char/short sext，
+                // 否则 i1/i8/i16 直接喂 i32 形参时高位填垃圾（int_to_str(c) 输出随机大数）
+                else if ((wvk == TYPE_BOOL || wvk == TYPE_CHAR || wvk == TYPE_SHORT) &&
+                         wpk != wvk && cg_is_int_kind(wpk) == 1) {
+                    wval = cg_cast_val(wval, wvk, wpk);
                 }
                 new_args = array_push(new_args, wval);
                 wi = wi + 1;
@@ -2248,6 +2337,11 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                 let wval = arg_vals[wi];
                 if (cg_is_float_kind(wvk) == 1) {
                     wval = cg_cast_val(wval, wvk, TYPE_DOUBLE);
+                }
+                // 运行时/extern 数值形参均为 int/long/double：bool(i1) zext、char/short(i8/i16) sext
+                // 到 i32，否则窄类型喂 i32 形参高位垃圾（int_to_str(c) 输出随机大数）。
+                else if (wvk == TYPE_BOOL || wvk == TYPE_CHAR || wvk == TYPE_SHORT) {
+                    wval = cg_cast_val(wval, wvk, TYPE_INT);
                 }
                 new_args = array_push(new_args, wval);
                 wi = wi + 1;
@@ -2365,11 +2459,26 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                     new_args = array_push(new_args, ext_val);
                     arg_vals = new_args;
                 }
+            } else if (vk != TYPE_STRING && cg_is_ptr_kind(vk) == 1) {
+                // struct/引用值 → 指针变体（键=指针地址十六进制串，指针同一性语义）。
+                // string 元素仍走默认字符串变体（by 内容）。
+                if (str_eq(mi.strval, "set_add") == 1) { resolved_name = "shadow_set_add_ptr"; }
+                else if (str_eq(mi.strval, "set_contains") == 1) { resolved_name = "shadow_set_contains_ptr"; }
+                else { resolved_name = "shadow_set_remove_ptr"; }
             }
         }
         if (len(args) == 3 && str_eq(mi.strval, "hashmap_insert") == 1) {
+            // 按第 3 实参的类型分派：int 族→insert_int，float/double→insert_float，
+            // 引用族（数组/结构/dict/any/指针）→insert_ptr（否则会被当作 const char*
+            // 以 strdup 截断到首个 NUL，丢失对象数据）。string 保持默认 insert（tag=2）。
             let hvk = cg_get_reg_kind(args[2] as int);
-            if (hvk == TYPE_INT || hvk == TYPE_LONG || hvk == TYPE_DATE
+            let his_ref = 0;
+            // 非 string 的引用族（array/dict/set/struct/any/function/opaque/enum_payload/
+            // trait_object）走 ptr 变体；字符串仍走默认 string 变体（tag=2）。
+            if (hvk != TYPE_STRING && cg_is_ptr_kind(hvk) == 1) { his_ref = 1; }
+            if (his_ref == 1) {
+                resolved_name = "shadow_hashmap_insert_ptr";
+            } else if (hvk == TYPE_INT || hvk == TYPE_LONG || hvk == TYPE_DATE
                 || hvk == TYPE_TIMESTAMP || hvk == TYPE_NANOTIMESTAMP
                 || hvk == TYPE_BOOL) {
                 resolved_name = "shadow_hashmap_insert_int";
@@ -2378,6 +2487,16 @@ pub kimo cg_gen_call(mi: MirInst) -> void {
                     let hnew_args: array<any> = [arg_vals[0]];
                     hnew_args = array_push(hnew_args, arg_vals[1]);
                     hnew_args = array_push(hnew_args, hext_val);
+                    arg_vals = hnew_args;
+                }
+            } else if (hvk == TYPE_FLOAT || hvk == TYPE_DOUBLE) {
+                // float/double → insert_float（double 变体，tag==3）。float 需先 fpext 成 double。
+                resolved_name = "shadow_hashmap_insert_float";
+                if (hvk == TYPE_FLOAT) {
+                    let hf_val = cg_cast_val(arg_vals[2], TYPE_FLOAT, TYPE_DOUBLE);
+                    let hnew_args: array<any> = [arg_vals[0]];
+                    hnew_args = array_push(hnew_args, arg_vals[1]);
+                    hnew_args = array_push(hnew_args, hf_val);
                     arg_vals = hnew_args;
                 }
             }
@@ -2542,6 +2661,165 @@ pub kimo cg_gen_call_indirect(mi: MirInst) -> void {
         cg_set_reg(mi.dst, result, ret_kind);
         return;
 
+}
+
+// ============ 0.5.3 dyn Trait 运行时多态 ============
+// 具体 struct → dyn Trait 对象 { data@0, vtable@8 }。vtable 为 GC 整数数组（函数地址槽），
+// 槽位顺序 = tc_dyn_flat_methods(trait)，各槽填 __impl__<S>__<owner>__<m> 的函数地址。
+pub kimo cg_gen_make_traitobj(mi: MirInst) -> void {
+    let trait_name = mi.strval;
+    let struct_name = mi.strval2;
+    if (cg_dyn_box_stub == 1) {
+        cg_set_reg(mi.dst, llvm_const_null(llvm_ptr_ty(llvm_i8(cg_ctx), 0)), TYPE_TRAIT_OBJECT);
+        return;
+    }
+    // [DBG-dyn] 定位崩溃点
+    cg_dbg("[make_start] trait=" + trait_name + " struct=" + struct_name);
+    // —— vtable：n 个函数地址槽
+    // LU 磁盘缓存命中时 type-check 函数体被跳过，tc_dyn_* 全局表为空且无 CompileContext；
+    // 直接从 cg_prog.prog.traits 重建扁平布局，保证 vtable 槽位可得且与 TC 同序（幂等）。
+    tc_dyn_ensure_from_prog(cg_prog as Program, trait_name);
+    let methods = tc_dyn_flat_methods(trait_name);
+    cg_dbg("[flat] n=" + int_to_str(len(methods)));
+    let n = len(methods);
+    let vt_size = n * 8;
+    let vt_tid = cg_gc_type_get("__vtbl__" + struct_name + "__" + trait_name, vt_size, 0);
+    cg_dbg("[vt_tid]=" + int_to_str(vt_tid));
+    let vt_args: array<any> = [];
+    vt_args = array_push(vt_args, llvm_const_int(llvm_i32(cg_ctx), vt_size, 1));
+    vt_args = array_push(vt_args, llvm_const_int(llvm_i32(cg_ctx), vt_tid, 1));
+    let vtable = cg_call_named("rt_gc_alloc", TYPE_ANY, vt_args);
+    cg_dbg("[vtable_alloc] ok");
+    // vtable 在下面逐槽 store 的多个 call 之间没有其他根指向它，必须写入 sf
+    let vslot = cg_sf_intr_next();
+    if (vslot >= 0) { cg_sf_store(vslot, vtable, TYPE_ARRAY); }
+    let slot_i = 0;
+    while (slot_i < n) {
+        let mname = methods[slot_i] as string;
+        cg_dbg("[slot] i=" + int_to_str(slot_i) + " m=" + mname);
+        let owner = tc_dyn_method_owner(trait_name, mname);
+        let sym = tc_impl_symbol(struct_name, owner, mname);
+        cg_dbg("[slot] sym=" + sym);
+        let fnv = llvm_get_fn(cg_mod, sym);
+        cg_dbg("[slot] fnv is zero=" + int_to_str((fnv as any) == 0));
+        if ((fnv as any) == 0) {
+            // 理论上不可达（全函数预声明），兜底防 0
+            let dbg_pty = llvm_ptr_ty(llvm_i8(cg_ctx), 0);
+            let dbg_fnty = llvm_fn_ty(dbg_pty, 1, 0);
+            fnv = llvm_add_fn(cg_mod, sym, dbg_fnty);
+        }
+        let off = llvm_const_int(llvm_i32(cg_ctx), slot_i * 8, 1);
+        cg_dbg("[store] before rt_store_ptr");
+        let sa: array<any> = [];
+        sa = array_push(sa, vtable);
+        sa = array_push(sa, off);
+        sa = array_push(sa, fnv);
+        cg_call_named("rt_store_ptr", TYPE_VOID, sa);
+        cg_dbg("[store] after rt_store_ptr");
+        slot_i = slot_i + 1;
+    }
+    cg_dbg("[loop] done");
+    if (cg_dyn_box_stub == 2) {
+        cg_set_reg(mi.dst, llvm_const_null(llvm_ptr_ty(llvm_i8(cg_ctx), 0)), TYPE_TRAIT_OBJECT);
+        return;
+    }
+    // —— 对象块 { data@0, vtable@8 }：两槽皆可指向堆（位图 0b11=3）
+    cg_dbg("[obj] get tid");
+    let obj_tid = cg_gc_type_get("__dyn__" + struct_name + "__" + trait_name, 16, 3);
+    cg_dbg("[obj] tid=" + int_to_str(obj_tid));
+    let obj_args: array<any> = [];
+    obj_args = array_push(obj_args, llvm_const_int(llvm_i32(cg_ctx), 16, 1));
+    obj_args = array_push(obj_args, llvm_const_int(llvm_i32(cg_ctx), obj_tid, 1));
+    cg_dbg("[obj] before alloc");
+    let obj = cg_call_named("rt_gc_alloc", TYPE_ANY, obj_args);
+    cg_dbg("[obj] alloc ok");
+    let oslot = cg_sf_reg_slot[mi.dst];
+    cg_dbg("[obj] oslot=" + int_to_str(oslot));
+    if (oslot >= 0) { cg_sf_store(oslot, obj, TYPE_TRAIT_OBJECT); }
+    cg_dbg("[obj] sf stored");
+    if (cg_dyn_box_stub >= 3) {
+        cg_set_reg(mi.dst, obj, TYPE_TRAIT_OBJECT);
+        return;
+    }
+    cg_dbg("[tail] A data fetch kind=" + int_to_str(cg_get_reg_kind(mi.args[0])));
+    let data = cg_get_reg(mi.args[0]);
+    cg_dbg("[tail] data fetched raw=" + int_to_str((data as any) as int) + " isnull=" + int_to_str((data as any) == 0));
+    let d0 = llvm_const_int(llvm_i32(cg_ctx), 0, 1);
+    let da: array<any> = [];
+    da = array_push(da, obj);
+    da = array_push(da, d0);
+    da = array_push(da, data);
+    cg_dbg("[tail] da built");
+    cg_call_named("rt_store_ptr", TYPE_VOID, da);
+    cg_dbg("[tail] store data ok");
+    let d8 = llvm_const_int(llvm_i32(cg_ctx), 8, 1);
+    let va: array<any> = [];
+    va = array_push(va, obj);
+    va = array_push(va, d8);
+    va = array_push(va, vtable);
+    cg_dbg("[tail] va built");
+    cg_call_named("rt_store_ptr", TYPE_VOID, va);
+    cg_dbg("[tail] store vtable ok");
+    cg_set_reg(mi.dst, obj, TYPE_TRAIT_OBJECT);
+    cg_dbg("[tail] set_reg ok");
+    return;
+}
+
+// dyn Trait 方法调用：dyn 对象 → 载入 vtable/data，按方法槽位间接调用。
+pub kimo cg_gen_call_dyn(mi: MirInst) -> void {
+    let dyn_val = cg_get_reg(mi.arg1);
+    let trait_name = mi.strval;
+    let method = mi.strval2;
+    let off0 = llvm_const_int(llvm_i32(cg_ctx), 0, 1);
+    let off8 = llvm_const_int(llvm_i32(cg_ctx), 8, 1);
+    let la0: array<any> = [];
+    la0 = array_push(la0, dyn_val);
+    la0 = array_push(la0, off0);
+    let data = cg_call_named("rt_load_ptr", TYPE_ANY, la0);
+    let la8: array<any> = [];
+    la8 = array_push(la8, dyn_val);
+    la8 = array_push(la8, off8);
+    let vtable = cg_call_named("rt_load_ptr", TYPE_ANY, la8);
+    // 方法槽位：扁平方法列表中的下标（与 make_traitobj 打包同序，单点 tc_dyn_flat_methods）
+    // 缓存命中同样可能使 tc_dyn_* 全局表为空，ensure 保证槽位列表可得（幂等）。
+    tc_dyn_ensure_from_prog(cg_prog as Program, trait_name);
+    let methods = tc_dyn_flat_methods(trait_name);
+    let slot_idx = -1;
+    let k = 0;
+    while (k < len(methods)) {
+        if (str_eq(methods[k] as string, method) == 1) { slot_idx = k; break; }
+        k = k + 1;
+    }
+    if (slot_idx < 0) { slot_idx = 0; }
+    let offs = llvm_const_int(llvm_i32(cg_ctx), slot_idx * 8, 1);
+    let ls: array<any> = [];
+    ls = array_push(ls, vtable);
+    ls = array_push(ls, offs);
+    let fn_ptr = cg_call_named("rt_load_ptr", TYPE_ANY, ls);
+    // 实参：self(data) + 剩余方法实参
+    let ret_kind = cg_type_kind(mi.ty);
+    let ret_ty = cg_llvm_type_kind(ret_kind);
+    let arg_vals: array<any> = [];
+    arg_vals = array_push(arg_vals, data);
+    let args = mi.args;
+    let ai = 0;
+    while (ai < len(args)) {
+        let reg = args[ai] as int;
+        arg_vals = array_push(arg_vals, cg_get_reg(reg));
+        ai = ai + 1;
+    }
+    buf_reset();
+    let bj = 0;
+    while (bj < len(arg_vals)) { buf_push(llvm_type_of(arg_vals[bj])); bj = bj + 1; }
+    let fn_ty = llvm_fn_ty(ret_ty, len(arg_vals), 0);
+    buf_reset();
+    let bj2 = 0;
+    while (bj2 < len(arg_vals)) { buf_push(arg_vals[bj2]); bj2 = bj2 + 1; }
+    let nm = "calltmp";
+    if (ret_kind == TYPE_VOID || ret_kind == TYPE_UNIT) { nm = ""; }
+    let result = llvm_call(cg_builder, fn_ty, fn_ptr, len(arg_vals), nm);
+    cg_set_reg(mi.dst, result, ret_kind);
+    return;
 }
 
 // 拆分 helper：cg_gen_inst 过大触发旧宿主 slot 上限（历史约束）
@@ -2761,10 +3039,18 @@ pub kimo cg_gen_cast(mi: MirInst) -> void {
             if (cg_is_float_kind(dst_k) == 1) {
                 cg_set_reg(mi.dst, llvm_sitofp(cg_builder, val, dst_ty, "casttmp"), dst_k);
             } else {
-                if (dst_k == TYPE_LONG) {
-                    cg_set_reg(mi.dst, llvm_sext(cg_builder, val, dst_ty, "casttmp"), dst_k);
-                } else {
+                if (dst_k == TYPE_BOOL && src_k != TYPE_BOOL) {
                     cg_set_reg(mi.dst, llvm_trunc(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                } else if (src_k == TYPE_BOOL && dst_k != TYPE_BOOL) {
+                    cg_set_reg(mi.dst, llvm_zext(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                } else {
+                    let src_w = cg_int_width(src_k);
+                    let dst_w = cg_int_width(dst_k);
+                    if (dst_w > src_w) {
+                        cg_set_reg(mi.dst, llvm_sext(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                    } else {
+                        cg_set_reg(mi.dst, llvm_trunc(cg_builder, val, dst_ty, "casttmp"), dst_k);
+                    }
                 }
             }
         }
@@ -2877,13 +3163,13 @@ pub kimo cg_gen_enum_getpayload(mi: MirInst) -> void {
 // ============ §5.2.4 精确根集：活跃性预扫描（对标 Go stack map） ============
 // 安全点：该 MIR opcode 的 codegen 会生成 runtime 调用，可能触发 GC。
 pub kimo cg_safepoint_op(op: int) -> int {
-    if (op == MIR_CALL || op == MIR_CALL_INDIRECT) { return 1; }
+    if (op == MIR_CALL || op == MIR_CALL_INDIRECT || op == MIR_CALL_DYN) { return 1; }
     if (op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
     if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT) { return 1; }
     if (op == MIR_INDEX || op == MIR_MEMBER) { return 1; }
     if (op == MIR_BINOP || op == MIR_CAST) { return 1; }
     if (op == MIR_ENUM_CONSTRUCT || op == MIR_ENUM_GET_TAG || op == MIR_ENUM_GET_PAYLOAD) { return 1; }
-    if (op == MIR_MAKE_CLOSURE) { return 1; }
+    if (op == MIR_MAKE_CLOSURE || op == MIR_MAKE_TRAITOBJ) { return 1; }
     if (op == MIR_STORE_INDEX || op == MIR_STORE_MEMBER) { return 1; }
     return 0;
 }
@@ -3036,7 +3322,7 @@ pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) ->
         if (cg_may_collect_ready == 0) { return 1; }
         return cg_callee_may_collect(mi.strval);
     }
-    if (op == MIR_CALL_INDIRECT || op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
+    if (op == MIR_CALL_INDIRECT || op == MIR_CALL_DYN || op == MIR_SPAWN || op == MIR_AWAIT) { return 1; }
     return cg_safepoint_op(op);
 }
 
@@ -3044,7 +3330,7 @@ pub kimo cg_inst_safepoint(mi: MirInst, kinds: array<int>, trust: array<int>) ->
 // （array_lit 的 arr_ptr、struct_lit 的 obj_ptr、enum 的 buf、closure 的 env），
 // 只有指令结束才写入 dst reg —— 中途没有任何根指向它们，必须强制分配 sf 槽。
 pub kimo cg_force_slot_op(op: int) -> int {
-    if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT) { return 1; }
+    if (op == MIR_ARRAY_LIT || op == MIR_STRUCT_LIT || op == MIR_MAKE_TRAITOBJ) { return 1; }
     if (op == MIR_ENUM_CONSTRUCT || op == MIR_MAKE_CLOSURE) { return 1; }
     return 0;
 }
@@ -3052,6 +3338,7 @@ pub kimo cg_force_slot_op(op: int) -> int {
 // 需要额外内部临时槽的数量（每个独立中间指针一个槽）
 pub kimo cg_intr_slot_count(op: int, inst: MirInst) -> int {
     if (op == MIR_MAKE_CLOSURE || op == MIR_SPAWN) { return 1; }   // env
+    if (op == MIR_MAKE_TRAITOBJ) { return 1; }                     // vtable（中间指针）
     if (op == MIR_BINOP) {
         if (cg_type_kind(inst.ty) == TYPE_STRING) { return 2; }   // sl, sr
     }
@@ -3067,6 +3354,199 @@ pub kimo cg_ana_blk_index(label: string, blocks: array<MirBlock>, n: int) -> int
         i = i + 1;
     }
     return -1;
+}
+
+// 精确计算每个基本块是否属于某个循环体。回边判定沿用 §liveness 的"跳转目标下标 <
+// 当前块下标"约定（结构化 MIR 按序发射）。对每个循环头 h（存在回边 s→h，s>h），
+// 循环体 = h 自身 ∪ { 从某回边源 s 出发、沿入边回溯、不穿过 h、且位于 h 正向可达集
+// 内的所有块 } —— 即"一次迭代会再次执行的块"，不含病态的外层绕行（那些可能绕经其它
+// 循环头与回边源，若用前后象可达性会把循环外的预头/出口块误算入循环体，导致把非循环
+// 块里的 STORE_VAR 错当"循环内写"，使 root_loop 优化失效）。返回 in_loop[]（长度 n）。
+pub kimo cg_compute_loop_members(blocks: array<MirBlock>, n: int) -> array<int> {
+    let in_loop: array<int> = [];
+    let i0 = 0;
+    while (i0 < n) {
+        in_loop = array_push(in_loop, 0);
+        i0 = i0 + 1;
+    }
+    // 正向邻接 succ[b] 与反向邻接 pred[b]
+    let succ: array<array<int>> = [];
+    let pred: array<array<int>> = [];
+    let b0 = 0;
+    while (b0 < n) {
+        succ = array_push(succ, ([] as array<int>));
+        pred = array_push(pred, ([] as array<int>));
+        b0 = b0 + 1;
+    }
+    let s = 0;
+    while (s < n) {
+        let tm = blocks[s].terminator;
+        if ((tm as any) != 0 && (tm.op == MIR_BR || tm.op == MIR_CONDBR)) {
+            let ta = cg_ana_blk_index(tm.strval, blocks, n);
+            let tb = cg_ana_blk_index(tm.strval2, blocks, n);
+            if (ta >= 0) {
+                let a = succ[s];
+                a = array_push(a, ta);
+                succ[s] = a;
+                let p = pred[ta];
+                p = array_push(p, s);
+                pred[ta] = p;
+            }
+            if (tb >= 0 && tb != ta) {
+                let b2 = succ[s];
+                b2 = array_push(b2, tb);
+                succ[s] = b2;
+                let p2 = pred[tb];
+                p2 = array_push(p2, s);
+                pred[tb] = p2;
+            }
+        }
+        s = s + 1;
+    }
+    // 为每个块求正向可达掩码（存成 reachM[i][j]，避免重复算）
+    let reachM: array<array<int>> = [];
+    let i = 0;
+    while (i < n) {
+        let mask: array<int> = [];
+        let j0 = 0;
+        while (j0 < n) {
+            mask = array_push(mask, 0);
+            j0 = j0 + 1;
+        }
+        let work: array<int> = [i];
+        mask[i] = 1;
+        let wi = 0;
+        while (wi < len(work)) {
+            let cur = work[wi];
+            let cl = succ[cur];
+            let k = 0;
+            while (k < len(cl)) {
+                let nx = cl[k];
+                if (mask[nx] == 0) {
+                    mask[nx] = 1;
+                    work = array_push(work, nx);
+                }
+                k = k + 1;
+            }
+            wi = wi + 1;
+        }
+        reachM = array_push(reachM, mask);
+        i = i + 1;
+    }
+    // 回边源列表 srcs[h]（使 h 成为循环头的回边源）
+    let srcs: array<array<int>> = [];
+    let b1 = 0;
+    while (b1 < n) {
+        srcs = array_push(srcs, ([] as array<int>));
+        b1 = b1 + 1;
+    }
+    s = 0;
+    while (s < n) {
+        let tm2 = blocks[s].terminator;
+        if ((tm2 as any) != 0 && (tm2.op == MIR_BR || tm2.op == MIR_CONDBR)) {
+            let ta2 = cg_ana_blk_index(tm2.strval, blocks, n);
+            let tb2 = cg_ana_blk_index(tm2.strval2, blocks, n);
+            if (ta2 >= 0 && ta2 < s) {
+                let a2 = srcs[ta2];
+                a2 = array_push(a2, s);
+                srcs[ta2] = a2;
+            }
+            if (tb2 >= 0 && tb2 < s && tb2 != ta2) {
+                let b3 = srcs[tb2];
+                b3 = array_push(b3, s);
+                srcs[tb2] = b3;
+            }
+        }
+        s = s + 1;
+    }
+    let h = 0;
+    while (h < n) {
+        let hs = srcs[h];
+        if (len(hs) == 0) {
+            h = h + 1;
+            continue;
+        }
+        // 循环体 = h ∪ 从回边源反向 BFS（仅穿行 h 的正向可达块，不穿过 h）
+        in_loop[h] = 1;
+        let body: array<int> = [];
+        let vis: array<int> = [];
+        let v0 = 0;
+        while (v0 < n) {
+            vis = array_push(vis, 0);
+            v0 = v0 + 1;
+        }
+        let wi2 = 0;
+        while (wi2 < len(hs)) {
+            let src0 = hs[wi2];
+            if (vis[src0] == 0) {
+                vis[src0] = 1;
+                body = array_push(body, src0);
+            }
+            wi2 = wi2 + 1;
+        }
+        let wj = 0;
+        while (wj < len(body)) {
+            let cur2 = body[wj];
+            let pl = pred[cur2];
+            let kk = 0;
+            while (kk < len(pl)) {
+                let px = pl[kk];
+                if (vis[px] == 0 && px != h && reachM[h][px] == 1) {
+                    vis[px] = 1;
+                    body = array_push(body, px);
+                }
+                kk = kk + 1;
+            }
+            wj = wj + 1;
+        }
+        let wk = 0;
+        while (wk < len(body)) {
+            in_loop[body[wk]] = 1;
+            wk = wk + 1;
+        }
+        h = h + 1;
+    }
+    return in_loop;
+}
+
+// 精确"跨安全点存活"判定（W7）：指针 reg 是否在任一真安全点仍存活，须为其分配
+// root-spill 槽。逐 def 区间分析——某 def d 的值在该 reg 下一次重定义（next_def）前
+// 一直持有；若某个安全点 S（d < S < next_def）在其后仍有读取该值的使用 u（S ≤ u <
+// next_def），则该值在 S 上存活 → 返回 0（需 spill）。反之，值在到达任何安全点前
+// 已死亡 → 返回 1（可安全免除 spill 槽）。
+//
+// 安全性：保守启发（safepoint_after_def / first_use<last_def）会把"reg 号被循环内
+// 迭代复用的纯载入"（如 sieve 内层循环里 `load fslot -> 直写数组 -> 死在回边前`）
+// 误判为跨安全点存活，从而每迭代发出一趟多余的 root-spill 栈写。本判定只在这些
+// 载入的值确实在任何安全点都不再被读取时才豁免，绝不漏掉（调用实参的使用 seq 与
+// CALL 安全点同 seq，恒满足 u ≥ S，始终保留）。
+pub kimo cg_ptr_dead_at_all_sp(r: int, def_seqs: array<array<int>>, use_seqs: array<array<int>>, sp_seqs: array<int>) -> int {
+    let ds = def_seqs[r];
+    let us = use_seqs[r];
+    if (len(ds) == 0 || len(us) == 0 || len(sp_seqs) == 0) { return 1; }
+    let di = 0;
+    while (di < len(ds)) {
+        let d = ds[di];
+        let nd = 2000000000;                        // 区间上界（下一次重定义 / ∞）
+        if (di + 1 < len(ds)) { nd = ds[di + 1]; }
+        let min_sp = -1;
+        let si = 0;
+        while (si < len(sp_seqs)) {
+            let s = sp_seqs[si];
+            if (s > d && s < nd) { min_sp = s; break; }
+            si = si + 1;
+        }
+        if (min_sp >= 0) {
+            let uj = 0;
+            while (uj < len(us)) {
+                let u = us[uj];
+                if (u >= min_sp && u < nd) { return 0; }
+                uj = uj + 1;
+            }
+        }
+        di = di + 1;
+    }
+    return 1;
 }
 
 // 预扫描函数 MIR：计算哪些指针 reg 跨越安全点需要保活 + 内部临时槽。
@@ -3115,9 +3595,17 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
     if (total_slots > 256) { total_slots = 256; }
     let ptrmap = cg_scan_ptr_slots(mf, blocks_arg, total_slots);
     let rootable: array<int> = [];
+    // W6 循环内直根槽：指针型局部槽，其所有写点都在非循环块（循环内恒定不换）。
+    // 循环体内对该槽的载入在循环任一回边/调用安全点仍被帧覆盖 → 免 spill。
+    let root_loop: array<int> = [];
+    let write_cnt: array<int> = [];
+    let write_in_loop: array<int> = [];
     let ri0 = 0;
     while (ri0 < total_slots) {
         rootable = array_push(rootable, 0);
+        root_loop = array_push(root_loop, 0);
+        write_cnt = array_push(write_cnt, 0);
+        write_in_loop = array_push(write_in_loop, 0);
         ri0 = ri0 + 1;
     }
     let pa = 0;
@@ -3141,6 +3629,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         }
         pa = pa + 1;
     }
+    // 统计各槽写入：root_loop 需"所有写点都在非循环块"；循环内任一次写即逐出资格。
+    let member = cg_compute_loop_members(blocks, n_blks);
     let sb = 0;
     while (sb < n_blks) {
         let sblk = blocks[sb];
@@ -3149,17 +3639,30 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         while (sj < len(sinsts)) {
             let smi = sinsts[sj];
             if (smi.op == MIR_STORE_VAR && smi.arg2 >= 0 && smi.arg2 < total_slots) {
-                rootable[smi.arg2] = 0;
+                let wc = smi.arg2;
+                rootable[wc] = 0;
+                write_cnt[wc] = write_cnt[wc] + 1;
+                if (member[sb] == 1) { write_in_loop[wc] = 1; }
             }
             sj = sj + 1;
         }
         let stm = sblk.terminator;
         if ((stm as any) != 0) {
             if (stm.op == MIR_STORE_VAR && stm.arg2 >= 0 && stm.arg2 < total_slots) {
-                rootable[stm.arg2] = 0;
+                let wc2 = stm.arg2;
+                rootable[wc2] = 0;
+                write_cnt[wc2] = write_cnt[wc2] + 1;
+                if (member[sb] == 1) { write_in_loop[wc2] = 1; }
             }
         }
         sb = sb + 1;
+    }
+    let ro = 0;
+    while (ro < total_slots) {
+        if (ptrmap[ro] == 1 && write_cnt[ro] >= 1 && write_in_loop[ro] == 0) {
+            root_loop[ro] = 1;
+        }
+        ro = ro + 1;
     }
     let alias: array<int> = [];
     ri0 = 0;
@@ -3167,6 +3670,21 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         alias = array_push(alias, 1);               // 1 = 迄今所有 def 都是直根载入
         ri0 = ri0 + 1;
     }
+    // W7 精确"跨安全点存活"分析：逐 def 区间判定每个 reg 是否在任一安全点仍存活。
+    // 保守启发（safepoint_after_def || first_use<last_def）对"reg 号被循环内重复定义"
+    // 的载入会误判为跨安全点存活（如 sieve 内层循环里 `load fslot`，其值仅在单次迭代
+    // 内使用、死在回边安全点之前），导致每迭代一次多余的 root-spill 栈写。这里用精确的
+    // def/use/安全点序列，仅对"确实在某个 def 区间内跨过安全点、且安全点之后仍需该值"
+    // 的 reg 判存活；非存活则免除其 spill 槽。
+    let def_seqs: array<array<int>> = [];
+    let use_seqs: array<array<int>> = [];
+    ri0 = 0;
+    while (ri0 < n_regs) {
+        def_seqs = array_push(def_seqs, ([] as array<int>));
+        use_seqs = array_push(use_seqs, ([] as array<int>));
+        ri0 = ri0 + 1;
+    }
+    let sp_seqs: array<int> = [];
     let sp_dbg = 0;
     let dbg_want = cg_sp_dbg_want();
     if (len(dbg_want) > 0) {
@@ -3185,10 +3703,16 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mi.arg1 >= 0 && mi.arg1 < n_regs) {
                 has_use[mi.arg1] = 1;
                 if (first_use[mi.arg1] < 0) { first_use[mi.arg1] = seq; }
+                let wu = use_seqs[mi.arg1];
+                wu = array_push(wu, seq);
+                use_seqs[mi.arg1] = wu;
             }
             if (mi.arg2 >= 0 && mi.arg2 < n_regs) {
                 has_use[mi.arg2] = 1;
                 if (first_use[mi.arg2] < 0) { first_use[mi.arg2] = seq; }
+                let wu2 = use_seqs[mi.arg2];
+                wu2 = array_push(wu2, seq);
+                use_seqs[mi.arg2] = wu2;
             }
             let ai = 0;
             while (ai < len(mi.args)) {
@@ -3196,12 +3720,18 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (ar >= 0 && ar < n_regs) {
                     has_use[ar] = 1;
                     if (first_use[ar] < 0) { first_use[ar] = seq; }
+                    let wu3 = use_seqs[ar];
+                    wu3 = array_push(wu3, seq);
+                    use_seqs[ar] = wu3;
                 }
                 ai = ai + 1;
             }
             // defs
             if (mi.dst >= 0 && mi.dst < n_regs) {
                 last_def[mi.dst] = seq;
+                let wd = def_seqs[mi.dst];
+                wd = array_push(wd, seq);
+                def_seqs[mi.dst] = wd;
                 let pk = cg_def_kind_predict(mi);
                 if (pk >= 0) { kinds[mi.dst] = pk; }
                 trust[mi.dst] = cg_def_kind_trusted(mi);
@@ -3209,6 +3739,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 let direct = 0;
                 if (mi.op == MIR_LOAD_VAR && mi.arg1 >= 0 && mi.arg1 < total_slots) {
                     if (rootable[mi.arg1] == 1) { direct = 1; }
+                    else if (root_loop[mi.arg1] == 1 && member[bi] == 1) { direct = 1; }
                 }
                 if (direct == 0) { alias[mi.dst] = 0; }
             }
@@ -3226,6 +3757,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (sp == 1) {
                 has_sp = 1;
                 if (mi.op != MIR_CALL) { self_sp = 1; }
+                sp_seqs = array_push(sp_seqs, seq);
                 let ri = 0;
                 while (ri < n_regs) {
                     if (last_def[ri] >= 0) { safepoint_after_def[ri] = 1; }
@@ -3241,10 +3773,16 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
             if (mt.arg1 >= 0 && mt.arg1 < n_regs) {
                 has_use[mt.arg1] = 1;
                 if (first_use[mt.arg1] < 0) { first_use[mt.arg1] = seq; }
+                let wu4 = use_seqs[mt.arg1];
+                wu4 = array_push(wu4, seq);
+                use_seqs[mt.arg1] = wu4;
             }
             if (mt.arg2 >= 0 && mt.arg2 < n_regs) {
                 has_use[mt.arg2] = 1;
                 if (first_use[mt.arg2] < 0) { first_use[mt.arg2] = seq; }
+                let wu5 = use_seqs[mt.arg2];
+                wu5 = array_push(wu5, seq);
+                use_seqs[mt.arg2] = wu5;
             }
             let ai2 = 0;
             while (ai2 < len(mt.args)) {
@@ -3252,17 +3790,24 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 if (ar2 >= 0 && ar2 < n_regs) {
                     has_use[ar2] = 1;
                     if (first_use[ar2] < 0) { first_use[ar2] = seq; }
+                    let wu6 = use_seqs[ar2];
+                    wu6 = array_push(wu6, seq);
+                    use_seqs[ar2] = wu6;
                 }
                 ai2 = ai2 + 1;
             }
             if (mt.dst >= 0 && mt.dst < n_regs) {
                 last_def[mt.dst] = seq;
+                let wd2 = def_seqs[mt.dst];
+                wd2 = array_push(wd2, seq);
+                def_seqs[mt.dst] = wd2;
                 if ((mt.ty as any) != 0) { kinds[mt.dst] = mt.ty.kind; }
                 trust[mt.dst] = cg_def_kind_trusted(mt);
                 if (cg_force_slot_op(mt.op) == 1) { forced[mt.dst] = 1; }
                 let direct_t = 0;
                 if (mt.op == MIR_LOAD_VAR && mt.arg1 >= 0 && mt.arg1 < total_slots) {
                     if (rootable[mt.arg1] == 1) { direct_t = 1; }
+                    else if (root_loop[mt.arg1] == 1 && member[bi] == 1) { direct_t = 1; }
                 }
                 if (direct_t == 0) { alias[mt.dst] = 0; }
             }
@@ -3293,6 +3838,7 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
                 // 终止指令（回边 poll / main 的 RET）不是调用，但同样是 collect 可能
                 // 落地的点 —— 别的线程举旗后就在这里停住并被扫根，故必须计入 self_sp。
                 self_sp = 1;
+                sp_seqs = array_push(sp_seqs, seq);
                 let ri2 = 0;
                 while (ri2 < n_regs) {
                     if (last_def[ri2] >= 0) { safepoint_after_def[ri2] = 1; }
@@ -3321,7 +3867,8 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         } else if (alias[r] == 1 && last_def[r] >= 0) {
             need = 0;                       // W5：值恒被帧内参数槽直根，寄存器 spill 冗余
         } else if (cg_is_ptr_kind(kinds[r]) == 1 && has_use[r] == 1 && last_def[r] >= 0) {
-            if (safepoint_after_def[r] == 1 || first_use[r] < last_def[r]) {
+            if ((safepoint_after_def[r] == 1 || first_use[r] < last_def[r])
+                    && cg_ptr_dead_at_all_sp(r, def_seqs, use_seqs, sp_seqs) == 0) {
                 need = 1;
             }
         }
@@ -3367,10 +3914,17 @@ pub kimo cg_analyze_liveness(mf: MirFunc, blocks_arg: array<MirBlock>) -> int {
         bi2 = bi2 + 1;
     }
     if (sp_dbg == 1) {
-        println("SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
+        let sdp = "SPDBG-SUM " + mf.name + " nregs=" + int_to_str(mf.n_regs) + " nslots=" + int_to_str(mf.n_slots)
             + " nparams=" + int_to_str(len(mf.params)) + " nblk=" + int_to_str(n_blks)
             + " has_sp=" + int_to_str(has_sp) + " self_sp=" + int_to_str(self_sp)
-            + " sf_n=" + int_to_str(slot));
+            + " sf_n=" + int_to_str(slot);
+        let sdi = 0;
+        while (sdi < total_slots) {
+            sdp = sdp + " s" + int_to_str(sdi) + ":p" + int_to_str(ptrmap[sdi]) + "w" + int_to_str(write_cnt[sdi])
+                + "l" + int_to_str(write_in_loop[sdi]) + "R" + int_to_str(root_loop[sdi]) + "r" + int_to_str(rootable[sdi]);
+            sdi = sdi + 1;
+        }
+        println(sdp);
     }
     cg_ana_has_safepoint = has_sp;
     cg_ana_self_sp = self_sp;
@@ -3383,6 +3937,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         let n_blks = len(blocks_arg);
         if (n_blks == 0) { return; }
     }
+    cg_dbg("[func] " + mf.name);
     // §5.2.4：活跃性预扫描，确定 shadow frame 布局（需在分配 reg/slot 前）
     cg_sf_alloca = 0 as any;
     cg_sf_n = 0;
@@ -3461,6 +4016,19 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         cg_func = llvm_add_fn(cg_mod, mf.name, fn_ty);
     }
     cg_maybe_alwaysinline(cg_func, mf.name);
+    // debug：为本函数建立 DISubprogram 作 DILocation scope（仅 -g 开启且已启动 DIBuilder）。
+    if ((cg_di_file as any) != 0) {
+        cg_di_scope = llvm_di_subprogram(cg_func, mf.name, cg_di_file);
+        // 清空并打底：prologue（frame/gc alloca、set_args 等非块内 call）inlinable call
+        // 若缺 !dbg 会让 LLVM 丢弃整个模块 debug info，故 reset 后立即设 line=0 的
+        // DILocation，使 prologue 指令带合法 !dbg；cg_gen_inst 遇真实行号再覆盖。
+        llvm_di_reset(cg_builder);
+        cg_di_last_line = 0;
+        let _l0 = llvm_di_loc(0, 0, cg_di_scope);
+        llvm_di_set(cg_builder, _l0);
+    } else {
+        cg_di_scope = 0 as any;
+    }
 
     cg_block_labels = [];
     cg_block_ptrs = [];
@@ -3627,6 +4195,7 @@ pub kimo cg_gen_func(mf: MirFunc, blocks_arg: array<MirBlock>) -> void {
         }
         i = i + 1;
     }
+    cg_dbg("[func_end] " + mf.name);
 }
 
 // ============ 外部函数声明 codegen ============
@@ -3745,6 +4314,7 @@ pub kimo cg_emit_globals(globals: array<GlobalVar>) -> void {
 pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any) -> void {
     // 强引用根：防止 GC 中途回收 MirFunc.blocks（0.3 历史 workaround，保留）
     cg_all_blocks = [];
+    cg_prog = prog;   // dyn vtable 布局在缓存命中时据此重建
     let cgabi = 0;
     while (cgabi < len(mfuncs)) {
         let cgabmf = mfuncs[cgabi];
@@ -3754,6 +4324,16 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
     cg_ctx = ctx;
     cg_mod = mod;
     cg_builder = llvm_new_builder(cg_ctx);
+    // 模块级 debug 元数据：DIBuilder 启动，返回模块级 DIFile。仅 cg_enable_debug(-g)
+    // 打开时启动；is_optimized=0（DWARF 行表仍照常生成）。真正作指令 DILocation scope
+    // 的 DISubprogram 在每个函数创建处建立（见 cg_gen_func）。
+    if (cg_enable_debug == 1) {
+        cg_di_file = llvm_di_begin(cg_mod, cg_ctx, "", prog.module_name + ".shadow", 0);
+    } else {
+        cg_di_file = 0 as any;
+    }
+    cg_di_scope = 0 as any;
+    cg_di_last_line = -1;
     cg_str_keys = [];
     cg_str_vals = [];
     cg_extern_names = [];
@@ -3937,6 +4517,13 @@ pub kimo cg_gen_module(prog: Program, mfuncs: array<MirFunc>, ctx: any, mod: any
         i = i + 1;
     }
 
+    // 收尾：finalize 把 !llvm.dbg.cu 挂回模块并生成 .debug_line 所需元数据。
+    if ((cg_di_file as any) != 0) {
+        llvm_di_end(cg_di_file);
+        cg_di_file = 0 as any;
+    }
+    cg_di_scope = 0 as any;
+
 }
 
 // 把 src 链接进 dest（LLVMLinkModules2：Src 被合并进 Dest 并消费）。0=成功。
@@ -3950,7 +4537,9 @@ pub kimo cg_gen_program(prog: Program, mfuncs: array<MirFunc>) -> string {
     cg_prog_has_threads = cg_scan_threads(mfuncs);
     let mod = llvm_mod_create("shadow_module", ctx);
     cg_gen_module(prog, mfuncs, ctx, mod);
+    cg_dbg("[finalize] single print_mod start, mfuncs=" + int_to_str(len(mfuncs)));
     let ir = llvm_print_mod(mod);
+    cg_dbg("[finalize] single print_mod done, len=" + int_to_str(len(ir)));
     llvm_del_builder(cg_builder);
     llvm_mod_dispose(mod);
     return ir;
@@ -3978,6 +4567,7 @@ pub kimo cg_gen_program_multi(modules: array<Program>, mfuncs_list: array<any>) 
         bi = bi + 1;
     }
     let ir = llvm_print_mod(final_mod);
+    cg_dbg("[finalize] multi print_mod done");
     llvm_del_builder(cg_builder);
     llvm_mod_dispose(final_mod);
     return ir;

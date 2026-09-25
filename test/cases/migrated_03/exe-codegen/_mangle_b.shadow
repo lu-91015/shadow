@@ -1,4 +1,4 @@
-dsb mangle_b;
+dsb _mangle_b;
 
 pub let VALUE: int = 200;
 

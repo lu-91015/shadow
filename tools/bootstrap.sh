@@ -1,7 +1,7 @@
 #!/bin/bash
 # 自举引导脚本（CI / 本地通用）
 #
-# 用 0.5.2 每轮自举 [5/7] 留下的 build/shadow.exe（下一轮自举 HOST）把 tools/build_shadow.shadow（权威构建程序，Shadow 源码）
+# 用 0.5.3 每轮自举 [5/7] 留下的 build/shadow.exe（下一轮自举 HOST）把 tools/build_shadow.shadow（权威构建程序，Shadow 源码）
 # 先编成驱动 build/build_shadow.exe，再运行该驱动执行 7 阶段自举，
 # 最终部署出 build/shadow.exe（新鲜自托管编译器）+ 编译 rt/*.o。
 #
@@ -26,7 +26,7 @@ export LLVM_HOME
 export BUILD_TARGETS="${BUILD_TARGETS:-windows}"
 
 [ -n "${LLVM_HOME:-}" ] || { echo "[X] LLVM_HOME 未设置且 tools/env.local.sh 无默认值"; exit 1; }
-[ -x build/shadow.exe ] || { echo "[X] 0.5.2 自举产物 build/shadow.exe 缺失（需先完成一轮自举或恢复该文件）"; exit 1; }
+[ -x build/shadow.exe ] || { echo "[X] 0.5.3 自举产物 build/shadow.exe 缺失（需先完成一轮自举或恢复该文件）"; exit 1; }
 
 # 全新 .lu 函数级缓存（陈旧缓存会让 src/ 改动看起来完全无效）
 TS="$(date +%Y%m%d_%H%M%S)"; export SHADOW_TS="$TS"
@@ -51,7 +51,7 @@ echo "[1] emit IR: tools/build_shadow.shadow -> build/build_shadow.ll"
 build/shadow.exe tools/build_shadow.shadow -o build/build_shadow.ll
 
 echo "[2] llc -> build/build_shadow.o"
-"$bin/llc.exe" -O0 -filetype=obj build/build_shadow.ll -o build/build_shadow.o
+"$bin/llc.exe" -O2 -filetype=obj build/build_shadow.ll -o build/build_shadow.o
 
 # ── [2a] runtime .o 无条件从源码现编 ─────────────────────────────
 # 下面 objcopy 派生 wk.o / user.o 的母本就是 build/rt/runtime_for_selfhost.o。
@@ -61,20 +61,20 @@ echo "[2] llc -> build/build_shadow.o"
 RT_CPP=rt/linux/runtime_for_selfhost.cpp
 RT_O=build/rt/runtime_for_selfhost.o
 echo "[2a] runtime .o 从源码现编 -> $RT_O"
-"$bin/clang++.exe" -O1 -c "$RT_CPP" -o "$RT_O" \
+"$bin/clang++.exe" -O2 -c "$RT_CPP" -o "$RT_O" \
   -I rt -I "$LLVM_HOME/include" -std=c++17 -D_CRT_SECURE_NO_WARNINGS -w
 
 echo "[3] precompile runtime objects"
-"$bin/clang.exe" -O0 -I rt -c rt/rt_zip.c -o build/rt/rt_zip.o
-"$bin/clang.exe" -O0 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o
-"$bin/clang.exe" -O1 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o
-"$bin/clang.exe" -O0 -I rt -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o
-"$bin/clang.exe" -O0 -I rt -c rt/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o
+"$bin/clang.exe" -O2 -I rt -c rt/rt_zip.c -o build/rt/rt_zip.o
+"$bin/clang.exe" -O2 -c rt/shadow_gc_supplement.c -o build/rt/shadow_gc_supplement.o
+"$bin/clang.exe" -O2 -Wall -c rt/shadow_index.c -o build/rt/shadow_index.o
+"$bin/clang.exe" -O2 -I rt -c rt/rt_proc_spawn.c -o build/rt/rt_proc_spawn.o
+"$bin/clang.exe" -O2 -I rt -c rt/sys_exec_cpa.c -o build/rt/sys_exec_cpa.o
 # 用户程序 runtime 辅助对象：miniz 源已入库（rt/miniz.c），一律现编，不复制预编译 .o。
 # 同时刷新 build/rt/miniz.o —— 驱动 build_shadow.exe 与 stage 链接行都引用该路径。
-"$bin/clang.exe" -O1 -I rt -c rt/miniz.c -o build/rt/miniz.o
-"$bin/clang.exe" -O1 -I rt -c rt/miniz.c -o build/rt/miniz.o
-"$bin/clang.exe" -O0 -I rt -c rt/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o
+"$bin/clang.exe" -O2 -I rt -c rt/miniz.c -o build/rt/miniz.o
+"$bin/clang.exe" -O2 -I rt -c rt/miniz.c -o build/rt/miniz.o
+"$bin/clang.exe" -O2 -I rt -c rt/cxa_atexit_shim.c -o build/rt/cxa_atexit_shim.o
 # 编译器本体 runtime（wk 版）：与 tools/build_shadow.shadow 的 [0.4/7] 完全一致——
 # stage1.o 内含 runtime_lib 强符号，C++ runtime 同名实现全部加 __cpp_ 前缀避免重复定义。
 "$bin/llvm-objcopy.exe" \

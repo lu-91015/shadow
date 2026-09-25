@@ -1,0 +1,44 @@
+//@expect: Rex
+//@expect: Dog:Rex
+//@expect: Mia
+//@expect: Cat:Mia
+//@desc: 0.5.3 dyn Trait × supertrait：dyn Named 的 vtable 覆盖父 trait(Speaker)与子 trait(Named)方法
+dsb ex_trait_dyn_supertrait;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+}
+
+trait Named : Speaker {
+    kimo label(self: Self) -> string;
+}
+
+struct Dog { tag: string }
+struct Cat { tag: string }
+
+impl Speaker for Dog {
+    kimo name(self: Dog) -> string { return self.tag; }
+}
+impl Named for Dog {
+    kimo label(self: Dog) -> string { return "Dog:" + self.name(); }
+}
+
+impl Speaker for Cat {
+    kimo name(self: Cat) -> string { return self.tag; }
+}
+impl Named for Cat {
+    kimo label(self: Cat) -> string { return "Cat:" + self.name(); }
+}
+
+kimo speak(n: dyn Named) -> void {
+    println(n.name());    // 父 trait 方法（vtable 槽）
+    println(n.label());   // 子 trait 方法（vtable 槽）
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Rex" };
+    let c = Cat { tag: "Mia" };
+    speak(d);
+    speak(c);
+    return 0;
+}

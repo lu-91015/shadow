@@ -1,0 +1,34 @@
+//@expect: box int -> 42
+//@expect: box txt -> hello
+//@desc: 0.5.3 关联类型：trait 声明 type Item; impl 绑定 type Item = int/string; 方法用 Self::Item
+dsb ex_trait_assoc_type;
+
+trait Container {
+    type Item;
+    kimo show(self: Self, tag: string) -> string;
+}
+
+struct BoxI { v: int }
+struct BoxS { v: string }
+
+impl Container for BoxI {
+    type Item = int;
+    kimo show(self: BoxI, tag: string) -> string {
+        return tag + " -> " + int_to_str(self.v);
+    }
+}
+
+impl Container for BoxS {
+    type Item = string;
+    kimo show(self: BoxS, tag: string) -> string {
+        return tag + " -> " + self.v;
+    }
+}
+
+kimo main() -> int {
+    let bi = BoxI { v: 42 };
+    let bs = BoxS { v: "hello" };
+    println(bi.show("box int"));
+    println(bs.show("box txt"));
+    return 0;
+}

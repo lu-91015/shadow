@@ -1151,6 +1151,12 @@ pub kimo tc_main_module_end() -> int {
 let tc_g_valid_ns: array<string> = [];
 pub kimo tc_set_valid_ns(list: array<string>) -> void { tc_g_valid_ns = list; }
 
+// 缓存命中只跳过「前 TC 原始函数」的函数体检查：合成函数（如 __impl__ 默认实现）总是
+// fresh-lower（fi>=N0），若因其 loc.line 落在缓存有效模块内也被跳过，则表达式
+// inferred_type 不回填 → 生成 add ptr / sext ptr / call @裸符号 等错误 MIR。
+// 每次 tc_check_program 入口在合成默认实现之前捕获 parse 后的原始函数数。
+let tc_g_orig_func_count: int = 0;
+
 // 函数所在行所属模块是否在缓存命中集合内。
 //
 // ⚠️ 此处曾有一行无条件 `return 0;`（配合 main_g_lu_cache=0 的第二道硬闸），
@@ -1396,7 +1402,7 @@ pub kimo tc_error_at(ctx: CompileContext, loc: Location, msg: string) -> void {
 
 // ============ 类型环境 TEnv ============
 pub kimo tc_env_new() -> TEnv {
-    return TEnv { names: [], types: [] };
+    return TEnv { names: [], types: [], conflags: [] };
 }
 
 pub kimo tc_env_find(env: TEnv, name: string) -> int {
@@ -1424,16 +1430,51 @@ pub kimo tc_env_set(env: TEnv, name: string, t: Type) -> void {
     } else {
         env.names = array_push(env.names, name);
         env.types = array_push(env.types, t);
+        env.conflags = array_push(env.conflags, 0);
     }
+}
+
+// 登记/改写变量的 const 标志（0 = 可变，1 = const 不可再赋值）
+pub kimo tc_env_set_const(env: TEnv, name: string, is_const: int) -> void {
+    let i = tc_env_find(env, name);
+    if (i >= 0) {
+        env.conflags[i] = is_const;
+    }
+}
+
+pub kimo tc_env_is_const(env: TEnv, name: string) -> int {
+    let i = tc_env_find(env, name);
+    if (i < 0) { return 0; }
+    return env.conflags[i] as int;
+}
+
+// 解析赋值目标表达式（EXPR_VAR / 经 .field / [i] 链左值）最左端的根变量名。
+// 仅 EXPR_VAR 或合法左值链（成员/下标/切片）可解析出根；其余（如函数调用）返回 ""。
+pub kimo tc_assign_target_root_name(e: Expr) -> string {
+    if (expr_is_none(e) == 1) { return ""; }
+    if (e.kind == EXPR_VAR) { return e.str1; }
+    if (e.kind == EXPR_MEMBER || e.kind == EXPR_INDEX || e.kind == EXPR_SLICE) {
+        return tc_assign_target_root_name(e.child1);
+    }
+    return "";
+}
+
+// 赋值目标是否为 const 冻结：先解析根变量名，再查 env 的 const 标志。
+// 根变量不存在或非 const 均返回 0。
+pub kimo tc_assign_target_is_const(e: Expr, env: TEnv) -> int {
+    let root = tc_assign_target_root_name(e);
+    if (str_eq(root, "") == 1) { return 0; }
+    return tc_env_is_const(env, root);
 }
 
 // 克隆 env（match 臂作用域）
 pub kimo tc_env_clone(env: TEnv) -> TEnv {
-    let ne = TEnv { names: [], types: [] };
+    let ne = TEnv { names: [], types: [], conflags: [] };
     let i = 0;
     while (i < len(env.names)) {
         ne.names = array_push(ne.names, env.names[i]);
         ne.types = array_push(ne.types, env.types[i]);
+        ne.conflags = array_push(ne.conflags, env.conflags[i]);
         i = i + 1;
     }
     return ne;
@@ -1467,6 +1508,7 @@ pub kimo ty_display_name(t: Type) -> string {
     if (k == TYPE_TUPLE) { return "tuple"; }
     if (k == TYPE_SET) { return "set"; }
     if (k == TYPE_FUTURE) { return "future"; }
+    if (k == TYPE_TRAIT_OBJECT) { return "dyn " + t.name; }
     return "unknown";
 }
 
@@ -1489,6 +1531,14 @@ pub kimo tc_type_compat(ctx: CompileContext, declared: Type, actual: Type) -> in
     if (dk == TYPE_ANY) { return 1; }
     if (dk == TYPE_INFER) { return 1; }
     if (ak == TYPE_INFER) { return 1; }
+    // 0.5.3 dyn Trait：具体命名类型实现了该 trait（经 impl 表）即视为同一类型，可隐式装箱。
+    // 严格态 impl key 用 trait 注册名（mangled）——dyn 类型里是裸名，须经 trait 表解析（同 tc_satisfies_constraint）。
+    if (dk == TYPE_TRAIT_OBJECT && len(declared.name) > 0 && ak == TYPE_STRUCT) {
+        let vd = tc_mg_lookup_trait(ctx, declared.name);
+        if (tc_trait_is_none(vd) == 0) {
+            if (tc_type_impls_trait(ctx, actual.name, vd.name) == 1) { return 1; }
+        }
+    }
     // 类型相等（结构比较）
     if (type_eq(declared, actual) == 1) { return 1; }
     // 命名类型族（STRUCT/ENUM/ENUM_PAYLOAD/OPAQUE）同名即兼容：
@@ -1640,6 +1690,73 @@ pub kimo tc_tparam_constraints_numeric(name: string) -> int {
     return 0;
 }
 
+// 0.5.3 泛型 trait 分发模板检查：类型参数 tname 的任一约束 trait 是否声明 method_name。
+// 声命时宽容返回其返回类型（含 Self/关联类型等无法在模板上下文定值的引用 → TYPE_ANY）。
+// 真正的 impl 符号解析在特化（mono：T→具体类型）阶段对具体类型重检查完成。
+pub kimo tc_tparam_generic_method(ctx: CompileContext, tname: string, method_name: string) -> Type {
+    let i = 0;
+    while (i < len(tc_cur_tparams)) {
+        let tp = tc_cur_tparams[i] as TypeParam;
+        if (str_eq(tp.name, tname) == 1) {
+            let j = 0;
+            while (j < len(tp.constraints)) {
+                let c = tp.constraints[j] as string;
+                let td = tc_mg_lookup_trait(ctx, c);
+                if (tc_trait_is_none(td) == 0) {
+                    // 0.5.3 supertrait：命中本 trait 或任一父 trait（递归）的方法即视为可调用
+                    let sr = tc_trait_super_method_ret(ctx, td, tname, method_name);
+                    if (sr.kind != TYPE_INFER) { return sr; }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return mk_type(TYPE_INFER);
+}
+
+// 0.5.3 supertrait：在 trait 及其父 trait（递归）中查找方法返回类型。
+// 返回 mk_type(TYPE_INFER) 表示「本 trait 及其 supertrait 均未声明该方法」，
+// 其余返回值语义与 tc_tparam_generic_method 内部一致（Self/tname → tname 替换）。
+pub kimo tc_trait_super_method_ret(ctx: CompileContext, td: TraitDef, tname: string, method_name: string) -> Type {
+    let k = 0;
+    while (k < len(td.methods)) {
+        let tm = td.methods[k] as FuncDef;
+        if (str_eq(tm.name, method_name) == 1) {
+            let rt = tm.return_type;
+            if (type_is_none(rt) == 0) {
+                if (str_eq(rt.name, "Self") == 1) {
+                    return mk_named_type(rt.kind, tname);
+                }
+                let di = str_index_of(rt.name, "::");
+                if (di >= 0) {
+                    let base = substr2(rt.name, 0, di);
+                    if (str_eq(base, "Self") == 1 || str_eq(base, tname) == 1) {
+                        return mk_named_type(rt.kind, tname + "::" + substr2(rt.name, di + 2, len(rt.name)));
+                    }
+                    return rt;
+                }
+                if (tc_is_unbound_tparam(rt, tc_cur_tparams) == 0) {
+                    return rt;
+                }
+            }
+            return mk_type(TYPE_ANY);
+        }
+        k = k + 1;
+    }
+    let s = 0;
+    while (s < len(td.supertraits)) {
+        let st_raw = td.supertraits[s] as string;
+        let st_td = tc_mg_lookup_trait(ctx, st_raw);
+        if (tc_trait_is_none(st_td) == 0) {
+            let r = tc_trait_super_method_ret(ctx, st_td, tname, method_name);
+            if (r.kind != TYPE_INFER) { return r; }
+        }
+        s = s + 1;
+    }
+    return mk_type(TYPE_INFER);
+}
+
 // 泛型绑定推断（递归 unify）：declared（含类型参数）↔ actual（具体类型）
 //  - declared 是裸类型参数 → 绑定
 //  - declared 是含 param_types 的命名类型 → 按位递归（不管名字是否 mono 化）
@@ -1673,6 +1790,66 @@ pub kimo tc_infer_bindings(ctx: CompileContext, declared: Type, actual: Type, tp
         tc_infer_bindings(ctx, declared.key_type, actual.key_type, tparams);
         tc_infer_bindings(ctx, declared.val_type, actual.val_type, tparams);
         return;
+    }
+}
+
+// 0.5.3 关联类型具体化：对已绑定的具体类型参数，把其约束 trait 声明的关联类型
+// 解析为 impl 的实际绑定类型，并追加进 ctx.bind_names/bind_types（调用前须已含
+// T→具体类型 的常规绑定）。这样单态化时 `T::Item` 可被 tc_mono_type 命中替换。
+pub kimo tc_resolve_assoc_bindings(ctx: CompileContext, tparams: array<TypeParam>) -> void {
+    let t = 0;
+    while (t < len(tparams)) {
+        let tp = tparams[t] as TypeParam;
+        let bound = -1;
+        let ci = 0;
+        while (ci < len(ctx.bind_names)) {
+            if (str_eq(ctx.bind_names[ci] as string, tp.name) == 1) { bound = ci; }
+            ci = ci + 1;
+        }
+        if (bound < 0) { t = t + 1; continue; }
+        let concrete = ctx.bind_types[bound] as Type;
+        if ((concrete.kind != TYPE_STRUCT && concrete.kind != TYPE_ENUM && concrete.kind != TYPE_ENUM_PAYLOAD)
+            || tc_is_type_param(concrete, tparams) == 1) {
+            t = t + 1;
+            continue;
+        }
+        let j = 0;
+        while (j < len(tp.constraints)) {
+            let c = tp.constraints[j] as string;
+            let td = tc_mg_lookup_trait(ctx, c);
+            if (tc_trait_is_none(td) == 1) { j = j + 1; continue; }
+            let a = 0;
+            while (a < len(td.assoc_types)) {
+                let assoc_name = td.assoc_types[a] as string;
+                // 已在绑定集（可能来自另一 tparam）→ 跳过，避免重复
+                let dupb = 0;
+                let dk = 0;
+                while (dk < len(ctx.bind_names)) {
+                    if (str_eq(ctx.bind_names[dk] as string, assoc_name) == 1) { dupb = 1; }
+                    dk = dk + 1;
+                }
+                if (dupb == 0) {
+                    let key = td.name + "@@" + concrete.name;
+                    let id = tc_mg_lookup_impl(ctx, key);
+                    if (tc_impl_is_none(id) == 0) {
+                        let b = 0;
+                        while (b < len(id.assoc_types)) {
+                            let al = id.assoc_types[b] as TypeAlias;
+                            if (str_eq(al.name, assoc_name) == 1) {
+                                ctx.bind_names = array_push(ctx.bind_names, assoc_name);
+                                ctx.bind_types = array_push(ctx.bind_types, tc_resolve_type(ctx, al.target));
+                                b = b + 1;
+                                break;
+                            }
+                            b = b + 1;
+                        }
+                    }
+                }
+                a = a + 1;
+            }
+            j = j + 1;
+        }
+        t = t + 1;
     }
 }
 
@@ -2498,6 +2675,485 @@ pub kimo tc_impl_find_method(ctx: CompileContext, type_name: string, method_name
     return "";
 }
 
+// ============ 0.5.3 dyn Trait 运行时多态 ============
+// 三个 TC 全局注册表（编译期填充，mir/codegen 无 ctx 时按名读取）：
+
+// (1) 被调函数的 dyn Trait 形参位置登记：(函数名, 形参位置, trait 名) 三条标量平行数组。
+//     仅持久化 string/int 标量。严禁持久化 array<Type>/嵌套容器——Type 含递归指针成员，
+//     作为数组元素在 GC 移动后悬垂 → AV（compile_api.shadow 同款教训）。mir 在实参处
+//     按 (函数名, 位置) 查到 trait 名即判需装箱。
+let tc_dyn_hkeys: array<string> = [];
+let tc_dyn_hpos: array<int> = [];
+let tc_dyn_hnames: array<string> = [];
+pub kimo tc_dyn_param_register(name: string, ptys: array<Type>) -> void {
+    let pi = 0;
+    while (pi < len(ptys)) {
+        let t = ptys[pi] as Type;
+        if (t.kind == TYPE_TRAIT_OBJECT && len(t.name) > 0) {
+            tc_dyn_hkeys = array_push(tc_dyn_hkeys, name);
+            tc_dyn_hpos = array_push(tc_dyn_hpos, pi);
+            tc_dyn_hnames = array_push(tc_dyn_hnames, t.name);
+        }
+        pi = pi + 1;
+    }
+}
+pub kimo tc_dyn_trait_at(name: string, pos: int) -> string {
+    let i = 0;
+    while (i < len(tc_dyn_hkeys)) {
+        if (str_eq(tc_dyn_hkeys[i] as string, name) == 1 && tc_dyn_hpos[i] == pos) {
+            return tc_dyn_hnames[i] as string;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// (2) trait 名 → 扁平化方法名列表（自身 + supertrait 递归，去重，顺序即 vtable 槽位顺序）。
+//     vtable 打包与动态分发都用同一顺序，须单点生成。
+let tc_dyn_vkeys: array<string> = [];
+let tc_dyn_vvals: array<array<string>> = [];
+// (2b) trait 名 → 扁平方法各槽的声明者（owner）trait 名（与 (2) 同位并行，codegen 算 impl symbol 用）。
+let tc_dyn_okeys: array<string> = [];
+let tc_dyn_ovals: array<array<string>> = [];
+pub kimo tc_dyn_flat_methods(trait_name: string) -> array<string> {
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] flat_m lookup q=" + trait_name + " nvkeys=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] flat_m FOUND idx=" + int_to_str(i) + " n=" + int_to_str(len(tc_dyn_vvals[i] as array<string>)));
+            }
+            return tc_dyn_vvals[i] as array<string>;
+        }
+        i = i + 1;
+    }
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] flat_m MISS vkeys=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+    let empty: array<string> = [];
+    return empty;
+}
+// 返回 trait 继承图中声明 method 的 owner trait 名（codegen 经 tc_impl_symbol 定位 vtable 槽）。
+pub kimo tc_dyn_method_owner(trait_name: string, method: string) -> string {
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) {
+            let list = tc_dyn_vvals[i] as array<string>;
+            let owners = tc_dyn_ovals[i] as array<string>;
+            let j = 0;
+            while (j < len(list)) {
+                if (str_eq(list[j] as string, method) == 1) { return owners[j]; }
+                j = j + 1;
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+// 惰性填充：整个 trait 继承图扁平化。visited 阻止菱形/环重复。
+pub kimo tc_dyn_ensure_trait(ctx: CompileContext, trait_name: string) -> void {
+    let ok = 0;
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) { ok = 1; break; }
+        i = i + 1;
+    }
+    if (ok == 1) { return; }
+    let list: array<string> = [];
+    let owners: array<string> = [];
+    let visited: array<string> = [];
+    let visit: array<string> = [trait_name];
+    while (len(visit) > 0) {
+        let cur = array_pop(visit) as string;
+        // visited 去重
+        let seen = 0;
+        let vi = 0;
+        while (vi < len(visited)) {
+            if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+            vi = vi + 1;
+        }
+        if (seen == 1) { continue; }
+        visited = array_push(visited, cur);
+        let td = tc_mg_lookup_trait(ctx, cur);
+        if (tc_trait_is_none(td) == 1) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] ensure lookup_trait NONE cur=" + cur);
+            }
+            continue;
+        }
+        if (file_exists("build/.qdbg") == 1) {
+            println("[dyn] ensure got trait cur=" + cur + " nmethods=" + int_to_str(len(td.methods)));
+        }
+        let mj = 0;
+        while (mj < len(td.methods)) {
+            let tm = td.methods[mj] as FuncDef;
+            // 方法名去重（子类覆写同名时以先出现者为准）
+            let dup = 0;
+            let di = 0;
+            while (di < len(list)) {
+                if (str_eq(list[di] as string, tm.name) == 1) { dup = 1; break; }
+                di = di + 1;
+            }
+            if (dup == 0) {
+                list = array_push(list, tm.name);
+                owners = array_push(owners, cur);
+            }
+            mj = mj + 1;
+        }
+        let si = 0;
+        while (si < len(td.supertraits)) {
+            visit = array_push(visit, td.supertraits[si] as string);
+            si = si + 1;
+        }
+    }
+    tc_dyn_vkeys = array_push(tc_dyn_vkeys, trait_name);
+    tc_dyn_vvals = array_push(tc_dyn_vvals, list);
+    tc_dyn_okeys = array_push(tc_dyn_okeys, trait_name);
+    tc_dyn_ovals = array_push(tc_dyn_ovals, owners);
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] ensure done trait=" + trait_name + " nlist=" + int_to_str(len(list)) + " nvkeys_now=" + int_to_str(len(tc_dyn_vkeys)));
+    }
+}
+// codegen 专用：.lu 缓存命中时 type-check 函数体被跳过，tc_dyn_* 全局表为空，
+// 且 codegen 阶段没有可用的 CompileContext/模块图。此处改为直接从 prog.traits
+// （parse 产物，编解码缓存无关，缓存命中时仍完整可读）计算扁平方法布局并写入同一全局表。
+// 算法与 tc_dyn_ensure_trait 完全一致（BFS + visited 去重 + 方法名去重），
+// 保证 vtable 打包与动态分发槽位顺序单点。trait 名以 bare 名匹配，owner 存 bare 名
+// （tc_impl_symbol 内部 unmangle，mangled/bare 殊途同归）。
+pub kimo tc_dyn_ensure_from_prog(prog: Program, trait_name: string) -> void {
+    let i = 0;
+    while (i < len(tc_dyn_vkeys)) {
+        if (str_eq(tc_dyn_vkeys[i] as string, trait_name) == 1) { return; }
+        i = i + 1;
+    }
+    let list: array<string> = [];
+    let owners: array<string> = [];
+    let visited: array<string> = [];
+    let visit: array<string> = [trait_name];
+    while (len(visit) > 0) {
+        let cur = array_pop(visit) as string;
+        let seen = 0;
+        let vi = 0;
+        while (vi < len(visited)) {
+            if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+            vi = vi + 1;
+        }
+        if (seen == 1) { continue; }
+        visited = array_push(visited, cur);
+        let td = 0 as TraitDef;
+        let tii = 0;
+        let cur_bare = tc_bare_name(cur);
+        while (tii < len(prog.traits)) {
+            let t = prog.traits[tii];
+            if (str_eq(tc_bare_name(t.name), cur_bare) == 1) { td = t; break; }
+            tii = tii + 1;
+        }
+        if (len(td.name) == 0) { continue; }   // 未找到（none TraitDef）
+        let mj = 0;
+        while (mj < len(td.methods)) {
+            let tm = td.methods[mj] as FuncDef;
+            let dup = 0;
+            let di = 0;
+            while (di < len(list)) {
+                if (str_eq(list[di] as string, tm.name) == 1) { dup = 1; break; }
+                di = di + 1;
+            }
+            if (dup == 0) {
+                list = array_push(list, tm.name);
+                owners = array_push(owners, cur_bare);
+            }
+            mj = mj + 1;
+        }
+        let si = 0;
+        while (si < len(td.supertraits)) {
+            visit = array_push(visit, td.supertraits[si] as string);
+            si = si + 1;
+        }
+    }
+    tc_dyn_vkeys = array_push(tc_dyn_vkeys, trait_name);
+    tc_dyn_vvals = array_push(tc_dyn_vvals, list);
+    tc_dyn_okeys = array_push(tc_dyn_okeys, trait_name);
+    tc_dyn_ovals = array_push(tc_dyn_ovals, owners);
+}
+// 解析 dyn 方法调用返回类型：在 trait 全继承图中找方法，Self→any / Self::X→any 擦除。
+// 返回 mk_type(TYPE_INFER) 表示未声明该方法（调用方据此报错或放行）。
+pub kimo tc_dyn_method_ret(ctx: CompileContext, trait_name: string, method: string) -> Type {
+    let list = tc_dyn_flat_methods(trait_name);
+    let mj = 0;
+    while (mj < len(list)) {
+        if (str_eq(list[mj] as string, method) == 1) {
+            let visited: array<string> = [];
+            let todo: array<string> = [trait_name];
+            while (len(todo) > 0) {
+                let cur = array_pop(todo) as string;
+                let seen = 0;
+                let vi = 0;
+                while (vi < len(visited)) {
+                    if (str_eq(visited[vi] as string, cur) == 1) { seen = 1; break; }
+                    vi = vi + 1;
+                }
+                if (seen == 1) { continue; }
+                visited = array_push(visited, cur);
+                let td = tc_mg_lookup_trait(ctx, cur);
+                if (tc_trait_is_none(td) == 1) { continue; }
+                let mk = 0;
+                while (mk < len(td.methods)) {
+                    let tm = td.methods[mk] as FuncDef;
+                    if (str_eq(tm.name, method) == 1) {
+                        let rt = tm.return_type;
+                        if (type_is_none(rt) == 1) { return mk_type(TYPE_ANY); }
+                        let rn = rt.name;
+                        if (str_eq(rn, "Self") == 1) { return mk_type(TYPE_ANY); }
+                        let di = str_index_of(rn, "::");
+                        if (di >= 0) { return mk_type(TYPE_ANY); }
+                        return rt;
+                    }
+                    mk = mk + 1;
+                }
+                let si = 0;
+                while (si < len(td.supertraits)) {
+                    todo = array_push(todo, td.supertraits[si] as string);
+                    si = si + 1;
+                }
+            }
+        }
+        mj = mj + 1;
+    }
+    return mk_type(TYPE_INFER);
+}
+
+// ============ trait 默认实现合成（0.5.3） ============
+// 对每个 trait impl，把 trait 声明了默认实现体（body 非空）但 impl 未覆写的方法，
+// 以 Self→具体类型 + 关联类型→impl 具体绑定的方式合成为 __impl__<T>__<Tr>__<m> 函数，
+// 复用既有静态分发链路（tc_impl_find_method → tc_func_lookup → codegen 发射）。
+// 必须在 tc_register_decls 之前运行：合成的 mangled 函数需进入 prog.funcs 才能被
+// 函数注册循环（while i < len(prog.funcs)）登记，从而在函数体检查阶段被分发命中。
+
+// 把默认实现体里 `self.<m>()` 的调用（m ∈ trait 方法）重写为 impl 的 mangled 符号
+// __impl__<T>__<Tr>__<m>。fix: TC 对合成体 self 调用的改写可能不落到 codegen 复制的
+// AST 上（曾 `call i32 @name` 而非 @__impl__Dog__Speaker__name），故在合成时直接定址。
+pub kimo tc_synth_rewrite_self_calls_expr(e: Expr, type_name: string, trait_name: string, tms: array<string>) -> Expr {
+    if (expr_is_none(e) == 1) { return e; }
+    if (e.kind == EXPR_CALL && len(e.items) > 0) {
+        let r0 = e.items[0] as Expr;
+        if (r0.kind == EXPR_VAR && len(r0.str1) > 0 && str_eq(r0.str1, "self") == 1) {
+            let ci = 0;
+            let in_trait = 0;
+            while (ci < len(tms)) {
+                if (str_eq(tms[ci] as string, e.str1) == 1) { in_trait = 1; }
+                ci = ci + 1;
+            }
+            if (in_trait == 1) {
+                e.str1 = tc_impl_symbol(type_name, trait_name, e.str1);
+            }
+        }
+    }
+    if (expr_is_none(e.child1) == 0) { e.child1 = tc_synth_rewrite_self_calls_expr(e.child1, type_name, trait_name, tms); }
+    if (expr_is_none(e.child2) == 0) { e.child2 = tc_synth_rewrite_self_calls_expr(e.child2, type_name, trait_name, tms); }
+    if (expr_is_none(e.child3) == 0) { e.child3 = tc_synth_rewrite_self_calls_expr(e.child3, type_name, trait_name, tms); }
+    let ii = 0;
+    while (ii < len(e.items)) {
+        e.items[ii] = tc_synth_rewrite_self_calls_expr(e.items[ii], type_name, trait_name, tms);
+        ii = ii + 1;
+    }
+    let ii2 = 0;
+    while (ii2 < len(e.items2)) {
+        e.items2[ii2] = tc_synth_rewrite_self_calls_expr(e.items2[ii2], type_name, trait_name, tms);
+        ii2 = ii2 + 1;
+    }
+    return e;
+}
+
+pub kimo tc_synth_rewrite_self_calls_stmt(s: Stmt, type_name: string, trait_name: string, tms: array<string>) -> Stmt {
+    if (stmt_is_none(s) == 1) { return s; }
+    if (stmt_is_none(s.child1) == 0) { s.child1 = tc_synth_rewrite_self_calls_stmt(s.child1, type_name, trait_name, tms); }
+    if (stmt_is_none(s.child2) == 0) { s.child2 = tc_synth_rewrite_self_calls_stmt(s.child2, type_name, trait_name, tms); }
+    if (stmt_is_none(s.child3) == 0) { s.child3 = tc_synth_rewrite_self_calls_stmt(s.child3, type_name, trait_name, tms); }
+    let ii = 0;
+    while (ii < len(s.items)) {
+        s.items[ii] = tc_synth_rewrite_self_calls_stmt(s.items[ii], type_name, trait_name, tms);
+        ii = ii + 1;
+    }
+    let ii2 = 0;
+    while (ii2 < len(s.items2)) {
+        s.items2[ii2] = tc_synth_rewrite_self_calls_stmt(s.items2[ii2], type_name, trait_name, tms);
+        ii2 = ii2 + 1;
+    }
+    let ii3 = 0;
+    while (ii3 < len(s.exprs)) {
+        s.exprs[ii3] = tc_synth_rewrite_self_calls_expr(s.exprs[ii3], type_name, trait_name, tms);
+        ii3 = ii3 + 1;
+    }
+    if (expr_is_none(s.expr1) == 0) { s.expr1 = tc_synth_rewrite_self_calls_expr(s.expr1, type_name, trait_name, tms); }
+    if (expr_is_none(s.expr2) == 0) { s.expr2 = tc_synth_rewrite_self_calls_expr(s.expr2, type_name, trait_name, tms); }
+    return s;
+}
+
+pub kimo tc_synth_default_func(type_name: string, trait_name: string, tm: FuncDef,
+                               bn: array<string>, bt: array<Type>) -> FuncDef {
+    // 替换用 tparams：使 Self / 关联类型名可被 tc_is_unbound_tparam 识别
+    let tparams: array<TypeParam> = [];
+    let bi = 0;
+    while (bi < len(bn)) {
+        tparams = array_push(tparams, TypeParam { name: bn[bi] as string, constraints: [] });
+        bi = bi + 1;
+    }
+    let nf = FuncDef {
+        name: "__impl__" + type_name + "__" + trait_name + "__" + tm.name,
+        params: [],
+        return_type: tc_mono_type(tm.return_type, tparams, bn, bt),
+        body: tm.body,
+        loc: tm.loc,
+        is_pub: tm.is_pub,
+        is_extern: 0,
+        extern_name: "",
+        type_params: [],
+        is_async: 0,
+        is_macro: 0,
+        is_nogc: 0,
+    };
+    let pi = 0;
+    while (pi < len(tm.params)) {
+        let p = tm.params[pi] as Param;
+        let np = Param {
+            name: p.name,
+            type_ref: tc_mono_type(p.type_ref, tparams, bn, bt),
+            loc: p.loc,
+            is_mut: p.is_mut,
+            is_variadic: 0,
+            default_value: p.default_value,
+        };
+        nf.params = array_push(nf.params, np);
+        pi = pi + 1;
+    }
+    if (stmt_is_none(tm.body) == 0) {
+        nf.body = tc_mono_clone_stmt(tm.body, tparams, bn, bt);
+    }
+    return nf;
+}
+
+pub kimo tc_synth_default_impls(prog: Program) -> void {
+    let seen: array<string> = [];
+    let i = 0;
+    while (i < len(prog.impls)) {
+        let id = prog.impls[i] as ImplDef;
+        if (len(id.trait_name) == 0) { i = i + 1; continue; }  // inherent impl 跳过
+        // 用 prog.traits（裸名）定位 trait 声明
+        let td = 0 as TraitDef;
+        let ti = 0;
+        while (ti < len(prog.traits)) {
+            let t0 = prog.traits[ti] as TraitDef;
+            if (str_eq(t0.name, id.trait_name) == 1) { td = t0; }
+            ti = ti + 1;
+        }
+        if (tc_trait_is_none(td) == 1) { i = i + 1; continue; }
+        // 已覆写方法名集合 + trait 全部方法名（供自我调用重写）
+        let provided: array<string> = [];
+        let trait_methods: array<string> = [];
+        let mm = 0;
+        while (mm < len(id.methods)) {
+            let im = id.methods[mm] as FuncDef;
+            provided = array_push(provided, im.name);
+            mm = mm + 1;
+        }
+        let tmk = 0;
+        while (tmk < len(td.methods)) {
+            let tmp0 = td.methods[tmk] as FuncDef;
+            trait_methods = array_push(trait_methods, tmp0.name);
+            tmk = tmk + 1;
+        }
+        // 绑定：Self → 具体类型；各关联类型 → impl 绑定
+        let bn: array<string> = [];
+        let bt: array<Type> = [];
+        bn = array_push(bn, "Self");
+        bt = array_push(bt, mk_named_type(TYPE_STRUCT, id.type_name));
+        let ai = 0;
+        while (ai < len(id.assoc_types)) {
+            let al = id.assoc_types[ai] as TypeAlias;
+            bn = array_push(bn, al.name);
+            bt = array_push(bt, al.target);
+            ai = ai + 1;
+        }
+        let k = 0;
+        while (k < len(td.methods)) {
+            let tm = td.methods[k] as FuncDef;
+            k = k + 1;
+            if (stmt_is_none(tm.body) == 1) { continue; }  // 仅签名 → 必须显式实现
+            let found = 0;
+            let pj = 0;
+            while (pj < len(provided)) {
+                if (str_eq(provided[pj] as string, tm.name) == 1) { found = 1; }
+                pj = pj + 1;
+            }
+            if (found == 1) { continue; }  // impl 已覆写
+            let dk = id.type_name + "@@" + id.trait_name + "@@" + tm.name;
+            let dup = 0;
+            let dj = 0;
+            while (dj < len(seen)) {
+                if (str_eq(seen[dj] as string, dk) == 1) { dup = 1; }
+                dj = dj + 1;
+            }
+            if (dup == 1) { continue; }
+            seen = array_push(seen, dk);
+            // 合成 mangled 函数进 prog.funcs（保证注册 + codegen 发射）
+            let synth = tc_synth_default_func(id.type_name, id.trait_name, tm, bn, bt);
+            // 把 trait 方法名集传下去，供重写自我调用（self.<m>() → __impl__<T>__<Tr>__<m>）
+            if (stmt_is_none(synth.body) == 0) {
+                synth.body = tc_synth_rewrite_self_calls_stmt(synth.body, id.type_name, id.trait_name, trait_methods);
+            }
+            prog.funcs = array_push(prog.funcs, synth);
+            // 裸名条目进 id.methods：completeness 找到、tc_impl_find_method 判定存在
+            let syn = FuncDef {
+                name: tm.name,
+                params: synth.params,
+                return_type: synth.return_type,
+                body: synth.body,
+                loc: tm.loc,
+                is_pub: tm.is_pub,
+                is_extern: 0,
+                extern_name: "",
+                type_params: [],
+                is_async: 0,
+                is_macro: 0,
+                is_nogc: 0,
+            };
+            id.methods = array_push(id.methods, syn);
+        }
+        i = i + 1;
+    }
+}
+
+// 把 trait 签名里的类型按 impl 绑定具体化：Self→type_name；Self::Assoc / 裸 Assoc →
+// impl 的关联类型绑定目标；无法解析返回原类型（调用方以宽容方式处理）。
+pub kimo tc_impl_assoc_type(ctx: CompileContext, id: ImplDef, type_name: string, td: TraitDef, ty: Type) -> Type {
+    let tn = ty.name;
+    if (str_eq(tn, "Self") == 1) {
+        return mk_named_type(TYPE_STRUCT, type_name);
+    }
+    let d = str_index_of(tn, "::");
+    if (d >= 0) {
+        let assoc = substr2(tn, d + 2, len(tn));
+        let ci = 0;
+        while (ci < len(id.assoc_types)) {
+            let al = id.assoc_types[ci] as TypeAlias;
+            if (str_eq(al.name, assoc) == 1) { return al.target; }
+            ci = ci + 1;
+        }
+        return ty;
+    }
+    // 裸关联类型名（Self 外的 trait 自定义别名遗留）
+    let ci2 = 0;
+    while (ci2 < len(id.assoc_types)) {
+        let al2 = id.assoc_types[ci2] as TypeAlias;
+        if (str_eq(al2.name, tn) == 1) { return al2.target; }
+        ci2 = ci2 + 1;
+    }
+    return mk_type(TYPE_INFER); // 非关联类型引用 → none（type_is_none 判定）
+}
+
 // impl 完整性检查：trait 每个方法在 impl 中都有实现且签名兼容
 pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, type_name: string) -> array<string> {
     let errs: array<string> = [];
@@ -2527,6 +3183,9 @@ pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, typ
                             let ip = im.params[pi] as Param;
                             let t_ty = tp.type_ref;
                             let i_ty = ip.type_ref;
+                            // 关联类型引用（Self::Assoc）→ 先按 impl 绑定解析
+                            let t_ty_res = tc_impl_assoc_type(ctx, id, type_name, td, t_ty);
+                            if (t_ty_res.kind != TYPE_INFER) { t_ty = t_ty_res; }
                             // Self 或 trait 名（self 参数）→ 匹配实现类型或 any
                             let is_self = 0;
                             if (str_eq(t_ty.name, "Self") == 1) { is_self = 1; }
@@ -2543,9 +3202,12 @@ pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, typ
                             }
                             pi = pi + 1;
                         }
-                        // 返回类型匹配（Self → type_name；trait 声明 string 但 impl 返回 int 应拒绝）
+                        // 返回类型匹配（Self → type_name；Self::Assoc → impl 绑定；trait 声明 string 但 impl 返回 int 应拒绝）
                         let trt = tm.return_type;
                         let irt = im.return_type;
+                        // 关联类型引用（Self::Assoc / 裸 Assoc）→ 先按 impl 绑定具体化
+                        let trt0 = tc_impl_assoc_type(ctx, id, type_name, td, trt);
+                        if (trt0.kind != TYPE_INFER) { trt = trt0; }
                         if (str_eq(trt.name, "Self") == 1) {
                             let st = mk_named_type(TYPE_STRUCT, type_name);
                             if (tc_type_compat(ctx, st, irt) == 0 && irt.kind != TYPE_ANY) {
@@ -2566,6 +3228,57 @@ pub kimo tc_check_impl_completeness(ctx: CompileContext, trait_name: string, typ
             errs = array_push(errs, m);
         }
         i = i + 1;
+    }
+    // 关联类型完整性：trait 声明的每个关联类型必须在 impl 中绑定；未知绑定拒绝。
+    let ai = 0;
+    while (ai < len(td.assoc_types)) {
+        let req = td.assoc_types[ai] as string;
+        let bound = 0;
+        let bj = 0;
+        if (tc_impl_is_none(id) == 0) {
+            while (bj < len(id.assoc_types)) {
+                let al = id.assoc_types[bj] as TypeAlias;
+                if (str_eq(al.name, req) == 1) { bound = 1; }
+                bj = bj + 1;
+            }
+        }
+        if (bound == 0) {
+            let m = "missing associated type '" + req + "'";
+            errs = array_push(errs, m);
+        }
+        ai = ai + 1;
+    }
+    if (tc_impl_is_none(id) == 0) {
+        let cj = 0;
+        while (cj < len(id.assoc_types)) {
+            let al = id.assoc_types[cj] as TypeAlias;
+            let ok_inner = 0;
+            let dj = 0;
+            while (dj < len(td.assoc_types)) {
+                if (str_eq(al.name, td.assoc_types[dj] as string) == 1) { ok_inner = 1; }
+                dj = dj + 1;
+            }
+            if (ok_inner == 0) {
+                let m = "unknown associated type '" + al.name + "'";
+                errs = array_push(errs, m);
+            }
+            cj = cj + 1;
+        }
+    }
+    // 0.5.3 supertrait 要求：trait B : A 意味着「impl B for X」必须有「impl A for X」。
+    // 父 trait 方法由父 trait 的 impl 提供（tc_impl_find_method 已跨 trait 扫描 receiver 类型），
+    // 此处只需保证父 impl 确实存在，否则调用父方法会静默 undefined。
+    let si = 0;
+    while (si < len(td.supertraits)) {
+        let st_raw = td.supertraits[si] as string;
+        let st_td = tc_mg_lookup_trait(ctx, st_raw);
+        if (tc_trait_is_none(st_td) == 0) {
+            if (tc_type_impls_trait(ctx, type_name, st_td.name) == 0) {
+                let m = "missing supertrait impl '" + st_raw + "' (trait '" + trait_name + "' requires it)";
+                errs = array_push(errs, m);
+            }
+        }
+        si = si + 1;
     }
     return errs;
 }
@@ -2625,6 +3338,20 @@ pub kimo tc_is_unbound_tparam(t: Type, tparams: array<TypeParam>) -> int {
 // 泛型类型实例化（递归替换槽位；未绑定 → any）
 pub kimo tc_mono_type(t: Type, tparams: array<TypeParam>, bind_names: array<string>, bind_types: array<Type>) -> Type {
     let k = t.kind;
+    // 关联类型引用 X::Item（X 为 Self / 类型参数）：基座与 assoc 都经 bindings 替换。
+    // 合成默认实现 / 单态化时 bind_names/bind_types 已含关联类型具体化。
+    if ((k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_ENUM_PAYLOAD) && str_index_of(t.name, "::") >= 0) {
+        let d = str_index_of(t.name, "::");
+        let assoc = substr2(t.name, d + 2, len(t.name));
+        let j = 0;
+        while (j < len(bind_names)) {
+            if (str_eq(assoc, bind_names[j] as string) == 1) {
+                return bind_types[j] as Type;
+            }
+            j = j + 1;
+        }
+        return mk_type(TYPE_ANY);
+    }
     if (tc_is_unbound_tparam(t, tparams) == 1) {
         let i = 0;
         while (i < len(bind_names)) {
@@ -3129,6 +3856,12 @@ pub kimo tc_check_lit(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
         let ik = it.kind;
         if (ik == TYPE_CHAR) { return it; }
         if (ik == TYPE_DATE) { return it; }
+        // 无后缀 int 字面量必须落在 i32 范围，否则常量物化会静默截断出错误值
+        if (e.intval > 2147483647 || e.intval < -2147483648) {
+            tc_error_at(ctx, loc, "integer literal out of range for 'int' (allowed -2147483648..2147483647); append 'L' suffix for 'long' (i64)");
+            if (e.intval > 2147483647) { e.intval = 2147483647; }
+            else { e.intval = -2147483648; }
+        }
         let t = mk_type(TYPE_INT);
         e.inferred_type = t;
         return t;
@@ -3596,6 +4329,45 @@ pub kimo tc_check_index(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     return mk_type(TYPE_ANY);
 }
 
+// ============ EXPR_SLICE ============
+pub kimo tc_check_slice(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
+    let base_t = tc_check_expr(ctx, e.child1, env);
+    let lo_t = tc_check_expr(ctx, e.child2, env);
+    let hi_t = tc_check_expr(ctx, e.child3, env);
+    let loc = e.loc;
+    if ((lo_t.kind == TYPE_INT || lo_t.kind == TYPE_LONG || lo_t.kind == TYPE_ANY) && (hi_t.kind == TYPE_INT || hi_t.kind == TYPE_LONG || hi_t.kind == TYPE_ANY)) {
+        // bounds ok
+    } else {
+        let msg = "slice bounds must be int, got '" + ty_display_name(lo_t) + "' and '" + ty_display_name(hi_t) + "'";
+        tc_error_at(ctx, loc, msg);
+    }
+    let bk = base_t.kind;
+    if (bk == TYPE_ARRAY) {
+        let et = base_t.elem_type;
+        if (et.kind == TYPE_INFER) { et = mk_type(TYPE_ANY); }
+        let rt = mk_type(TYPE_ARRAY);
+        rt.elem_type = et;
+        e.inferred_type = rt;
+        return rt;
+    }
+    if (bk == TYPE_STRING) {
+        let st = mk_type(TYPE_STRING);
+        e.inferred_type = st;
+        return st;
+    }
+    // any 基按字符串/数组中的哪一种切是不确定的，禁止静默切错 —— 显式 cast 后再切。
+    if (bk == TYPE_ANY) {
+        let msg = "cannot slice 'any' value; cast it to array or string first";
+        tc_error_at(ctx, loc, msg);
+        e.inferred_type = mk_type(TYPE_ANY);
+        return mk_type(TYPE_ANY);
+    }
+    let msg2 = "cannot slice non-array/string type '" + ty_display_name(base_t) + "'";
+    tc_error_at(ctx, loc, msg2);
+    e.inferred_type = mk_type(TYPE_ANY);
+    return mk_type(TYPE_ANY);
+}
+
 // 在所有已知 struct 定义中按字段名查找字段索引（供 any 成员访问使用）。
 // any 值擦除了具体 struct 类型，但字段布局统一（每字段 8 字节，offset=idx*8），
 // 故按字段名在结构体表中定位第一个匹配的字段索引。找不到返回 0。
@@ -3965,6 +4737,10 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     let args = e.items;
     let arg_names = e.str_items;
 
+    if (file_exists("build/.qdbg") == 1 && str_index_of(name, "speak") >= 0) {
+        println("[DBG] tc_check_call name=" + name);
+    }
+
     // 1. 内置函数白名单
     let bt = tc_builtin_ret_type(name);
     if (type_is_none(bt) == 0) {
@@ -4025,6 +4801,23 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                 let bt_et = bt.elem_type;
                 if ((bt_et as any) == 0 || bt_et.kind == TYPE_INFER) {
                     bt.elem_type = vt;
+                }
+            }
+        }
+        // 内置名与 struct receiver 同名方法冲突时（如 trait ToString::to_string 被内置
+        // to_string 遮蔽），struct 上的方法应优先于内置。仅当首参已推断为 struct 且能
+        // 解析到同名 trait/inherent 方法才改走方法分发，复用 3a 的
+        // __impl__<type>__<trait>__<method> 符号链路；非 struct 调用零影响。
+        if (len(args) > 0) {
+            let r0t = args[0].inferred_type;
+            if ((r0t as any) != 0 && r0t.kind == TYPE_STRUCT && len(r0t.name) > 0) {
+                let recv_mangled = tc_impl_find_method(ctx, r0t.name, name);
+                if (len(recv_mangled) > 0) {
+                    let fd3 = tc_func_lookup(ctx, recv_mangled);
+                    if (tc_func_is_none(fd3) == 0) {
+                        e.str1 = recv_mangled;
+                        return tc_check_call_fd(ctx, e, env, fd3, args, arg_names);
+                    }
                 }
             }
         }
@@ -4181,6 +4974,46 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
                         return tc_check_call_fd(ctx, e, env, fd3, args, arg_names);
                     }
                 }
+                // 0.5.3 泛型 trait 分发：接收者为当前函数类型参数且某约束 trait 声明该方法。
+                // 模板检查阶段仅检查其余实参并宽容放行；特化（T→具体类型）时经 mono 重检查
+                // 解析为具体 impl 符号（__impl__<T>__<Tr>__<m>）。
+                else if (tc_is_type_param(recv_t, tc_cur_tparams) == 1) {
+                    let gret = tc_tparam_generic_method(ctx, recv_t.name, name);
+                    if (type_is_none(gret) == 0) {
+                        let gi = 1;
+                        while (gi < len(args)) {
+                            tc_check_expr(ctx, args[gi], env);
+                            gi = gi + 1;
+                        }
+                        e.str1 = name;
+                        e.inferred_type = gret;
+                        return gret;
+                    }
+                }
+            }
+            // 0.5.3 dyn Trait：接收者是 trait 对象（dyn Foo.m()），走 vtable 动态分发。
+            else if (recv_t.kind == TYPE_TRAIT_OBJECT && len(recv_t.name) > 0) {
+                if (file_exists("build/.qdbg") == 1) {
+                    println("[dyn] SITE-4837 recv kind=" + int_to_str(recv_t.kind) + " name=" + recv_t.name + " method=" + name);
+                }
+                tc_dyn_ensure_trait(ctx, recv_t.name);
+                let dmlist = tc_dyn_flat_methods(recv_t.name);
+                let dmfound = 0;
+                let dmj = 0;
+                while (dmj < len(dmlist)) {
+                    if (str_eq(dmlist[dmj] as string, name) == 1) { dmfound = 1; break; }
+                    dmj = dmj + 1;
+                }
+                if (dmfound == 1) {
+                    let gi2 = 1;
+                    while (gi2 < len(args)) {
+                        tc_check_expr(ctx, args[gi2], env);
+                        gi2 = gi2 + 1;
+                    }
+                    e.str1 = name;
+                    e.inferred_type = tc_dyn_method_ret(ctx, recv_t.name, name);
+                    return e.inferred_type;
+                }
             }
         }
         // 3b. payload enum 变体构造：Some(v) / Ok(v)
@@ -4253,11 +5086,61 @@ pub kimo tc_check_call(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
 }
 
 // 函数调用（已找到 FuncDef）：参数处理 + 泛型推断 + 单态化
+// 深拷贝默认值表达式：完整复制子表达式（child/items/items2），支持任意默认表达式；
+// 产生独立对象以避免跨函数复用 AST 大 struct 触发自举编译崩。
+pub kimo tc_clone_expr(src: Expr) -> Expr {
+    let r = mk_expr(src.kind, src.loc);
+    r.str1 = src.str1;
+    r.str2 = src.str2;
+    r.intval = src.intval;
+    r.floatval = src.floatval;
+    r.id = src.id;
+    if (expr_is_none(src.child1) == 0) { r.child1 = tc_clone_expr(src.child1); }
+    if (expr_is_none(src.child2) == 0) { r.child2 = tc_clone_expr(src.child2); }
+    if (expr_is_none(src.child3) == 0) { r.child3 = tc_clone_expr(src.child3); }
+    let ci = 0;
+    while (ci < len(src.items)) {
+        r.items = array_push(r.items, tc_clone_expr(src.items[ci]));
+        ci = ci + 1;
+    }
+    let cj = 0;
+    while (cj < len(src.items2)) {
+        r.items2 = array_push(r.items2, tc_clone_expr(src.items2[cj]));
+        cj = cj + 1;
+    }
+    r.str_items = src.str_items;
+    r.type_args = src.type_args;
+    r.inferred_type = src.inferred_type;
+    return r;
+}
+
 pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, args: array<Expr>, arg_names: array<string>) -> Type {
     let loc = e.loc;
+    if (file_exists("build/.qdbg") == 1 && str_index_of(fd.name, "speak") >= 0) {
+        println("[DBG] tc_check_call_fd fd=" + fd.name);
+    }
     let params = fd.params;
     let nparams = len(params);
     let nargs = len(args);
+
+    // 0.5.3 dyn Trait：登记被调函数形参类型（mir 实参装箱用）；遇 dyn 形参惰性建 vtable 方法表。
+    let dyn_pty: array<Type> = [];
+    let dyn_pi = 0;
+    while (dyn_pi < nparams) {
+        let dyn_p = params[dyn_pi] as Param;
+        dyn_pty = array_push(dyn_pty, dyn_p.type_ref);
+        if (dyn_p.type_ref.kind == TYPE_TRAIT_OBJECT && len(dyn_p.type_ref.name) > 0) {
+            if (file_exists("build/.qdbg") == 1) {
+                println("[dyn] SITE-4940 callfd=" + fd.name + " pkind=" + int_to_str(dyn_p.type_ref.kind) + " pname=" + dyn_p.type_ref.name);
+            }
+            tc_dyn_ensure_trait(ctx, dyn_p.type_ref.name);
+        }
+        dyn_pi = dyn_pi + 1;
+    }
+    tc_dyn_param_register(fd.name, dyn_pty);
+    if (file_exists("build/.qdbg") == 1) {
+        println("[dyn] param_register called fd=" + fd.name + " npty=" + int_to_str(len(dyn_pty)));
+    }
 
     // 命名参数校验：arg_names[i] 必须存在于函数参数列表
     //（0.3 语义；tc-fail_named_param_wrong_name：f(x:1, nonexistent:2) 应拒绝）
@@ -4293,40 +5176,104 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         if (pp0.is_variadic == 1) { var_idx = pv0; }
         pv0 = pv0 + 1;
     }
-    if (var_idx >= 0 && nargs >= var_idx) {
-        if (file_exists("build/.qdbg") == 1) {
-            println("DBG varargs PACK idx=" + int_to_str(var_idx) + " nargs=" + int_to_str(nargs));
+    // 变参打包 + 具名参数映射 + 默认参数展开（统一处理）：
+    //   fixed_count = 需按位置/名称填写的固定参数个数（变参 = 固定前缀，非变参 = 全部形参）。
+    //   - 位置实参按序占最靠前的未占用固定槽；非变参溢出→报错，变参溢出→收进尾包。
+    //   - 具名实参按名匹配固定槽（变参尾包不可按名指定）；重复占用→报错。
+    //   - 未占用固定槽：带默认值→克隆默认值实参（tc_clone_expr）；无默认值→参数个数错误。
+    //   - 变参函数：收拢的尾包作为一个数组实参填到末位（EXPR_ARRAY_LIT）。
+    // 写回 e.items（引用语义，MIR 直接消费）。非变参且实参恰数与无具名时不进入（省开销）。
+    let fixed_count = (var_idx < 0) ? nparams : var_idx;
+    let has_named = 0;
+    let aq2 = 0;
+    while (aq2 < len(arg_names)) {
+        if (len(arg_names[aq2] as string) > 0) { has_named = 1; }
+        aq2 = aq2 + 1;
+    }
+    if (has_named == 1 || nargs < fixed_count || var_idx >= 0) {
+        let used_arg: array<int> = [];
+        let ua0 = 0;
+        while (ua0 < nparams) { used_arg = array_push(used_arg, 0); ua0 = ua0 + 1; }
+        let ord: array<Expr> = [];
+        let oo0 = 0;
+        while (oo0 < nparams) { ord = array_push(ord, mk_expr(EXPR_NULL, loc)); oo0 = oo0 + 1; }
+        let next_pos0 = 0;
+        let var_pack: array<Expr> = [];
+        let aa2 = 0;
+        while (aa2 < nargs) {
+            let nm = arg_names[aa2] as string;
+            let tslot = -1;
+            if (len(nm) == 0) {
+                while (next_pos0 < fixed_count && used_arg[next_pos0] == 1) { next_pos0 = next_pos0 + 1; }
+                if (next_pos0 < fixed_count) {
+                    tslot = next_pos0;
+                    next_pos0 = next_pos0 + 1;
+                } else if (var_idx >= 0) {
+                    var_pack = array_push(var_pack, args[aa2]);
+                } else {
+                    tc_error_at(ctx, loc, "function '" + fd.name + "' has too many positional arguments");
+                    tslot = fixed_count - 1;
+                }
+            } else {
+                let tk2 = 0;
+                while (tk2 < nparams) {
+                    if (str_eq((params[tk2] as Param).name, nm) == 1) { tslot = tk2; break; }
+                    tk2 = tk2 + 1;
+                }
+                if (tslot < 0 || (var_idx >= 0 && tslot >= fixed_count)) {
+                    tc_error_at(ctx, loc, "unknown named argument '" + nm + "' for function '" + fd.name + "'");
+                    tslot = (var_idx >= 0) ? (fixed_count - 1) : 0;
+                    if (tslot < 0) { tslot = 0; }
+                }
+            }
+            if (tslot >= 0) {
+                if (used_arg[tslot] == 1) {
+                    tc_error_at(ctx, loc, "argument for parameter '" + (params[tslot] as Param).name + "' specified more than once");
+                }
+                used_arg[tslot] = 1;
+                ord[tslot] = args[aa2];
+            }
+            aa2 = aa2 + 1;
         }
-        let pack: array<Expr> = [];
-        let pi6 = var_idx;
-        while (pi6 < nargs) {
-            pack = array_push(pack, args[pi6]);
-            pi6 = pi6 + 1;
+        // 未占用的固定槽：默认值补齐 或 报参数个数错误
+        let miss = 0;
+        let ua1 = 0;
+        while (ua1 < fixed_count) {
+            if (used_arg[ua1] == 0) {
+                let pd = params[ua1] as Param;
+                if (expr_is_none(pd.default_value) == 1) {
+                    miss = 1;
+                } else {
+                    ord[ua1] = tc_clone_expr(pd.default_value);
+                    used_arg[ua1] = 1;
+                }
+            }
+            ua1 = ua1 + 1;
         }
-        let new_args: array<Expr> = [];
-        let pi7 = 0;
-        while (pi7 < var_idx) {
-            new_args = array_push(new_args, args[pi7]);
-            pi7 = pi7 + 1;
+        if (miss == 1) {
+            tc_error_at(ctx, loc, "function '" + fd.name + "' expects " + int_to_str(fixed_count) + " args but got " + int_to_str(nargs));
+            let uM = 0;
+            while (uM < fixed_count) {
+                if (used_arg[uM] == 0) { ord[uM] = mk_expr(EXPR_NULL, loc); used_arg[uM] = 1; }
+                uM = uM + 1;
+            }
         }
-        let vp = params[var_idx] as Param;
-        let alit = mk_expr(EXPR_ARRAY_LIT, loc);
-        alit.items = pack;
-        alit.inferred_type = vp.type_ref;
-        new_args = array_push(new_args, alit);
-        e.items = new_args;
-        args = new_args;
-        nargs = len(new_args);
-        let new_names: array<string> = [];
-        let pi8 = 0;
-        while (pi8 < var_idx) {
-            let nn = "";
-            if (pi8 < len(arg_names)) { nn = arg_names[pi8] as string; }
-            new_names = array_push(new_names, nn);
-            pi8 = pi8 + 1;
+        // 变参函数：把尾包作为数组实参填到末位
+        if (var_idx >= 0) {
+            let vp = params[var_idx] as Param;
+            let alit = mk_expr(EXPR_ARRAY_LIT, loc);
+            alit.items = var_pack;
+            alit.inferred_type = vp.type_ref;
+            ord[var_idx] = alit;
+            used_arg[var_idx] = 1;
         }
-        new_names = array_push(new_names, "");
-        arg_names = new_names;
+        args = ord;
+        e.items = ord;
+        nargs = nparams;
+        let an2: array<string> = [];
+        let a3 = 0;
+        while (a3 < nparams) { an2 = array_push(an2, ""); a3 = a3 + 1; }
+        arg_names = an2;
     }
 
     // 泛型函数：先做类型实参推断与约束检查
@@ -4363,6 +5310,9 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
             }
             ti = ti + 1;
         }
+        // 0.5.3 关联类型具体化：把 T::Item 解析为绑定类型的 impl 关联绑定，
+        // 使单态化时返回类型/方法体的 `T::Item` 都能命中替换（见 tc_mono_type）。
+        tc_resolve_assoc_bindings(ctx, tparams);
         // 递归检查其余实参（未绑定参数位置）
         let ai = 0;
         while (ai < nargs) {
@@ -4387,21 +5337,6 @@ pub kimo tc_check_call_fd(ctx: CompileContext, e: Expr, env: TEnv, fd: FuncDef, 
         tc_error_at(ctx, loc, msg2);
         e.inferred_type = mk_type(TYPE_ANY);
         return mk_type(TYPE_ANY);
-    }
-    // 缺失参数：0.4 尚未实现默认参数展开（codegen 对缺参调用生成越界读 → 运行时 AV；
-    // 曾在 TC 调用处补默认值实参，但默认值 Expr 跨上下文复用触发 AST 大 struct 装箱崩溃）。
-    // 统一在 TC 拒绝：无默认值 → 参数数错误；有默认值 → 明确"未实现"（编译器自身源码/runtime 无默认参数，安全）。
-    let pi2 = nargs;
-    while (pi2 < nparams) {
-        let p = params[pi2] as Param;
-        if (expr_is_none(p.default_value) == 1) {
-            let msg3 = "function '" + fd.name + "' expects " + int_to_str(nparams) + " args but got " + int_to_str(nargs);
-            tc_error_at(ctx, loc, msg3);
-        } else {
-            let msg3b = "default parameter not implemented: '" + p.name + "' has default value";
-            tc_error_at(ctx, loc, msg3b);
-        }
-        break;
     }
     // 参数类型检查（已推断泛型）
     let pi3 = 0;
@@ -4963,6 +5898,7 @@ pub kimo tc_check_expr(ctx: CompileContext, e: Expr, env: TEnv) -> Type {
     if (k == EXPR_UNARY) { return tc_check_unary(ctx, e, env); }
     if (k == EXPR_CALL) { return tc_check_call(ctx, e, env); }
     if (k == EXPR_INDEX) { return tc_check_index(ctx, e, env); }
+    if (k == EXPR_SLICE) { return tc_check_slice(ctx, e, env); }
     if (k == EXPR_MEMBER) { return tc_check_member(ctx, e, env); }
     if (k == EXPR_CAST) { return tc_check_cast(ctx, e, env); }
     if (k == EXPR_ARRAY_LIT) { return tc_check_array_lit(ctx, e, env); }
@@ -5025,6 +5961,8 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
         // 回填 final 类型到 stmt（MIR_STORE_VAR 依赖）
         let final_ty = tc_env_get(env, name);
         s.inferred_type = final_ty;
+        // const 标志：const x = ... 声明后禁止再赋值
+        tc_env_set_const(env, name, s.intval);
         return;
     }
 
@@ -5069,7 +6007,7 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
         return;
     }
 
-    if (k == STMT_WHILE) {
+    if (k == STMT_WHILE || k == STMT_DO_WHILE) {
         let cond_t2 = tc_check_expr(ctx, s.expr1, env);
         let ck2 = cond_t2.kind;
         if (ck2 != TYPE_BOOL && ck2 != TYPE_ANY && ck2 != TYPE_INT && ck2 != TYPE_LONG) {
@@ -5096,7 +6034,14 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
             let bind_t = mk_type(TYPE_INT);
             if (ik == TYPE_ARRAY) { bind_t = iter_t.elem_type; }
             else if (ik == TYPE_STRING) { bind_t = mk_type(TYPE_CHAR); }
-            else if (ik == TYPE_DICT) { bind_t = iter_t.key_type; }
+            else if (ik == TYPE_DICT) {
+                bind_t = iter_t.key_type;
+                // hashmap_new() 返回裸 dict（key_type=TYPE_NONE）；单变量迭代的键
+                // 由 shadow_dict_key_at 固定返回 string。缺此回退会以 TYPE_NONE 登记
+                // 循环变量 → 用户用 k 时报 "undefined variable"。与下方双变量 dict
+                // 分支已有的 none->string 回退保持一致。
+                if (type_is_none(bind_t) == 1) { bind_t = mk_type(TYPE_STRING); }
+            }
             else if (ik == TYPE_SET) { bind_t = iter_t.elem_type; }
             else if (ik == TYPE_ANY) { bind_t = mk_type(TYPE_ANY); }
             tc_env_set(env, parts[0] as string, bind_t);
@@ -5156,6 +6101,13 @@ pub kimo tc_check_stmt(ctx: CompileContext, s: Stmt, env: TEnv, ret_type: Type, 
     }
 
     if (k == STMT_ASSIGN) {
+        // const 不可变绑定：目标变量的根（EXPR_VAR，或经 .field / [i] 链）若是 const 声明，
+        // 则整个对象冻结，禁止任何再赋值（含字段/元素写入）。
+        if (tc_assign_target_is_const(s.expr1, env) == 1) {
+            let tname = tc_assign_target_root_name(s.expr1);
+            let msgc = "cannot assign to const variable '" + tname + "'";
+            tc_error_at(ctx, loc, msgc);
+        }
         let lhs_t = tc_check_expr(ctx, s.expr1, env);
         let rhs_t = tc_check_expr(ctx, s.expr2, env);
         // 赋值给 array<T> 时回填元素类型到数组字面量（空 [] 的 elem_type 是 TYPE_NONE）
@@ -5409,7 +6361,11 @@ pub kimo tc_check_bodies(ctx: CompileContext, prog: Program) -> int {
         let fd = prog.funcs[i] as FuncDef;
         if (len(fd.extern_name) == 0) {
             // Phase 11 增量缓存：函数所属模块缓存命中 → 跳过函数体检查（MIR 由 loader 从 .lu 加载）
-            if (tc_ns_is_valid(ctx, fd.loc.line) == 1) {
+            // 仅跳过前 TC 原始函数（i < tc_g_orig_func_count）：其 MIR 从 .lu 载入，inferred_type
+            // 无消费者。TC 期间合成的 __impl__ 默认实现函数（总 fresh-lower、fi>=N0）必须照常
+            // 检查函数体，否则其类型推断被跳过 → 生成 add ptr / call @裸符号 等错误 MIR
+            //（缓存反序列化 bug：ex_trait_default_impl / ex_trait_supertrait_default 热缓存失败）。
+            if (i < tc_g_orig_func_count && tc_ns_is_valid(ctx, fd.loc.line) == 1) {
                 i = i + 1;
                 continue;
             }
@@ -5581,7 +6537,12 @@ pub kimo tc_check_program(prog: Program) -> int {
         imports: [],
     };
     ctx.graph = tc_mg_add(ctx.graph, pnode);
-    // Pass 1：声明收集
+    // Pass 1：默认实现合成（必须早于符号注册，使合成的 mangled 函数进入注册循环）
+    // 先记录 parse 后的原始函数数：合成默认实现会追加 __impl__ 函数（fi>=N0，总 fresh-lower），
+    // 缓存命中的跳过判定必须排除它们，否则其函数体类型推断被跳过 → 错误 MIR。
+    tc_g_orig_func_count = len(prog.funcs);
+    tc_synth_default_impls(prog);
+    // Pass 2：声明收集
     tc_register_decls(ctx, prog);
     // 0.5：注册后统一 resolve 字段/payload 类型（严格态多 node 下按模块命名空间）
     tc_resolve_all_field_types(ctx);

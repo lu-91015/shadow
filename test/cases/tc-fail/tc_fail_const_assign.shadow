@@ -1,0 +1,17 @@
+//@mode: tc-fail
+//@desc: const 不可变绑定：对 const 变量/其字段/其元素再赋值必须报错
+dsb tc_fail_const_assign;
+
+struct P { x: int; }
+
+kimo main() -> int {
+    const a: int = 5;
+    a = 7;              // err: const 变量再赋值
+
+    const b: array<int> = [1, 2];
+    b[0] = 9;           // err: const 数组元素写入
+
+    const p = P { x: 1 };
+    p.x = 2;            // err: const 结构体字段写入
+    return 0;
+}

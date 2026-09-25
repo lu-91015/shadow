@@ -1011,6 +1011,23 @@ extern "C" void shadow_hashmap_insert_int(void* map, const char* key, int64_t va
     sdict_set(m, key, DictValue(value));
 }
 
+// dict<K, float/double> 的 hashmap_insert 变体。值以 double 变体存放，
+// 否则 float 会被当作 const char* 以 strdup 截断（与 insert_int 同类问题）。
+extern "C" void shadow_hashmap_insert_float(void* map, const char* key, double value) {
+    if (!map || !key) return;
+    ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
+    sdict_set(m, key, DictValue(value));
+}
+
+// dict<K, array/struct/dict/any/ptr> 的 hashmap_insert 变体。
+// 值以指针变体（tag==4）原样存放（shadow_dict_get 会按其 type_tag 还原嵌套容器），
+// 不做 strdup —— 否则数组等堆对象会被当作 C 字符串截断到首个 NUL，元素全部丢失。
+extern "C" void shadow_hashmap_insert_ptr(void* map, const char* key, void* value) {
+    if (!map || !key) return;
+    ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
+    sdict_set(m, key, DictValue((void*)value));
+}
+
 extern "C" const char* shadow_hashmap_get(void* map, const char* key) {
     if (!map || !key) return dup_str("");
     ShadowDict* m = reinterpret_cast<ShadowDict*>(map);
@@ -1110,6 +1127,34 @@ extern "C" int shadow_set_remove_int(void* set, int64_t value) {
     ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
     char buf[32];
     snprintf(buf, sizeof(buf), "%lld", (long long)value);
+    return sset_erase(s, buf);
+}
+
+// 值/指针元素版本（struct / 引用）：以指针地址的十六进制串为键存储，
+// 与 int 版本同构（set 仍统一以字符串为键），语义为指针同一性。
+// add/contains/remove 用同一格式，保证往返一致。
+extern "C" int shadow_set_add_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
+    sset_add(s, buf);
+    return 0;
+}
+
+extern "C" int shadow_set_contains_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
+    return sset_lookup(s, buf, sdict_hash(buf)) != nullptr ? 1 : 0;
+}
+
+extern "C" int shadow_set_remove_ptr(void* set, void* value) {
+    if (!set || !value) return 0;
+    ShadowSet* s = reinterpret_cast<ShadowSet*>(set);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%p", value);
     return sset_erase(s, buf);
 }
 
@@ -3218,6 +3263,16 @@ extern "C" const char* shadow_dict_get_string(void* dict_ptr, const char* key) {
     if (v && v->tag == 2)
         return strdup(v->val.s);
     return nullptr;
+}
+
+// ── shadow_dict_get_float ───────────────────────────────────────────
+extern "C" double shadow_dict_get_float(void* dict_ptr, const char* key) {
+    if (!dict_ptr || !key) return 0.0;
+    ShadowDict* d = reinterpret_cast<ShadowDict*>(dict_ptr);
+    DictValue* v = sdict_get(d, key);
+    if (v && v->tag == 1)
+        return v->val.d;
+    return 0.0;
 }
 
 // Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
@@ -5452,6 +5507,7 @@ extern "C" void shadow_bad_node_report(void* e) {
 #include <csetjmp>
 #include <cstring>
 #include <llvm-c/Core.h>
+#include <llvm-c/DebugInfo.h>
 static_assert(sizeof(jmp_buf) <= 256, "jmp_buf exceeds 256 bytes");
 
 // Ã¢ÂÂÃ¢ÂÂ LLVM Bridge: Shadow Ã¢ÂÂ LLVM-C API (thread-local buffer for array params) Ã¢ÂÂÃ¢ÂÂ
@@ -5545,6 +5601,95 @@ extern "C" void shadow_llvm_set_alwaysinline(void* ctx, void* fn) {
     if (kind == 0) return;
     LLVMAttributeRef attr = LLVMCreateEnumAttribute((LLVMContextRef)ctx, kind, 0);
     LLVMAddAttributeAtIndex((LLVMValueRef)fn, LLVMAttributeFunctionIndex, attr);
+}
+
+// ---- Debug Info (DWARF line tables) bridge ----
+// 让编译器为每条 MIR 指令挂 !dbg 行号，使 llc 产出 .debug_line，addr2line 可把
+// 反汇编 PC 精确映射回源码行。用"编译单元即作用域"的最小方案：不建 DISubprogram，
+// 只建 DICompileUnit + DIFile，所有 DILocation 的 scope 指向该编译单元。
+static LLVMDIBuilderRef g_shadow_di_builder = nullptr;
+static LLVMContextRef g_shadow_di_ctx = nullptr;
+static LLVMMetadataRef g_shadow_di_cu = nullptr;
+// 创建 DIBuilder + DIFile + DICompileUnit。dirname 为目录、filename 为文件 basename。
+// 返回模块级 DIFile（供 DISubprogram 的 scope/file 用）；真正作 DILocation scope
+// 的是每个函数创建的 DISubprogram（见 shadow_llvm_di_subprogram）——LLVM verifier
+// 要求 DILocation.scope 必须是 DISubprogram，指向 DIFile/DICompileUnit 都会报
+// "location requires a valid scope"，故这里不直接返回 CU 当 scope。
+extern "C" void* shadow_llvm_di_begin(void* mod, void* ctx, const char* dirname,
+                                      const char* filename, int is_optimized) {
+    LLVMContextRef C = (LLVMContextRef)ctx;
+    g_shadow_di_ctx = C;
+    g_shadow_di_builder = LLVMCreateDIBuilder((LLVMModuleRef)mod);
+    LLVMMetadataRef file = LLVMDIBuilderCreateFile(
+        g_shadow_di_builder, filename ? filename : "", filename ? strlen(filename) : 0,
+        dirname ? dirname : "", dirname ? strlen(dirname) : 0);
+    // DW_LANG_C(2), emission Full(1)；Producer/Flags 传空。
+    g_shadow_di_cu = LLVMDIBuilderCreateCompileUnit(
+        g_shadow_di_builder, (LLVMDWARFSourceLanguage)2, file,
+        "shadow", 6, (LLVMBool)is_optimized, "", 0, 0, "", 0,
+        (LLVMDWARFEmissionKind)1, 0, 0, 0, "", 0, "", 0);
+    // 显式声明调试 flags：DIBuilder::finalize 只自动加 "Debug Info Version"，
+    // 而 "Dwarf Version"（llc 据此选 DWARF 版本）与 target triple 都需前端主动设置，
+    // 否则 llc 报 "invalid version (0)"、产物缺 .debug_*。Dwarf Version=4 尽跨兼容，
+    // 与 clang 默认（git 上多用 5，老工具链仍收 4）取保守值，保证 addr2line 可用。
+    {
+        LLVMModuleRef M = (LLVMModuleRef)mod;
+        // Dwarf Version=4：llc 据此选 DWARF 版本（缺失则报 invalid version、无 .debug_*）。
+        LLVMMetadataRef dv = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(C), 4, 0));
+        LLVMAddModuleFlag(M, LLVMModuleFlagBehaviorError,
+                          "Dwarf Version", strlen("Dwarf Version"), dv);
+        // Debug Info Version=3：调试元数据格式版本（DIBuilder::finalize 通常也自动加，
+        // 这里显式先加保证覆盖；行为 Warning 与 clang 一致）。
+        LLVMMetadataRef di = LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(C), 3, 0));
+        LLVMAddModuleFlag(M, LLVMModuleFlagBehaviorWarning,
+                          "Debug Info Version", strlen("Debug Info Version"), di);
+    }
+    return file;
+}
+// 为单个函数创建 DISubprogram 作用域并返回（供 codegen 作为该函数体内
+// DILocation 的 scope）。func 是 LLVM 函数值，name 与 fn 对应。规格化最低限度：
+// 不含参数类型、无 Declaration（definition flag）、line=0、scope 指向 DIFile。
+extern "C" void* shadow_llvm_di_subprogram(void* func, const char* name, void* file) {
+    if (!g_shadow_di_builder) return nullptr;
+    LLVMMetadataRef f = (LLVMMetadataRef)file;
+    LLVMMetadataRef st = LLVMDIBuilderCreateSubroutineType(
+        g_shadow_di_builder, f, nullptr, 0, (LLVMDIFlags)0);
+    LLVMMetadataRef sub = LLVMDIBuilderCreateFunction(
+        g_shadow_di_builder, f,
+        name ? name : "", name ? strlen(name) : 0,
+        name ? name : "", name ? strlen(name) : 0,  // linkage name 亦用同名
+        f, /*line*/0,
+        /*scope/inlined in*/st,
+        /*isLocal*/0, /*isDefinition*/1,
+        /*scopeLine*/0, (LLVMDIFlags)0, /*isOptimized*/0);
+    // 把 sub 关联到 LLVM 函数实体的 !dbg 属性（DWARF 里函数符号有行号信息）。
+    LLVMSetSubprogram((LLVMValueRef)func, sub);
+    return sub;
+}
+// 构建 (line,col,scope) 的 DILocation，并作为 Value 返回（供 SetCurrentDebugLocation）。
+extern "C" void* shadow_llvm_di_loc(int line, int col, void* scope) {
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(
+        g_shadow_di_ctx, (unsigned)line, (unsigned)col,
+        (LLVMMetadataRef)scope, nullptr);
+    return LLVMMetadataAsValue(g_shadow_di_ctx, loc);
+}
+// 让 builder 之后的指令带上该 debug location。
+extern "C" void shadow_llvm_di_set(void* b, void* loc_value) {
+    LLVMSetCurrentDebugLocation((LLVMBuilderRef)b, (LLVMValueRef)loc_value);
+}
+// 清空当前 debug location：进入新函数、在发射任何带 !dbg 指令（如 frame alloca，
+// 由 cg_gen_func 单独生成、不经 cg_gen_inst）前调用，避免残留上一函数的 DILocation
+// 被 LLVM verifier 判为 "attachment points at wrong subprogram for function"。
+extern "C" void shadow_llvm_di_reset(void* b) {
+    LLVMSetCurrentDebugLocation((LLVMBuilderRef)b, nullptr);
+}
+// 收尾：finalize 把 !llvm.dbg.cu 挂回模块并生成调试数据，随后释放 DIBuilder。
+extern "C" void shadow_llvm_di_end(void*) {
+    if (g_shadow_di_builder) {
+        LLVMDIBuilderFinalize(g_shadow_di_builder);
+        LLVMDisposeDIBuilder(g_shadow_di_builder);
+        g_shadow_di_builder = nullptr;
+    }
 }
 
 // 把 LLVM 全局变量标记为 thread_local。codegen 用它声明 shadow_gc_tls_frame_head

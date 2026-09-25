@@ -1,0 +1,26 @@
+//@expect: unwrap(int) = 42
+//@desc: 0.5.3 综合：where 子句 + 关联类型，泛型函数签名返回 T::Item，方法体 b.get() 泛型分发
+dsb ex_trait_assoc_generic;
+
+trait Getter {
+    type Item;
+    kimo get(self: Self) -> Self::Item;
+}
+
+struct BoxI { v: int }
+
+impl Getter for BoxI {
+    type Item = int;
+    kimo get(self: BoxI) -> int { return self.v; }
+}
+
+kimo unwrap<T>(b: T) -> T::Item where T: Getter {
+    return b.get();
+}
+
+kimo main() -> int {
+    let b = BoxI { v: 42 };
+    let r: int = unwrap(b);
+    println("unwrap(int) = " + int_to_str(r));
+    return 0;
+}

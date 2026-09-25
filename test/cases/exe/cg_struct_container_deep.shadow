@@ -1,0 +1,72 @@
+//@mode: exe
+//@desc: 复杂 struct 网格 —— struct 内嵌 array<struct> / set<string> / dict<string,struct> 字段，
+//       array<struct>、set<struct>、dict<string,set<struct>> 等深层嵌套的创建/读取/改字段/删除。
+//@expect: N1\n10\n4\n2\n5\n7\n99\n0\n2\n2\n1\n1\n115
+dsb cg_struct_container_deep;
+
+struct Vec { x: int; y: int; }
+
+struct Node {
+    id: string;
+    pos: Vec;
+    links: array<Vec>;          // struct 字段内嵌 array<struct>
+    tags: set<string>;          // struct 字段内嵌 set<string>
+    map: dict<string, Vec>;     // struct 字段内嵌 dict<string, struct>
+}
+
+kimo main() -> int {
+    // —— 构造带嵌套容器字段的 struct ——
+    let base = Vec { x: 1, y: 10 };
+    let links: array<Vec> = [];
+    links = array_push(links, Vec { x: 1, y: 2 });
+    links = array_push(links, Vec { x: 3, y: 4 });
+    let tags = set_new();
+    set_add(tags, "a");
+    set_add(tags, "b");
+    set_add(tags, "a");               // 去重
+    let vp = Vec { x: 5, y: 6 };
+    let m: dict<string, Vec> = hashmap_new();
+    hashmap_insert(m, "p", vp);
+
+    let n = Node { id: "N1", pos: base, links: links, tags: tags, map: m };
+    println(n.id);                    // N1
+    println(n.pos.y);                 // 10
+    println(n.links[1].y);            // 4
+    println(set_size(n.tags));        // 2
+    println(n.map["p"].x);            // 5
+
+    // —— array<struct>，含 struct 内嵌套字段再索引 ——
+    let nodes: array<Node> = [];
+    nodes = array_push(nodes, n);
+    let n2 = Node { id: "N2", pos: Vec { x: 7, y: 8 }, links: links, tags: tags, map: m };
+    nodes = array_push(nodes, n2);
+    println(nodes[1].pos.x);          // 7
+    // 就地修改 array<struct> 里 struct 的字段
+    nodes[0].pos.y = 99;
+    println(nodes[0].pos.y);          // 99
+
+    // —— set<struct>：按指针同一性去重，contains 判定 ——
+    let sn = set_new();
+    set_add(sn, n);
+    println(set_contains(sn, n2));    // 0
+    set_add(sn, n2);
+    println(set_size(sn));            // 2
+
+    // —— dict<string, set<struct>>：struct 集合收进 dict（须类型化 dict，否则 set 句柄被 any 装箱丢失）——
+    let dss: dict<string, set<Node>> = hashmap_new();
+    hashmap_insert(dss, "grp", sn);
+    println(set_size(dss["grp"]));    // 2
+    println(set_contains(dss["grp"], n2));  // 1
+    set_remove(dss["grp"], n);
+    println(set_size(dss["grp"]));    // 1
+
+    // —— array<struct> 读回并参与计算 + 多维组合 ——
+    let acc = 0;
+    let i = 0;
+    while (i < len(nodes)) {
+        acc = acc + nodes[i].pos.x + nodes[i].pos.y;
+        i = i + 1;
+    }
+    println(acc);                     // 100 + 15 = 115
+    return 0;
+}

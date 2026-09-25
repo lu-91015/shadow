@@ -1,0 +1,27 @@
+//@mode: exe
+//@desc: 覆盖率 —— 3 级嵌套 dict dict<string,dict<string,dict<string,int>>> 三跳索引+深链改写；
+//       array<dict<string,dict<string,int>>> 索引后两跳；并验证两个 dict 路径共享同一内层 dict 的
+//       引用别名语义（一处改写，另一视图同步可见）。
+//@expect: 5\n55\n55
+dsb cg_nested_dict3_level;
+
+kimo main() -> int {
+    // ① 3 级嵌套 dict：l3["top"]["mid"]["leaf"] 三跳索引 + 深链改写
+    let l1: dict<string, int> = hashmap_new();
+    hashmap_insert(l1, "leaf", 5);
+    let l2: dict<string, dict<string, int>> = hashmap_new();
+    hashmap_insert(l2, "mid", l1);
+    let l3: dict<string, dict<string, dict<string, int>>> = hashmap_new();
+    hashmap_insert(l3, "top", l2);
+    println(l3["top"]["mid"]["leaf"]);   // 5
+    l3["top"]["mid"]["leaf"] = 55;
+    println(l3["top"]["mid"]["leaf"]);   // 55
+
+    // ② array<dict<string, dict<string,int>>> 索引后两跳
+    let a: array<dict<string, dict<string, int>>> = [];
+    let inner: dict<string, dict<string, int>> = hashmap_new();
+    hashmap_insert(inner, "k", l1);      // 复用 l1：与 l3 共享同一内层 dict
+    a = array_push(a, inner);
+    println(a[0]["k"]["leaf"]);          // 引用别名 → 与①同步为 55
+    return 0;
+}

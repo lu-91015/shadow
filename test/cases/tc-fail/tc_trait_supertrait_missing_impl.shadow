@@ -1,0 +1,27 @@
+//@mode: tc-fail
+//@desc: 0.5.3 supertrait 完整性：impl B for X 必须同时有 impl A for X；否则编译报错
+//@expect-stderr: missing supertrait impl
+dsb tc_trait_supertrait_missing_impl;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+}
+
+trait Named : Speaker {
+    kimo label(self: Self) -> string;
+}
+
+struct Dog { tag: string }
+
+// 只 impl Named，缺 impl Speaker -> 应报 missing supertrait impl
+impl Named for Dog {
+    kimo label(self: Dog) -> string {
+        return "Dog:" + self.tag;
+    }
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Rex" };
+    println(d.label());
+    return 0;
+}

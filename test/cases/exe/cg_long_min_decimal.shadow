@@ -1,0 +1,28 @@
+//@expect: A min   = -9223372036854775808\nB min+1 = -9223372036854775807\nC -big  = -9223372036854775800\nD +max  = 9223372036854775807\nE min+1calc = -9223372036854775807
+//@timeout: 60
+// 回归：十进制 i64 最小值字面量 -9223372036854775808L。
+// 旧实现走 strtoll，+2^63 溢出返回 0/LLONG_MAX，导致该字面量被解析成错误值，
+// 且因后续 int 截断诊断（如 as int）无法区分“解析为 0”与正确 MIN，必须用 long_to_str 校验全宽。
+// 修复：parser_parse_radix_lit 对十进制幅值恰为 2^63 的文本特判返回 i64-min 位型，
+// 配合 parse_unary_inner 的 -* 负号折叠得 LONG_MIN，且不误伤其后的整数运算。
+dsb cg_long_min_decimal;
+
+kimo main() -> int {
+    let a: long = -9223372036854775808L;  // i64 min
+    println("A min   = " + long_to_str(a)); // expect -9223372036854775808
+
+    let b: long = -9223372036854775807L;  // min+1
+    println("B min+1 = " + long_to_str(b)); // expect -9223372036854775807
+
+    let c: long = -9223372036854775800L;
+    println("C -big  = " + long_to_str(c)); // expect -9223372036854775800
+
+    let d: long = 9223372036854775807L;   // max
+    println("D +max  = " + long_to_str(d)); // expect 9223372036854775807
+
+    // MIN 的字面量参与整数运算仍应得 min+1，而非 (0+1)=1 之类的错值
+    let e: long = -9223372036854775808L + 1L;
+    println("E min+1calc = " + long_to_str(e)); // expect -9223372036854775807
+
+    return 0;
+}

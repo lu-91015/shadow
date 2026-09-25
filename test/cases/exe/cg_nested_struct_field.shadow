@@ -1,0 +1,51 @@
+//@mode: exe
+//@desc: 覆盖率 —— struct 字段嵌入 dict<string,array<int>> 与 array<struct>、enum 的 struct 载荷与 match
+//       绑定解构、裸泛型函数返回嵌套容器再索引。
+//@expect: 20\n2\n18\n2
+dsb cg_nested_struct_field;
+
+struct Pair { a: int; b: int; }
+enum Shape { Dot(Pair); Segment(Pair, Pair); }
+
+struct Tracker {
+    id: string;
+    hist: dict<string, array<int>>;   // struct 字段 = dict 内嵌 array
+    items: array<Pair>;               // struct 字段 = array<struct>
+}
+
+kimo makeMatrix() -> array<array<int>> {
+    let r: array<array<int>> = [];
+    let c: array<int> = [];
+    c = array_push(c, 1);
+    c = array_push(c, 2);
+    r = array_push(r, c);
+    return r;
+}
+
+kimo main() -> int {
+    // ① struct 字段嵌套 dict<string,array<int>>：t.hist["x"][1] 两跳索引
+    let h: dict<string, array<int>> = hashmap_new();
+    let v: array<int> = [];
+    v = array_push(v, 10);
+    v = array_push(v, 20);
+    hashmap_insert(h, "x", v);
+    let its: array<Pair> = [];
+    its = array_push(its, Pair { a: 1, b: 2 });
+    let t = Tracker { id: "t1", hist: h, items: its };
+    println(t.hist["x"][1]);      // 20
+    println(t.items[0].b);        // 2
+
+    // ② enum 的 struct 载荷 + match 绑定解构
+    let s = Shape.Segment(Pair { a: 3, b: 4 }, Pair { a: 5, b: 6 });
+    let ssum = 0;
+    match s {
+        Shape.Dot(pp) => { ssum = ssum + pp.a; }
+        Shape.Segment(p1, p2) => { ssum = ssum + p1.a + p1.b + p2.a + p2.b; }
+    }
+    println(ssum);                // 3+4+5+6 = 18
+
+    // ③ 裸泛型函数返回嵌套容器后直接索引
+    let m = makeMatrix();
+    println(m[0][1]);             // 2
+    return 0;
+}

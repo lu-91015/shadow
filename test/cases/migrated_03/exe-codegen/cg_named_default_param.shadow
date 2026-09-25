@@ -1,5 +1,4 @@
 //@desc: named + default params combined
-//@xfail: default param not implemented in 0.4
 //@expect: 6\n1\n42
 dsb cg_named_default_param;
 

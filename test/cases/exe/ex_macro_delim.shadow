@@ -1,0 +1,33 @@
+//@mode: exe
+//@desc: [] 宏调用定界符：表达式/语句/条目位置宏调用 + 数组索引不受影响
+//@expect: a=6\nb=14\nc=9\nd=20\nl=50\nf=33
+//@timeout: 120
+dsb ex_macro_delim;
+
+// [] 定界符在表达式位置的声明式宏
+macro sumall { ($($x: expr),+) => { (0 $(+ $x)+) } }
+macro dbl2 { ($v: expr) => { ($v * 2) } }
+macro echo2 { ($a: expr, $b: expr) => { (($a + $b)) } }
+
+// [] 定界符在语句位置：展开为多语句（块内 let + 打印）
+macro mklet { ($n: ident, $v: expr) => { let $n = $v * 10; println("l=" + int_to_str($n)); } }
+
+// [] 定界符在条目位置：展开为函数
+macro mkfn { ($n: ident, $v: expr) => { kimo $n() -> int { return $v; } } }
+
+mkfn[ff, 33];
+
+kimo main() -> int {
+    let a = sumall[1,2,3];        // 表达式位置 []：0+1+2+3=6
+    let b = dbl2[7];              // 14
+    let c = echo2[4, 5];          // 9
+    let arr = [10, 20, 30];
+    let d = arr[1];               // 数组索引仍正常：20（arr 非宏名，不拦截）
+    mklet[g2, 5];                 // 语句位置 []：块内 let g2=50，打印 l=50
+    println("a=" + int_to_str(a));
+    println("b=" + int_to_str(b));
+    println("c=" + int_to_str(c));
+    println("d=" + int_to_str(d));
+    println("f=" + int_to_str(ff()));   // 条目位置 [] 展开的函数：33
+    return 0;
+}

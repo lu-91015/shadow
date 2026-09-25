@@ -1,0 +1,21 @@
+//@mode: tc-fail
+//@desc: 0.5.3 关联类型未知：impl 绑定了 trait 未声明的关联类型 → 必须报 err
+dsb tc_fail_assoc_unknown;
+
+trait Getter {
+    type Item;
+    kimo get(self: Self) -> Self::Item;
+}
+
+struct BoxI { v: int }
+
+impl Getter for BoxI {
+    type Item = int;
+    type Mystery = string;
+    kimo get(self: BoxI) -> int { return self.v; }
+}
+
+kimo main() -> int {
+    let b = BoxI { v: 1 };
+    return 0;
+}

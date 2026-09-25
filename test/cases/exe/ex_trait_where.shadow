@@ -1,0 +1,29 @@
+//@expect: doubled 8
+//@expect: named 4
+//@desc: 0.5.3 where 子句：泛型约束被移到函数签名末尾（where T: TraitB)，generic trait 方法照常分发
+dsb ex_trait_where;
+
+struct Num { v: int }
+
+trait HasVal {
+    kimo val(self: Self) -> int;
+}
+
+impl HasVal for Num {
+    kimo val(self: Num) -> int { return self.v; }
+}
+
+kimo double_it<T>(x: T) -> int where T: HasVal {
+    return x.val() * 2;
+}
+
+kimo describe_tag<T>(t: string, x: T) -> string where T: HasVal {
+    return t + " " + int_to_str(x.val());
+}
+
+kimo main() -> int {
+    let n = Num { v: 4 };
+    println("doubled " + int_to_str(double_it(n)));
+    println(describe_tag("named", n));
+    return 0;
+}

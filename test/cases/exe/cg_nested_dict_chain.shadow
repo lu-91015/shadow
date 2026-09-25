@@ -1,0 +1,47 @@
+//@mode: exe
+//@desc: 覆盖率 —— dict 内嵌 dict<int> 读写、dict<string, array<dict<string, struct>>> 链式深读、
+//       dict 值深链改写、追加元素后重插、嵌套遍历聚合求和。
+//@expect: 7\n11\n2\n20\n9\n39
+dsb cg_nested_dict_chain;
+
+struct Point { x: int; y: int; }
+
+kimo main() -> int {
+    // ① dict<string, dict<string, int>>：两跳索引 + 内层后改回读
+    let inner: dict<string, int> = hashmap_new();
+    hashmap_insert(inner, "b", 7);
+    let outer: dict<string, dict<string, int>> = hashmap_new();
+    hashmap_insert(outer, "a", inner);
+    println(outer["a"]["b"]);     // 7
+    hashmap_insert(inner, "c", 11);
+    println(outer["a"]["c"]);     // 11
+
+    // ② dict<string, array<dict<string, Point>>>：top["list"][0]["P"].y 深链
+    let p = Point { x: 1, y: 2 };
+    let mobj: dict<string, Point> = hashmap_new();
+    hashmap_insert(mobj, "P", p);
+    let arr: array<dict<string, Point>> = [];
+    arr = array_push(arr, mobj);
+    let top: dict<string, array<dict<string, Point>>> = hashmap_new();
+    hashmap_insert(top, "list", arr);
+    println(top["list"][0]["P"].y);   // 2
+    top["list"][0]["P"].y = 20;       // 深链改写
+    println(top["list"][0]["P"].y);   // 20
+
+    // ③ 追加第二个 dict 元素后整链重插 + 读新元素
+    let m2: dict<string, Point> = hashmap_new();
+    hashmap_insert(m2, "P", Point { x: 9, y: 9 });
+    arr = array_push(arr, m2);
+    hashmap_insert(top, "list", arr); // 覆盖写整个 array 值
+    println(top["list"][1]["P"].x);   // 9
+
+    // ④ 嵌套遍历聚合求和
+    let tot = 0;
+    let k = 0;
+    while (k < len(top["list"])) {
+        tot = tot + top["list"][k]["P"].x + top["list"][k]["P"].y;
+        k = k + 1;
+    }
+    println(tot);                     // (1+20) + (9+9) = 39
+    return 0;
+}

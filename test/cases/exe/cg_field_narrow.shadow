@@ -1,0 +1,30 @@
+//@expect: 65\n4464\n65\n-1\n-5\n0\n75
+//@timeout: 60
+// 回归：MIR_MEMBER 读 char/short 结构体字段时未收窄到 i8/i16。
+// cg_load_fn(fk) 对 char/short 一律返回 i32（__rt_shadow_load_int），若直接以 i32
+// 值登记 CHAR 寄存器，二元运算与其 i8 字面量操作数类型不匹配，生成 sub i32, i8
+// 之类的非法 IR（llc 拒绝编译）—— 与 cg_gen_array_load 对窄数组元素已做的收窄不一致。
+// 修复：MIR_MEMBER 镜像数组 load，对 char/short 字段 trunc 到 i8/i16。
+dsb cg_field_narrow;
+
+struct Pt { ch: char; sh: short; }
+
+kimo id_int(x: int) -> int { return x; }
+
+kimo main() -> int {
+    let p = Pt{ch: 'A', sh: 70000 as short};
+    println(int_to_str(p.ch));          // 65:    char 字段 → int_to_str
+    println(int_to_str(p.sh));          // 4464:  short 字段（70000 as short）
+    println(int_to_str(id_int(p.ch)));  // 65:    char 字段喂用户 int 形参
+
+    let neg = Pt{ch: (-1 as char), sh: (-5 as short)};
+    println(int_to_str(neg.ch));        // -1:    负 char 字段（i8 sext）
+    println(int_to_str(neg.sh));        // -5:    负 short 字段（i16 sext）
+
+    let idx = p.ch - 'A';               // 0:     char 字段参与二元运算（触发原 IR 类型不匹配）
+    println(int_to_str(idx));
+
+    let cc: char = 'K';
+    println(int_to_str(cc));            // 75:    char 变量
+    return 0;
+}

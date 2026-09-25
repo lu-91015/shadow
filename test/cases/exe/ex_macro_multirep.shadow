@@ -1,0 +1,14 @@
+//@mode: exe
+//@desc: 多重复组模式：两个独立重复组并列（Rust 对齐），碎片数一致时正常匹配并展开
+//@expect: r=33
+//@timeout: 120
+dsb ex_macro_multirep;
+
+// 双重复组：分号分隔两组，转录把两组元素交替并入同一重复组
+macro sum2 { ($($x: expr),+; $($y: expr),+) => { (0 $(+ $x + $y)+) } }
+
+kimo main() -> int {
+    let r = sum2(1,2; 10,20);   // 0+1+10+2+20 = 33
+    println("r=" + int_to_str(r));
+    return 0;
+}

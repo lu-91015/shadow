@@ -1,0 +1,32 @@
+//@expect: Rex
+//@expect: I am Rex
+//@desc: 0.5.3 supertrait + 默认实现：子 trait 的默认方法体内调用父 trait 方法 self.name()
+dsb ex_trait_supertrait_default;
+
+trait Speaker {
+    kimo name(self: Self) -> string;
+}
+
+trait Named : Speaker {
+    kimo intro(self: Self) -> string {
+        return "I am " + self.name();
+    }
+}
+
+struct Dog { tag: string }
+
+impl Speaker for Dog {
+    kimo name(self: Dog) -> string {
+        return self.tag;
+    }
+}
+
+impl Named for Dog {
+}
+
+kimo main() -> int {
+    let d = Dog { tag: "Rex" };
+    println(d.name());
+    println(d.intro());
+    return 0;
+}
