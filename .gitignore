@@ -100,6 +100,10 @@ tools/bench_short.sh
 tools/bench_fourway.sh
 tools/_test_basic_linux.sh
 tools/_bench_short_linux.sh
+# 本地快速重建/开发辅助（dev_rebuild/rebuild_compiler 含本机绝对路径；bench_time 配合不入库的 bench/*）
+tools/dev_rebuild.sh
+tools/rebuild_compiler.sh
+tools/bench_time.py
 
 # 项目文档（不入库）
 开发原则.md
