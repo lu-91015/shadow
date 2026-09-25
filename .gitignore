@@ -104,6 +104,10 @@ tools/_bench_short_linux.sh
 tools/dev_rebuild.sh
 tools/rebuild_compiler.sh
 tools/bench_time.py
+tools/dev_rebuild.ps1
+tools/run_case.ps1
+tools/run_rt_test.ps1
+tools/_linux_bench_only.sh
 
 # 项目文档（不入库）
 开发原则.md
