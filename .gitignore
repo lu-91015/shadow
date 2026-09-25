@@ -108,6 +108,8 @@ tools/dev_rebuild.ps1
 tools/run_case.ps1
 tools/run_rt_test.ps1
 tools/_linux_bench_only.sh
+tools/bl.sh
+tools/bl_o2.sh
 
 # 项目文档（不入库）
 开发原则.md
