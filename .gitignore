@@ -1,4 +1,4 @@
-# 构建产物（build/* 而非 build/：需例外跟踪 build/shadow.exe，即 0.5.3 每轮自举 [5/7] 留下的产物，见下）
+# 构建产物（build/* 全部忽略：build/shadow.exe / build/run_tests.exe 为自举与测试运行器产物，本地生成、不入库）
 build/*
 # Linux 自举构建产物（WSL：stage1.ll/.o、shadow 二进制、rt/ 运行时对象）
 linux_build/
@@ -11,10 +11,8 @@ linux_build/
 *.ilk
 *.lib
 *.exp
-# 例外：build/shadow.exe 是 0.5.3 每轮自举 [5/7] 留下的产物（入库作 CI 冷启动自举链 HOST，build_shadow.sh [1/7] 依赖）
-!build/shadow.exe
-# 例外：build/run_tests.exe 预构建测试运行器入库（干净克隆可直接跑回归，无需从源码重建）
-!build/run_tests.exe
+# build/shadow.exe（自举 [5/7] 产物）与 build/run_tests.exe（测试运行器）均由本地构建生成，不入库；
+# 干净克隆自举需先有种子 HOST（见 readme / CI workflow 说明）。
 # 函数级增量缓存（.lu）：源码旁旧位置已废弃，缓存统一在 build/lu_cache/（build/ 已覆盖）。
 # 防止历史 .lu 文件（旧缓存位置遗留）再次被 git 跟踪。
 *.lu
